@@ -104,7 +104,21 @@ Press `8` for the full log viewer with three tabs: **agent**, **gateway**, and *
 
 Requires Python 3.11+ and a working [Hermes Agent](https://github.com/NousResearch/hermes-agent) installation (`~/.hermes/` must exist).
 
-### From Source (recommended)
+### Via pip
+
+```bash
+pip install hermesd
+hermesd
+```
+
+### Via uv
+
+```bash
+uv tool install hermesd
+hermesd
+```
+
+### From Source
 
 ```bash
 git clone https://github.com/mudrii/hermesd.git
@@ -112,20 +126,6 @@ cd hermesd
 uv venv .venv --python 3.11
 source .venv/bin/activate
 uv pip install -e .
-hermesd
-```
-
-### Via pip (from source)
-
-```bash
-pip install git+https://github.com/mudrii/hermesd.git
-hermesd
-```
-
-### Via uv (from source)
-
-```bash
-uv tool install git+https://github.com/mudrii/hermesd.git
 hermesd
 ```
 
@@ -145,8 +145,6 @@ nix run github:mudrii/hermesd
 # Dev shell
 nix develop github:mudrii/hermesd
 ```
-
-> **Note:** PyPI publication is planned. Once published, `pip install hermesd` and `uv tool install hermesd` will work without the `git+` prefix.
 
 ## Usage
 
