@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermesd"
-version = "0.1.0"
+version = "2026.4.9"
 description = "TUI monitoring dashboard for Hermes AI agent"
 readme = "README.md"
 requires-python = ">=3.11"
