@@ -34,7 +34,6 @@ def test_gateway_state_with_platforms():
         pid=12345,
         running=True,
         state="running",
-        uptime_seconds=3600.0,
         platforms=[
             PlatformStatus(name="telegram", state="connected"),
             PlatformStatus(name="discord", state="disconnected"),

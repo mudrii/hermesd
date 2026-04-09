@@ -75,16 +75,21 @@ class Collector:
             return self._json_cache.get(key)
 
     def _read_yaml_cached(self) -> dict[str, Any]:
-        if self._config_cache is not None:
-            return self._config_cache
         path = self._home / "config.yaml"
-        if not path.exists():
-            return {}
+        key = str(path)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return self._config_cache or {}
+        if self._mtime_cache.get(key) == mtime and self._config_cache is not None:
+            return self._config_cache
         try:
             with open(path) as f:
                 self._config_cache = yaml.safe_load(f) or {}
+            self._mtime_cache[key] = mtime
         except Exception:
-            self._config_cache = {}
+            if self._config_cache is None:
+                self._config_cache = {}
         return self._config_cache
 
     def _collect_gateway(self) -> GatewayState:
@@ -404,7 +409,11 @@ class Collector:
         if not path.exists():
             return []
         try:
-            text = path.read_text()
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 32768))
+                text = f.read().decode("utf-8", errors="replace")
             lines = text.strip().splitlines()[-max_lines:]
             result = []
             for line in lines:

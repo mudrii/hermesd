@@ -63,6 +63,7 @@ class DashboardApp:
         self._running = False
         self._force_refresh = threading.Event()
         self._lock = threading.Lock()
+        self._view_lock = threading.Lock()
         self._spinner_idx = 0
         self._console = Console(force_terminal=not no_color, no_color=no_color)
 
@@ -110,7 +111,7 @@ class DashboardApp:
                     self._state = new_state
             except Exception:
                 with self._lock:
-                    self._state.is_stale = True
+                    self._state = self._state.model_copy(update={"is_stale": True})
 
     def _input_loop(self) -> None:
         if not sys.stdin.isatty():
@@ -130,7 +131,8 @@ class DashboardApp:
                 if not data:
                     break
                 key = data.decode("utf-8", errors="replace")
-                action = self._handle_key(key)
+                with self._view_lock:
+                    action = self._handle_key(key)
                 if action == "quit":
                     self._running = False
                     break
@@ -171,6 +173,12 @@ class DashboardApp:
     def _build_layout(self) -> Layout:
         with self._lock:
             state = self._state
+        with self._view_lock:
+            mode = self._view.mode
+            detail_panel = self._view.detail_panel
+            scroll_offset = self._view.scroll_offset
+            log_sub_view = self._view.log_sub_view
+            show_help = self._view.show_help
 
         layout = Layout()
         layout.split_column(
@@ -181,13 +189,13 @@ class DashboardApp:
 
         layout["header"].update(self._build_header(state))
 
-        if self._view.show_help:
+        if show_help:
             layout["body"].update(self._build_help())
-        elif self._view.mode == "detail" and self._view.detail_panel:
+        elif mode == "detail" and detail_panel:
             panel = render_panel(
-                self._view.detail_panel, state, self._theme,
-                detail=True, log_sub_view=self._view.log_sub_view,
-                scroll_offset=self._view.scroll_offset,
+                detail_panel, state, self._theme,
+                detail=True, log_sub_view=log_sub_view,
+                scroll_offset=scroll_offset,
             )
             layout["body"].update(panel)
         else:

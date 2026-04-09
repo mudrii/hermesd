@@ -16,7 +16,6 @@ class GatewayState(BaseModel):
     pid: int = 0
     running: bool = False
     state: str = "unknown"
-    uptime_seconds: float = 0.0
     platforms: list[PlatformStatus] = Field(default_factory=list)
     hermes_version: str = ""
     updates_behind: int = 0
@@ -114,7 +113,7 @@ class LogState(BaseModel):
 
 
 class DashboardState(BaseModel):
-    hermes_home: Path = Path.home() / ".hermes"
+    hermes_home: Path = Field(default_factory=lambda: Path.home() / ".hermes")
     collected_at: float = Field(default_factory=time.time)
     is_stale: bool = False
     gateway: GatewayState = Field(default_factory=GatewayState)
