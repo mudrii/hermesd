@@ -50,9 +50,10 @@ def test_main_exits_on_missing_dir(tmp_path):
 
 
 def test_parse_args_version(capsys):
+    from hermesd import __version__
     with pytest.raises(SystemExit) as exc:
         parse_args(["--version"])
     assert exc.value.code == 0
     out = capsys.readouterr().out
     assert "hermesd" in out
-    assert "0.1.0" in out
+    assert __version__ in out
