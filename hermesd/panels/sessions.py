@@ -6,6 +6,7 @@ from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import DashboardState
+from hermesd.panels.formatting import fmt_tokens
 from hermesd.theme import Theme
 
 
@@ -63,7 +64,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         table.add_row(
             sid, s.source, s.model or "—",
             str(s.message_count), str(s.tool_call_count),
-            _fmt_tokens(s.input_tokens), _fmt_tokens(s.output_tokens),
+            fmt_tokens(s.input_tokens), fmt_tokens(s.output_tokens),
             f"${s.estimated_cost_usd:.2f}",
         )
 
@@ -75,11 +76,3 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         box=rich.box.HORIZONTALS,
         padding=(1, 2),
     )
-
-
-def _fmt_tokens(n: int) -> str:
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return str(n)

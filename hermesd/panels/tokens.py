@@ -6,6 +6,7 @@ from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import DashboardState
+from hermesd.panels.formatting import fmt_tokens
 from hermesd.theme import Theme
 
 
@@ -15,22 +16,14 @@ def render_tokens(state: DashboardState, theme: Theme, detail: bool = False) -> 
     return _render_compact(state, theme)
 
 
-def _fmt_tokens(n: int) -> str:
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return str(n)
-
-
 def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     t = state.tokens_today
     total = state.tokens_total
     lines = Text()
     lines.append("  Today", style=theme.ui_label)
-    lines.append(f"  In:{_fmt_tokens(t.input_tokens):>6}  Out:{_fmt_tokens(t.output_tokens):>6}\n", style=theme.ui_accent)
+    lines.append(f"  In:{fmt_tokens(t.input_tokens):>6}  Out:{fmt_tokens(t.output_tokens):>6}\n", style=theme.ui_accent)
     lines.append("       ", style=theme.ui_label)
-    lines.append(f"  Cache-R:{_fmt_tokens(t.cache_read_tokens):>6}\n", style=theme.banner_text)
+    lines.append(f"  Cache-R:{fmt_tokens(t.cache_read_tokens):>6}\n", style=theme.banner_text)
     lines.append("  Cost", style=theme.ui_label)
     lines.append(f"   Today:~${t.total_cost_usd:.2f}\n", style=theme.ui_accent)
     lines.append("       ", style=theme.ui_label)
@@ -59,9 +52,9 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     for s in state.sessions:
         table.add_row(
             s.session_id[-8:],
-            _fmt_tokens(s.input_tokens), _fmt_tokens(s.output_tokens),
-            _fmt_tokens(s.cache_read_tokens), _fmt_tokens(s.cache_write_tokens),
-            _fmt_tokens(s.reasoning_tokens), f"${s.estimated_cost_usd:.2f}",
+            fmt_tokens(s.input_tokens), fmt_tokens(s.output_tokens),
+            fmt_tokens(s.cache_read_tokens), fmt_tokens(s.cache_write_tokens),
+            fmt_tokens(s.reasoning_tokens), f"${s.estimated_cost_usd:.2f}",
         )
 
     return Panel(
