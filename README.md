@@ -6,7 +6,7 @@ A real-time TUI monitoring dashboard for [Hermes Agent](https://github.com/NousR
 
 ## Why This Exists
 
-When you run Hermes Agent seriously — gateway handling Telegram, Discord, Feishu, and WhatsApp simultaneously, cron jobs firing reminders, multiple CLI sessions with sub-agents spawning sub-agents, dozens of skills loaded, 7+ LLM providers configured — the information gets scattered fast.
+When you run Hermes Agent seriously — gateway handling Telegram, Discord, Slack, and WhatsApp simultaneously, cron jobs firing reminders, multiple CLI sessions with sub-agents spawning sub-agents, dozens of skills loaded, 7+ LLM providers configured — the information gets scattered fast.
 
 **The problem:** there was no single place to answer the obvious questions:
 - Is my gateway actually running? Which platforms are connected?
@@ -104,10 +104,10 @@ Press `8` for the full log viewer with three tabs: **agent**, **gateway**, and *
 
 Requires Python 3.11+ and a working [Hermes Agent](https://github.com/NousResearch/hermes-agent) installation (`~/.hermes/` must exist).
 
-### From Source
+### From Source (recommended)
 
 ```bash
-git clone https://github.com/NousResearch/hermesd.git
+git clone https://github.com/mudrii/hermesd.git
 cd hermesd
 uv venv .venv --python 3.11
 source .venv/bin/activate
@@ -115,19 +115,38 @@ uv pip install -e .
 hermesd
 ```
 
-### Via pip
+### Via pip (from source)
 
 ```bash
-pip install hermesd
+pip install git+https://github.com/mudrii/hermesd.git
 hermesd
 ```
 
-### Via uv
+### Via uv (from source)
 
 ```bash
-uv tool install hermesd
+uv tool install git+https://github.com/mudrii/hermesd.git
 hermesd
 ```
+
+### Docker
+
+```bash
+docker build -t hermesd .
+docker run -it -v ~/.hermes:/home/hermesd/.hermes:ro hermesd
+```
+
+### Nix Flake
+
+```bash
+# Run directly
+nix run github:mudrii/hermesd
+
+# Dev shell
+nix develop github:mudrii/hermesd
+```
+
+> **Note:** PyPI publication is planned. Once published, `pip install hermesd` and `uv tool install hermesd` will work without the `git+` prefix.
 
 ## Usage
 
@@ -223,7 +242,7 @@ hermesd inherits the active skin from Hermes Agent's `config.yaml`:
 ## Development
 
 ```bash
-git clone https://github.com/NousResearch/hermesd.git
+git clone https://github.com/mudrii/hermesd.git
 cd hermesd
 uv venv .venv --python 3.11
 source .venv/bin/activate
@@ -277,13 +296,15 @@ tests/                 164 tests: panels, data, resilience, edge cases
 
 ### Dependencies
 
-Only 3 runtime dependencies:
+Only 3 runtime dependencies — all of which are already installed as part of Hermes Agent, so hermesd adds **zero new packages** to your system:
 
-| Package | Version | Purpose |
-|---------|---------|---------|
-| `rich` | >= 14.0 | TUI rendering (Live, Layout, Panel, Table, Text) |
-| `pyyaml` | >= 6.0 | Reading config.yaml |
-| `pydantic` | >= 2.0 | Data models and validation |
+| Package | Version | Purpose | In hermes-agent? |
+|---------|---------|---------|------------------|
+| `rich` | >= 14.0 | TUI rendering (Live, Layout, Panel, Table, Text) | Yes (`rich>=14.3.3`) |
+| `pyyaml` | >= 6.0 | Reading config.yaml | Yes (`pyyaml>=6.0.2`) |
+| `pydantic` | >= 2.0 | Data models and validation | Yes (`pydantic>=2.12.5`) |
+
+If you install hermesd into the same environment as Hermes Agent, no additional downloads are needed.
 
 ## License
 

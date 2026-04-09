@@ -1,0 +1,15 @@
+.venv/
+venv/
+.git/
+.github/
+.pytest_cache/
+.claude/
+.remember/
+.superpowers/
+docs/
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.pyc
+.DS_Store

@@ -40,10 +40,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/NousResearch/hermesd"
-Repository = "https://github.com/NousResearch/hermesd"
-Issues = "https://github.com/NousResearch/hermesd/issues"
-Changelog = "https://github.com/NousResearch/hermesd/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/mudrii/hermesd"
+Repository = "https://github.com/mudrii/hermesd"
+Issues = "https://github.com/mudrii/hermesd/issues"
+Changelog = "https://github.com/mudrii/hermesd/blob/main/CHANGELOG.md"
 
 [project.scripts]
 hermesd = "hermesd.__main__:main"

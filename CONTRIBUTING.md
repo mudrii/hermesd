@@ -5,7 +5,7 @@ Thanks for your interest in contributing to hermesd!
 ## Getting Started
 
 ```bash
-git clone https://github.com/NousResearch/hermesd.git
+git clone https://github.com/mudrii/hermesd.git
 cd hermesd
 uv venv .venv --python 3.11
 source .venv/bin/activate
