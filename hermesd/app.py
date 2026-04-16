@@ -13,11 +13,10 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
 
-from hermesd import __version__
 from hermesd.collector import Collector
 from hermesd.models import DashboardState
 from hermesd.panels import render_panel
-from hermesd.theme import Theme, load_theme
+from hermesd.theme import load_theme
 
 _LOG_VIEWS = ("agent", "gateway", "errors")
 _DOTS_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -81,7 +80,9 @@ class DashboardApp:
         input_thread.start()
 
         try:
-            with Live(self._build_layout(), console=self._console, refresh_per_second=2, screen=True) as live:
+            with Live(
+                self._build_layout(), console=self._console, refresh_per_second=2, screen=True
+            ) as live:
                 while self._running:
                     time.sleep(0.5)
                     self._spinner_idx = (self._spinner_idx + 1) % len(_DOTS_FRAMES)
@@ -120,6 +121,7 @@ class DashboardApp:
         import select
         import termios
         import tty
+
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
         try:
@@ -193,8 +195,11 @@ class DashboardApp:
             layout["body"].update(self._build_help())
         elif mode == "detail" and detail_panel:
             panel = render_panel(
-                detail_panel, state, self._theme,
-                detail=True, log_sub_view=log_sub_view,
+                detail_panel,
+                state,
+                self._theme,
+                detail=True,
+                log_sub_view=log_sub_view,
                 scroll_offset=scroll_offset,
             )
             layout["body"].update(panel)
@@ -207,7 +212,7 @@ class DashboardApp:
     def _build_header(self, state: DashboardState) -> Text:
         now = datetime.now().strftime("%H:%M:%S")
         t = Text(style="on #1A1A2E")
-        t.append(f" ⚕ hermesd ", style=f"bold {self._theme.banner_title} on #1A1A2E")
+        t.append(" ⚕ hermesd ", style=f"bold {self._theme.banner_title} on #1A1A2E")
         skin_label = f"{state.active_skin} skin" if state.active_skin != "default" else ""
         padding = " " * max(1, 60 - len(skin_label) - len(now))
         t.append(f"{padding}{skin_label}   {now} ", style=f"{self._theme.banner_dim} on #1A1A2E")
@@ -237,7 +242,10 @@ class DashboardApp:
 
         spinner = _DOTS_FRAMES[self._spinner_idx]
         stale = " (stale)" if state.is_stale else ""
-        t.append(f"   {spinner} {self._refresh_rate}s{stale}", style=f"{self._theme.session_border} on #1A1A2E")
+        t.append(
+            f"   {spinner} {self._refresh_rate}s{stale}",
+            style=f"{self._theme.session_border} on #1A1A2E",
+        )
         return t
 
     def _build_overview(self, state: DashboardState) -> Layout:
@@ -308,6 +316,7 @@ class DashboardApp:
 
     def _build_help(self) -> Panel:
         import rich.box
+
         lines = Text()
         lines.append("  Keyboard Shortcuts\n\n", style=f"bold {self._theme.banner_title}")
         shortcuts = [

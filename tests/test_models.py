@@ -75,8 +75,10 @@ def test_tool_stats():
 
 def test_config_summary():
     c = ConfigSummary(
-        model="gpt-5.4", provider="openai-codex",
-        personality="kawaii", max_turns=192,
+        model="gpt-5.4",
+        provider="openai-codex",
+        personality="kawaii",
+        max_turns=192,
     )
     assert c.personality == "kawaii"
 

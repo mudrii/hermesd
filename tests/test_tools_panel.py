@@ -1,9 +1,10 @@
 """Tests for [4] Tools panel — two-table detail layout."""
+
 from rich.console import Console
 
 from hermesd.models import DashboardState, ToolStats
-from hermesd.theme import Theme
 from hermesd.panels import render_panel
+from hermesd.theme import Theme
 
 
 def _render_to_str(panel) -> str:

@@ -8,7 +8,9 @@ from hermesd.models import DashboardState, LogLine
 from hermesd.theme import Theme
 
 
-def render_logs(state: DashboardState, theme: Theme, detail: bool = False, sub_view: str = "agent") -> Panel:
+def render_logs(
+    state: DashboardState, theme: Theme, detail: bool = False, sub_view: str = "agent"
+) -> Panel:
     if detail:
         return _render_detail(state, theme, sub_view)
     return _render_compact(state, theme)

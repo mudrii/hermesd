@@ -1,4 +1,5 @@
 """Tests for shared formatting utilities."""
+
 from hermesd.panels.formatting import fmt_tokens
 
 

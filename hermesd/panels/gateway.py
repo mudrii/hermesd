@@ -22,7 +22,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     if gw.running:
         lines.append("  ● ", style=f"bold {theme.ui_ok}")
         lines.append("Running", style=theme.banner_text)
-        lines.append(f"  PID:", style=theme.ui_label)
+        lines.append("  PID:", style=theme.ui_label)
         lines.append(f"{gw.pid}", style=theme.ui_accent)
     else:
         lines.append("  ● ", style=f"bold {theme.ui_error}")
@@ -76,12 +76,15 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     if gw.hermes_version:
         header.append(f"\n  Hermes v{gw.hermes_version}", style=theme.ui_accent)
         if gw.updates_behind > 0:
-            header.append(f"  ({gw.updates_behind} commits behind — run 'hermes update')", style=theme.ui_warn)
+            header.append(
+                f"  ({gw.updates_behind} commits behind — run 'hermes update')", style=theme.ui_warn
+            )
         else:
             header.append("  (up to date)", style=theme.ui_ok)
     header.append("\n\n")
 
     from rich.console import Group
+
     content = Group(header, table)
 
     return Panel(

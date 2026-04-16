@@ -1,4 +1,5 @@
 """Tests for [6] Cron panel — job listing, compact and detail views."""
+
 import json
 from pathlib import Path
 
@@ -24,8 +25,15 @@ def test_cron_compact_shows_job_count():
             job_count=2,
             error_count=0,
             jobs=[
-                CronJob(name="daily-report", schedule_display="every day at 9am", state="scheduled", enabled=True),
-                CronJob(name="cleanup", schedule_display="every 6h", state="scheduled", enabled=True),
+                CronJob(
+                    name="daily-report",
+                    schedule_display="every day at 9am",
+                    state="scheduled",
+                    enabled=True,
+                ),
+                CronJob(
+                    name="cleanup", schedule_display="every 6h", state="scheduled", enabled=True
+                ),
             ],
         ),
     )
@@ -38,9 +46,13 @@ def test_cron_compact_shows_job_count():
 
 def test_cron_compact_shows_errors():
     state = DashboardState(
-        cron=CronState(job_count=1, error_count=1, jobs=[
-            CronJob(name="broken", state="error", last_status="error"),
-        ]),
+        cron=CronState(
+            job_count=1,
+            error_count=1,
+            jobs=[
+                CronJob(name="broken", state="error", last_status="error"),
+            ],
+        ),
     )
     panel = render_panel(6, state, Theme(), detail=False)
     text = _render_to_str(panel)
@@ -54,14 +66,20 @@ def test_cron_detail_shows_job_table():
             job_count=2,
             jobs=[
                 CronJob(
-                    job_id="abc123", name="meeting-reminder",
-                    schedule_display="once in 2m", state="scheduled",
-                    enabled=True, next_run_at="2026-04-09T18:21:49+08:00",
+                    job_id="abc123",
+                    name="meeting-reminder",
+                    schedule_display="once in 2m",
+                    state="scheduled",
+                    enabled=True,
+                    next_run_at="2026-04-09T18:21:49+08:00",
                 ),
                 CronJob(
-                    job_id="def456", name="daily-backup",
-                    schedule_display="every day at 3am", state="scheduled",
-                    enabled=False, last_status="ok",
+                    job_id="def456",
+                    name="daily-backup",
+                    schedule_display="every day at 3am",
+                    state="scheduled",
+                    enabled=False,
+                    last_status="ok",
                 ),
             ],
         ),
@@ -82,22 +100,33 @@ def test_cron_detail_empty():
 
 
 def test_collector_reads_jobs_json(hermes_home: Path):
-    (hermes_home / "cron" / "jobs.json").write_text(json.dumps({
-        "jobs": [
+    (hermes_home / "cron" / "jobs.json").write_text(
+        json.dumps(
             {
-                "id": "j1", "name": "test-cron",
-                "schedule_display": "every 10m", "state": "scheduled",
-                "enabled": True, "next_run_at": "2026-04-09T19:00:00",
-                "last_status": None, "last_error": None,
-            },
-            {
-                "id": "j2", "name": "failed-job",
-                "schedule_display": "every 1h", "state": "error",
-                "enabled": True, "last_status": "error",
-                "last_error": "timeout",
-            },
-        ],
-    }))
+                "jobs": [
+                    {
+                        "id": "j1",
+                        "name": "test-cron",
+                        "schedule_display": "every 10m",
+                        "state": "scheduled",
+                        "enabled": True,
+                        "next_run_at": "2026-04-09T19:00:00",
+                        "last_status": None,
+                        "last_error": None,
+                    },
+                    {
+                        "id": "j2",
+                        "name": "failed-job",
+                        "schedule_display": "every 1h",
+                        "state": "error",
+                        "enabled": True,
+                        "last_status": "error",
+                        "last_error": "timeout",
+                    },
+                ],
+            }
+        )
+    )
     c = Collector(hermes_home)
     state = c.collect()
     assert state.cron.job_count == 2

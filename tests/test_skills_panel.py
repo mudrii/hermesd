@@ -1,9 +1,10 @@
 """Tests for [7] Skills/Providers panel — two-table detail layout."""
+
 from rich.console import Console
 
 from hermesd.models import DashboardState, ProviderInfo, SkillInfo, SkillsMemory
-from hermesd.theme import Theme
 from hermesd.panels import render_panel
+from hermesd.theme import Theme
 
 
 def _render_to_str(panel) -> str:
@@ -90,10 +91,16 @@ def test_skills_detail_shows_description_column():
             skill_categories=1,
             providers=[],
             skills=[
-                SkillInfo(name="apple-notes", category="apple",
-                          description="Manage Apple Notes via memo CLI"),
-                SkillInfo(name="apple-reminders", category="apple",
-                          description="Manage Apple Reminders via remindctl"),
+                SkillInfo(
+                    name="apple-notes",
+                    category="apple",
+                    description="Manage Apple Notes via memo CLI",
+                ),
+                SkillInfo(
+                    name="apple-reminders",
+                    category="apple",
+                    description="Manage Apple Reminders via remindctl",
+                ),
             ],
         ),
     )
@@ -106,12 +113,14 @@ def test_skills_detail_shows_description_column():
 
 def test_skills_detail_scroll_offset():
     skills = [
-        SkillInfo(name=f"skill-{i}", category="cat", description=f"Desc {i}")
-        for i in range(20)
+        SkillInfo(name=f"skill-{i}", category="cat", description=f"Desc {i}") for i in range(20)
     ]
     state = DashboardState(
         skills_memory=SkillsMemory(
-            skill_count=20, skill_categories=1, providers=[], skills=skills,
+            skill_count=20,
+            skill_categories=1,
+            providers=[],
+            skills=skills,
         ),
     )
     # Scroll to offset 5
@@ -125,12 +134,14 @@ def test_skills_detail_scroll_offset():
 
 def test_skills_detail_scroll_offset_zero():
     skills = [
-        SkillInfo(name=f"skill-{i}", category="cat", description=f"Desc {i}")
-        for i in range(5)
+        SkillInfo(name=f"skill-{i}", category="cat", description=f"Desc {i}") for i in range(5)
     ]
     state = DashboardState(
         skills_memory=SkillsMemory(
-            skill_count=5, skill_categories=1, providers=[], skills=skills,
+            skill_count=5,
+            skill_categories=1,
+            providers=[],
+            skills=skills,
         ),
     )
     panel = render_panel(7, state, Theme(), detail=True, scroll_offset=0)

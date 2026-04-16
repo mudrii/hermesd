@@ -1,6 +1,4 @@
-import os
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -51,6 +49,7 @@ def test_main_exits_on_missing_dir(tmp_path):
 
 def test_parse_args_version(capsys):
     from hermesd import __version__
+
     with pytest.raises(SystemExit) as exc:
         parse_args(["--version"])
     assert exc.value.code == 0

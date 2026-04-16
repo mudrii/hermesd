@@ -37,10 +37,16 @@ def test_collect_missing_files(hermes_home: Path):
 
 def test_collect_gateway_not_running(hermes_home: Path):
     gw = hermes_home / "gateway_state.json"
-    gw.write_text(json.dumps({
-        "pid": 99999, "gateway_state": "stopped",
-        "platforms": {}, "updated_at": "",
-    }))
+    gw.write_text(
+        json.dumps(
+            {
+                "pid": 99999,
+                "gateway_state": "stopped",
+                "platforms": {},
+                "updated_at": "",
+            }
+        )
+    )
     c = Collector(hermes_home)
     state = c.collect()
     assert state.gateway.running is False
@@ -68,6 +74,7 @@ def test_collect_providers(populated_hermes_home: Path):
 def test_collect_sessions_with_null_columns(hermes_home: Path):
     """Sessions with NULL model, source, and token columns must not crash."""
     import sqlite3
+
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
     conn.executescript("""
@@ -96,8 +103,7 @@ def test_collect_sessions_with_null_columns(hermes_home: Path):
         );
     """)
     conn.execute(
-        "INSERT INTO sessions (id, source, model, started_at) "
-        "VALUES (?, NULL, NULL, ?)",
+        "INSERT INTO sessions (id, source, model, started_at) VALUES (?, NULL, NULL, ?)",
         ("sess_null", time.time()),
     )
     conn.commit()

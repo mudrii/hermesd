@@ -37,6 +37,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=9.0.0",
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
+    "types-PyYAML>=6.0.0",
+    "pip-audit>=2.7.0",
 ]
 
 [project.urls]
@@ -50,6 +54,53 @@ hermesd = "hermesd.__main__:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",
+    "I",
+    "UP",
+    "B",
+    "C4",
+    "SIM",
+    "RET",
+    "N",
+    "RUF",
+]
+ignore = [
+    "E501",
+    "RET504",
+    "SIM108",
+    "B008",
+    "B904",
+    "N818",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = "hermesd.db"
+disallow_any_explicit = false
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+check_untyped_defs = false
 
 [tool.hatch.build.targets.sdist]
 include = ["hermesd/", "tests/", "LICENSE", "README.md", "CHANGELOG.md"]

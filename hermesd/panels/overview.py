@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import rich.box
-from rich.console import Group
+from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -11,7 +11,10 @@ from hermesd.theme import Theme
 
 
 def render_overview(
-    state: DashboardState, theme: Theme, detail: bool = False, scroll_offset: int = 0,
+    state: DashboardState,
+    theme: Theme,
+    detail: bool = False,
+    scroll_offset: int = 0,
 ) -> Panel:
     if detail:
         return _render_detail(state, theme, scroll_offset)
@@ -44,7 +47,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
 
 def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> Panel:
     sm = state.skills_memory
-    sections = []
+    sections: list[RenderableType] = []
 
     # Table 1: Providers
     prov_header = Text()
@@ -55,7 +58,11 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
     prov_table.add_column("Status", width=3)
     prov_table.add_column("Name", style=theme.banner_text)
     for p in sm.providers:
-        sym = Text("●", style=f"bold {theme.ui_ok}") if p.is_active else Text("○", style=theme.banner_dim)
+        sym = (
+            Text("●", style=f"bold {theme.ui_ok}")
+            if p.is_active
+            else Text("○", style=theme.banner_dim)
+        )
         prov_table.add_row(sym, p.name)
     sections.append(prov_table)
 
@@ -81,7 +88,9 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
         visible = rows[offset:]
 
         skills_header = Text()
-        scroll_hint = f" [{offset + 1}-{min(offset + len(visible), total)}/{total}]" if total > 20 else ""
+        scroll_hint = (
+            f" [{offset + 1}-{min(offset + len(visible), total)}/{total}]" if total > 20 else ""
+        )
         skills_header.append(
             f"\nSkills ({sm.skill_count} in {sm.skill_categories} categories){scroll_hint}  ",
             style=f"bold {theme.ui_label}",

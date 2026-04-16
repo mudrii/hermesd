@@ -2,7 +2,6 @@ import json
 import sqlite3
 import time
 from pathlib import Path
-from unittest.mock import patch
 
 import yaml
 
@@ -11,6 +10,7 @@ from hermesd.collector import Collector, _today_epoch
 
 def test_today_epoch_is_midnight():
     import datetime
+
     epoch = _today_epoch()
     dt = datetime.datetime.fromtimestamp(epoch)
     assert dt.hour == 0
@@ -24,9 +24,34 @@ def test_collect_tokens_today_filters_by_date(hermes_home: Path, sample_db: Path
     yesterday = time.time() - 86400 * 2
     conn.execute(
         "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("sess_old", "cli", None, "gpt-5.4", None, None, None,
-         yesterday, None, None, 10, 5, 5000, 3000, 1000, 500, 0,
-         None, None, None, 0.10, None, None, None, None, None),
+        (
+            "sess_old",
+            "cli",
+            None,
+            "gpt-5.4",
+            None,
+            None,
+            None,
+            yesterday,
+            None,
+            None,
+            10,
+            5,
+            5000,
+            3000,
+            1000,
+            500,
+            0,
+            None,
+            None,
+            None,
+            0.10,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
     )
     conn.commit()
     conn.close()
@@ -54,14 +79,22 @@ def test_collect_total_tool_calls(hermes_home: Path, sample_db: Path):
 
 def test_collect_available_tools_from_session_json(hermes_home: Path):
     sessions_json = hermes_home / "sessions" / "sessions.json"
-    sessions_json.write_text(json.dumps({
-        "entry1": {"session_id": "s1"},
-    }))
+    sessions_json.write_text(
+        json.dumps(
+            {
+                "entry1": {"session_id": "s1"},
+            }
+        )
+    )
     session_file = hermes_home / "sessions" / "session_s1.json"
-    session_file.write_text(json.dumps({
-        "session_id": "s1",
-        "tools": [{"name": "terminal"}, {"name": "web_search"}, {"name": "read_file"}],
-    }))
+    session_file.write_text(
+        json.dumps(
+            {
+                "session_id": "s1",
+                "tools": [{"name": "terminal"}, {"name": "web_search"}, {"name": "read_file"}],
+            }
+        )
+    )
     c = Collector(hermes_home)
     state = c.collect()
     assert state.available_tools == 3
@@ -96,10 +129,14 @@ def test_collect_config_partial(hermes_home: Path):
 def test_collect_config_personality_fallback(hermes_home: Path):
     """When active_personality is unset, pick first from personalities dict."""
     cfg = hermes_home / "config.yaml"
-    cfg.write_text(yaml.dump({
-        "model": {"default": "gpt-5.4"},
-        "agent": {"personalities": {"pirate": "arrr"}},
-    }))
+    cfg.write_text(
+        yaml.dump(
+            {
+                "model": {"default": "gpt-5.4"},
+                "agent": {"personalities": {"pirate": "arrr"}},
+            }
+        )
+    )
     c = Collector(hermes_home)
     state = c.collect()
     assert state.config.personality == "pirate"
@@ -206,10 +243,16 @@ def test_json_cache_returns_none_on_missing_file(hermes_home: Path):
 def test_gateway_pid_not_running(hermes_home: Path):
     """Gateway state says running but PID doesn't exist and no gateway.pid."""
     gw = hermes_home / "gateway_state.json"
-    gw.write_text(json.dumps({
-        "pid": 999999999, "gateway_state": "running",
-        "platforms": {}, "updated_at": "",
-    }))
+    gw.write_text(
+        json.dumps(
+            {
+                "pid": 999999999,
+                "gateway_state": "running",
+                "platforms": {},
+                "updated_at": "",
+            }
+        )
+    )
     c = Collector(hermes_home)
     state = c.collect()
     assert state.gateway.running is False
@@ -220,13 +263,19 @@ def test_gateway_pid_not_running(hermes_home: Path):
 def test_gateway_stale_pid_with_launchd_pid(hermes_home: Path):
     """gateway_state.json has stale PID but gateway.pid has live PID."""
     import os
+
     my_pid = os.getpid()  # use our own PID as a "live" process
     gw = hermes_home / "gateway_state.json"
-    gw.write_text(json.dumps({
-        "pid": 999999999, "gateway_state": "running",
-        "platforms": {"telegram": {"state": "connected", "updated_at": ""}},
-        "updated_at": "",
-    }))
+    gw.write_text(
+        json.dumps(
+            {
+                "pid": 999999999,
+                "gateway_state": "running",
+                "platforms": {"telegram": {"state": "connected", "updated_at": ""}},
+                "updated_at": "",
+            }
+        )
+    )
     pid_file = hermes_home / "gateway.pid"
     pid_file.write_text(json.dumps({"pid": my_pid, "kind": "hermes-gateway"}))
     c = Collector(hermes_home)
@@ -248,6 +297,7 @@ def test_session_active_detection(hermes_home: Path, sample_db: Path):
 def test_session_ended_detection(hermes_home: Path):
     """Sessions with ended_at set should not be marked active."""
     import sqlite3
+
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
     conn.executescript("""

@@ -15,32 +15,31 @@ def render_panel(
     log_sub_view: str = "agent",
     scroll_offset: int = 0,
 ) -> Panel:
+    from hermesd.panels.config_panel import render_config
+    from hermesd.panels.cron import render_cron
     from hermesd.panels.gateway import render_gateway
+    from hermesd.panels.logs import render_logs
+    from hermesd.panels.overview import render_overview
     from hermesd.panels.sessions import render_sessions
     from hermesd.panels.tokens import render_tokens
     from hermesd.panels.tools import render_tools
-    from hermesd.panels.config_panel import render_config
-    from hermesd.panels.cron import render_cron
-    from hermesd.panels.overview import render_overview
-    from hermesd.panels.logs import render_logs
 
-    renderers = {
-        1: render_gateway,
-        2: render_sessions,
-        3: render_tokens,
-        4: render_tools,
-        5: render_config,
-        6: render_cron,
-        7: render_overview,
-        8: render_logs,
-    }
-    renderer = renderers.get(panel_num)
-    if renderer:
-        if panel_num == 8:
-            return renderer(state, theme, detail=detail, sub_view=log_sub_view)
-        if panel_num == 7:
-            return renderer(state, theme, detail=detail, scroll_offset=scroll_offset)
-        return renderer(state, theme, detail=detail)
+    if panel_num == 1:
+        return render_gateway(state, theme, detail=detail)
+    if panel_num == 2:
+        return render_sessions(state, theme, detail=detail)
+    if panel_num == 3:
+        return render_tokens(state, theme, detail=detail)
+    if panel_num == 4:
+        return render_tools(state, theme, detail=detail)
+    if panel_num == 5:
+        return render_config(state, theme, detail=detail)
+    if panel_num == 6:
+        return render_cron(state, theme, detail=detail)
+    if panel_num == 7:
+        return render_overview(state, theme, detail=detail, scroll_offset=scroll_offset)
+    if panel_num == 8:
+        return render_logs(state, theme, detail=detail, sub_view=log_sub_view)
     return Panel(Text("Unknown panel"), title="?", border_style=theme.panel_border_style)
 
 

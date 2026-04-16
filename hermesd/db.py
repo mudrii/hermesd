@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -21,28 +22,25 @@ class HermesDB:
 
     def _connect(self) -> None:
         if self._conn:
-            try:
+            with contextlib.suppress(sqlite3.Error, sqlite3.ProgrammingError):
                 self._conn.close()
-            except (sqlite3.Error, sqlite3.ProgrammingError):
-                pass
             self._conn = None
         if not self._path.exists():
             return
         self._uri = f"file:{self._path}?mode=ro"
         try:
-            self._conn = sqlite3.connect(self._uri, uri=True, timeout=2,
-                                         check_same_thread=False)
+            self._conn = sqlite3.connect(self._uri, uri=True, timeout=2, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             self._last_data_version = None
             self._consecutive_errors = 0
         except sqlite3.OperationalError:
             self._conn = None
 
-    def _ensure_connection(self) -> bool:
+    def _ensure_connection(self) -> sqlite3.Connection | None:
         if self._conn:
-            return True
+            return self._conn
         self._connect()
-        return self._conn is not None
+        return self._conn
 
     def _data_version_changed(self) -> bool:
         if not self._conn:
@@ -59,12 +57,13 @@ class HermesDB:
             return True
 
     def read_sessions(self) -> list[dict[str, Any]]:
-        if not self._ensure_connection():
+        conn = self._ensure_connection()
+        if conn is None:
             return self._cached_sessions
         if not self._data_version_changed() and self._cached_sessions:
             return self._cached_sessions
         try:
-            cur = self._conn.execute(
+            cur = conn.execute(
                 "SELECT id, source, user_id, model, started_at, ended_at, "
                 "end_reason, message_count, tool_call_count, "
                 "input_tokens, output_tokens, cache_read_tokens, "
@@ -81,12 +80,13 @@ class HermesDB:
         return self._cached_sessions
 
     def read_tool_stats(self) -> list[dict[str, Any]]:
-        if not self._ensure_connection():
+        conn = self._ensure_connection()
+        if conn is None:
             return self._cached_tool_stats
         if not self._data_version_changed() and self._cached_tool_stats:
             return self._cached_tool_stats
         try:
-            cur = self._conn.execute(
+            cur = conn.execute(
                 "SELECT tool_name, COUNT(*) as call_count "
                 "FROM messages WHERE tool_name IS NOT NULL "
                 "GROUP BY tool_name ORDER BY call_count DESC"
@@ -100,14 +100,21 @@ class HermesDB:
         return self._cached_tool_stats
 
     def read_token_totals(self) -> dict[str, Any]:
-        empty = {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
-                 "cache_write_tokens": 0, "reasoning_tokens": 0, "total_cost_usd": 0.0}
-        if not self._ensure_connection():
+        empty = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+            "total_cost_usd": 0.0,
+        }
+        conn = self._ensure_connection()
+        if conn is None:
             return self._cached_token_totals or empty
         if not self._data_version_changed() and self._cached_token_totals:
             return self._cached_token_totals
         try:
-            cur = self._conn.execute(
+            cur = conn.execute(
                 "SELECT "
                 "COALESCE(SUM(input_tokens), 0) as input_tokens, "
                 "COALESCE(SUM(output_tokens), 0) as output_tokens, "
@@ -127,8 +134,6 @@ class HermesDB:
 
     def close(self) -> None:
         if self._conn:
-            try:
+            with contextlib.suppress(sqlite3.ProgrammingError):
                 self._conn.close()
-            except sqlite3.ProgrammingError:
-                pass
             self._conn = None

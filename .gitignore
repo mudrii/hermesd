@@ -35,3 +35,12 @@ Thumbs.db
 .remember/
 .superpowers/
 docs/superpowers/
+CLAUDE.md
+rules/
+skills/
+
+# Codex local instructions
+AGENTS.md
+.codex/rules/python-idioms.md
+.codex/rules/python-patterns.md
+.codex/skills/py-rig/SKILL.md

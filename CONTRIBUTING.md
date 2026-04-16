@@ -15,21 +15,28 @@ python -m pytest tests/ -v
 
 ## Development Workflow
 
+This project uses **TDD/ATDD** — write the failing test first, then the smallest implementation that makes it pass, then refactor while green. See `.claude/skills/py-rig/SKILL.md` for the full discipline.
+
 1. **Create a branch** from `main`
-2. **Write tests first** — every change should have tests
-3. **Make your changes** — keep diffs small and focused
-4. **Run the test suite** — `python -m pytest tests/ -v` (all 164+ tests must pass)
-5. **Test the TUI manually** — run `hermesd` and verify your changes look correct
-6. **Open a PR** with a clear description
+2. **Write the failing test first** — acceptance-level if user-visible, unit-level otherwise
+3. **Implement the minimum change** that makes the test pass
+4. **Refactor while green** — improve naming/cohesion without changing behavior
+5. **Run the full suite** — `uv run pytest tests/ -v` (all 168+ tests must pass)
+6. **Run lint + type + audit** — `uv run ruff check . && uv run ruff format --check . && uv run mypy hermesd && uv run pip-audit`
+7. **Test the TUI manually** — run `hermesd` and verify your changes look correct
+8. **Update `CHANGELOG.md`** for user-visible changes
+9. **Open a PR** with a clear description
 
 ## Code Guidelines
 
-- **Python 3.11+** — use modern syntax (`X | None`, not `Optional[X]`)
-- **Type annotations** on all public functions
-- **Pydantic models** for data structures
+- **Python 3.11+** — see `.claude/rules/python-idioms.md` for version-safe modern syntax
+- **`from __future__ import annotations`** at the top of every module
+- **Type annotations** on all public functions; `mypy` enforces this in CI
+- **Pydantic models** for data structures; `@dataclass(frozen=True, slots=True)` for value objects
+- **Dependency injection** — pass collaborators through constructors / function arguments (see `py-rig` skill for the CLI-entry carve-out)
 - **Read-only** — hermesd must never write to `~/.hermes/`
 - **No hermes-agent imports** — hermesd reads files directly, zero dependency on hermes-agent code
-- **Error resilience** — never crash on missing/corrupt data; show last known good state
+- **Error resilience** — never crash on missing/corrupt data; show last known good state (cache-preservation pattern)
 
 ## Adding a New Panel
 

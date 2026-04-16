@@ -62,9 +62,13 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         sid.append_text(active)
         sid.append(s.session_id[-8:])
         table.add_row(
-            sid, s.source, s.model or "—",
-            str(s.message_count), str(s.tool_call_count),
-            fmt_tokens(s.input_tokens), fmt_tokens(s.output_tokens),
+            sid,
+            s.source,
+            s.model or "—",
+            str(s.message_count),
+            str(s.tool_call_count),
+            fmt_tokens(s.input_tokens),
+            fmt_tokens(s.output_tokens),
             f"${s.estimated_cost_usd:.2f}",
         )
 

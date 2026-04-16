@@ -1,4 +1,5 @@
 """Tests for session active/ended detection."""
+
 import sqlite3
 import time
 from pathlib import Path
@@ -62,9 +63,10 @@ def test_active_sessions_detected(hermes_home: Path):
 def test_active_count_in_compact_panel(hermes_home: Path):
     _make_db(hermes_home)
     from rich.console import Console
+
     from hermesd.collector import Collector
-    from hermesd.theme import Theme
     from hermesd.panels import render_panel
+    from hermesd.theme import Theme
 
     c = Collector(hermes_home)
     state = c.collect()

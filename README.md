@@ -246,12 +246,18 @@ uv venv .venv --python 3.11
 source .venv/bin/activate
 uv pip install -e ".[dev]"
 
-# Run tests (164 tests, <0.5s)
-python -m pytest tests/ -v
+# Run the full local gate set — matches CI across Python 3.11/3.12/3.13
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy hermesd
+uv run pytest tests/ -v          # 168 tests, <0.5s
+uv run pip-audit
 
 # Run the dashboard
 hermesd
 ```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full TDD-first contributor workflow.
 
 ### Project Structure
 
@@ -274,17 +280,20 @@ hermesd/
     cron.py            [6] Cron
     overview.py        [7] Skills / Providers
     logs.py            [8] Logs
-tests/                 164 tests: panels, data, resilience, edge cases
+tests/                 168 tests: panels, data, resilience, edge cases
 ```
 
 ### Adding a Panel
 
-1. Create `hermesd/panels/your_panel.py` with `render_*(state, theme, detail)` function
+hermesd uses **TDD-first** contribution (see [`CONTRIBUTING.md`](CONTRIBUTING.md)). Write the failing test first, then implement:
+
+1. Write the failing test in `tests/test_your_panel.py` — acceptance-level (full `Collector → DashboardState → render` flow) + unit tests for edge cases
 2. Add data model to `hermesd/models.py`
 3. Collect data in `hermesd/collector.py`
-4. Register in `hermesd/panels/__init__.py`
-5. Add to layout in `hermesd/app.py`
-6. Write tests in `tests/test_your_panel.py`
+4. Create `hermesd/panels/your_panel.py` with `render_*(state, theme, detail)` function
+5. Register in `hermesd/panels/__init__.py`
+6. Add to layout in `hermesd/app.py`
+7. Update `CHANGELOG.md` under `[Unreleased]`
 
 ## Requirements
 

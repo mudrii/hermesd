@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from hermesd.app import DashboardApp, ViewState
+from hermesd.app import DashboardApp
 
 
 def test_handle_key_refresh(populated_hermes_home: Path):
@@ -117,6 +117,7 @@ def test_build_detail_layout(populated_hermes_home: Path):
 
 def test_build_header_with_custom_skin(populated_hermes_home: Path):
     import yaml
+
     config_path = populated_hermes_home / "config.yaml"
     config_path.write_text(yaml.dump({"display": {"skin": "ares"}}))
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
@@ -138,6 +139,7 @@ def test_build_footer_detail_logs(populated_hermes_home: Path):
     app._view.enter_detail(8)
     footer = app._build_footer(app._state)
     from rich.text import Text
+
     assert isinstance(footer, Text)
     app.close()
 

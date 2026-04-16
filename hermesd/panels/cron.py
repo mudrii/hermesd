@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import rich.box
-from rich.console import Group
+from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -52,7 +52,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
 
 def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     c = state.cron
-    sections = []
+    sections: list[RenderableType] = []
 
     header = Text()
     if c.last_tick_ago_seconds is not None:
@@ -72,7 +72,11 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         table.add_column("Last", style=theme.banner_text)
 
         for j in c.jobs:
-            sym = Text("●", style=f"bold {theme.ui_ok}") if j.enabled else Text("○", style=theme.banner_dim)
+            sym = (
+                Text("●", style=f"bold {theme.ui_ok}")
+                if j.enabled
+                else Text("○", style=theme.banner_dim)
+            )
             state_color = theme.ui_ok if j.state == "scheduled" else theme.ui_warn
             next_run = j.next_run_at[:19] if j.next_run_at else "—"
             last = j.last_status or "—"

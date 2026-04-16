@@ -39,8 +39,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def resolve_hermes_home(args: argparse.Namespace) -> Path:
     import os
-    if args.hermes_home:
-        return args.hermes_home.expanduser()
+
+    cli_home: Path | None = args.hermes_home
+    if cli_home is not None:
+        return cli_home.expanduser()
     env = os.environ.get("HERMES_HOME")
     if env:
         return Path(env).expanduser()
@@ -54,6 +56,7 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Error: {hermes_home} does not exist", file=sys.stderr)
         sys.exit(1)
     from hermesd.app import DashboardApp
+
     app = DashboardApp(
         hermes_home=hermes_home,
         refresh_rate=args.refresh_rate,

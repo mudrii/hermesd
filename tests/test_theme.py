@@ -16,6 +16,7 @@ def test_load_theme_default(hermes_home, sample_config):
 
 def test_load_theme_builtin_skin(hermes_home):
     import yaml
+
     config_path = hermes_home / "config.yaml"
     config_path.write_text(yaml.dump({"display": {"skin": "ares"}}))
     t = load_theme(hermes_home)
@@ -25,6 +26,7 @@ def test_load_theme_builtin_skin(hermes_home):
 
 def test_load_theme_unknown_skin_falls_back(hermes_home):
     import yaml
+
     config_path = hermes_home / "config.yaml"
     config_path.write_text(yaml.dump({"display": {"skin": "nonexistent"}}))
     t = load_theme(hermes_home)

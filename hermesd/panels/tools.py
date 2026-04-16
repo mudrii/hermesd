@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import rich.box
-from rich.console import Group
+from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -35,11 +35,13 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
 
 
 def _render_detail(state: DashboardState, theme: Theme) -> Panel:
-    sections = []
+    sections: list[RenderableType] = []
 
     # Table 1: Tool call stats
     calls_header = Text()
-    calls_header.append(f"Tool Calls ({state.total_tool_calls} total)\n", style=f"bold {theme.ui_label}")
+    calls_header.append(
+        f"Tool Calls ({state.total_tool_calls} total)\n", style=f"bold {theme.ui_label}"
+    )
     sections.append(calls_header)
 
     if state.tool_stats:
@@ -55,7 +57,9 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     # Table 2: Available tools
     sections.append(Text("\n"))
     tools_header = Text()
-    tools_header.append(f"Available Tools ({state.available_tools})\n", style=f"bold {theme.ui_label}")
+    tools_header.append(
+        f"Available Tools ({state.available_tools})\n", style=f"bold {theme.ui_label}"
+    )
     sections.append(tools_header)
 
     if state.available_tool_names:

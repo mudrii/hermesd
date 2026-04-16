@@ -1,5 +1,5 @@
 """Tests for DB resilience: cache preservation, reconnection, WAL handling."""
-import json
+
 import sqlite3
 import time
 from pathlib import Path
@@ -127,7 +127,7 @@ def test_ensure_connection_reopens(tmp_path):
 
     # _ensure_connection should reopen
     result = db._ensure_connection()
-    assert result is True
+    assert result is not None
     assert db._conn is not None
     db.close()
 

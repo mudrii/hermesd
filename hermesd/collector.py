@@ -98,11 +98,13 @@ class Collector:
             return GatewayState()
         platforms = []
         for name, info in (data.get("platforms") or {}).items():
-            platforms.append(PlatformStatus(
-                name=name,
-                state=info.get("state", "unknown"),
-                updated_at=info.get("updated_at", ""),
-            ))
+            platforms.append(
+                PlatformStatus(
+                    name=name,
+                    state=info.get("state", "unknown"),
+                    updated_at=info.get("updated_at", ""),
+                )
+            )
         pid = data.get("pid", 0)
         running = data.get("gateway_state") == "running"
         # The PID in gateway_state.json can be stale if launchd restarted
@@ -136,14 +138,13 @@ class Collector:
                 if content:
                     data = json.loads(content)
                     if isinstance(data, dict):
-                        lpid = data.get("pid", 0)
+                        lpid = int(data.get("pid", 0) or 0)
                     else:
                         lpid = int(content)
                     if lpid:
                         os.kill(lpid, 0)
                         return lpid
-            except (ValueError, json.JSONDecodeError, ProcessLookupError,
-                    PermissionError, OSError):
+            except (ValueError, json.JSONDecodeError, ProcessLookupError, PermissionError, OSError):
                 pass
         return None
 
@@ -315,15 +316,17 @@ class Collector:
                 state = j.get("state", "")
                 if j.get("last_status") == "error" or j.get("last_error"):
                     error_count += 1
-                jobs.append(CronJob(
-                    job_id=j.get("id", ""),
-                    name=j.get("name", ""),
-                    schedule_display=j.get("schedule_display", ""),
-                    state=state,
-                    enabled=j.get("enabled", True),
-                    next_run_at=j.get("next_run_at", ""),
-                    last_status=j.get("last_status"),
-                ))
+                jobs.append(
+                    CronJob(
+                        job_id=j.get("id", ""),
+                        name=j.get("name", ""),
+                        schedule_display=j.get("schedule_display", ""),
+                        state=state,
+                        enabled=j.get("enabled", True),
+                        next_run_at=j.get("next_run_at", ""),
+                        last_status=j.get("last_status"),
+                    )
+                )
 
         return CronState(
             last_tick_ago_seconds=last_tick,
@@ -380,7 +383,7 @@ class Collector:
                     front = text[3:end].strip()
                     for line in front.splitlines():
                         if line.startswith("description:"):
-                            return line[len("description:"):].strip()
+                            return line[len("description:") :].strip()
         except OSError:
             pass
         return ""
@@ -393,10 +396,7 @@ class Collector:
         pool = data.get("credential_pool", {})
         providers_section = data.get("providers", {})
         all_names = set(pool.keys()) | set(providers_section.keys())
-        return [
-            ProviderInfo(name=name, is_active=(name == active))
-            for name in sorted(all_names)
-        ]
+        return [ProviderInfo(name=name, is_active=(name == active)) for name in sorted(all_names)]
 
     def _collect_logs(self) -> LogState:
         return LogState(
@@ -423,9 +423,13 @@ class Collector:
                 )
                 if match:
                     ts = match.group(1).split()[-1]
-                    result.append(LogLine(
-                        timestamp=ts, level=match.group(2), message=match.group(3).strip(),
-                    ))
+                    result.append(
+                        LogLine(
+                            timestamp=ts,
+                            level=match.group(2),
+                            message=match.group(3).strip(),
+                        )
+                    )
                 elif line.strip():
                     result.append(LogLine(message=line.strip()))
             return result
@@ -435,12 +439,13 @@ class Collector:
     def _collect_version_behind(self) -> int:
         data = self._read_json_cached(self._home / ".update_check")
         if isinstance(data, dict):
-            return data.get("behind", 0)
+            return int(data.get("behind", 0) or 0)
         return 0
 
     def _collect_skin(self) -> str:
         cfg = self._read_yaml_cached()
-        return cfg.get("display", {}).get("skin", "default")
+        skin = cfg.get("display", {}).get("skin", "default")
+        return str(skin) if skin else "default"
 
     def close(self) -> None:
         self._db.close()
@@ -448,6 +453,7 @@ class Collector:
 
 def _today_epoch() -> float:
     import datetime
+
     now = datetime.datetime.now()
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return midnight.timestamp()
@@ -456,7 +462,7 @@ def _today_epoch() -> float:
 # Approximate cost per 1M tokens (USD) — used when provider doesn't report costs.
 # Covers the most common models; defaults to GPT-4o pricing as a reasonable midpoint.
 _COST_PER_M = {
-    "input": 2.50,      # GPT-4o / Claude Sonnet class
+    "input": 2.50,  # GPT-4o / Claude Sonnet class
     "output": 10.00,
     "cache_read": 0.30,  # typical prompt caching discount
     "reasoning": 10.00,

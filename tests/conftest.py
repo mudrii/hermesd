@@ -77,23 +77,84 @@ def sample_db(hermes_home: Path) -> Path:
     now = time.time()
     conn.execute(
         "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("sess_001", "cli", None, "gpt-5.4", None, None, None,
-         now - 3600, None, None, 77, 51, 12400, 8200, 28300, 5000, 0,
-         "openai-codex", None, None, 0.42, None, "unknown", None, None, None),
+        (
+            "sess_001",
+            "cli",
+            None,
+            "gpt-5.4",
+            None,
+            None,
+            None,
+            now - 3600,
+            None,
+            None,
+            77,
+            51,
+            12400,
+            8200,
+            28300,
+            5000,
+            0,
+            "openai-codex",
+            None,
+            None,
+            0.42,
+            None,
+            "unknown",
+            None,
+            None,
+            None,
+        ),
     )
     conn.execute(
         "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("sess_002", "telegram", "user1", "gpt-5.4", None, None, None,
-         now - 1800, None, None, 47, 14, 9100, 6300, 15200, 3000, 0,
-         "openai-codex", None, None, 0.31, None, "unknown", None, None, None),
+        (
+            "sess_002",
+            "telegram",
+            "user1",
+            "gpt-5.4",
+            None,
+            None,
+            None,
+            now - 1800,
+            None,
+            None,
+            47,
+            14,
+            9100,
+            6300,
+            15200,
+            3000,
+            0,
+            "openai-codex",
+            None,
+            None,
+            0.31,
+            None,
+            "unknown",
+            None,
+            None,
+            None,
+        ),
     )
     for i in range(5):
         conn.execute(
             "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (None, "sess_001", "assistant", f"response {i}", None,
-             json.dumps([{"function": {"name": "shell_exec"}}]) if i % 2 == 0 else None,
-             "shell_exec" if i % 2 == 0 else None,
-             now - 3600 + i * 60, 100, "stop", None, None, None),
+            (
+                None,
+                "sess_001",
+                "assistant",
+                f"response {i}",
+                None,
+                json.dumps([{"function": {"name": "shell_exec"}}]) if i % 2 == 0 else None,
+                "shell_exec" if i % 2 == 0 else None,
+                now - 3600 + i * 60,
+                100,
+                "stop",
+                None,
+                None,
+                None,
+            ),
         )
     conn.commit()
     conn.close()
@@ -104,19 +165,23 @@ def sample_db(hermes_home: Path) -> Path:
 def sample_gateway_state(hermes_home: Path) -> Path:
     """Create a gateway_state.json."""
     path = hermes_home / "gateway_state.json"
-    path.write_text(json.dumps({
-        "pid": 12345,
-        "kind": "hermes-gateway",
-        "argv": [],
-        "start_time": None,
-        "gateway_state": "running",
-        "exit_reason": None,
-        "platforms": {
-            "telegram": {"state": "connected", "updated_at": "2026-04-08T17:42:57+00:00"},
-            "discord": {"state": "disconnected", "updated_at": "2026-04-08T10:00:00+00:00"},
-        },
-        "updated_at": "2026-04-08T17:42:57+00:00",
-    }))
+    path.write_text(
+        json.dumps(
+            {
+                "pid": 12345,
+                "kind": "hermes-gateway",
+                "argv": [],
+                "start_time": None,
+                "gateway_state": "running",
+                "exit_reason": None,
+                "platforms": {
+                    "telegram": {"state": "connected", "updated_at": "2026-04-08T17:42:57+00:00"},
+                    "discord": {"state": "disconnected", "updated_at": "2026-04-08T10:00:00+00:00"},
+                },
+                "updated_at": "2026-04-08T17:42:57+00:00",
+            }
+        )
+    )
     return path
 
 
@@ -124,21 +189,26 @@ def sample_gateway_state(hermes_home: Path) -> Path:
 def sample_config(hermes_home: Path) -> Path:
     """Create a config.yaml."""
     import yaml
+
     path = hermes_home / "config.yaml"
-    path.write_text(yaml.dump({
-        "model": {"default": "gpt-5.4", "provider": "openai-codex"},
-        "agent": {
-            "max_turns": 192,
-            "reasoning_effort": "medium",
-            "personalities": {"kawaii": "uwu"},
-            "active_personality": "kawaii",
-        },
-        "compression": {"threshold": 0.86},
-        "security": {"redact_secrets": True},
-        "approvals": {"mode": "manual"},
-        "display": {"skin": "default"},
-        "_config_version": 12,
-    }))
+    path.write_text(
+        yaml.dump(
+            {
+                "model": {"default": "gpt-5.4", "provider": "openai-codex"},
+                "agent": {
+                    "max_turns": 192,
+                    "reasoning_effort": "medium",
+                    "personalities": {"kawaii": "uwu"},
+                    "active_personality": "kawaii",
+                },
+                "compression": {"threshold": 0.86},
+                "security": {"redact_secrets": True},
+                "approvals": {"mode": "manual"},
+                "display": {"skin": "default"},
+                "_config_version": 12,
+            }
+        )
+    )
     return path
 
 
@@ -146,16 +216,23 @@ def sample_config(hermes_home: Path) -> Path:
 def sample_auth(hermes_home: Path) -> Path:
     """Create an auth.json with provider names only."""
     path = hermes_home / "auth.json"
-    path.write_text(json.dumps({
-        "version": 1,
-        "active_provider": "openai-codex",
-        "providers": {"openai-codex": {"id_token": "REDACTED"}},
-        "credential_pool": {
-            "openai-codex": {}, "anthropic": {}, "deepseek": {},
-            "gemini": {}, "kimi-coding": {},
-        },
-        "updated_at": "2026-04-08T00:00:00+00:00",
-    }))
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "active_provider": "openai-codex",
+                "providers": {"openai-codex": {"id_token": "REDACTED"}},
+                "credential_pool": {
+                    "openai-codex": {},
+                    "anthropic": {},
+                    "deepseek": {},
+                    "gemini": {},
+                    "kimi-coding": {},
+                },
+                "updated_at": "2026-04-08T00:00:00+00:00",
+            }
+        )
+    )
     return path
 
 
@@ -185,13 +262,9 @@ def sample_logs(hermes_home: Path) -> Path:
         "2026-04-09 15:42:03,789 - hermes - INFO - Session saved\n"
     )
     gw_log = hermes_home / "logs" / "gateway.log"
-    gw_log.write_text(
-        "2026-04-09 15:40:00,000 - gateway - INFO - Telegram connected\n"
-    )
+    gw_log.write_text("2026-04-09 15:40:00,000 - gateway - INFO - Telegram connected\n")
     err_log = hermes_home / "logs" / "errors.log"
-    err_log.write_text(
-        "2026-04-09 14:00:00,000 - hermes - WARNING - High context usage\n"
-    )
+    err_log.write_text("2026-04-09 14:00:00,000 - hermes - WARNING - High context usage\n")
     return agent_log
 
 
@@ -205,8 +278,14 @@ def sample_cron_tick(hermes_home: Path) -> Path:
 
 @pytest.fixture
 def populated_hermes_home(
-    hermes_home, sample_db, sample_gateway_state, sample_config,
-    sample_auth, sample_skills_manifest, sample_logs, sample_cron_tick,
+    hermes_home,
+    sample_db,
+    sample_gateway_state,
+    sample_config,
+    sample_auth,
+    sample_skills_manifest,
+    sample_logs,
+    sample_cron_tick,
 ) -> Path:
     """A fully populated mock ~/.hermes."""
     return hermes_home

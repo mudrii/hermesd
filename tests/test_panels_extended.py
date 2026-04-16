@@ -11,11 +11,10 @@ from hermesd.models import (
     ProviderInfo,
     SessionInfo,
     SkillsMemory,
-    TokenSummary,
     ToolStats,
 )
-from hermesd.theme import Theme
 from hermesd.panels import render_panel
+from hermesd.theme import Theme
 
 
 def _render_to_str(panel) -> str:
@@ -32,15 +31,24 @@ def test_sessions_panel_detail():
     state = DashboardState(
         sessions=[
             SessionInfo(
-                session_id="sess_001", source="cli", model="gpt-5.4",
-                message_count=77, tool_call_count=51,
-                input_tokens=12400, output_tokens=8200,
-                estimated_cost_usd=0.42, is_active=True,
+                session_id="sess_001",
+                source="cli",
+                model="gpt-5.4",
+                message_count=77,
+                tool_call_count=51,
+                input_tokens=12400,
+                output_tokens=8200,
+                estimated_cost_usd=0.42,
+                is_active=True,
             ),
             SessionInfo(
-                session_id="sess_002", source="telegram", model="",
-                message_count=47, tool_call_count=14,
-                input_tokens=9100, output_tokens=6300,
+                session_id="sess_002",
+                source="telegram",
+                model="",
+                message_count=47,
+                tool_call_count=14,
+                input_tokens=9100,
+                output_tokens=6300,
                 estimated_cost_usd=0.31,
             ),
         ],
@@ -56,9 +64,13 @@ def test_tokens_panel_detail():
     state = DashboardState(
         sessions=[
             SessionInfo(
-                session_id="s1", input_tokens=12400, output_tokens=8200,
-                cache_read_tokens=28300, cache_write_tokens=5000,
-                reasoning_tokens=1000, estimated_cost_usd=0.42,
+                session_id="s1",
+                input_tokens=12400,
+                output_tokens=8200,
+                cache_read_tokens=28300,
+                cache_write_tokens=5000,
+                reasoning_tokens=1000,
+                estimated_cost_usd=0.42,
             ),
         ],
     )
@@ -86,8 +98,10 @@ def test_tools_panel_detail():
 def test_config_panel_detail():
     state = DashboardState(
         config=ConfigSummary(
-            model="gpt-5.4", provider="openai-codex",
-            personality="kawaii", max_turns=192,
+            model="gpt-5.4",
+            provider="openai-codex",
+            personality="kawaii",
+            max_turns=192,
             reasoning_effort="medium",
             compression_threshold=0.86,
             security_redact=True,
@@ -103,9 +117,12 @@ def test_config_panel_detail():
 
 def test_overview_panel_detail():
     from hermesd.models import SkillInfo
+
     state = DashboardState(
         skills_memory=SkillsMemory(
-            skill_count=70, skill_categories=28, memory_file_count=3,
+            skill_count=70,
+            skill_categories=28,
+            memory_file_count=3,
             providers=[
                 ProviderInfo(name="openai-codex", is_active=True),
                 ProviderInfo(name="anthropic", is_active=False),
@@ -201,9 +218,13 @@ def test_overview_panel_no_providers():
 
 def test_panels_render_with_ares_skin():
     state = DashboardState(
-        gateway=GatewayState(running=True, pid=123, platforms=[
-            PlatformStatus(name="telegram", state="connected"),
-        ]),
+        gateway=GatewayState(
+            running=True,
+            pid=123,
+            platforms=[
+                PlatformStatus(name="telegram", state="connected"),
+            ],
+        ),
     )
     panel = render_panel(1, state, Theme("ares"), detail=False)
     text = _render_to_str(panel)
