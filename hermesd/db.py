@@ -15,7 +15,6 @@ class HermesDB:
         self._cached_tool_stats: list[dict[str, Any]] = []
         self._cached_token_totals: dict[str, Any] = {}
         self._cache_hits = 0
-        self._readonly = True
         self._uri = ""
         self._consecutive_errors = 0
         self._connect()

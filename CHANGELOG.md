@@ -7,13 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `--refresh-rate` now rejects non-positive values at argument parsing time instead of allowing a busy collector loop.
+- Collector reads are more defensive against malformed Hermes files: gateway state, config, auth, and update metadata now ignore invalid shapes and continue rendering with the last valid data they can recover.
+- Log tailing now preserves the last good lines when a log file temporarily disappears or cannot be read, matching the dashboard's cache-preservation behavior.
+- The logs detail view now supports `j`/`k` scrolling, and compact overview mode now keeps panels 4 and 7 visible instead of dropping them on smaller terminals.
+- The dashboard theme now refreshes live when the active skin changes in `config.yaml`, so the header label and panel colors stay in sync.
+- Available tool discovery now unions tool names across session files instead of stopping at the first session entry that contains a `tools` list.
+
 ### Developer tooling
 
 - CI now runs `ruff check`, `ruff format --check`, `mypy hermesd`, `pytest`, and `pip-audit` across Python 3.11/3.12/3.13; the release/publish workflow runs the same gates before building the PyPI artifact.
 - Added `ruff`, `mypy`, `types-PyYAML`, and `pip-audit` to dev dependencies; `pyproject.toml` now contains `[tool.ruff]` and `[tool.mypy]` configuration with per-module overrides for the SQLite boundary (`hermesd/db.py`) and tests.
 - Refreshed `.claude/rules/python-idioms.md`, `.claude/rules/python-patterns.md`, and `.claude/skills/py-rig/SKILL.md`: version-tagged idioms (3.11/3.12/3.13), threading and resilience rules, a CLI composition-root carve-out for DI, the `panels/__init__.py` OCP seam, hermesd-shaped DI and test examples, and a unified TDD-first contributor workflow shared across `CLAUDE.md`, `CONTRIBUTING.md`, and `README.md`.
 
-### Changed
+### Compatibility
 
 - `HermesDB._ensure_connection()` now returns `sqlite3.Connection | None` instead of `bool`; external callers that relied on the bool form should check `is not None` instead.
 
@@ -40,4 +49,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Skin/theme system inheriting from Hermes Agent config
 - Keyboard navigation: 1-8 expand, Esc back, j/k scroll, Tab cycle logs, r refresh, q quit
 - Escape sequence handling for Ghostty/SSH/tmux environments
-- 164 tests covering all panels, data collection, resilience, and edge cases
+- 164 tests at initial release covering all panels, data collection, resilience, and edge cases

@@ -19,6 +19,12 @@ def test_parse_args_custom():
     assert args.no_color is True
 
 
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_parse_args_rejects_non_positive_refresh_rate(value: str):
+    with pytest.raises(SystemExit):
+        parse_args(["--refresh-rate", value])
+
+
 def test_resolve_hermes_home_explicit():
     args = parse_args(["--hermes-home", "/tmp/test-hermes"])
     path = resolve_hermes_home(args)

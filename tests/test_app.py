@@ -1,3 +1,4 @@
+import threading
 from pathlib import Path
 
 from hermesd.app import DashboardApp, ViewState
@@ -86,4 +87,19 @@ def test_app_handle_key_escape_sequence_ignored(populated_hermes_home: Path):
     app._handle_key("\x1b[A")  # Up arrow
     assert app._view.mode == "detail"
     assert app._view.detail_panel == 3
+    app.close()
+
+
+def test_app_uses_event_for_running_state(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    assert isinstance(app._running, threading.Event)
+    assert app._running.is_set() is False
+    app.close()
+
+
+def test_signal_handler_clears_running_event(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._running.set()
+    app._signal_handler(0, None)
+    assert app._running.is_set() is False
     app.close()

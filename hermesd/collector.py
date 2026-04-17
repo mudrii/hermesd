@@ -4,12 +4,12 @@ import json
 import os
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from hermesd.db import HermesDB
+from hermesd.file_cache import LastGoodFileCache
 from hermesd.models import (
     ConfigSummary,
     CronJob,
@@ -29,12 +29,16 @@ from hermesd.models import (
 
 
 class Collector:
-    def __init__(self, hermes_home: Path):
+    def __init__(
+        self,
+        hermes_home: Path,
+        pid_exists: Callable[[int], bool] | None = None,
+    ):
         self._home = hermes_home
         self._db = HermesDB(hermes_home / "state.db")
-        self._mtime_cache: dict[str, float] = {}
-        self._json_cache: dict[str, Any] = {}
-        self._config_cache: dict[str, Any] | None = None
+        self._file_cache = LastGoodFileCache()
+        self._log_cache: dict[str, list[LogLine]] = {}
+        self._pid_exists = pid_exists or _pid_exists
 
     def collect(self) -> DashboardState:
         tool_count, tool_names = self._collect_available_tools()
@@ -57,63 +61,45 @@ class Collector:
             active_skin=self._collect_skin(),
         )
 
-    def _read_json_cached(self, path: Path) -> Any:
-        key = str(path)
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            return self._json_cache.get(key)
-        if self._mtime_cache.get(key) == mtime and key in self._json_cache:
-            return self._json_cache[key]
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            self._mtime_cache[key] = mtime
-            self._json_cache[key] = data
-            return data
-        except (json.JSONDecodeError, OSError):
-            return self._json_cache.get(key)
+    def _read_json_cached(self, path: Path) -> dict[str, Any]:
+        return self._file_cache.read_json_mapping(path)
 
     def _read_yaml_cached(self) -> dict[str, Any]:
-        path = self._home / "config.yaml"
-        key = str(path)
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            return self._config_cache or {}
-        if self._mtime_cache.get(key) == mtime and self._config_cache is not None:
-            return self._config_cache
-        try:
-            with open(path) as f:
-                self._config_cache = yaml.safe_load(f) or {}
-            self._mtime_cache[key] = mtime
-        except Exception:
-            if self._config_cache is None:
-                self._config_cache = {}
-        return self._config_cache
+        return self._file_cache.read_yaml_mapping(self._home / "config.yaml")
 
     def _collect_gateway(self) -> GatewayState:
         data = self._read_json_cached(self._home / "gateway_state.json")
         if not data:
             return GatewayState()
         platforms = []
-        for name, info in (data.get("platforms") or {}).items():
+        for name, raw_info in _as_dict(data.get("platforms")).items():
+            info = _as_dict(raw_info)
+            if not info:
+                continue
             platforms.append(
                 PlatformStatus(
-                    name=name,
+                    name=str(name),
                     state=info.get("state", "unknown"),
                     updated_at=info.get("updated_at", ""),
                 )
             )
-        pid = data.get("pid", 0)
+        pid = _coerce_int(data.get("pid"))
         running = data.get("gateway_state") == "running"
         # The PID in gateway_state.json can be stale if launchd restarted
         # the gateway. Check both the recorded PID and the launchd PID.
-        if running and pid:
-            try:
-                os.kill(pid, 0)
-            except (ProcessLookupError, PermissionError):
-                # Recorded PID is dead — check if launchd has a live gateway
+        if running:
+            if pid:
+                try:
+                    if not self._pid_exists(pid):
+                        raise ProcessLookupError
+                except (ProcessLookupError, PermissionError):
+                    # Recorded PID is dead — check if launchd has a live gateway
+                    launchd_pid = self._find_gateway_launchd_pid()
+                    if launchd_pid:
+                        pid = launchd_pid
+                    else:
+                        running = False
+            else:
                 launchd_pid = self._find_gateway_launchd_pid()
                 if launchd_pid:
                     pid = launchd_pid
@@ -141,8 +127,7 @@ class Collector:
                         lpid = int(data.get("pid", 0) or 0)
                     else:
                         lpid = int(content)
-                    if lpid:
-                        os.kill(lpid, 0)
+                    if lpid and self._pid_exists(lpid):
                         return lpid
             except (ValueError, json.JSONDecodeError, ProcessLookupError, PermissionError, OSError):
                 pass
@@ -162,8 +147,8 @@ class Collector:
                 pass
         behind = 0
         update_check = self._read_json_cached(self._home / ".update_check")
-        if isinstance(update_check, dict):
-            behind = update_check.get("behind", 0)
+        if update_check:
+            behind = _coerce_int(update_check.get("behind"))
         return version, behind
 
     def _collect_sessions(self) -> list[SessionInfo]:
@@ -180,7 +165,7 @@ class Collector:
                 cache_read_tokens=r.get("cache_read_tokens") or 0,
                 cache_write_tokens=r.get("cache_write_tokens") or 0,
                 reasoning_tokens=r.get("reasoning_tokens") or 0,
-                estimated_cost_usd=r.get("estimated_cost_usd") or 0.0,
+                estimated_cost_usd=_resolved_session_cost(r),
                 started_at=r.get("started_at") or 0.0,
                 ended_at=r.get("ended_at"),
                 title=r.get("title"),
@@ -190,45 +175,13 @@ class Collector:
         ]
 
     def _collect_tokens_today(self) -> TokenSummary:
-        rows = self._db.read_sessions()
-        today_start = _today_epoch()
-        totals = TokenSummary()
-        for r in rows:
-            if (r.get("started_at") or 0) >= today_start:
-                in_tok = r.get("input_tokens") or 0
-                out_tok = r.get("output_tokens") or 0
-                cache_r = r.get("cache_read_tokens") or 0
-                cache_w = r.get("cache_write_tokens") or 0
-                reason = r.get("reasoning_tokens") or 0
-                totals.input_tokens += in_tok
-                totals.output_tokens += out_tok
-                totals.cache_read_tokens += cache_r
-                totals.cache_write_tokens += cache_w
-                totals.reasoning_tokens += reason
-                cost = r.get("estimated_cost_usd") or 0.0
-                if not cost:
-                    cost = _estimate_cost(in_tok, out_tok, cache_r, reason)
-                totals.total_cost_usd += cost
-        return totals
+        return _summarize_tokens(
+            self._db.read_sessions(),
+            started_at_min=_today_epoch(),
+        )
 
     def _collect_tokens_total(self) -> TokenSummary:
-        d = self._db.read_token_totals()
-        in_tok = d.get("input_tokens", 0)
-        out_tok = d.get("output_tokens", 0)
-        cache_r = d.get("cache_read_tokens", 0)
-        cache_w = d.get("cache_write_tokens", 0)
-        reason = d.get("reasoning_tokens", 0)
-        cost = d.get("total_cost_usd", 0.0)
-        if not cost:
-            cost = _estimate_cost(in_tok, out_tok, cache_r, reason)
-        return TokenSummary(
-            input_tokens=in_tok,
-            output_tokens=out_tok,
-            cache_read_tokens=cache_r,
-            cache_write_tokens=cache_w,
-            reasoning_tokens=reason,
-            total_cost_usd=cost,
-        )
+        return _summarize_tokens(self._db.read_sessions())
 
     def _collect_tool_stats(self) -> list[ToolStats]:
         # Try messages table first (has per-tool breakdown)
@@ -252,37 +205,37 @@ class Collector:
 
     def _collect_available_tools(self) -> tuple[int, list[str]]:
         sessions_data = self._read_json_cached(self._home / "sessions" / "sessions.json")
-        if not isinstance(sessions_data, dict):
+        if not sessions_data:
             return 0, []
+        names: set[str] = set()
         for entry in sessions_data.values():
             if isinstance(entry, dict) and "session_id" in entry:
                 sid = entry["session_id"]
                 session_file = self._home / "sessions" / f"session_{sid}.json"
                 data = self._read_json_cached(session_file)
                 if isinstance(data, dict) and "tools" in data:
-                    names = []
                     for t in data["tools"]:
                         if isinstance(t, dict):
                             name = t.get("function", {}).get("name") or t.get("name", "")
                         else:
                             name = str(t)
                         if name:
-                            names.append(name)
-                    return len(names), sorted(names)
-        return 0, []
+                            names.add(name)
+        tool_names = sorted(names)
+        return len(tool_names), tool_names
 
     def _collect_config(self) -> ConfigSummary:
         cfg = self._read_yaml_cached()
         if not cfg:
             return ConfigSummary()
-        model_cfg = cfg.get("model", {})
-        agent_cfg = cfg.get("agent", {})
-        comp_cfg = cfg.get("compression", {})
-        sec_cfg = cfg.get("security", {})
-        app_cfg = cfg.get("approvals", {})
+        model_cfg = _as_dict(cfg.get("model"))
+        agent_cfg = _as_dict(cfg.get("agent"))
+        comp_cfg = _as_dict(cfg.get("compression"))
+        sec_cfg = _as_dict(cfg.get("security"))
+        app_cfg = _as_dict(cfg.get("approvals"))
         personality = agent_cfg.get("active_personality", "")
         if not personality:
-            personalities = agent_cfg.get("personalities", {})
+            personalities = _as_dict(agent_cfg.get("personalities"))
             if personalities:
                 personality = next(iter(personalities))
         return ConfigSummary(
@@ -309,7 +262,7 @@ class Collector:
         jobs: list[CronJob] = []
         error_count = 0
         data = self._read_json_cached(self._home / "cron" / "jobs.json")
-        if isinstance(data, dict):
+        if data:
             for j in data.get("jobs", []):
                 if not isinstance(j, dict):
                     continue
@@ -392,9 +345,9 @@ class Collector:
         data = self._read_json_cached(self._home / "auth.json")
         if not data:
             return []
-        active = data.get("active_provider", "")
-        pool = data.get("credential_pool", {})
-        providers_section = data.get("providers", {})
+        active = str(data.get("active_provider") or "")
+        pool = _as_dict(data.get("credential_pool"))
+        providers_section = _as_dict(data.get("providers"))
         all_names = set(pool.keys()) | set(providers_section.keys())
         return [ProviderInfo(name=name, is_active=(name == active)) for name in sorted(all_names)]
 
@@ -406,8 +359,9 @@ class Collector:
         )
 
     def _tail_log(self, path: Path, max_lines: int) -> list[LogLine]:
+        key = str(path)
         if not path.exists():
-            return []
+            return self._log_cache.get(key, [])
         try:
             with open(path, "rb") as f:
                 f.seek(0, 2)
@@ -432,19 +386,20 @@ class Collector:
                     )
                 elif line.strip():
                     result.append(LogLine(message=line.strip()))
+            self._log_cache[key] = result
             return result
         except OSError:
-            return []
+            return self._log_cache.get(key, [])
 
     def _collect_version_behind(self) -> int:
         data = self._read_json_cached(self._home / ".update_check")
-        if isinstance(data, dict):
-            return int(data.get("behind", 0) or 0)
+        if data:
+            return _coerce_int(data.get("behind"))
         return 0
 
     def _collect_skin(self) -> str:
         cfg = self._read_yaml_cached()
-        skin = cfg.get("display", {}).get("skin", "default")
+        skin = _as_dict(cfg.get("display")).get("skin", "default")
         return str(skin) if skin else "default"
 
     def close(self) -> None:
@@ -457,6 +412,24 @@ def _today_epoch() -> float:
     now = datetime.datetime.now()
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return midnight.timestamp()
+
+
+def _summarize_tokens(
+    rows: list[dict[str, Any]],
+    started_at_min: float | None = None,
+) -> TokenSummary:
+    totals = TokenSummary()
+    for row in rows:
+        started_at = row.get("started_at") or 0.0
+        if started_at_min is not None and started_at < started_at_min:
+            continue
+        totals.input_tokens += row.get("input_tokens") or 0
+        totals.output_tokens += row.get("output_tokens") or 0
+        totals.cache_read_tokens += row.get("cache_read_tokens") or 0
+        totals.cache_write_tokens += row.get("cache_write_tokens") or 0
+        totals.reasoning_tokens += row.get("reasoning_tokens") or 0
+        totals.total_cost_usd += _resolved_session_cost(row)
+    return totals
 
 
 # Approximate cost per 1M tokens (USD) — used when provider doesn't report costs.
@@ -481,3 +454,46 @@ def _estimate_cost(
         + cache_read_tokens * _COST_PER_M["cache_read"]
         + reasoning_tokens * _COST_PER_M["reasoning"]
     ) / 1_000_000
+
+
+def _resolved_session_cost(row: dict[str, Any]) -> float:
+    cost = row.get("estimated_cost_usd") or 0.0
+    if cost:
+        return float(cost)
+    return _estimate_cost(
+        row.get("input_tokens") or 0,
+        row.get("output_tokens") or 0,
+        row.get("cache_read_tokens") or 0,
+        row.get("reasoning_tokens") or 0,
+    )
+
+
+def _as_dict(value: object) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def _coerce_int(value: object) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value or "0")
+        except ValueError:
+            return 0
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+    return 0
+
+
+def _pid_exists(pid: int) -> bool:
+    os.kill(pid, 0)
+    return True

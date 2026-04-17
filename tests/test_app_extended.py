@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from rich.console import Console
+
 from hermesd.app import DashboardApp
 
 
@@ -127,6 +129,22 @@ def test_build_header_with_custom_skin(populated_hermes_home: Path):
     app.close()
 
 
+def test_app_refreshes_theme_when_skin_changes(populated_hermes_home: Path):
+    import yaml
+
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    assert app._theme.skin_name == "default"
+
+    config_path = populated_hermes_home / "config.yaml"
+    config_path.write_text(yaml.dump({"display": {"skin": "ares"}}))
+
+    new_state = app._collector.collect()
+    app._set_state(new_state)
+
+    assert app._theme.skin_name == "ares"
+    app.close()
+
+
 def test_build_footer_overview(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     footer = app._build_footer(app._state)
@@ -144,13 +162,52 @@ def test_build_footer_detail_logs(populated_hermes_home: Path):
     app.close()
 
 
+def test_build_footer_shows_input_error(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._input_error = "input failure"
+    footer = app._build_footer(app._state)
+    assert "input failure" in footer.plain
+    app.close()
+
+
+def test_compact_overview_renders_tools_and_skills_panels(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._console = Console(width=80, height=24, force_terminal=True)
+    state = app._collector.collect()
+    overview = app._build_overview(state)
+
+    with app._console.capture() as cap:
+        app._console.print(overview)
+    text = cap.get()
+
+    assert "Tools" in text
+    assert "Skills / Providers" in text
+    app.close()
+
+
 def test_app_close_idempotent(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app.close()
     app.close()
 
 
+def test_app_close_wakes_collector_wait(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=30)
+    assert app._force_refresh.is_set() is False
+    app.close()
+    assert app._force_refresh.is_set() is True
+
+
 def test_no_color_mode(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
     assert app._console.no_color is True
     app.close()
+
+
+def test_app_requires_positive_refresh_rate(populated_hermes_home: Path):
+    try:
+        DashboardApp(populated_hermes_home, refresh_rate=0)
+    except ValueError as exc:
+        assert "refresh_rate must be positive" in str(exc)
+    else:
+        raise AssertionError("DashboardApp should reject non-positive refresh_rate")

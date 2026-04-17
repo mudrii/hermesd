@@ -95,3 +95,92 @@ def test_collector_estimates_when_cost_is_null(hermes_home: Path):
     assert state.tokens_total.total_cost_usd > 0
     assert state.tokens_today.total_cost_usd > 0
     c.close()
+
+
+def test_collector_estimates_missing_session_cost_in_detail_rows(hermes_home: Path):
+    """Per-session rows should estimate cost when the DB cost column is NULL."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
+            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
+            started_at REAL NOT NULL, ended_at REAL, end_reason TEXT,
+            message_count INTEGER, tool_call_count INTEGER,
+            input_tokens INTEGER, output_tokens INTEGER,
+            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
+            reasoning_tokens INTEGER, billing_provider TEXT,
+            billing_base_url TEXT, billing_mode TEXT,
+            estimated_cost_usd REAL, actual_cost_usd REAL,
+            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
+            title TEXT
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
+            tool_calls TEXT, tool_name TEXT, timestamp REAL,
+            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
+            reasoning_details TEXT, codex_reasoning_items TEXT
+        );
+    """)
+    now = time.time()
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, input_tokens, output_tokens, "
+        "cache_read_tokens, estimated_cost_usd) VALUES (?, ?, ?, ?, ?, ?, NULL)",
+        ("s1", "cli", now, 100_000, 5_000, 50_000),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert len(state.sessions) == 1
+    assert state.sessions[0].estimated_cost_usd > 0
+    c.close()
+
+
+def test_collector_total_cost_estimates_missing_sessions_when_db_has_mixed_costs(hermes_home: Path):
+    """Total cost should include estimated fallback for sessions with missing DB cost."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
+            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
+            started_at REAL NOT NULL, ended_at REAL, end_reason TEXT,
+            message_count INTEGER, tool_call_count INTEGER,
+            input_tokens INTEGER, output_tokens INTEGER,
+            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
+            reasoning_tokens INTEGER, billing_provider TEXT,
+            billing_base_url TEXT, billing_mode TEXT,
+            estimated_cost_usd REAL, actual_cost_usd REAL,
+            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
+            title TEXT
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
+            tool_calls TEXT, tool_name TEXT, timestamp REAL,
+            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
+            reasoning_details TEXT, codex_reasoning_items TEXT
+        );
+    """)
+    now = time.time()
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, input_tokens, output_tokens, "
+        "cache_read_tokens, estimated_cost_usd) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("s_reported", "cli", now, 10_000, 2_000, 1_000, 0.42),
+    )
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, input_tokens, output_tokens, "
+        "cache_read_tokens, estimated_cost_usd) VALUES (?, ?, ?, ?, ?, ?, NULL)",
+        ("s_missing", "cli", now, 100_000, 5_000, 50_000),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    expected_missing = _estimate_cost(100_000, 5_000, 50_000, 0)
+    assert state.tokens_total.total_cost_usd >= 0.42 + expected_missing
+    c.close()

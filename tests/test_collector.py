@@ -1,16 +1,14 @@
 import json
 import time
 from pathlib import Path
-from unittest.mock import patch
 
 from hermesd.collector import Collector
 from hermesd.models import DashboardState
 
 
 def test_collect_full(populated_hermes_home: Path):
-    with patch("os.kill"):
-        c = Collector(populated_hermes_home)
-        state = c.collect()
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    state = c.collect()
     assert isinstance(state, DashboardState)
     assert state.gateway.running is True
     assert state.gateway.pid == 12345
@@ -122,9 +120,8 @@ def test_collect_sessions_with_null_columns(hermes_home: Path):
 
 
 def test_collect_mtime_cache(populated_hermes_home: Path):
-    with patch("os.kill"):
-        c = Collector(populated_hermes_home)
-        s1 = c.collect()
-        s2 = c.collect()
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    s1 = c.collect()
+    s2 = c.collect()
     assert s1.gateway.pid == s2.gateway.pid
     c.close()

@@ -41,11 +41,11 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 
 - **Read-only** — hermesd never writes to `~/.hermes/` or modifies Hermes Agent state
 - **Live-updating** — polls every 5 seconds (configurable with `--refresh-rate`)
-- **Adaptive layout** — full 8-panel grid on wide terminals, compact single-column on 80x24 (SSH/tmux)
+- **Adaptive layout** — full 8-panel grid on wide terminals, denser all-panel overview on 80x24 (SSH/tmux)
 - **Detail views** — press `1`-`8` to expand any panel to full-screen
-- **Scrollable lists** — `j`/`k` to scroll through skills and logs in detail mode
-- **Resilient** — keeps showing last known good data on transient SQLite lock contention
-- **Theme-aware** — inherits your Hermes Agent skin (default, ares, mono, slate, poseidon, sisyphus, charizard)
+- **Scrollable lists** — `j`/`k` scroll both skills and log detail views
+- **Resilient** — keeps showing last known good data on transient SQLite and log-read failures
+- **Theme-aware** — inherits your Hermes Agent skin and updates live when `config.yaml` changes
 - **SSH/tmux compatible** — `tty.setcbreak` mode, escape sequence handling for remote terminals
 - **Cost estimation** — computes ~USD from token counts when the provider doesn't report costs
 - **Zero config** — no config file, no API keys, just `hermesd` and go
@@ -72,7 +72,7 @@ Press `3` for the full per-session token breakdown. Shows input, output, cache-r
 
 ### [4] Tools — What's Available and What's Being Used?
 
-Press `4` for two tables: **Tool Calls** showing per-session call counts (which sessions are using the most tools), and **Available Tools** listing all 29 registered tools in a 3-column grid. The compact view shows the top callers.
+Press `4` for two tables: **Tool Calls** showing per-session call counts (which sessions are using the most tools), and **Available Tools** listing the union of tools discovered across session files in a 3-column grid. The compact view shows the top callers.
 
 ![Tools Detail](images/SCR-20260409-qacn.png)
 
@@ -96,7 +96,7 @@ Press `7` for two sections: **Providers** showing auth status for each configure
 
 ### [8] Logs — What Just Happened?
 
-Press `8` for the full log viewer with three tabs: **agent**, **gateway**, and **errors**. Press `Tab` to switch between them. Log lines are color-coded by level (INFO green, WARNING orange, ERROR red). The compact view shows the last 5 agent log lines.
+Press `8` for the full log viewer with three tabs: **agent**, **gateway**, and **errors**. Press `Tab` to switch between them and `j`/`k` to move the viewport through the cached log window. Log lines are color-coded by level (INFO green, WARNING orange, ERROR red). The compact view shows the last 5 agent log lines.
 
 ![Logs Detail](images/SCR-20260409-qcgt.png)
 
@@ -250,7 +250,7 @@ uv pip install -e ".[dev]"
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy hermesd
-uv run pytest tests/ -v          # 168 tests, <0.5s
+uv run pytest tests/ -v          # 189 tests, <0.5s
 uv run pip-audit
 
 # Run the dashboard
@@ -280,7 +280,7 @@ hermesd/
     cron.py            [6] Cron
     overview.py        [7] Skills / Providers
     logs.py            [8] Logs
-tests/                 168 tests: panels, data, resilience, edge cases
+tests/                 189 tests: panels, data, resilience, edge cases
 ```
 
 ### Adding a Panel

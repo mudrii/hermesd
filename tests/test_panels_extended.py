@@ -174,6 +174,22 @@ def test_logs_panel_detail_errors():
     assert "[errors]" in text
 
 
+def test_logs_panel_detail_scroll_offset():
+    state = DashboardState(
+        logs=LogState(
+            agent_lines=[
+                LogLine(timestamp=f"15:42:{i:02d}", level="INFO", message=f"line-{i}")
+                for i in range(12)
+            ]
+        ),
+    )
+    panel = render_panel(8, state, Theme(), detail=True, log_sub_view="agent", scroll_offset=5)
+    text = _render_to_str(panel)
+    assert "line-0" not in text
+    assert "line-5" in text
+    assert "j/k scroll" in text
+
+
 # ── Empty state tests ──────────────────────────────────────────────────
 
 

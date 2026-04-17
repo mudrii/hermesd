@@ -55,5 +55,5 @@ def test_missing_db():
 
 def test_read_only_mode(sample_db, hermes_home):
     db = HermesDB(hermes_home / "state.db")
-    assert "mode=ro" in db._uri or db._readonly
+    assert db._uri == "" or "mode=ro" in db._uri
     db.close()

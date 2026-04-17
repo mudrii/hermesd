@@ -21,7 +21,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 2. **Write the failing test first** — acceptance-level if user-visible, unit-level otherwise
 3. **Implement the minimum change** that makes the test pass
 4. **Refactor while green** — improve naming/cohesion without changing behavior
-5. **Run the full suite** — `uv run pytest tests/ -v` (all 168+ tests must pass)
+5. **Run the full suite** — `uv run pytest tests/ -v` (all 189+ tests must pass)
 6. **Run lint + type + audit** — `uv run ruff check . && uv run ruff format --check . && uv run mypy hermesd && uv run pip-audit`
 7. **Test the TUI manually** — run `hermesd` and verify your changes look correct
 8. **Update `CHANGELOG.md`** for user-visible changes

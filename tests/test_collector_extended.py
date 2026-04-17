@@ -5,7 +5,7 @@ from pathlib import Path
 
 import yaml
 
-from hermesd.collector import Collector, _today_epoch
+from hermesd.collector import Collector, _coerce_int, _today_epoch
 
 
 def test_today_epoch_is_midnight():
@@ -83,6 +83,7 @@ def test_collect_available_tools_from_session_json(hermes_home: Path):
         json.dumps(
             {
                 "entry1": {"session_id": "s1"},
+                "entry2": {"session_id": "s2"},
             }
         )
     )
@@ -95,9 +96,25 @@ def test_collect_available_tools_from_session_json(hermes_home: Path):
             }
         )
     )
+    second_session_file = hermes_home / "sessions" / "session_s2.json"
+    second_session_file.write_text(
+        json.dumps(
+            {
+                "session_id": "s2",
+                "tools": [{"name": "read_file"}, {"name": "write_file"}, {"name": "fetch_url"}],
+            }
+        )
+    )
     c = Collector(hermes_home)
     state = c.collect()
-    assert state.available_tools == 3
+    assert state.available_tools == 5
+    assert state.available_tool_names == [
+        "fetch_url",
+        "read_file",
+        "terminal",
+        "web_search",
+        "write_file",
+    ]
     c.close()
 
 
@@ -126,6 +143,30 @@ def test_collect_config_partial(hermes_home: Path):
     c.close()
 
 
+def test_collect_config_ignores_non_mapping_yaml(hermes_home: Path):
+    cfg = hermes_home / "config.yaml"
+    cfg.write_text(yaml.dump(["not", "a", "mapping"]))
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.config.model == ""
+    assert state.config.provider == ""
+    assert state.active_skin == "default"
+    c.close()
+
+
+def test_collect_config_preserves_last_good_mapping_on_non_mapping_yaml(hermes_home: Path):
+    cfg = hermes_home / "config.yaml"
+    cfg.write_text(yaml.dump({"model": {"default": "claude-4"}}))
+    c = Collector(hermes_home)
+    first = c.collect()
+    assert first.config.model == "claude-4"
+
+    cfg.write_text(yaml.dump(["not", "a", "mapping"]))
+    second = c.collect()
+    assert second.config.model == "claude-4"
+    c.close()
+
+
 def test_collect_config_personality_fallback(hermes_home: Path):
     """When active_personality is unset, pick first from personalities dict."""
     cfg = hermes_home / "config.yaml"
@@ -140,6 +181,30 @@ def test_collect_config_personality_fallback(hermes_home: Path):
     c = Collector(hermes_home)
     state = c.collect()
     assert state.config.personality == "pirate"
+    c.close()
+
+
+def test_collect_gateway_preserves_last_good_mapping_on_non_mapping_json(hermes_home: Path):
+    gw = hermes_home / "gateway_state.json"
+    gw.write_text(
+        json.dumps(
+            {
+                "pid": 12345,
+                "gateway_state": "running",
+                "platforms": {"telegram": {"state": "connected", "updated_at": ""}},
+            }
+        )
+    )
+
+    c = Collector(hermes_home, pid_exists=lambda pid: pid == 12345)
+    first = c.collect()
+    assert first.gateway.running is True
+    assert first.gateway.pid == 12345
+
+    gw.write_text(json.dumps(["not", "a", "mapping"]))
+    second = c.collect()
+    assert second.gateway.running is True
+    assert second.gateway.pid == 12345
     c.close()
 
 
@@ -190,6 +255,17 @@ def test_collect_logs_non_standard_line(hermes_home: Path):
     c.close()
 
 
+def test_collect_logs_preserves_cache_when_file_disappears(hermes_home: Path):
+    log = hermes_home / "logs" / "agent.log"
+    log.write_text("2026-04-09 15:41:58,123 - hermes - INFO - first line\n")
+    c = Collector(hermes_home)
+    first = c.collect()
+    log.unlink()
+    second = c.collect()
+    assert second.logs.agent_lines == first.logs.agent_lines
+    c.close()
+
+
 def test_collect_version_behind(hermes_home: Path):
     (hermes_home / ".update_check").write_text(json.dumps({"behind": 7}))
     c = Collector(hermes_home)
@@ -233,10 +309,10 @@ def test_json_cache_returns_stale_on_read_error(hermes_home: Path):
     c.close()
 
 
-def test_json_cache_returns_none_on_missing_file(hermes_home: Path):
+def test_json_cache_returns_empty_mapping_on_missing_file(hermes_home: Path):
     c = Collector(hermes_home)
     data = c._read_json_cached(hermes_home / "nonexistent.json")
-    assert data is None
+    assert data == {}
     c.close()
 
 
@@ -257,6 +333,58 @@ def test_gateway_pid_not_running(hermes_home: Path):
     state = c.collect()
     assert state.gateway.running is False
     assert state.gateway.state == "running"
+    c.close()
+
+
+def test_gateway_invalid_pid_type_does_not_make_state_stale(hermes_home: Path):
+    gw = hermes_home / "gateway_state.json"
+    gw.write_text(
+        json.dumps(
+            {
+                "pid": "not-a-pid",
+                "gateway_state": "running",
+                "platforms": {},
+            }
+        )
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.is_stale is False
+    assert state.gateway.running is False
+    assert state.gateway.pid == 0
+    c.close()
+
+
+def test_coerce_int_handles_bool_values():
+    assert _coerce_int(True) == 1
+    assert _coerce_int(False) == 0
+
+
+def test_coerce_int_handles_bytes_and_bytearray():
+    assert _coerce_int(b"42") == 42
+    assert _coerce_int(bytearray(b"7")) == 7
+    assert _coerce_int(b"not-a-number") == 0
+
+
+def test_gateway_ignores_non_mapping_platform_entries(hermes_home: Path):
+    gw = hermes_home / "gateway_state.json"
+    gw.write_text(
+        json.dumps(
+            {
+                "pid": 0,
+                "gateway_state": "stopped",
+                "platforms": {
+                    "telegram": {"state": "connected", "updated_at": "2026-04-08T17:42:57+00:00"},
+                    "broken": ["not", "a", "mapping"],
+                },
+            }
+        )
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.is_stale is False
+    assert len(state.gateway.platforms) == 1
+    assert state.gateway.platforms[0].name == "telegram"
     c.close()
 
 
@@ -282,6 +410,15 @@ def test_gateway_stale_pid_with_launchd_pid(hermes_home: Path):
     state = c.collect()
     assert state.gateway.running is True
     assert state.gateway.pid == my_pid
+    c.close()
+
+
+def test_collect_providers_ignores_non_mapping_auth_json(hermes_home: Path):
+    auth = hermes_home / "auth.json"
+    auth.write_text(json.dumps(["not", "a", "mapping"]))
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.skills_memory.providers == []
     c.close()
 
 

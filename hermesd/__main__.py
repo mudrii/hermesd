@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 from hermesd import __version__
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("refresh rate must be greater than 0")
+    return parsed
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -20,7 +28,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--refresh-rate",
-        type=int,
+        type=_positive_int,
         default=5,
         help="Polling interval in seconds (default: 5)",
     )
@@ -38,8 +46,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def resolve_hermes_home(args: argparse.Namespace) -> Path:
-    import os
-
     cli_home: Path | None = args.hermes_home
     if cli_home is not None:
         return cli_home.expanduser()

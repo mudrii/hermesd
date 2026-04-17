@@ -178,7 +178,10 @@ def load_theme(hermes_home: Path) -> Theme:
 
             with open(config_path) as f:
                 cfg = yaml.safe_load(f) or {}
-            skin_name = cfg.get("display", {}).get("skin", "default")
-        except Exception:
+            if isinstance(cfg, dict):
+                display = cfg.get("display", {})
+                if isinstance(display, dict):
+                    skin_name = str(display.get("skin", "default") or "default")
+        except (OSError, yaml.YAMLError):
             pass
     return Theme(skin_name)
