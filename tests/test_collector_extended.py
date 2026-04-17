@@ -505,10 +505,10 @@ def test_latest_cron_output_excerpt_ignores_file_that_disappears_during_stat(
     latest_file.write_text("fresh output\n")
     original_stat = Path.stat
 
-    def flaky_stat(path: Path):
+    def flaky_stat(path: Path, *args, **kwargs):
         if path == stale_file:
             raise FileNotFoundError
-        return original_stat(path)
+        return original_stat(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "stat", flaky_stat)
 
