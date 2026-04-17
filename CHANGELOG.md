@@ -36,9 +36,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Narrow but tall terminals now get a dedicated single-column 10-row overview layout instead of the denser compact mixed grid, which improves readability in vertical tmux splits.
 - The footer now shows a collector health indicator with `ok/total` source counts and degraded-source names, while preserving the last good source data if one collector slice raises unexpectedly during refresh.
 - The header and footer now surface an `AGENT OFFLINE` banner when the gateway is down and there has been no recent runtime activity under the selected profile, making “idle because stopped” clearer than a merely quiet dashboard.
-- hermesd now supports `--snapshot` for one-shot overview rendering to stdout without entering the live TUI loop, `--snapshot-panel N` for exporting a single panel detail view, and `--snapshot-file PATH` for writing either form to disk.
+- hermesd now supports `--snapshot` for one-shot overview rendering to stdout without entering the live TUI loop, `--snapshot-panel N` for selecting a text detail view or annotating JSON snapshot output, and `--snapshot-file PATH` for writing either form to disk.
 - Pressing `c` now copies the current rendered view as plain text via OSC 52, so overview and detail panels can be pasted directly into bug reports or chats from compatible terminals.
+- Sessions detail search now supports `message:term` / `msg:term`, using SQLite-backed message-content lookup to find sessions by conversation text instead of only session metadata.
+- Logs detail search now supports `minlevel:` severity thresholds in addition to exact `level:` matching, so warning-or-higher and error-only views are easier to isolate.
+- SQLite cache invalidation now tracks `PRAGMA data_version` per cached reader, so sessions, tool stats, and repeated message-search queries all refresh correctly after database writes.
+- Log tailing is now configurable with `--log-tail-bytes`, making large log files cheaper to monitor without changing the rendered panel behavior.
+- Snapshot export now supports `--snapshot-format json`, producing a machine-readable full-state payload with optional selected-panel metadata for automation and bug-report attachments.
 - Panel expansion shortcuts now match the actual keyboard contract: use `1`-`9` for panels 1-9 and `0` for panel 10.
+- `HermesDB` now serializes shared SQLite connection access across the collector and render threads, preventing concurrent read/search races against the same read-only connection and keeping cache metadata consistent.
+- Collector health counts now derive from the actual `safe_collect` calls, so the footer reflects all 18 sources instead of a stale hardcoded denominator.
+- Gateway version parsing now reads `project.version` from `pyproject.toml`, skill descriptions now parse YAML frontmatter correctly, and log tails preserve the last good content when a rotated file is briefly empty or a saved cron output disappears.
+- Panel 5 now labels Tool Gateway environment-derived values as dashboard-local env data instead of implying they came from Hermes Agent runtime state.
+- Removed unused helpers `HermesDB.read_token_totals()`, `Collector.set_profile()`, and `app._panel_range_label()` to keep the codebase aligned with live production paths.
+- `--snapshot-panel 0` now aliases panel 10 in snapshot mode, matching the documented interactive shortcut and deriving validity from the live panel registry instead of a hardcoded range.
+- View-state snapshot/restore now uses a typed dataclass, logs reject unknown `minlevel:` values instead of silently showing the full stream, and filter parsers use typed criteria instead of `dict[str, object]` plus runtime asserts.
+- Unknown skins now normalize to `default` at collection time, preventing per-refresh theme reload churn and keeping the header/footer skin label aligned with the active theme.
+- `LastGoodFileCache` now remembers invalid-shape mtimes for JSON/YAML reads so repeated polls reuse the last good value without reparsing the same bad file until it changes again.
+- Sessions message-search extraction now follows the existing “last field wins” filter semantics when multiple `message:` / `msg:` clauses are present.
+- Tool Gateway env values and MCP server targets now redact secret-bearing URL query params and command arguments before rendering them in dashboard panels or snapshots.
+- Sessions message search now falls back to SQL `LIKE` matching when FTS yields no matches for punctuation-heavy queries, reducing false negatives in detail filters.
+- Panel 4 now labels its first detail column generically to match both per-tool and fallback per-session call summaries.
 
 ### Developer tooling
 

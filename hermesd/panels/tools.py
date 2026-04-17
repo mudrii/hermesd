@@ -52,7 +52,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
 
     if state.tool_stats:
         calls_table = Table(box=None, show_header=True, padding=(0, 2))
-        calls_table.add_column("Session", style=theme.ui_label)
+        calls_table.add_column("Name", style=theme.ui_label)
         calls_table.add_column("Calls", justify="right", style=theme.ui_accent)
         for ts in state.tool_stats:
             calls_table.add_row(ts.name, str(ts.call_count))

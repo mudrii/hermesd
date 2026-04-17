@@ -11,14 +11,16 @@ from hermesd import __version__
 def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
-        raise argparse.ArgumentTypeError("refresh rate must be greater than 0")
+        raise argparse.ArgumentTypeError("value must be a positive integer")
     return parsed
 
 
 def _snapshot_panel_num(value: str) -> int:
-    parsed = int(value)
-    if parsed < 1 or parsed > 10:
-        raise argparse.ArgumentTypeError("snapshot panel must be between 1 and 10")
+    from hermesd.panels import PANEL_NAMES
+
+    parsed = 10 if value == "0" else int(value)
+    if parsed not in PANEL_NAMES:
+        raise argparse.ArgumentTypeError("snapshot panel must be 1-9 or 0 (panel 10)")
     return parsed
 
 
@@ -65,7 +67,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--snapshot-panel",
         type=_snapshot_panel_num,
         default=None,
-        help="Render a single panel detail snapshot (1-10) instead of the overview",
+        help="Select panel 1-9 or 0 (panel 10); text snapshots render that detail view, JSON snapshots annotate full-state output",
+    )
+    parser.add_argument(
+        "--snapshot-format",
+        choices=("text", "json"),
+        default="text",
+        help="Snapshot output format (default: text)",
+    )
+    parser.add_argument(
+        "--log-tail-bytes",
+        type=_positive_int,
+        default=32768,
+        help="Bytes read from the end of each log file per refresh (default: 32768)",
     )
     parser.add_argument(
         "--version",
@@ -110,16 +124,28 @@ def main(argv: list[str] | None = None) -> None:
             refresh_rate=args.refresh_rate,
             no_color=args.no_color,
             profile_name=profile_name,
+            log_tail_bytes=args.log_tail_bytes,
         )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
-    if args.snapshot or args.snapshot_file is not None or args.snapshot_panel is not None:
-        snapshot_text = app.render_snapshot_text(panel_num=args.snapshot_panel)
+    if (
+        args.snapshot
+        or args.snapshot_file is not None
+        or args.snapshot_panel is not None
+        or args.snapshot_format != "text"
+    ):
+        if args.snapshot_format == "json":
+            snapshot_text = app.render_snapshot_json(panel_num=args.snapshot_panel)
+        else:
+            snapshot_text = app.render_snapshot_text(panel_num=args.snapshot_panel)
         if args.snapshot_file is not None:
             args.snapshot_file.write_text(snapshot_text)
         else:
-            app.render_snapshot(panel_num=args.snapshot_panel)
+            if args.snapshot_format == "json":
+                print(snapshot_text)
+            else:
+                app.render_snapshot(panel_num=args.snapshot_panel)
         app.close()
         return
     app.run()

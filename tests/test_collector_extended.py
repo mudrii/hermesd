@@ -1,11 +1,12 @@
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
 
 import yaml
 
-from hermesd.collector import Collector, _coerce_int, _today_epoch
+from hermesd.collector import Collector, _coerce_int, _pid_exists, _today_epoch
 
 
 def test_today_epoch_is_midnight():
@@ -67,6 +68,35 @@ def test_collect_tool_stats(hermes_home: Path, sample_db: Path):
     assert isinstance(state.tool_stats, list)
     names = [t.name for t in state.tool_stats]
     assert "shell_exec" in names
+    c.close()
+
+
+def test_collect_logs_respects_log_tail_bytes(hermes_home: Path):
+    agent_log = hermes_home / "logs" / "agent.log"
+    lines = [f"2026-04-09 15:42:{idx:02d},000 - hermes - INFO - line {idx}\n" for idx in range(30)]
+    agent_log.write_text("".join(lines))
+
+    c = Collector(hermes_home, log_tail_bytes=256)
+    state = c.collect()
+
+    messages = [line.message for line in state.logs.agent_lines]
+    assert any("line 29" in message for message in messages)
+    assert all("line 00" not in message for message in messages)
+    c.close()
+
+
+def test_collect_cron_logs_respect_log_tail_bytes(hermes_home: Path):
+    cron_output_dir = hermes_home / "cron" / "output" / "job-1"
+    cron_output_dir.mkdir(parents=True)
+    output_file = cron_output_dir / "latest.md"
+    output_file.write_text("\n".join(f"cron line {idx}" for idx in range(40)))
+
+    c = Collector(hermes_home, log_tail_bytes=128)
+    state = c.collect()
+
+    messages = [line.message for line in state.logs.cron_lines]
+    assert any("cron line 39" in message for message in messages)
+    assert all("cron line 0" not in message for message in messages)
     c.close()
 
 
@@ -219,6 +249,41 @@ def test_collect_config_tool_gateway_routes(hermes_home: Path, monkeypatch):
     c.close()
 
 
+def test_collect_config_redacts_secret_bearing_tool_gateway_urls(hermes_home: Path, monkeypatch):
+    cfg = hermes_home / "config.yaml"
+    cfg.write_text(yaml.dump({"web": {"use_gateway": True}}))
+    monkeypatch.setenv("FIRECRAWL_GATEWAY_URL", "https://firecrawl.example.com?token=secret")
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.config.firecrawl_gateway_url == "https://firecrawl.example.com?token=[REDACTED]"
+    c.close()
+
+
+def test_collect_hermes_version_ignores_non_version_keys(hermes_home: Path):
+    pyproject = hermes_home / "hermes-agent" / "pyproject.toml"
+    pyproject.parent.mkdir(parents=True, exist_ok=True)
+    pyproject.write_text(
+        """
+[tool.example]
+versioning_scheme = "calendar"
+
+[project]
+name = "hermes-agent"
+version = "2026.4.10"
+"""
+    )
+    (hermes_home / "gateway_state.json").write_text(
+        json.dumps({"pid": 0, "gateway_state": "stopped", "platforms": {}})
+    )
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.gateway.hermes_version == "2026.4.10"
+    c.close()
+
+
 def test_collect_config_richer_agent_settings(populated_hermes_home: Path):
     c = Collector(populated_hermes_home)
     state = c.collect()
@@ -229,6 +294,33 @@ def test_collect_config_richer_agent_settings(populated_hermes_home: Path):
     assert state.config.dashboard_theme == "midnight"
     assert state.config.session_reset_mode == "both"
     assert state.config.memory_provider == "supermemory"
+    c.close()
+
+
+def test_collect_mcp_servers_redacts_secret_targets(hermes_home: Path):
+    cfg = hermes_home / "config.yaml"
+    cfg.write_text(
+        yaml.dump(
+            {
+                "mcp_servers": {
+                    "local-demo": {
+                        "command": "python",
+                        "args": ["server.py", "--api-key", "sk-test-secret"],
+                    },
+                    "remote-demo": {
+                        "url": "https://example.com/mcp?token=secret123&mode=full",
+                    },
+                }
+            }
+        )
+    )
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    servers = {server.name: server for server in state.skills_memory.mcp_servers}
+    assert servers["local-demo"].target == "python server.py --api-key [REDACTED]"
+    assert servers["remote-demo"].target == "https://example.com/mcp?token=[REDACTED]&mode=full"
     c.close()
 
 
@@ -315,6 +407,32 @@ def test_collect_logs_preserves_cache_when_file_disappears(hermes_home: Path):
     c.close()
 
 
+def test_collect_logs_preserves_cache_when_file_rotates_to_empty(hermes_home: Path):
+    log = hermes_home / "logs" / "agent.log"
+    log.write_text("2026-04-09 15:41:58,123 - hermes - INFO - first line\n")
+    c = Collector(hermes_home)
+    first = c.collect()
+    log.write_text("")
+    second = c.collect()
+    assert second.logs.agent_lines == first.logs.agent_lines
+    c.close()
+
+
+def test_collect_cron_logs_preserve_cache_when_latest_output_disappears(hermes_home: Path):
+    cron_output_dir = hermes_home / "cron" / "output" / "job-1"
+    cron_output_dir.mkdir(parents=True)
+    output_file = cron_output_dir / "latest.md"
+    output_file.write_text("cron line 1\ncron line 2\n")
+
+    c = Collector(hermes_home)
+    first = c.collect()
+    output_file.unlink()
+    second = c.collect()
+
+    assert second.logs.cron_lines == first.logs.cron_lines
+    c.close()
+
+
 def test_collect_version_behind(hermes_home: Path):
     (hermes_home / ".update_check").write_text(json.dumps({"behind": 7}))
     c = Collector(hermes_home)
@@ -340,6 +458,15 @@ def test_collect_skin(hermes_home: Path):
 
 
 def test_collect_skin_default(hermes_home: Path):
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.active_skin == "default"
+    c.close()
+
+
+def test_collect_skin_unknown_falls_back_to_default(hermes_home: Path):
+    cfg = hermes_home / "config.yaml"
+    cfg.write_text(yaml.dump({"display": {"skin": "nonexistent"}}))
     c = Collector(hermes_home)
     state = c.collect()
     assert state.active_skin == "default"
@@ -459,6 +586,41 @@ def test_gateway_stale_pid_with_launchd_pid(hermes_home: Path):
     state = c.collect()
     assert state.gateway.running is True
     assert state.gateway.pid == my_pid
+    c.close()
+
+
+def test_pid_exists_returns_false_for_missing_process(monkeypatch):
+    def fake_kill(pid: int, sig: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(os, "kill", fake_kill)
+    assert _pid_exists(12345) is False
+
+
+def test_pid_exists_returns_true_for_permission_error(monkeypatch):
+    def fake_kill(pid: int, sig: int) -> None:
+        raise PermissionError
+
+    monkeypatch.setattr(os, "kill", fake_kill)
+    assert _pid_exists(12345) is True
+
+
+def test_read_skill_description_parses_yaml_frontmatter(hermes_home: Path):
+    skill_md = hermes_home / "skills" / "dev" / "lint" / "SKILL.md"
+    skill_md.parent.mkdir(parents=True, exist_ok=True)
+    skill_md.write_text(
+        """---
+description: |
+  Use: lint tools
+  Keep style clean
+---
+
+Body
+"""
+    )
+
+    c = Collector(hermes_home)
+    assert c._read_skill_description("dev", "lint") == "Use: lint tools\nKeep style clean"
     c.close()
 
 

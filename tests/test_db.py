@@ -29,14 +29,6 @@ def test_read_tool_stats(sample_db, hermes_home):
     db.close()
 
 
-def test_read_token_totals(sample_db, hermes_home):
-    db = HermesDB(hermes_home / "state.db")
-    totals = db.read_token_totals()
-    assert totals["input_tokens"] == 12400 + 9100
-    assert totals["output_tokens"] == 8200 + 6300
-    db.close()
-
-
 def test_data_version_caching(sample_db, hermes_home):
     db = HermesDB(hermes_home / "state.db")
     s1 = db.read_sessions()

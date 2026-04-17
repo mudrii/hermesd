@@ -127,10 +127,15 @@ _BUILTIN_SKINS: dict[str, dict[str, str]] = {
 _DEFAULT = _BUILTIN_SKINS["default"]
 
 
+def normalize_skin_name(skin_name: str) -> str:
+    return skin_name if skin_name in _BUILTIN_SKINS else "default"
+
+
 class Theme:
     def __init__(self, skin_name: str = "default"):
-        colors = _BUILTIN_SKINS.get(skin_name, _DEFAULT)
-        self.skin_name = skin_name if skin_name in _BUILTIN_SKINS else "default"
+        normalized_skin_name = normalize_skin_name(skin_name)
+        colors = _BUILTIN_SKINS.get(normalized_skin_name, _DEFAULT)
+        self.skin_name = normalized_skin_name
         self.banner_border: str = colors["banner_border"]
         self.banner_title: str = colors["banner_title"]
         self.banner_accent: str = colors["banner_accent"]
@@ -184,4 +189,4 @@ def load_theme(hermes_home: Path) -> Theme:
                     skin_name = str(display.get("skin", "default") or "default")
         except (OSError, yaml.YAMLError):
             pass
-    return Theme(skin_name)
+    return Theme(normalize_skin_name(skin_name))

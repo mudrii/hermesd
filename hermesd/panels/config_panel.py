@@ -67,7 +67,9 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     sections.append(table)
 
     if c.tool_gateway_routes:
-        sections.append(Text("\nTool Gateway\n", style=f"bold {theme.ui_label}"))
+        sections.append(
+            Text("\nTool Gateway (dashboard-local env)\n", style=f"bold {theme.ui_label}")
+        )
 
         gateway_table = Table(box=None, show_header=False, padding=(0, 2))
         gateway_table.add_column("Key", style=theme.ui_label)

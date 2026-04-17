@@ -1,10 +1,12 @@
 import io
 from pathlib import Path
+from unittest.mock import patch
 
 from rich.console import Console
 
 from hermesd.app import DashboardApp
 from hermesd.models import HealthSummary, RuntimeStatus
+from hermesd.theme import load_theme
 
 
 def test_handle_key_refresh(populated_hermes_home: Path):
@@ -283,6 +285,56 @@ def test_build_detail_layout(populated_hermes_home: Path):
     app.close()
 
 
+def test_build_detail_layout_uses_session_message_search(populated_hermes_home: Path, monkeypatch):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._set_state(app._collector.collect())
+    app._view.enter_detail(2)
+    app._view.filter_query = "message:response"
+    called: dict[str, str] = {}
+
+    def fake_search(query: str) -> set[str]:
+        called["query"] = query
+        return {"sess_001"}
+
+    monkeypatch.setattr(app._collector, "search_session_ids_by_message", fake_search)
+    layout = app._build_layout()
+    assert layout is not None
+    assert called["query"] == "response"
+    app.close()
+
+
+def test_snapshot_view_state_round_trips_all_fields(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._view.mode = "detail"
+    app._view.detail_panel = 8
+    app._view.focus_panel = 7
+    app._view.scroll_offset = 12
+    app._view.log_sub_view = "errors"
+    app._view.show_help = True
+    app._view.profile_cycle_index = 3
+    app._view.filter_query = "message:timeout"
+    app._view.filter_edit_mode = True
+    app._view.session_sort = "cost"
+
+    snapshot = app._snapshot_view_state()
+    app._view = app._view.__class__()
+    app._restore_view_state(snapshot)
+
+    restored = app._snapshot_view_state()
+    assert restored == snapshot
+    assert restored.mode == "detail"
+    assert restored.detail_panel == 8
+    assert restored.focus_panel == 7
+    assert restored.scroll_offset == 12
+    assert restored.log_sub_view == "errors"
+    assert restored.show_help is True
+    assert restored.profile_cycle_index == 3
+    assert restored.filter_query == "message:timeout"
+    assert restored.filter_edit_mode is True
+    assert restored.session_sort == "cost"
+    app.close()
+
+
 def test_build_header_with_custom_skin(populated_hermes_home: Path):
     import yaml
 
@@ -308,6 +360,23 @@ def test_app_refreshes_theme_when_skin_changes(populated_hermes_home: Path):
     app._set_state(new_state)
 
     assert app._theme.skin_name == "ares"
+    app.close()
+
+
+def test_app_unknown_skin_does_not_reload_theme_every_update(populated_hermes_home: Path):
+    import yaml
+
+    config_path = populated_hermes_home / "config.yaml"
+    config_path.write_text(yaml.dump({"display": {"skin": "nonexistent"}}))
+
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    state = app._collector.collect()
+
+    with patch("hermesd.app.load_theme", wraps=load_theme) as mocked:
+        app._set_state(state)
+        app._set_state(state)
+
+    assert mocked.call_count <= 1
     app.close()
 
 
@@ -525,4 +594,20 @@ def test_copy_current_view_returns_detail_text(populated_hermes_home: Path):
     copied = app.copy_current_view()
     assert "[2] Sessions" in copied
     assert "sess_001" in copied
+    app.close()
+
+
+def test_copy_current_view_preserves_detail_filter_and_sort(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    buffer = io.StringIO()
+    app._console = Console(file=buffer, width=120, height=40, force_terminal=True, no_color=True)
+    app._set_state(app._collector.collect())
+    app._handle_key("2")
+    app._view.filter_query = "source:telegram"
+    app._view.session_sort = "cost"
+
+    copied = app.copy_current_view()
+
+    assert "Filter: source:telegram" in copied
+    assert "Sort: cost" in copied
     app.close()

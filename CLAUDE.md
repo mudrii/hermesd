@@ -12,9 +12,15 @@
 uv venv .venv --python 3.11
 source .venv/bin/activate
 uv pip install -e ".[dev]"
-python -m pytest tests/ -v          # 164 tests, <0.5s
+uv run pytest tests/ -v             # 306 tests
 hermesd                              # run the dashboard
 hermesd --hermes-home /path          # custom hermes home
+hermesd --profile coding             # opt-in profile-scoped runtime data
+hermesd --snapshot                   # one-shot overview to stdout
+hermesd --snapshot-panel 10          # one-shot detail snapshot in text mode
+hermesd --snapshot-panel 0           # panel 10 alias matching the interactive shortcut
+hermesd --snapshot-format json       # machine-readable full-state snapshot
+hermesd --log-tail-bytes 8192        # cap per-refresh log reads for large files
 ```
 
 ## Architecture
@@ -25,9 +31,11 @@ hermesd/
   app.py          Rich TUI: Live context, input thread, adaptive layout
   collector.py    Reads all ~/.hermes data sources (JSON, YAML, SQLite, files)
   db.py           Read-only SQLite with PRAGMA data_version caching
+  file_cache.py   mtime-keyed JSON/YAML cache
   models.py       Pydantic models for DashboardState
+  paths.py        Profile-scoped path resolution
   theme.py        Skin/color system (inherits from hermes config.yaml)
-  panels/         8 panel renderers (compact + detail views)
+  panels/         10 panel renderers (compact + detail views)
 ```
 
 ### Data Flow
@@ -52,8 +60,19 @@ State is shared via `threading.Lock` on `_state`. SQLite uses `check_same_thread
 
 ## Adding Features
 
-1. Add data model fields to `models.py`
-2. Populate them in `collector.py`
-3. Render in `panels/*.py` (both `_render_compact` and `_render_detail`)
-4. Write tests (compact render, detail render, empty state, collector integration)
-5. Update `app.py` layout if adding new panels
+Canonical contributor workflow lives in [`CONTRIBUTING.md`](CONTRIBUTING.md). The short version:
+
+1. **Write the failing test first** — this project mandates TDD/ATDD (see `.claude/skills/py-rig/SKILL.md`).
+2. Add data model fields to `models.py`.
+3. Populate them in `collector.py`.
+4. Render in `panels/*.py` (both `_render_compact` and `_render_detail`).
+5. Make tests pass with the minimum change; refactor while green.
+6. Update `app.py` layout if adding new panels; register the panel in both `PANEL_NAMES` and `_RENDERERS` in `panels/__init__.py`, then add its panel number to `_WIDE_LAYOUT_SPEC`, `_COMPACT_LAYOUT_SPEC`, and `_TALL_NARROW_LAYOUT_SPEC` in `app.py` as needed.
+7. Update `CHANGELOG.md` for user-visible changes.
+
+See also:
+
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — branch/PR workflow and per-panel instructions.
+- [`.claude/rules/python-idioms.md`](.claude/rules/python-idioms.md) — version-tagged modern Python syntax.
+- [`.claude/rules/python-patterns.md`](.claude/rules/python-patterns.md) — style, types, errors, tests.
+- [`.claude/skills/py-rig/SKILL.md`](.claude/skills/py-rig/SKILL.md) — design/TDD/ATDD/DI/review discipline.

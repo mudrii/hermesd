@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import base64
+import json
 import signal
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -52,6 +54,20 @@ _TALL_NARROW_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = 
     (f"row{panel_num}", None, (panel_num,)) for panel_num in _PANEL_NUMBERS
 )
 _SESSION_SORTS = ("recent", "cost", "tokens")
+
+
+@dataclass(frozen=True, slots=True)
+class ViewSnapshot:
+    mode: str
+    detail_panel: int | None
+    focus_panel: int
+    scroll_offset: int
+    log_sub_view: str
+    show_help: bool
+    profile_cycle_index: int
+    filter_query: str
+    filter_edit_mode: bool
+    session_sort: str
 
 
 class ViewState:
@@ -135,13 +151,20 @@ class DashboardApp:
         refresh_rate: int = 5,
         no_color: bool = False,
         profile_name: str | None = None,
+        log_tail_bytes: int = 32768,
     ) -> None:
         if refresh_rate <= 0:
             raise ValueError("refresh_rate must be positive")
+        if log_tail_bytes <= 0:
+            raise ValueError("log_tail_bytes must be positive")
         self._home = hermes_home
         self._refresh_rate = refresh_rate
         self._no_color = no_color
-        self._collector = Collector(hermes_home, profile_name=profile_name)
+        self._collector = Collector(
+            hermes_home,
+            profile_name=profile_name,
+            log_tail_bytes=log_tail_bytes,
+        )
         self._theme = load_theme(hermes_home)
         self._view = ViewState()
         profile_mode_label = "root" if profile_name is None else f"profile:{profile_name}"
@@ -153,7 +176,7 @@ class DashboardApp:
         self._running = threading.Event()
         self._force_refresh = threading.Event()
         self._lock = threading.Lock()
-        self._view_lock = threading.Lock()
+        self._view_lock = threading.RLock()
         self._spinner_idx = 0
         self._input_error: str | None = None
         self._console = Console(force_terminal=not no_color, no_color=no_color)
@@ -210,12 +233,19 @@ class DashboardApp:
     def render_snapshot_text(self, panel_num: int | None = None) -> str:
         return self._capture_layout_text(panel_num=panel_num, refresh=True)
 
+    def render_snapshot_json(self, panel_num: int | None = None) -> str:
+        state = self._collector.collect()
+        self._set_state(state)
+        panel_name = PANEL_NAMES[panel_num] if panel_num is not None else ""
+        payload = {
+            "panel_num": panel_num,
+            "panel_name": panel_name,
+            "state": state.model_dump(mode="json"),
+        }
+        return json.dumps(payload, indent=2)
+
     def render_current_view_text(self) -> str:
-        panel_num = None
-        with self._view_lock:
-            if self._view.mode == "detail":
-                panel_num = self._view.detail_panel
-        return self._capture_layout_text(panel_num=panel_num, refresh=False)
+        return self._capture_layout_text(refresh=False)
 
     def render_snapshot(self, panel_num: int | None = None) -> None:
         self._console.print(self.render_snapshot_text(panel_num=panel_num), end="")
@@ -227,39 +257,33 @@ class DashboardApp:
         self._console.file.flush()
         return copied_text
 
-    def _snapshot_view_state(self) -> dict[str, object]:
+    def _snapshot_view_state(self) -> ViewSnapshot:
         with self._view_lock:
-            return {
-                "mode": self._view.mode,
-                "detail_panel": self._view.detail_panel,
-                "focus_panel": self._view.focus_panel,
-                "scroll_offset": self._view.scroll_offset,
-                "log_sub_view": self._view.log_sub_view,
-                "show_help": self._view.show_help,
-                "profile_cycle_index": self._view.profile_cycle_index,
-                "filter_query": self._view.filter_query,
-                "filter_edit_mode": self._view.filter_edit_mode,
-                "session_sort": self._view.session_sort,
-            }
-
-    def _restore_view_state(self, snapshot: dict[str, object]) -> None:
-        with self._view_lock:
-            self._view.mode = str(snapshot["mode"])
-            detail_panel = snapshot["detail_panel"]
-            self._view.detail_panel = detail_panel if isinstance(detail_panel, int) else None
-            focus_panel = snapshot["focus_panel"]
-            self._view.focus_panel = focus_panel if isinstance(focus_panel, int) else 1
-            scroll_offset = snapshot["scroll_offset"]
-            self._view.scroll_offset = scroll_offset if isinstance(scroll_offset, int) else 0
-            self._view.log_sub_view = str(snapshot["log_sub_view"])
-            self._view.show_help = bool(snapshot["show_help"])
-            profile_cycle_index = snapshot["profile_cycle_index"]
-            self._view.profile_cycle_index = (
-                profile_cycle_index if isinstance(profile_cycle_index, int) else 0
+            return ViewSnapshot(
+                mode=self._view.mode,
+                detail_panel=self._view.detail_panel,
+                focus_panel=self._view.focus_panel,
+                scroll_offset=self._view.scroll_offset,
+                log_sub_view=self._view.log_sub_view,
+                show_help=self._view.show_help,
+                profile_cycle_index=self._view.profile_cycle_index,
+                filter_query=self._view.filter_query,
+                filter_edit_mode=self._view.filter_edit_mode,
+                session_sort=self._view.session_sort,
             )
-            self._view.filter_query = str(snapshot["filter_query"])
-            self._view.filter_edit_mode = bool(snapshot["filter_edit_mode"])
-            self._view.session_sort = str(snapshot["session_sort"])
+
+    def _restore_view_state(self, snapshot: ViewSnapshot) -> None:
+        with self._view_lock:
+            self._view.mode = snapshot.mode
+            self._view.detail_panel = snapshot.detail_panel
+            self._view.focus_panel = snapshot.focus_panel
+            self._view.scroll_offset = snapshot.scroll_offset
+            self._view.log_sub_view = snapshot.log_sub_view
+            self._view.show_help = snapshot.show_help
+            self._view.profile_cycle_index = snapshot.profile_cycle_index
+            self._view.filter_query = snapshot.filter_query
+            self._view.filter_edit_mode = snapshot.filter_edit_mode
+            self._view.session_sort = snapshot.session_sort
 
     def close(self) -> None:
         self._running.clear()
@@ -402,6 +426,15 @@ class DashboardApp:
             filter_query = self._view.filter_query
             filter_edit_mode = self._view.filter_edit_mode
             session_sort = self._view.session_sort
+        session_message_match_ids: set[str] | None = None
+        if mode == "detail" and detail_panel == _SESSIONS_PANEL_NUM and filter_query:
+            from hermesd.panels.sessions import extract_message_search_query
+
+            message_query = extract_message_search_query(filter_query)
+            if message_query:
+                session_message_match_ids = self._collector.search_session_ids_by_message(
+                    message_query
+                )
 
         layout = Layout()
         layout.split_column(
@@ -425,6 +458,7 @@ class DashboardApp:
                 profile_view_index=profile_view_index,
                 filter_query=filter_query,
                 session_sort=session_sort,
+                session_message_match_ids=session_message_match_ids,
             )
             layout["body"].update(panel)
         else:
@@ -642,15 +676,6 @@ class DashboardApp:
             box=rich.box.HORIZONTALS,
             padding=(1, 2),
         )
-
-
-def _panel_range_label() -> str:
-    panel_numbers = sorted(PANEL_NAMES)
-    if not panel_numbers:
-        return ""
-    if panel_numbers == list(range(panel_numbers[0], panel_numbers[-1] + 1)):
-        return f"{panel_numbers[0]}-{panel_numbers[-1]}"
-    return ",".join(str(panel_num) for panel_num in panel_numbers)
 
 
 def _panel_shortcut_label() -> str:

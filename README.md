@@ -43,13 +43,14 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 
 - **Read-only** — hermesd never writes to `~/.hermes/` or modifies Hermes Agent state
 - **Live-updating** — polls every 5 seconds (configurable with `--refresh-rate`)
-- **Snapshot mode** — `--snapshot` renders one overview frame to stdout and exits; `--snapshot-panel N` exports a single panel detail view; `--snapshot-file PATH` writes either form to disk
+- **Snapshot mode** — `--snapshot` renders one overview frame to stdout and exits; `--snapshot-panel N` selects a detail panel for text snapshots and annotates JSON snapshots (`0` aliases panel 10); `--snapshot-file PATH` writes either form to disk; `--snapshot-format json` emits machine-readable full-state snapshots
+- **Bounded log reads** — `--log-tail-bytes` caps how much of each log file is read per refresh
 - **Opt-in profiles** — root mode stays the default; use `--profile NAME` or `HERMES_PROFILE=NAME` to read profile-scoped runtime data
 - **Adaptive layout** — full 10-panel grid on wide terminals, a tall-narrow single-column overview for vertical tmux splits, and a denser all-panel overview on 80x24
 - **Detail views** — press `1`-`9` or `0` for panel 10 to expand any panel to full-screen
 - **Focus toggle** — press `f` to jump between the overview and the last selected full-screen panel
 - **Clipboard export** — press `c` to copy the current rendered view as plain text via OSC 52 in compatible terminals
-- **Inline detail filters** — press `/` in Sessions or Logs detail view to live-filter the current table/log stream with field-aware queries
+- **Inline detail filters** — press `/` in Sessions or Logs detail view to live-filter the current table/log stream with field-aware queries, including message-content and severity-threshold filters
 - **Session sorting** — press `s` in Sessions detail to cycle recent/cost/token ordering
 - **Jump navigation** — press `g` / `G` in scrollable detail views to jump to the top or bottom
 - **Footer health indicator** — a green/yellow/red dot shows how many collector sources succeeded on the last refresh, with failed source names surfaced inline when degraded
@@ -78,7 +79,7 @@ Press `1` to expand. Shows whether the gateway process is alive (with correct PI
 
 ### [2] Sessions — What’s Active and Where Did It Fork?
 
-Press `2` to expand. The detail table now includes billing metadata plus parent-session lineage, so compression splits and child sessions are easier to spot without querying the DB directly. Press `/` to filter the currently loaded sessions by ID, source, model, lineage, provider, or title, and press `s` to cycle recent/cost/token sorting.
+Press `2` to expand. The detail table now includes billing metadata plus parent-session lineage, so compression splits and child sessions are easier to spot without querying the DB directly. Press `/` to filter the currently loaded sessions by ID, source, model, lineage, provider, title, or message content via `message:term`, and press `s` to cycle recent/cost/token sorting.
 
 ### [3] Tokens / Cost — Where Are My Tokens Going?
 
@@ -88,13 +89,13 @@ Press `3` for the full per-session token breakdown plus recent `7d`/`30d` rollup
 
 ### [4] Tools — What's Available and What's Being Used?
 
-Press `4` for four sections: **Tool Calls** showing per-session call counts, **Available Tools** listing the union of tools discovered across session files in a 3-column grid, **Background Processes** showing the running `processes.json` checkpoint with PID, notify-on-complete, watch-pattern summary, start time, and command, and **Checkpoints** showing filesystem shadow repos with workdir name, commit depth, and latest checkpoint reason. The compact view shows the top callers plus the current background-process and checkpoint counts.
+Press `4` for four sections: **Tool Calls** showing the current call leaders by name (tool names when the `messages` table provides them, otherwise fallback session labels), **Available Tools** listing the union of tools discovered across session files in a 3-column grid, **Background Processes** showing the running `processes.json` checkpoint with PID, notify-on-complete, watch-pattern summary, start time, and command, and **Checkpoints** showing filesystem shadow repos with workdir name, commit depth, and latest checkpoint reason. The compact view shows the top callers plus the current background-process and checkpoint counts.
 
 ![Tools Detail](images/SCR-20260409-qacn.png)
 
 ### [5] Config — Current Agent Configuration
 
-Press `5` for the full config key-value table: model, provider, personality, max turns, reasoning effort, compression threshold, secret redaction, approval mode, provider routing summary, smart routing, fallback model, dashboard theme, session reset mode, memory provider, and Tool Gateway routing for `web`, `image_gen`, `tts`, and `browser`. Tool Gateway domain, scheme, Firecrawl endpoint, and token presence are shown from config plus environment without exposing secrets.
+Press `5` for the full config key-value table: model, provider, personality, max turns, reasoning effort, compression threshold, secret redaction, approval mode, provider routing summary, smart routing, fallback model, dashboard theme, session reset mode, memory provider, and Tool Gateway routing for `web`, `image_gen`, `tts`, and `browser`. Tool Gateway domain, scheme, Firecrawl endpoint, and token presence are shown from config plus environment with secret-bearing values redacted.
 
 ![Config Detail](images/SCR-20260409-qael.png)
 
@@ -106,13 +107,13 @@ Press `6` to see all cron jobs with their schedule, delivery target, current sta
 
 ### [7] Skills & Integrations — What's Installed?
 
-Press `7` for provider and integration visibility in one place: **Providers** with active auth state, **Credential Pools** with redacted metadata, **Hooks** discovered from `~/.hermes/hooks/`, **Plugins** from `~/.hermes/plugins/`, **MCP Servers** from `config.yaml`, `BOOT.md` presence, and **Skills** grouped by category with descriptions loaded from each skill's `SKILL.md` frontmatter. Use `j`/`k` to scroll through the full skill list.
+Press `7` for provider and integration visibility in one place: **Providers** with active auth state, **Credential Pools** with redacted metadata, **Hooks** discovered from `~/.hermes/hooks/`, **Plugins** from `~/.hermes/plugins/`, **MCP Servers** from `config.yaml` with secret-bearing args and URL query params redacted, `BOOT.md` presence, and **Skills** grouped by category with descriptions loaded from each skill's `SKILL.md` frontmatter. Use `j`/`k` to scroll through the full skill list.
 
 ![Skills Detail](images/SCR-20260409-qbym.png)
 
 ### [8] Logs — What Just Happened?
 
-Press `8` for the full log viewer with four tabs: **agent**, **gateway**, **errors**, and **cron**. Press `Tab` to switch between them, `/` to filter the current log stream by `level:`, `component:`, `session:`, or free text, `j`/`k` to move the viewport, and `g`/`G` to jump to the top or bottom. Log lines are color-coded by level (INFO green, WARNING orange, ERROR red), while the cron tab shows the most recent saved cron output file.
+Press `8` for the full log viewer with four tabs: **agent**, **gateway**, **errors**, and **cron**. Press `Tab` to switch between them, `/` to filter the current log stream by `level:`, `minlevel:`, `component:`, `session:`, or free text, `j`/`k` to move the viewport, and `g`/`G` to jump to the top or bottom. Log lines are color-coded by level (INFO green, WARNING orange, ERROR red), while the cron tab shows the most recent saved cron output file.
 
 ![Logs Detail](images/SCR-20260409-qcgt.png)
 
@@ -197,6 +198,18 @@ hermesd --snapshot-file /tmp/hermesd.txt
 
 # Export a single panel detail snapshot
 hermesd --snapshot-panel 10
+
+# Panel 10 also accepts the interactive shortcut alias
+hermesd --snapshot-panel 0
+
+# Emit a machine-readable JSON snapshot of the full dashboard state
+hermesd --snapshot-format json
+
+# Annotate a JSON snapshot with a selected panel number
+hermesd --snapshot-panel 8 --snapshot-format json
+
+# Reduce log-read overhead for large log files
+hermesd --log-tail-bytes 8192
 ```
 
 ### Environment Variables
@@ -219,6 +232,7 @@ hermesd --snapshot-panel 10
 | `/` | Edit the inline filter for Sessions or Logs detail |
 | `s` | Cycle session sort in Sessions detail |
 | `g` / `G` | Jump to top/bottom in scrollable detail views |
+| `p` | Cycle the viewed profile in Profiles detail |
 | `r` | Force immediate refresh |
 | `q` | Quit |
 | `?` | Toggle help overlay |
@@ -261,7 +275,7 @@ hermesd is a **read-only companion** — it reads files from `~/.hermes/` and ne
 | `tty.setcbreak` (not `setraw`) | Preserves signal handling over SSH/tmux |
 | `os.read(fd, 64)` bulk read | Captures escape sequences as single chunks |
 | Cost estimation from tokens | Shows ~USD when provider doesn't report costs |
-| Adaptive layout threshold | 80x24 gets compact single-column; 100+ gets full grid |
+| Adaptive layout threshold | Width < 100 with height >= 50 gets the tall single-column layout; smaller terminals get the compact mixed grid |
 
 ## Themes
 
@@ -290,7 +304,7 @@ uv pip install -e ".[dev]"
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy hermesd
-uv run pytest tests/ -v          # 274 tests, <0.5s
+uv run pytest tests/ -v          # 306 tests
 uv run pip-audit
 
 # Run the dashboard
@@ -308,10 +322,13 @@ hermesd/
   app.py               Rich TUI: Live context, input thread, adaptive layout
   collector.py         Reads all ~/.hermes data sources
   db.py                Read-only SQLite with data_version caching
+  file_cache.py        mtime-keyed JSON/YAML cache
   models.py            Pydantic models for dashboard state
+  paths.py             HermesPaths profile-scoped path resolution
   theme.py             Skin/color system matching Hermes Agent
   panels/
     __init__.py        Panel dispatch and registry
+    formatting.py      Shared rendering helpers
     gateway.py         [1] Gateway & Platforms
     sessions.py        [2] Sessions
     tokens.py          [3] Tokens / Cost
@@ -319,9 +336,10 @@ hermesd/
     config_panel.py    [5] Config
     cron.py            [6] Cron
     overview.py        [7] Skills / Integrations
+    profiles.py        [9] Profiles
     memory_panel.py    [10] Memory
     logs.py            [8] Logs
-tests/                 274 tests: panels, data, resilience, edge cases
+tests/                 306 tests: panels, data, resilience, edge cases
 ```
 
 ### Adding a Panel
@@ -332,8 +350,8 @@ hermesd uses **TDD-first** contribution (see [`CONTRIBUTING.md`](CONTRIBUTING.md
 2. Add data model to `hermesd/models.py`
 3. Collect data in `hermesd/collector.py`
 4. Create `hermesd/panels/your_panel.py` with `render_*(state, theme, detail)` function
-5. Register in `hermesd/panels/__init__.py`
-6. Add to layout in `hermesd/app.py`
+5. Register in `hermesd/panels/__init__.py` (`PANEL_NAMES` and `_RENDERERS`)
+6. Add the panel number to the overview layout specs in `hermesd/app.py` (`_WIDE_LAYOUT_SPEC`, `_COMPACT_LAYOUT_SPEC`, `_TALL_NARROW_LAYOUT_SPEC`) as needed
 7. Update `CHANGELOG.md` under `[Unreleased]`
 
 ## Requirements
@@ -344,7 +362,7 @@ hermesd uses **TDD-first** contribution (see [`CONTRIBUTING.md`](CONTRIBUTING.md
 
 ### Dependencies
 
-Only 3 runtime dependencies — all of which are already installed as part of Hermes Agent, so hermesd adds **zero new packages** to your system:
+Only 3 runtime dependencies:
 
 | Package | Version | Purpose | In hermes-agent? |
 |---------|---------|---------|------------------|
@@ -352,7 +370,7 @@ Only 3 runtime dependencies — all of which are already installed as part of He
 | `pyyaml` | >= 6.0 | Reading config.yaml | Yes (`pyyaml>=6.0.2`) |
 | `pydantic` | >= 2.0 | Data models and validation | Yes (`pydantic>=2.12.5`) |
 
-If you install hermesd into the same environment as Hermes Agent, no additional downloads are needed.
+If you install hermesd into the same environment as Hermes Agent, these dependencies are usually already present, so no additional downloads may be needed.
 
 ## License
 

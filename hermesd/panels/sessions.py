@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import TypedDict
+
 import rich.box
 from rich.console import Group
 from rich.panel import Panel
@@ -11,15 +13,21 @@ from hermesd.panels.formatting import fmt_tokens
 from hermesd.theme import Theme
 
 
+class SessionFilterCriteria(TypedDict):
+    fields: dict[str, str]
+    terms: list[str]
+
+
 def render_sessions(
     state: DashboardState,
     theme: Theme,
     detail: bool = False,
     filter_query: str = "",
     session_sort: str = "recent",
+    message_match_ids: set[str] | None = None,
 ) -> Panel:
     if detail:
-        return _render_detail(state, theme, filter_query, session_sort)
+        return _render_detail(state, theme, filter_query, session_sort, message_match_ids)
     return _render_compact(state, theme)
 
 
@@ -57,8 +65,11 @@ def _render_detail(
     theme: Theme,
     filter_query: str,
     session_sort: str,
+    message_match_ids: set[str] | None,
 ) -> Panel:
-    sessions = _sort_sessions(_filter_sessions(state.sessions, filter_query), session_sort)
+    sessions = _sort_sessions(
+        _filter_sessions(state.sessions, filter_query, message_match_ids), session_sort
+    )
     table = Table(box=None, show_header=True, padding=(0, 1))
     table.add_column("ID", style=theme.session_label)
     table.add_column("Source", style=theme.ui_label)
@@ -119,18 +130,29 @@ def _render_detail(
     )
 
 
-def _filter_sessions(sessions: list[SessionInfo], filter_query: str) -> list[SessionInfo]:
+def _filter_sessions(
+    sessions: list[SessionInfo],
+    filter_query: str,
+    message_match_ids: set[str] | None = None,
+) -> list[SessionInfo]:
     criteria = _parse_session_filter(filter_query)
     if not criteria["terms"] and not criteria["fields"]:
         return sessions
-    return [session for session in sessions if _session_matches(session, criteria)]
+    return [
+        session
+        for session in sessions
+        if _session_matches(session, criteria, message_match_ids or set())
+    ]
 
 
-def _session_matches(session: SessionInfo, criteria: dict[str, object]) -> bool:
+def _session_matches(
+    session: SessionInfo,
+    criteria: SessionFilterCriteria,
+    message_match_ids: set[str],
+) -> bool:
     fields = criteria["fields"]
-    assert isinstance(fields, dict)
     for field_name, expected in fields.items():
-        if not _match_session_field(session, field_name, expected):
+        if not _match_session_field(session, field_name, expected, message_match_ids):
             return False
 
     haystack = " ".join(
@@ -146,15 +168,21 @@ def _session_matches(session: SessionInfo, criteria: dict[str, object]) -> bool:
         ]
     ).lower()
     terms = criteria["terms"]
-    assert isinstance(terms, list)
     return all(term in haystack for term in terms)
 
 
-def _match_session_field(session: SessionInfo, field_name: str, expected: object) -> bool:
+def _match_session_field(
+    session: SessionInfo,
+    field_name: str,
+    expected: object,
+    message_match_ids: set[str],
+) -> bool:
     value = str(expected).lower()
     if field_name == "active":
         is_active = value in {"1", "true", "yes", "active"}
         return session.is_active is is_active
+    if field_name == "message":
+        return session.session_id in message_match_ids
     field_map = {
         "id": session.session_id,
         "source": session.source,
@@ -168,7 +196,7 @@ def _match_session_field(session: SessionInfo, field_name: str, expected: object
     return value in field_map.get(field_name, "").lower()
 
 
-def _parse_session_filter(filter_query: str) -> dict[str, object]:
+def _parse_session_filter(filter_query: str) -> SessionFilterCriteria:
     fields: dict[str, str] = {}
     terms: list[str] = []
     for token in filter_query.split():
@@ -188,14 +216,28 @@ def _parse_session_filter(filter_query: str) -> dict[str, object]:
             "pricing",
             "title",
             "active",
+            "message",
         }:
             fields[key] = value
+        elif key == "msg":
+            fields["message"] = value
         elif key == "text":
             if value:
                 terms.append(value)
         else:
             terms.append(token.lower())
     return {"fields": fields, "terms": terms}
+
+
+def extract_message_search_query(filter_query: str) -> str:
+    latest_value = ""
+    for token in filter_query.split():
+        if ":" not in token:
+            continue
+        key, raw_value = token.split(":", 1)
+        if key.lower().strip() in {"message", "msg"} and raw_value.strip():
+            latest_value = raw_value.strip()
+    return latest_value
 
 
 def _sort_sessions(sessions: list[SessionInfo], session_sort: str) -> list[SessionInfo]:

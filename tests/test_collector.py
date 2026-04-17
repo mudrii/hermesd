@@ -11,6 +11,7 @@ def test_collect_full(populated_hermes_home: Path):
     c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
     state = c.collect()
     assert isinstance(state, DashboardState)
+    assert state.health.total_sources == 18
     assert state.health.ok_sources == state.health.total_sources
     assert state.runtime.agent_running is True
     assert state.gateway.running is True

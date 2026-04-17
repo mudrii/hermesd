@@ -5,9 +5,13 @@ import os
 import re
 import subprocess
 import time
+import tomllib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
+
+import yaml
 
 from hermesd.db import HermesDB
 from hermesd.file_cache import LastGoodFileCache
@@ -43,6 +47,7 @@ from hermesd.models import (
     ToolStats,
 )
 from hermesd.paths import HermesPaths
+from hermesd.theme import normalize_skin_name
 
 
 class Collector:
@@ -51,26 +56,20 @@ class Collector:
         hermes_home: Path,
         pid_exists: Callable[[int], bool] | None = None,
         profile_name: str | None = None,
+        log_tail_bytes: int = 32768,
     ):
         self._root_home = hermes_home
         self._file_cache = LastGoodFileCache()
         self._log_cache: dict[str, list[LogLine]] = {}
         self._pid_exists = pid_exists or _pid_exists
+        self._log_tail_bytes = max(1024, log_tail_bytes)
         self._paths = HermesPaths(hermes_home, profile_name)
         self._db = HermesDB(self._paths.profile_path("state.db"))
         self._last_state: DashboardState | None = None
 
-    def set_profile(self, profile_name: str | None) -> None:
-        next_paths = HermesPaths(self._root_home, profile_name)
-        if next_paths.profile_home == self._paths.profile_home:
-            self._paths = next_paths
-            return
-        self._db.close()
-        self._paths = next_paths
-        self._db = HermesDB(self._paths.profile_path("state.db"))
-
     def collect(self) -> DashboardState:
         failed_sources: list[str] = []
+        total_sources = 0
 
         def safe_collect(
             fallback: Callable[[], Any],
@@ -78,6 +77,8 @@ class Collector:
             fn: Callable[[], Any],
             default_factory: Callable[[], Any],
         ) -> Any:
+            nonlocal total_sources
+            total_sources += 1
             try:
                 return fn()
             except Exception:
@@ -239,8 +240,8 @@ class Collector:
             ),
         )
         state.health = HealthSummary(
-            total_sources=16,
-            ok_sources=16 - len(failed_sources),
+            total_sources=total_sources,
+            ok_sources=total_sources - len(failed_sources),
             failed_sources=sorted(failed_sources),
         )
         state.runtime = self._collect_runtime_status(state.gateway, state.sessions)
@@ -255,6 +256,9 @@ class Collector:
 
     def _read_yaml_cached(self) -> dict[str, Any]:
         return self._file_cache.read_yaml_mapping(self._paths.shared_path("config.yaml"))
+
+    def search_session_ids_by_message(self, query: str) -> set[str]:
+        return self._db.search_session_ids_by_message(query)
 
     def _collect_gateway(self) -> GatewayState:
         data = self._read_json_cached(self._paths.shared_path("gateway_state.json"))
@@ -278,10 +282,7 @@ class Collector:
         # the gateway. Check both the recorded PID and the launchd PID.
         if running:
             if pid:
-                try:
-                    if not self._pid_exists(pid):
-                        raise ProcessLookupError
-                except (ProcessLookupError, PermissionError):
+                if not self._pid_exists(pid):
                     # Recorded PID is dead — check if launchd has a live gateway
                     launchd_pid = self._find_gateway_launchd_pid()
                     if launchd_pid:
@@ -328,11 +329,13 @@ class Collector:
         pyproject = self._paths.shared_path("hermes-agent", "pyproject.toml")
         if pyproject.exists():
             try:
-                for line in pyproject.read_text().splitlines():
-                    if line.strip().startswith("version"):
-                        version = line.split("=", 1)[1].strip().strip('"').strip("'")
-                        break
+                with pyproject.open("rb") as handle:
+                    data = tomllib.load(handle)
+                project = _as_dict(data.get("project"))
+                version = str(project.get("version") or "")
             except OSError:
+                pass
+            except tomllib.TOMLDecodeError:
                 pass
         behind = 0
         update_check = self._read_json_cached(self._paths.shared_path(".update_check"))
@@ -488,9 +491,10 @@ class Collector:
             dashboard_theme=str(dashboard_cfg.get("theme") or ""),
             session_reset_mode=str(session_reset_cfg.get("mode") or ""),
             memory_provider=str(memory_cfg.get("provider") or ""),
+            # These values come from the dashboard process environment, not Hermes runtime state.
             tool_gateway_domain=os.environ.get("TOOL_GATEWAY_DOMAIN", ""),
             tool_gateway_scheme=os.environ.get("TOOL_GATEWAY_SCHEME", ""),
-            firecrawl_gateway_url=os.environ.get("FIRECRAWL_GATEWAY_URL", ""),
+            firecrawl_gateway_url=_redact_secret_url(os.environ.get("FIRECRAWL_GATEWAY_URL", "")),
             tool_gateway_routes=self._collect_tool_gateway_routes(cfg),
         )
 
@@ -694,11 +698,13 @@ class Collector:
                 continue
             args = server.get("args") or []
             command = str(server.get("command") or "")
-            url = str(server.get("url") or "")
+            url = _redact_secret_url(str(server.get("url") or ""))
             target = url
             transport = "url" if url else ""
             if not target and command:
-                rendered_args = " ".join(str(arg) for arg in args) if isinstance(args, list) else ""
+                rendered_args = (
+                    " ".join(_redact_secret_args(args)) if isinstance(args, list) else ""
+                )
                 target = " ".join(part for part in [command, rendered_args] if part)
                 transport = "command"
             result.append(
@@ -752,15 +758,21 @@ class Collector:
             return ""
         try:
             text = skill_md.read_text(errors="replace")
-            # Parse YAML frontmatter between --- markers
-            if text.startswith("---"):
-                end = text.find("---", 3)
-                if end > 0:
-                    front = text[3:end].strip()
-                    for line in front.splitlines():
-                        if line.startswith("description:"):
-                            return line[len("description:") :].strip()
+            lines = text.splitlines()
+            if lines and lines[0].strip() == "---":
+                frontmatter_lines: list[str] = []
+                for line in lines[1:]:
+                    if line.strip() == "---":
+                        data = yaml.safe_load("\n".join(frontmatter_lines)) or {}
+                        if isinstance(data, dict):
+                            description = data.get("description")
+                            if isinstance(description, str):
+                                return description
+                        break
+                    frontmatter_lines.append(line)
         except OSError:
+            pass
+        except yaml.YAMLError:
             pass
         return ""
 
@@ -809,7 +821,7 @@ class Collector:
             agent_lines=self._tail_log(self._paths.profile_path("logs", "agent.log"), 20),
             gateway_lines=self._tail_log(self._paths.profile_path("logs", "gateway.log"), 20),
             error_lines=self._tail_log(self._paths.profile_path("logs", "errors.log"), 10),
-            cron_lines=_tail_latest_cron_output(self._paths.shared_path("cron", "output"), 20),
+            cron_lines=self._tail_latest_cron_output(self._paths.shared_path("cron", "output"), 20),
         )
 
     def _collect_profiles(self) -> ProfilesState:
@@ -863,7 +875,7 @@ class Collector:
             with open(path, "rb") as f:
                 f.seek(0, 2)
                 size = f.tell()
-                f.seek(max(0, size - 32768))
+                f.seek(max(0, size - self._log_tail_bytes))
                 text = f.read().decode("utf-8", errors="replace")
             lines = text.strip().splitlines()[-max_lines:]
             result = []
@@ -886,10 +898,20 @@ class Collector:
                     )
                 elif line.strip():
                     result.append(LogLine(message=line.strip()))
-            self._log_cache[key] = result
-            return result
+            if result:
+                self._log_cache[key] = result
+                return result
+            return self._log_cache.get(key, [])
         except OSError:
             return self._log_cache.get(key, [])
+
+    def _tail_latest_cron_output(self, output_root: Path, max_lines: int) -> list[LogLine]:
+        key = f"cron:{output_root}"
+        result = _tail_latest_cron_output(output_root, max_lines, self._log_tail_bytes)
+        if result:
+            self._log_cache[key] = result
+            return result
+        return self._log_cache.get(key, [])
 
     def _collect_version_behind(self) -> int:
         data = self._read_json_cached(self._paths.shared_path(".update_check"))
@@ -900,7 +922,9 @@ class Collector:
     def _collect_skin(self) -> str:
         cfg = self._read_yaml_cached()
         skin = _as_dict(cfg.get("display")).get("skin", "default")
-        return str(skin) if skin else "default"
+        if not skin:
+            return "default"
+        return normalize_skin_name(str(skin))
 
     def close(self) -> None:
         self._db.close()
@@ -1175,7 +1199,7 @@ def _latest_cron_output_excerpt(output_root: Path, job_id: str) -> tuple[str, bo
     return "", silent
 
 
-def _tail_latest_cron_output(output_root: Path, max_lines: int) -> list[LogLine]:
+def _tail_latest_cron_output(output_root: Path, max_lines: int, max_bytes: int) -> list[LogLine]:
     if not output_root.is_dir():
         return []
     latest_file: Path | None = None
@@ -1196,7 +1220,11 @@ def _tail_latest_cron_output(output_root: Path, max_lines: int) -> list[LogLine]
     if latest_file is None:
         return []
     try:
-        lines = latest_file.read_text(errors="replace").splitlines()[-max_lines:]
+        with latest_file.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes))
+            lines = handle.read().decode("utf-8", errors="replace").splitlines()[-max_lines:]
     except OSError:
         return []
     return [LogLine(message=line.strip()) for line in lines if line.strip()]
@@ -1253,6 +1281,33 @@ _SECRET_FIELD_NAMES = {
 
 _OAUTH_FIELD_NAMES = {"id_token", "access_token", "refresh_token"}
 _API_KEY_FIELD_NAMES = {"api_key", "secret", "token", "user_token"}
+_SECRET_URL_QUERY_KEYS = {
+    "access_token",
+    "api_key",
+    "auth",
+    "auth_token",
+    "id_token",
+    "key",
+    "password",
+    "refresh_token",
+    "secret",
+    "token",
+    "user_token",
+}
+_SECRET_OPTION_NAMES = {
+    "access-token",
+    "api-key",
+    "apikey",
+    "auth",
+    "auth-token",
+    "id-token",
+    "key",
+    "password",
+    "refresh-token",
+    "secret",
+    "token",
+    "user-token",
+}
 
 
 def _as_dict(value: object) -> dict[str, Any]:
@@ -1294,6 +1349,53 @@ def _coerce_float(value: object) -> float:
     return 0.0
 
 
+def _normalize_secret_option_name(option: str) -> str:
+    return option.lstrip("-").lower().replace("_", "-")
+
+
+def _redact_secret_url(value: str) -> str:
+    if not value:
+        return ""
+    parts = urlsplit(value)
+    if not parts.scheme or not parts.netloc:
+        return value
+    query_pairs = parse_qsl(parts.query, keep_blank_values=True)
+    if not query_pairs:
+        return value
+    redacted_query = "&".join(
+        f"{key}={'[REDACTED]' if key.lower() in _SECRET_URL_QUERY_KEYS else item_value}"
+        for key, item_value in query_pairs
+    )
+    return urlunsplit(parts._replace(query=redacted_query))
+
+
+def _redact_secret_args(args: object) -> list[str]:
+    if not isinstance(args, list):
+        return []
+    redacted: list[str] = []
+    redact_next = False
+    for raw_arg in args:
+        arg = _redact_secret_url(str(raw_arg))
+        if redact_next:
+            redacted.append("[REDACTED]")
+            redact_next = False
+            continue
+        if "=" in arg:
+            option, _value = arg.split("=", 1)
+            if _normalize_secret_option_name(option) in _SECRET_OPTION_NAMES:
+                redacted.append(f"{option}=[REDACTED]")
+                continue
+            if option.startswith(("http://", "https://")):
+                redacted.append(_redact_secret_url(arg))
+                continue
+        if arg.startswith("-") and _normalize_secret_option_name(arg) in _SECRET_OPTION_NAMES:
+            redacted.append(arg)
+            redact_next = True
+            continue
+        redacted.append(arg)
+    return redacted
+
+
 def _has_secret_material(data: dict[str, Any]) -> bool:
     for key in _SECRET_FIELD_NAMES:
         value = data.get(key)
@@ -1316,5 +1418,10 @@ def _credential_auth_type(entry: dict[str, Any], provider_entry: dict[str, Any])
 
 
 def _pid_exists(pid: int) -> bool:
-    os.kill(pid, 0)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
     return True

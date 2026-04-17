@@ -19,6 +19,7 @@ from hermesd.models import (
     ToolStats,
 )
 from hermesd.panels import render_panel
+from hermesd.panels.sessions import extract_message_search_query
 from hermesd.theme import Theme
 
 
@@ -123,6 +124,47 @@ def test_sessions_panel_detail_structured_filter_and_sort():
     assert "Sort:" in text
     assert "sess_alpha"[-8:] in text
     assert "telegram" not in text
+
+
+def test_sessions_panel_detail_message_filter():
+    state = DashboardState(
+        sessions=[
+            SessionInfo(session_id="sess_alpha", source="cli", model="gpt-5.4"),
+            SessionInfo(session_id="sess_beta", source="telegram", model="claude"),
+        ],
+    )
+    panel = render_panel(
+        2,
+        state,
+        Theme(),
+        detail=True,
+        filter_query="message:timeout",
+        session_message_match_ids={"sess_beta"},
+    )
+    text = _render_to_str(panel)
+    assert "message:timeout" in text
+    assert "sess_beta"[-8:] in text
+    assert "sess_alpha"[-8:] not in text
+
+
+def test_extract_message_search_query_uses_last_message_term():
+    assert extract_message_search_query("message:timeout message:retry") == "retry"
+
+
+def test_sessions_panel_detail_shows_parent_session_id():
+    state = DashboardState(
+        sessions=[
+            SessionInfo(
+                session_id="child_session",
+                source="cli",
+                model="gpt-5.4",
+                parent_session_id="parent_sess",
+            )
+        ],
+    )
+    panel = render_panel(2, state, Theme(), detail=True)
+    text = _render_to_str(panel)
+    assert "ent_sess" in text
 
 
 def test_tokens_panel_detail():
@@ -279,6 +321,7 @@ def test_config_panel_detail_shows_tool_gateway_routes():
     panel = render_panel(5, state, Theme(), detail=True)
     text = _render_to_str(panel)
     assert "Tool Gateway" in text
+    assert "dashboard-local env" in text
     assert "gateway.example.com" in text
     assert "https" in text
     assert "web" in text
@@ -440,6 +483,78 @@ def test_logs_panel_detail_structured_filter_query():
     text = _render_to_str(panel)
     assert "provider timeout" in text
     assert "session saved" not in text
+
+
+def test_logs_panel_detail_minlevel_filter_query():
+    state = DashboardState(
+        logs=LogState(
+            agent_lines=[
+                LogLine(
+                    timestamp="15:42:03",
+                    component="hermes",
+                    level="INFO",
+                    session_id="sess-alpha",
+                    message="session saved",
+                ),
+                LogLine(
+                    timestamp="15:42:04",
+                    component="gateway",
+                    level="WARNING",
+                    session_id="sess-beta",
+                    message="provider slow",
+                ),
+                LogLine(
+                    timestamp="15:42:05",
+                    component="gateway",
+                    level="ERROR",
+                    session_id="sess-beta",
+                    message="provider timeout",
+                ),
+            ]
+        ),
+    )
+    panel = render_panel(
+        8,
+        state,
+        Theme(),
+        detail=True,
+        log_sub_view="agent",
+        filter_query="minlevel:warning",
+    )
+    text = _render_to_str(panel)
+    assert "provider slow" in text
+    assert "provider timeout" in text
+    assert "session saved" not in text
+
+
+def test_logs_panel_detail_invalid_minlevel_matches_nothing():
+    state = DashboardState(
+        logs=LogState(
+            agent_lines=[
+                LogLine(
+                    timestamp="15:42:03", component="hermes", level="INFO", message="session saved"
+                ),
+                LogLine(
+                    timestamp="15:42:04",
+                    component="gateway",
+                    level="ERROR",
+                    message="provider timeout",
+                ),
+            ]
+        ),
+    )
+    panel = render_panel(
+        8,
+        state,
+        Theme(),
+        detail=True,
+        log_sub_view="agent",
+        filter_query="minlevel:warnning",
+    )
+    text = _render_to_str(panel)
+    assert "No matching log lines" in text
+    assert "session saved" not in text
+    assert "provider timeout" not in text
 
 
 # ── Empty state tests ──────────────────────────────────────────────────

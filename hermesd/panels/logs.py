@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+from typing import TypedDict
+
 import rich.box
 from rich.panel import Panel
 from rich.text import Text
 
 from hermesd.models import DashboardState, LogLine
 from hermesd.theme import Theme
+
+
+class LogFilterCriteria(TypedDict):
+    fields: dict[str, str]
+    terms: list[str]
 
 
 def render_logs(
@@ -107,7 +114,8 @@ def _render_detail(
         lines.append("\n\n")
 
     if not visible_lines:
-        lines.append("  No log lines", style=theme.banner_dim)
+        empty_message = "  No matching log lines" if filter_query else "  No log lines"
+        lines.append(empty_message, style=theme.banner_dim)
 
     for log_line in visible_lines:
         lines.append_text(_log_line_text(log_line, theme))
@@ -130,13 +138,18 @@ def _filter_log_lines(log_lines: list[LogLine], filter_query: str) -> list[LogLi
     return [line for line in log_lines if _log_line_matches(line, criteria)]
 
 
-def _log_line_matches(line: LogLine, criteria: dict[str, object]) -> bool:
+def _log_line_matches(line: LogLine, criteria: LogFilterCriteria) -> bool:
     fields = criteria["fields"]
-    assert isinstance(fields, dict)
     for field_name, expected in fields.items():
         value = str(expected).lower()
         if field_name == "level" and value not in line.level.lower():
             return False
+        if field_name == "minlevel":
+            threshold = _log_level_rank(value)
+            if threshold == 0 and value != "debug":
+                return False
+            if _log_level_rank(line.level) < threshold:
+                return False
         if field_name == "component" and value not in line.component.lower():
             return False
         if field_name == "session" and value not in line.session_id.lower():
@@ -146,11 +159,10 @@ def _log_line_matches(line: LogLine, criteria: dict[str, object]) -> bool:
         f"{line.timestamp} {line.component} {line.level} {line.session_id} {line.message}".lower()
     )
     terms = criteria["terms"]
-    assert isinstance(terms, list)
     return all(term in haystack for term in terms)
 
 
-def _parse_log_filter(filter_query: str) -> dict[str, object]:
+def _parse_log_filter(filter_query: str) -> LogFilterCriteria:
     fields: dict[str, str] = {}
     terms: list[str] = []
     for token in filter_query.split():
@@ -160,7 +172,7 @@ def _parse_log_filter(filter_query: str) -> dict[str, object]:
         key, value = token.split(":", 1)
         key = key.lower().strip()
         value = value.strip().lower()
-        if key in {"level", "component", "session"}:
+        if key in {"level", "component", "session", "minlevel"}:
             fields[key] = value
         elif key == "text":
             if value:
@@ -168,3 +180,14 @@ def _parse_log_filter(filter_query: str) -> dict[str, object]:
         else:
             terms.append(token.lower())
     return {"fields": fields, "terms": terms}
+
+
+def _log_level_rank(level: str) -> int:
+    return {
+        "debug": 10,
+        "info": 20,
+        "warning": 30,
+        "warn": 30,
+        "error": 40,
+        "critical": 50,
+    }.get(level.lower(), 0)

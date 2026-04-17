@@ -8,7 +8,10 @@ from rich.text import Text
 from hermesd.models import DashboardState
 from hermesd.theme import Theme
 
-PanelRenderer = Callable[[DashboardState, Theme, bool, str, int, int, str, str], Panel]
+PanelRenderer = Callable[
+    [DashboardState, Theme, bool, str, int, int, str, str, set[str] | None],
+    Panel,
+]
 
 
 def _render_gateway_panel(
@@ -20,6 +23,7 @@ def _render_gateway_panel(
     profile_view_index: int,
     filter_query: str,
     session_sort: str,
+    session_message_match_ids: set[str] | None,
 ) -> Panel:
     from hermesd.panels.gateway import render_gateway
 
@@ -35,6 +39,7 @@ def _render_sessions_panel(
     profile_view_index: int,
     filter_query: str,
     session_sort: str,
+    session_message_match_ids: set[str] | None,
 ) -> Panel:
     from hermesd.panels.sessions import render_sessions
 
@@ -44,6 +49,7 @@ def _render_sessions_panel(
         detail=detail,
         filter_query=filter_query,
         session_sort=session_sort,
+        message_match_ids=session_message_match_ids,
     )
 
 
@@ -56,6 +62,7 @@ def _render_tokens_panel(
     profile_view_index: int,
     filter_query: str,
     session_sort: str,
+    session_message_match_ids: set[str] | None,
 ) -> Panel:
     from hermesd.panels.tokens import render_tokens
 
@@ -71,6 +78,7 @@ def _render_tools_panel(
     profile_view_index: int,
     filter_query: str,
     session_sort: str,
+    session_message_match_ids: set[str] | None,
 ) -> Panel:
     from hermesd.panels.tools import render_tools
 
@@ -86,6 +94,7 @@ def _render_config_panel(
     profile_view_index: int,
     filter_query: str,
     session_sort: str,
+    session_message_match_ids: set[str] | None,
 ) -> Panel:
     from hermesd.panels.config_panel import render_config
 
@@ -101,6 +110,7 @@ def _render_cron_panel(
     profile_view_index: int,
     filter_query: str,
     session_sort: str,
+    session_message_match_ids: set[str] | None,
 ) -> Panel:
     from hermesd.panels.cron import render_cron
 
@@ -116,6 +126,7 @@ def _render_overview_panel(
     profile_view_index: int,
     filter_query: str,
     session_sort: str,
+    session_message_match_ids: set[str] | None,
 ) -> Panel:
     from hermesd.panels.overview import render_overview
 
@@ -131,6 +142,7 @@ def _render_logs_panel(
     profile_view_index: int,
     filter_query: str,
     session_sort: str,
+    session_message_match_ids: set[str] | None,
 ) -> Panel:
     from hermesd.panels.logs import render_logs
 
@@ -153,6 +165,7 @@ def _render_profiles_panel(
     profile_view_index: int,
     filter_query: str,
     session_sort: str,
+    session_message_match_ids: set[str] | None,
 ) -> Panel:
     from hermesd.panels.profiles import render_profiles
 
@@ -173,6 +186,7 @@ def _render_memory_panel(
     profile_view_index: int,
     filter_query: str,
     session_sort: str,
+    session_message_match_ids: set[str] | None,
 ) -> Panel:
     from hermesd.panels.memory_panel import render_memory
 
@@ -217,6 +231,7 @@ def render_panel(
     profile_view_index: int = 0,
     filter_query: str = "",
     session_sort: str = "recent",
+    session_message_match_ids: set[str] | None = None,
 ) -> Panel:
     renderer = _RENDERERS.get(panel_num)
     if renderer is None:
@@ -230,4 +245,5 @@ def render_panel(
         profile_view_index,
         filter_query,
         session_sort,
+        session_message_match_ids,
     )

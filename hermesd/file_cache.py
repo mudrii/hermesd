@@ -13,6 +13,9 @@ class LastGoodFileCache:
         self._json_values: dict[str, dict[str, Any]] = {}
         self._json_lists: dict[str, list[dict[str, Any]]] = {}
         self._yaml_values: dict[str, dict[str, Any]] = {}
+        self._json_bad_mtimes: dict[str, float] = {}
+        self._json_list_bad_mtimes: dict[str, float] = {}
+        self._yaml_bad_mtimes: dict[str, float] = {}
 
     def read_json_mapping(self, path: Path) -> dict[str, Any]:
         key = str(path)
@@ -22,14 +25,19 @@ class LastGoodFileCache:
             return self._json_values.get(key, {})
         if self._mtimes.get(key) == mtime and key in self._json_values:
             return self._json_values[key]
+        if self._json_bad_mtimes.get(key) == mtime:
+            return self._json_values.get(key, {})
         try:
             with path.open() as handle:
                 value = json.load(handle)
         except (OSError, json.JSONDecodeError):
+            self._json_bad_mtimes[key] = mtime
             return self._json_values.get(key, {})
         if not isinstance(value, dict):
+            self._json_bad_mtimes[key] = mtime
             return self._json_values.get(key, {})
         self._mtimes[key] = mtime
+        self._json_bad_mtimes.pop(key, None)
         self._json_values[key] = value
         return value
 
@@ -41,14 +49,19 @@ class LastGoodFileCache:
             return self._json_lists.get(key, [])
         if self._mtimes.get(key) == mtime and key in self._json_lists:
             return self._json_lists[key]
+        if self._json_list_bad_mtimes.get(key) == mtime:
+            return self._json_lists.get(key, [])
         try:
             with path.open() as handle:
                 value = json.load(handle)
         except (OSError, json.JSONDecodeError):
+            self._json_list_bad_mtimes[key] = mtime
             return self._json_lists.get(key, [])
         if not isinstance(value, list) or not all(isinstance(entry, dict) for entry in value):
+            self._json_list_bad_mtimes[key] = mtime
             return self._json_lists.get(key, [])
         self._mtimes[key] = mtime
+        self._json_list_bad_mtimes.pop(key, None)
         self._json_lists[key] = value
         return value
 
@@ -60,13 +73,18 @@ class LastGoodFileCache:
             return self._yaml_values.get(key, {})
         if self._mtimes.get(key) == mtime and key in self._yaml_values:
             return self._yaml_values[key]
+        if self._yaml_bad_mtimes.get(key) == mtime:
+            return self._yaml_values.get(key, {})
         try:
             with path.open() as handle:
                 value = yaml.safe_load(handle) or {}
         except (OSError, yaml.YAMLError):
+            self._yaml_bad_mtimes[key] = mtime
             return self._yaml_values.get(key, {})
         if not isinstance(value, dict):
+            self._yaml_bad_mtimes[key] = mtime
             return self._yaml_values.get(key, {})
         self._mtimes[key] = mtime
+        self._yaml_bad_mtimes.pop(key, None)
         self._yaml_values[key] = value
         return value

@@ -10,7 +10,7 @@ cd hermesd
 uv venv .venv --python 3.11
 source .venv/bin/activate
 uv pip install -e ".[dev]"
-python -m pytest tests/ -v
+uv run pytest tests/ -v
 ```
 
 ## Development Workflow
@@ -21,9 +21,10 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 2. **Write the failing test first** — acceptance-level if user-visible, unit-level otherwise
 3. **Implement the minimum change** that makes the test pass
 4. **Refactor while green** — improve naming/cohesion without changing behavior
-5. **Run the full suite** — `uv run pytest tests/ -v` (all 274+ tests must pass)
+5. **Run the full suite** — `uv run pytest tests/ -v` (all 306+ tests must pass)
 6. **Run lint + type + audit** — `uv run ruff check . && uv run ruff format --check . && uv run mypy hermesd && uv run pip-audit`
 7. **Test the TUI manually** — run `hermesd` and verify your changes look correct
+   Consider both text and JSON snapshot paths when you change CLI/render surfaces (`--snapshot-format json`).
 8. **Update `CHANGELOG.md`** for user-visible changes
 9. **Open a PR** with a clear description
 
@@ -43,9 +44,9 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 1. Create `hermesd/panels/your_panel.py` with `render_your_panel(state, theme, detail=False)` function
 2. Add your data to `hermesd/models.py` (Pydantic model)
 3. Collect the data in `hermesd/collector.py`
-4. Register in `hermesd/panels/__init__.py` (add to renderers dict and PANEL_NAMES)
+4. Register in `hermesd/panels/__init__.py` (add to both `_RENDERERS` and `PANEL_NAMES`)
 5. Add tests in `tests/test_your_panel.py`
-6. Update the layout spec in `hermesd/app.py` if the new panel needs overview placement
+6. Update the overview layout specs in `hermesd/app.py` (`_WIDE_LAYOUT_SPEC`, `_COMPACT_LAYOUT_SPEC`, `_TALL_NARROW_LAYOUT_SPEC`) if the new panel needs overview placement
 
 ## Adding Data to an Existing Panel
 
