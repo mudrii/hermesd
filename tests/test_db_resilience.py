@@ -60,21 +60,6 @@ def test_cache_preserved_on_query_error(tmp_path):
     db.close()
 
 
-def test_cache_preserved_for_token_totals(tmp_path):
-    db_path = tmp_path / "state.db"
-    _create_db(db_path)
-    db = HermesDB(db_path)
-    totals = db.read_token_totals()
-    assert totals["input_tokens"] == 5000
-
-    db._conn.close()
-    db._conn = None
-
-    totals2 = db.read_token_totals()
-    assert totals2["input_tokens"] == 5000
-    db.close()
-
-
 def test_cache_preserved_for_tool_stats(tmp_path):
     db_path = tmp_path / "state.db"
     _create_db(db_path)
@@ -136,8 +121,6 @@ def test_missing_db_returns_empty_not_crash(tmp_path):
     db = HermesDB(tmp_path / "nonexistent.db")
     assert db.read_sessions() == []
     assert db.read_tool_stats() == []
-    totals = db.read_token_totals()
-    assert totals["input_tokens"] == 0
     db.close()
 
 

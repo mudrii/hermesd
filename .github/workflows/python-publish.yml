@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install
-        run: uv pip install -e ".[dev]" --system
+        run: uv pip install -e ".[dev]"
       - name: Lint (ruff)
         run: uv run ruff check .
       - name: Format check (ruff)

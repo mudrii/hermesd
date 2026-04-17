@@ -122,5 +122,88 @@ def test_null_columns_in_session(hermes_home: Path):
     assert s.message_count == 0
     assert s.input_tokens == 0
     assert s.estimated_cost_usd == 0.0
+    assert s.billing_provider == ""
+    assert s.cost_status == ""
+    assert s.pricing_version == ""
     assert s.is_active is True  # ended_at is NULL
+    c.close()
+
+
+def test_session_schema_fields_mapped(hermes_home: Path):
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
+            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
+            started_at REAL NOT NULL, ended_at REAL, end_reason TEXT,
+            message_count INTEGER, tool_call_count INTEGER,
+            input_tokens INTEGER, output_tokens INTEGER,
+            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
+            reasoning_tokens INTEGER, billing_provider TEXT,
+            billing_base_url TEXT, billing_mode TEXT,
+            estimated_cost_usd REAL, actual_cost_usd REAL,
+            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
+            title TEXT
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
+            tool_calls TEXT, tool_name TEXT, timestamp REAL,
+            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
+            reasoning_details TEXT, codex_reasoning_items TEXT
+        );
+    """)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, billing_provider, cost_status, pricing_version) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("schema_sess", "cli", time.time(), "openai-codex", "reported", "2026-04"),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    session = state.sessions[0]
+    assert session.billing_provider == "openai-codex"
+    assert session.cost_status == "reported"
+    assert session.pricing_version == "2026-04"
+    c.close()
+
+
+def test_session_parent_session_id_mapped(hermes_home: Path):
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
+            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
+            started_at REAL NOT NULL, ended_at REAL, end_reason TEXT,
+            message_count INTEGER, tool_call_count INTEGER,
+            input_tokens INTEGER, output_tokens INTEGER,
+            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
+            reasoning_tokens INTEGER, billing_provider TEXT,
+            billing_base_url TEXT, billing_mode TEXT,
+            estimated_cost_usd REAL, actual_cost_usd REAL,
+            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
+            title TEXT
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
+            tool_calls TEXT, tool_name TEXT, timestamp REAL,
+            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
+            reasoning_details TEXT, codex_reasoning_items TEXT
+        );
+    """)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, parent_session_id) VALUES (?, ?, ?, ?)",
+        ("child_sess", "cli", time.time(), "parent_sess"),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.sessions[0].parent_session_id == "parent_sess"
     c.close()

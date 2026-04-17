@@ -67,8 +67,8 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         table.add_column("", width=2)
         table.add_column("Name", style=theme.banner_text)
         table.add_column("Schedule", style=theme.banner_dim)
+        table.add_column("Deliver", style=theme.ui_label)
         table.add_column("State", style=theme.ui_label)
-        table.add_column("Next Run", style=theme.banner_dim)
         table.add_column("Last", style=theme.banner_text)
 
         for j in c.jobs:
@@ -78,18 +78,30 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
                 else Text("○", style=theme.banner_dim)
             )
             state_color = theme.ui_ok if j.state == "scheduled" else theme.ui_warn
-            next_run = j.next_run_at[:19] if j.next_run_at else "—"
             last = j.last_status or "—"
             last_style = theme.ui_error if last == "error" else theme.banner_text
             table.add_row(
                 sym,
                 j.name or j.job_id[:8],
                 j.schedule_display,
+                j.delivery_target_label or j.deliver or "—",
                 Text(j.state, style=state_color),
-                next_run,
                 Text(last, style=last_style),
             )
         sections.append(table)
+
+        if any(j.next_run_at or j.latest_output_excerpt or j.silent_run for j in c.jobs):
+            sections.append(Text("\nLatest Output\n", style=f"bold {theme.ui_label}"))
+            for j in c.jobs:
+                line = Text()
+                line.append(f"  {j.name or j.job_id[:8]}: ", style=theme.ui_label)
+                if j.next_run_at:
+                    line.append(f"next {j.next_run_at[:19]}  ", style=theme.banner_dim)
+                if j.silent_run:
+                    line.append("[SILENT] ", style=theme.ui_warn)
+                line.append(j.latest_output_excerpt or "—", style=theme.banner_text)
+                line.append("\n")
+                sections.append(line)
     else:
         sections.append(Text("  No cron jobs configured\n", style=theme.banner_dim))
 

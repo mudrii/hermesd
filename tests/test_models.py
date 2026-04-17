@@ -5,19 +5,26 @@ from hermesd.models import (
     CronState,
     DashboardState,
     GatewayState,
+    HealthSummary,
     LogLine,
     LogState,
+    MemoryOverview,
     PlatformStatus,
     ProviderInfo,
+    RuntimeStatus,
     SessionInfo,
     SkillsMemory,
+    TokenAnalytics,
+    TokenBreakdown,
     TokenSummary,
+    TokenWindowSummary,
     ToolStats,
 )
 
 
 def test_dashboard_state_defaults():
     state = DashboardState()
+    assert state.health.ok_sources == 0
     assert state.gateway.running is False
     assert state.sessions == []
     assert state.tokens_today.input_tokens == 0
@@ -68,6 +75,15 @@ def test_token_summary():
     assert t.total_cost_usd == 0.42
 
 
+def test_token_analytics():
+    analytics = TokenAnalytics(
+        windows=[TokenWindowSummary(label="7d", session_count=2, cache_ratio=0.5)],
+        by_model=[TokenBreakdown(label="gpt-5.4", session_count=2, input_tokens=1200)],
+    )
+    assert analytics.windows[0].label == "7d"
+    assert analytics.by_model[0].label == "gpt-5.4"
+
+
 def test_tool_stats():
     ts = ToolStats(name="shell_exec", call_count=23)
     assert ts.name == "shell_exec"
@@ -101,6 +117,20 @@ def test_skills_memory_with_providers():
     assert sm.providers[1].is_active is False
 
 
+def test_memory_overview():
+    memory = MemoryOverview(
+        provider="supermemory",
+        memory_file_count=3,
+        memory_word_count=42,
+        user_word_count=17,
+        soul_excerpt="remember the operator's preferences",
+        memory_files=["MEMORY.md", "USER.md", "notes.md"],
+    )
+    assert memory.provider == "supermemory"
+    assert memory.memory_file_count == 3
+    assert "USER.md" in memory.memory_files
+
+
 def test_log_line():
     ll = LogLine(timestamp="15:42:03", level="INFO", message="Session saved")
     assert ll.level == "INFO"
@@ -117,3 +147,17 @@ def test_log_state():
 def test_dashboard_state_is_stale():
     state = DashboardState(is_stale=True)
     assert state.is_stale is True
+
+
+def test_health_summary():
+    health = HealthSummary(total_sources=16, ok_sources=15, failed_sources=["logs"])
+    assert health.total_sources == 16
+    assert health.failed_sources == ["logs"]
+
+
+def test_runtime_status():
+    runtime = RuntimeStatus(
+        agent_running=False, last_activity_age_seconds=601.0, banner="AGENT OFFLINE"
+    )
+    assert runtime.agent_running is False
+    assert runtime.banner == "AGENT OFFLINE"

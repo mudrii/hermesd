@@ -30,6 +30,8 @@ def test_tools_detail_shows_calls_table():
     assert "30 total" in text
     assert "cli:abc123" in text
     assert "23" in text
+    assert "Tool" in text
+    assert "Session" not in text
 
 
 def test_tools_detail_shows_available_table():
