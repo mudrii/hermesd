@@ -304,7 +304,7 @@ uv pip install -e ".[dev]"
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy hermesd
-uv run pytest tests/ -v          # 306 tests
+uv run pytest tests/ -v          # 300+ tests
 uv run pip-audit
 
 # Run the dashboard
@@ -339,7 +339,7 @@ hermesd/
     profiles.py        [9] Profiles
     memory_panel.py    [10] Memory
     logs.py            [8] Logs
-tests/                 306 tests: panels, data, resilience, edge cases
+tests/                 300+ tests: panels, data, resilience, edge cases
 ```
 
 ### Adding a Panel

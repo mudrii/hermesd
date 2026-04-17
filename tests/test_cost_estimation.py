@@ -4,7 +4,12 @@ import sqlite3
 import time
 from pathlib import Path
 
-from hermesd.collector import Collector, _estimate_cost
+from hermesd.collector import (
+    Collector,
+    _estimate_cost,
+    _resolved_session_cost,
+    _summarize_breakdown,
+)
 
 
 def test_estimate_cost_basic():
@@ -41,6 +46,43 @@ def test_estimate_cost_mixed():
 def test_estimate_cost_zero():
     cost = _estimate_cost(0, 0, 0, 0)
     assert cost == 0.0
+
+
+def test_resolved_session_cost_preserves_reported_zero_cost():
+    row = {
+        "estimated_cost_usd": 0.0,
+        "cost_status": "reported",
+        "input_tokens": 100_000,
+        "output_tokens": 5_000,
+        "cache_read_tokens": 50_000,
+        "reasoning_tokens": 1_000,
+    }
+
+    assert _resolved_session_cost(row) == 0.0
+
+
+def test_summarize_breakdown_sorts_equal_labels_ascending():
+    rows = [
+        {
+            "model": "zed",
+            "input_tokens": 100,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "reasoning_tokens": 0,
+            "estimated_cost_usd": 1.0,
+        },
+        {
+            "model": "alpha",
+            "input_tokens": 100,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "reasoning_tokens": 0,
+            "estimated_cost_usd": 1.0,
+        },
+    ]
+
+    labels = [summary.label for summary in _summarize_breakdown(rows, key_name="model")]
+    assert labels == ["alpha", "zed"]
 
 
 def test_collector_uses_estimated_cost_when_db_cost_is_zero(hermes_home: Path, sample_db: Path):

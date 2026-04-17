@@ -65,6 +65,8 @@ class Collector:
         self._log_tail_bytes = max(1024, log_tail_bytes)
         self._paths = HermesPaths(hermes_home, profile_name)
         self._db = HermesDB(self._paths.profile_path("state.db"))
+        self._available_tools_cache_mtime: float | None = None
+        self._available_tools_cache_value: tuple[int, list[str]] = (0, [])
         self._last_state: DashboardState | None = None
 
     def collect(self) -> DashboardState:
@@ -431,10 +433,14 @@ class Collector:
         ]
 
     def _collect_available_tools(self) -> tuple[int, list[str]]:
-        sessions_data = self._read_json_cached(
-            self._paths.profile_path("sessions", "sessions.json")
-        )
+        sessions_index = self._paths.profile_path("sessions", "sessions.json")
+        sessions_mtime = _mtime(sessions_index)
+        if sessions_mtime is not None and self._available_tools_cache_mtime == sessions_mtime:
+            return self._available_tools_cache_value
+        sessions_data = self._read_json_cached(sessions_index)
         if not sessions_data:
+            self._available_tools_cache_mtime = sessions_mtime
+            self._available_tools_cache_value = (0, [])
             return 0, []
         names: set[str] = set()
         for entry in sessions_data.values():
@@ -451,7 +457,9 @@ class Collector:
                         if name:
                             names.add(name)
         tool_names = sorted(names)
-        return len(tool_names), tool_names
+        self._available_tools_cache_mtime = sessions_mtime
+        self._available_tools_cache_value = (len(tool_names), tool_names)
+        return self._available_tools_cache_value
 
     def _collect_config(self) -> ConfigSummary:
         cfg = self._read_yaml_cached()
@@ -855,7 +863,7 @@ class Collector:
         if db_path.exists():
             db = HermesDB(db_path)
             try:
-                session_count = len(db.read_sessions())
+                session_count = db.read_session_count()
             finally:
                 db.close()
         return ProfileSummary(
@@ -994,8 +1002,7 @@ def _summarize_breakdown(rows: list[dict[str, Any]], key_name: str) -> list[Toke
         )
     return sorted(
         summaries,
-        key=lambda summary: (summary.total_cost_usd, summary.input_tokens, summary.label),
-        reverse=True,
+        key=lambda summary: (-summary.total_cost_usd, -summary.input_tokens, summary.label),
     )
 
 
@@ -1024,7 +1031,9 @@ def _estimate_cost(
 
 
 def _resolved_session_cost(row: dict[str, Any]) -> float:
-    cost = row.get("estimated_cost_usd") or 0.0
+    cost = row.get("estimated_cost_usd")
+    if str(row.get("cost_status") or "") == "reported":
+        return float(cost or 0.0)
     if cost:
         return float(cost)
     return _estimate_cost(
@@ -1114,6 +1123,10 @@ def _mtime(path: Path) -> float | None:
         return None
 
 
+def _safe_mtime(path: Path) -> float:
+    return _mtime(path) or 0.0
+
+
 def _provider_model_label(cfg: dict[str, Any]) -> str:
     provider = str(cfg.get("provider") or "")
     model = str(cfg.get("model") or "")
@@ -1183,10 +1196,16 @@ def _latest_cron_output_excerpt(output_root: Path, job_id: str) -> tuple[str, bo
     job_output_dir = output_root / job_id
     if not job_output_dir.is_dir():
         return "", False
-    files = [path for path in job_output_dir.iterdir() if path.is_file()]
+    files = []
+    for path in job_output_dir.iterdir():
+        try:
+            if path.is_file():
+                files.append(path)
+        except OSError:
+            continue
     if not files:
         return "", False
-    latest = max(files, key=lambda path: path.stat().st_mtime)
+    latest = max(files, key=_safe_mtime)
     try:
         lines = latest.read_text(errors="replace").splitlines()
     except OSError:
@@ -1208,9 +1227,9 @@ def _tail_latest_cron_output(output_root: Path, max_lines: int, max_bytes: int) 
         if not job_dir.is_dir():
             continue
         for path in job_dir.iterdir():
-            if not path.is_file():
-                continue
             try:
+                if not path.is_file():
+                    continue
                 mtime = path.stat().st_mtime
             except OSError:
                 continue
@@ -1238,8 +1257,9 @@ def _git_checkpoint_summary(repo_dir: Path) -> tuple[int, float | None, str]:
             capture_output=True,
             text=True,
             check=False,
+            timeout=2,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return 0, None, ""
 
     if count_result.returncode == 0:
@@ -1253,8 +1273,9 @@ def _git_checkpoint_summary(repo_dir: Path) -> tuple[int, float | None, str]:
             capture_output=True,
             text=True,
             check=False,
+            timeout=2,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return commit_count, None, ""
 
     if log_result.returncode != 0:

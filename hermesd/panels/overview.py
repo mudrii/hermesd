@@ -93,7 +93,7 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
                 entry.last_status,
                 str(entry.request_count),
                 entry.cooldown_remaining,
-                str(entry.priority) if entry.priority else "",
+                str(entry.priority) if entry.priority else "—",
             )
         sections.append(pool_table)
 
@@ -213,10 +213,10 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
                 skills_table.add_row(
                     Text(cat_label, style=style),
                     Text(short, style=style),
-                    Text(desc[:80] if desc else "—", style=theme.banner_text),
+                    Text(desc or "—", style=theme.banner_text),
                 )
             else:
-                skills_table.add_row(cat_label, short, desc[:80] if desc else "")
+                skills_table.add_row(cat_label, short, desc or "—")
 
         sections.append(skills_table)
 

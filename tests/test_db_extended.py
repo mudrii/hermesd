@@ -108,6 +108,49 @@ def test_read_tool_stats_refreshes_after_sessions_read(sample_db, hermes_home):
     db.close()
 
 
+def test_read_session_count_refreshes_after_write(sample_db, hermes_home):
+    db = HermesDB(hermes_home / "state.db")
+    assert db.read_session_count() == 2
+
+    conn = sqlite3.connect(str(sample_db))
+    conn.execute(
+        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "sess_003",
+            "cli",
+            None,
+            "gpt-5.4",
+            None,
+            None,
+            None,
+            time.time(),
+            None,
+            None,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+            0.0,
+            None,
+            None,
+            None,
+            None,
+            "new title",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    assert db.read_session_count() == 3
+    db.close()
+
+
 def test_search_session_ids_by_message_refreshes_same_query_after_write(sample_db, hermes_home):
     db = HermesDB(hermes_home / "state.db")
     session_ids = db.search_session_ids_by_message("shared term")

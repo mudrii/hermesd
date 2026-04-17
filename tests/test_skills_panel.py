@@ -16,8 +16,8 @@ from hermesd.panels import render_panel
 from hermesd.theme import Theme
 
 
-def _render_to_str(panel) -> str:
-    console = Console(width=100, force_terminal=True)
+def _render_to_str(panel, width: int = 100) -> str:
+    console = Console(width=width, force_terminal=True)
     with console.capture() as cap:
         console.print(panel)
     return cap.get()
@@ -33,7 +33,7 @@ def test_skills_detail_shows_providers_table():
         ),
     )
     panel = render_panel(7, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = _render_to_str(panel, width=200)
     assert "Providers" in text
     assert "openai-codex" in text
     assert "anthropic" in text
@@ -54,7 +54,7 @@ def test_skills_detail_shows_skills_by_category():
         ),
     )
     panel = render_panel(7, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = _render_to_str(panel, width=200)
     assert "Skills (4 in 2 categories)" in text
     assert "dev" in text
     assert "lint" in text
@@ -102,6 +102,35 @@ def test_skills_detail_shows_credential_pools_without_secrets():
     assert "sk-live-secret" not in text
 
 
+def test_skills_detail_uses_dash_for_missing_priority():
+    state = DashboardState(
+        skills_memory=SkillsMemory(
+            providers=[ProviderInfo(name="openai-codex", is_active=True)],
+            credential_pools=[
+                CredentialPoolEntry(
+                    name="openai-codex",
+                    label="Primary Codex",
+                    auth_type="oauth",
+                    source="codex",
+                    last_status="ok",
+                    request_count=42,
+                    cooldown_remaining="ready",
+                    priority=0,
+                    token_present=True,
+                ),
+            ],
+        ),
+    )
+
+    panel = render_panel(7, state, Theme(), detail=True)
+    text = _render_to_str(panel, width=140)
+    line = next(
+        rendered_line for rendered_line in text.splitlines() if "Primary Codex" in rendered_line
+    )
+
+    assert "—" in line
+
+
 def test_skills_detail_no_skills():
     state = DashboardState(
         skills_memory=SkillsMemory(
@@ -109,7 +138,7 @@ def test_skills_detail_no_skills():
         ),
     )
     panel = render_panel(7, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = _render_to_str(panel, width=200)
     assert "Providers" in text
     assert "anthropic" in text
     # No skills section when empty
@@ -239,3 +268,39 @@ def test_skills_detail_scroll_offset_zero():
     panel = render_panel(7, state, Theme(), detail=True, scroll_offset=0)
     text = _render_to_str(panel)
     assert "skill-0" in text
+
+
+def test_skills_detail_uses_dash_for_empty_descriptions_after_scrolling():
+    state = DashboardState(
+        skills_memory=SkillsMemory(
+            skill_count=2,
+            skill_categories=1,
+            providers=[],
+            skills=[
+                SkillInfo(name="cat-skill-0", category="cat", description="Visible"),
+                SkillInfo(name="cat-skill-1", category="cat", description=""),
+            ],
+        ),
+    )
+
+    panel = render_panel(7, state, Theme(), detail=True, scroll_offset=1)
+    text = _render_to_str(panel)
+
+    assert "—" in text
+
+
+def test_skills_detail_does_not_truncate_long_descriptions():
+    long_description = "A" * 81 + "tail"
+    state = DashboardState(
+        skills_memory=SkillsMemory(
+            skill_count=1,
+            skill_categories=1,
+            providers=[],
+            skills=[SkillInfo(name="cat-skill", category="cat", description=long_description)],
+        ),
+    )
+
+    panel = render_panel(7, state, Theme(), detail=True)
+    text = _render_to_str(panel, width=200)
+
+    assert long_description in text

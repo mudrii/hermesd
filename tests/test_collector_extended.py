@@ -3,10 +3,18 @@ import os
 import sqlite3
 import time
 from pathlib import Path
+from subprocess import CompletedProcess
 
 import yaml
 
-from hermesd.collector import Collector, _coerce_int, _pid_exists, _today_epoch
+from hermesd.collector import (
+    Collector,
+    _coerce_int,
+    _git_checkpoint_summary,
+    _latest_cron_output_excerpt,
+    _pid_exists,
+    _today_epoch,
+)
 
 
 def test_today_epoch_is_midnight():
@@ -148,11 +156,64 @@ def test_collect_available_tools_from_session_json(hermes_home: Path):
     c.close()
 
 
+def test_collect_available_tools_reuses_cached_index_when_sessions_json_is_unchanged(
+    hermes_home: Path,
+):
+    sessions_json = hermes_home / "sessions" / "sessions.json"
+    sessions_json.write_text(json.dumps({"entry1": {"session_id": "s1"}}))
+    session_file = hermes_home / "sessions" / "session_s1.json"
+    session_file.write_text(json.dumps({"session_id": "s1", "tools": [{"name": "terminal"}]}))
+
+    c = Collector(hermes_home)
+    original = c._read_json_cached
+    session_reads = 0
+
+    def counting_read_json(path: Path) -> dict[str, object]:
+        nonlocal session_reads
+        if path.name.startswith("session_"):
+            session_reads += 1
+        return original(path)
+
+    c._read_json_cached = counting_read_json
+
+    assert c._collect_available_tools() == (1, ["terminal"])
+    assert c._collect_available_tools() == (1, ["terminal"])
+    assert session_reads == 1
+    c.close()
+
+
 def test_collect_available_tools_no_sessions_json(hermes_home: Path):
     c = Collector(hermes_home)
     state = c.collect()
     assert state.available_tools == 0
     c.close()
+
+
+def test_summarize_profile_uses_session_count_reader(hermes_home: Path, monkeypatch):
+    profile_home = hermes_home / "profiles" / "coding"
+    profile_home.mkdir(parents=True)
+    (profile_home / "state.db").touch()
+
+    class FakeHermesDB:
+        def __init__(self, db_path: Path):
+            self.db_path = db_path
+
+        def read_session_count(self) -> int:
+            return 7
+
+        def read_sessions(self) -> list[dict[str, object]]:
+            raise AssertionError("read_sessions() should not be used for profile counts")
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("hermesd.collector.HermesDB", FakeHermesDB)
+
+    collector = Collector(hermes_home)
+    summary = collector._summarize_profile("coding", profile_home)
+
+    assert summary.session_count == 7
+    collector.close()
 
 
 def test_collect_config_empty(hermes_home: Path):
@@ -431,6 +492,49 @@ def test_collect_cron_logs_preserve_cache_when_latest_output_disappears(hermes_h
 
     assert second.logs.cron_lines == first.logs.cron_lines
     c.close()
+
+
+def test_latest_cron_output_excerpt_ignores_file_that_disappears_during_stat(
+    hermes_home: Path, monkeypatch
+):
+    output_dir = hermes_home / "cron" / "output" / "job-1"
+    output_dir.mkdir(parents=True)
+    stale_file = output_dir / "stale.md"
+    stale_file.write_text("stale output\n")
+    latest_file = output_dir / "latest.md"
+    latest_file.write_text("fresh output\n")
+    original_stat = Path.stat
+
+    def flaky_stat(path: Path):
+        if path == stale_file:
+            raise FileNotFoundError
+        return original_stat(path)
+
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+
+    excerpt, silent = _latest_cron_output_excerpt(hermes_home / "cron" / "output", "job-1")
+
+    assert excerpt == "fresh output"
+    assert silent is False
+
+
+def test_git_checkpoint_summary_sets_timeouts(monkeypatch):
+    timeouts: list[int] = []
+
+    def fake_run(*args, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        if "rev-list" in args[0]:
+            return CompletedProcess(args[0], 0, stdout="3\n")
+        return CompletedProcess(args[0], 0, stdout="1712345678\tcheckpoint reason\n")
+
+    monkeypatch.setattr("hermesd.collector.subprocess.run", fake_run)
+
+    commit_count, timestamp, reason = _git_checkpoint_summary(Path("/tmp/repo.git"))
+
+    assert timeouts == [2, 2]
+    assert commit_count == 3
+    assert timestamp == 1712345678.0
+    assert reason == "checkpoint reason"
 
 
 def test_collect_version_behind(hermes_home: Path):

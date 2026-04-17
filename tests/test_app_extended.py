@@ -4,8 +4,9 @@ from unittest.mock import patch
 
 from rich.console import Console
 
-from hermesd.app import DashboardApp
+from hermesd.app import _SKILLS_PANEL_NUM, DashboardApp
 from hermesd.models import HealthSummary, RuntimeStatus
+from hermesd.panels import PANEL_NAMES
 from hermesd.theme import load_theme
 
 
@@ -347,6 +348,15 @@ def test_build_header_with_custom_skin(populated_hermes_home: Path):
     app.close()
 
 
+def test_build_header_pads_to_console_width(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._console = Console(width=100, height=24, force_terminal=True)
+    header = app._build_header(app._state)
+
+    assert len(header.plain) == app._console.width
+    app.close()
+
+
 def test_app_refreshes_theme_when_skin_changes(populated_hermes_home: Path):
     import yaml
 
@@ -433,6 +443,11 @@ def test_build_footer_detail_sessions_shows_sort(populated_hermes_home: Path):
     assert "[s]" in footer.plain
     assert "sort=recent" in footer.plain
     app.close()
+
+
+def test_skills_panel_constant_matches_registry():
+    assert _SKILLS_PANEL_NUM in PANEL_NAMES
+    assert PANEL_NAMES[_SKILLS_PANEL_NUM] == "Skills / Integrations"
 
 
 def test_build_help_panel_shows_filter_shortcut(populated_hermes_home: Path):

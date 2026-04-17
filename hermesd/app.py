@@ -30,6 +30,11 @@ _LOG_PANEL_NUM = next(
 _SESSIONS_PANEL_NUM = next(
     panel_num for panel_num, panel_name in PANEL_NAMES.items() if panel_name == "Sessions"
 )
+_SKILLS_PANEL_NUM = next(
+    panel_num
+    for panel_num, panel_name in PANEL_NAMES.items()
+    if panel_name == "Skills / Integrations"
+)
 _PROFILES_PANEL_NUM = next(
     panel_num for panel_num, panel_name in PANEL_NAMES.items() if panel_name == "Profiles"
 )
@@ -492,8 +497,12 @@ class DashboardApp:
         if state.active_skin != "default":
             right_labels.insert(0, f"{state.active_skin} skin")
         right_text = "   ".join(right_labels)
-        padding = " " * max(1, 60 - len(right_text) - len(now))
-        t.append(f"{padding}{right_text}   {now} ", style=f"{active_theme.banner_dim} on #1A1A2E")
+        right_segment = f"{right_text}   {now} "
+        padding_width = max(1, self._console.width - len(t.plain) - len(right_segment))
+        t.append(
+            f"{' ' * padding_width}{right_segment}",
+            style=f"{active_theme.banner_dim} on #1A1A2E",
+        )
         return t
 
     def _build_footer(
@@ -570,7 +579,7 @@ class DashboardApp:
                 t.append("[s]", style=f"bold {active_theme.banner_title} on #1A1A2E")
                 t.append(" Sort  ", style=f"{active_theme.session_border} on #1A1A2E")
                 t.append(f"sort={sort_mode}  ", style=f"{active_theme.banner_dim} on #1A1A2E")
-            if panel in {7, _LOG_PANEL_NUM}:
+            if panel in {_SKILLS_PANEL_NUM, _LOG_PANEL_NUM}:
                 t.append("[g/G]", style=f"bold {active_theme.banner_title} on #1A1A2E")
                 t.append(" Top/bottom  ", style=f"{active_theme.session_border} on #1A1A2E")
             if panel == _PROFILES_PANEL_NUM:

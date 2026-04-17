@@ -15,6 +15,8 @@ class HermesDB:
         self._current_data_version: int | None = None
         self._cached_sessions: list[dict[str, Any]] = []
         self._cached_sessions_version: int | None = None
+        self._cached_session_count = 0
+        self._cached_session_count_version: int | None = None
         self._cached_tool_stats: list[dict[str, Any]] = []
         self._cached_tool_stats_version: int | None = None
         self._cached_message_search_query: str = ""
@@ -100,6 +102,27 @@ class HermesDB:
             "FROM sessions ORDER BY started_at DESC"
         )
         return [dict(row) for row in cur.fetchall()]
+
+    def read_session_count(self) -> int:
+        with self._lock:
+            conn = self._ensure_connection()
+            if conn is None:
+                return self._cached_session_count
+            version = self._current_version()
+            if version is not None and self._cached_session_count_version == version:
+                return self._cached_session_count
+            try:
+                cur = conn.execute("SELECT COUNT(*) FROM sessions")
+                row = cur.fetchone()
+                self._cached_session_count = int(row[0]) if row is not None else 0
+                if version is not None:
+                    self._cached_session_count_version = version
+                self._consecutive_errors = 0
+            except sqlite3.Error:
+                self._consecutive_errors += 1
+                if self._consecutive_errors >= 3:
+                    self._connect()
+            return self._cached_session_count
 
     def read_tool_stats(self) -> list[dict[str, Any]]:
         with self._lock:
