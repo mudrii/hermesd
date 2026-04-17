@@ -1,6 +1,7 @@
 from rich.console import Console
 
 from hermesd.models import (
+    CheckpointInfo,
     ConfigSummary,
     CronState,
     DashboardState,
@@ -11,6 +12,10 @@ from hermesd.models import (
     ProviderInfo,
     SessionInfo,
     SkillsMemory,
+    TokenAnalytics,
+    TokenBreakdown,
+    TokenWindowSummary,
+    ToolGatewayRoute,
     ToolStats,
 )
 from hermesd.panels import render_panel
@@ -39,6 +44,9 @@ def test_sessions_panel_detail():
                 input_tokens=12400,
                 output_tokens=8200,
                 estimated_cost_usd=0.42,
+                billing_provider="openai-codex",
+                cost_status="reported",
+                pricing_version="2026-04",
                 is_active=True,
             ),
             SessionInfo(
@@ -50,6 +58,9 @@ def test_sessions_panel_detail():
                 input_tokens=9100,
                 output_tokens=6300,
                 estimated_cost_usd=0.31,
+                billing_provider="anthropic",
+                cost_status="estimated",
+                pricing_version="2026-05",
             ),
         ],
     )
@@ -58,6 +69,60 @@ def test_sessions_panel_detail():
     assert "cli" in text
     assert "telegram" in text
     assert "0.42" in text
+    assert "openai-codex" in text
+    assert "reported" in text
+    assert "2026-04" in text
+
+
+def test_sessions_panel_detail_filter_query():
+    state = DashboardState(
+        sessions=[
+            SessionInfo(session_id="sess_alpha", source="cli", model="gpt-5.4"),
+            SessionInfo(session_id="sess_beta", source="telegram", model="claude"),
+        ],
+    )
+    panel = render_panel(2, state, Theme(), detail=True, filter_query="telegram")
+    text = _render_to_str(panel)
+    assert "Filter:" in text
+    assert "telegram" in text
+    assert "claude" in text
+    assert "gpt-5.4" not in text
+
+
+def test_sessions_panel_detail_structured_filter_and_sort():
+    state = DashboardState(
+        sessions=[
+            SessionInfo(
+                session_id="sess_alpha",
+                source="cli",
+                model="gpt-5.4",
+                billing_provider="openai",
+                estimated_cost_usd=1.20,
+                started_at=10,
+            ),
+            SessionInfo(
+                session_id="sess_beta",
+                source="telegram",
+                model="claude",
+                billing_provider="anthropic",
+                estimated_cost_usd=0.20,
+                started_at=20,
+            ),
+        ],
+    )
+    panel = render_panel(
+        2,
+        state,
+        Theme(),
+        detail=True,
+        filter_query="source:cli provider:openai",
+        session_sort="cost",
+    )
+    text = _render_to_str(panel)
+    assert "source:cli provider:openai" in text
+    assert "Sort:" in text
+    assert "sess_alpha"[-8:] in text
+    assert "telegram" not in text
 
 
 def test_tokens_panel_detail():
@@ -73,11 +138,40 @@ def test_tokens_panel_detail():
                 estimated_cost_usd=0.42,
             ),
         ],
+        token_analytics=TokenAnalytics(
+            windows=[
+                TokenWindowSummary(
+                    label="7d", session_count=1, input_tokens=12400, cache_ratio=0.70
+                ),
+                TokenWindowSummary(
+                    label="30d", session_count=2, input_tokens=21500, cache_ratio=0.57
+                ),
+            ],
+            by_model=[
+                TokenBreakdown(
+                    label="gpt-5.4", session_count=1, input_tokens=12400, total_cost_usd=0.42
+                ),
+            ],
+            by_provider=[
+                TokenBreakdown(
+                    label="openai-codex",
+                    session_count=1,
+                    input_tokens=12400,
+                    total_cost_usd=0.42,
+                ),
+            ],
+        ),
     )
     panel = render_panel(3, state, Theme(), detail=True)
     text = _render_to_str(panel)
     assert "12" in text
     assert "0.42" in text
+    assert "Recent Windows" in text
+    assert "7d" in text
+    assert "By Model" in text
+    assert "gpt-5.4" in text
+    assert "By Provider" in text
+    assert "openai-codex" in text
 
 
 def test_tools_panel_detail():
@@ -93,6 +187,52 @@ def test_tools_panel_detail():
     assert "shell_exec" in text
     assert "23" in text
     assert "read_file" in text
+
+
+def test_tools_panel_detail_shows_background_processes():
+    from hermesd.models import BackgroundProcessInfo
+
+    state = DashboardState(
+        background_processes=[
+            BackgroundProcessInfo(
+                session_id="proc_alpha",
+                command="pytest -q",
+                pid=4242,
+                started_at=1775791440.0,
+                notify_on_complete=True,
+                watcher_interval=30,
+                watch_patterns=["ERROR", "READY"],
+            )
+        ]
+    )
+    panel = render_panel(4, state, Theme(), detail=True)
+    text = _render_to_str(panel)
+    assert "Background Processes" in text
+    assert "proc_alpha" in text
+    assert "pytest -q" in text
+    assert "Yes" in text
+    assert "2 @30s" in text
+
+
+def test_tools_panel_detail_shows_checkpoints():
+    state = DashboardState(
+        checkpoints=[
+            CheckpointInfo(
+                repo_id="abc123def4567890",
+                workdir="/tmp/project-alpha",
+                workdir_name="project-alpha",
+                commit_count=2,
+                last_reason="Refine config panel",
+                last_checkpoint_at=1775791450.0,
+            )
+        ]
+    )
+    panel = render_panel(4, state, Theme(), detail=True)
+    text = _render_to_str(panel)
+    assert "Checkpoints" in text
+    assert "project-alpha" in text
+    assert "Refine config panel" in text
+    assert "2" in text
 
 
 def test_config_panel_detail():
@@ -113,6 +253,44 @@ def test_config_panel_detail():
     assert "gpt-5.4" in text
     assert "192" in text
     assert "medium" in text
+
+
+def test_config_panel_detail_shows_tool_gateway_routes():
+    state = DashboardState(
+        config=ConfigSummary(
+            model="gpt-5.4",
+            provider="openai-codex",
+            provider_routing_summary="throughput only:2",
+            smart_model_routing_enabled=True,
+            smart_model_routing_cheap_model="openrouter/google/gemini-2.5-flash",
+            fallback_model_label="anthropic/claude-sonnet-4-20250514",
+            dashboard_theme="midnight",
+            session_reset_mode="both",
+            memory_provider="supermemory",
+            tool_gateway_domain="gateway.example.com",
+            tool_gateway_scheme="https",
+            tool_gateway_routes=[
+                ToolGatewayRoute(tool="web", mode="gateway", token_present=True),
+                ToolGatewayRoute(tool="image_gen", mode="direct", token_present=True),
+            ],
+            firecrawl_gateway_url="https://firecrawl.example.com",
+        ),
+    )
+    panel = render_panel(5, state, Theme(), detail=True)
+    text = _render_to_str(panel)
+    assert "Tool Gateway" in text
+    assert "gateway.example.com" in text
+    assert "https" in text
+    assert "web" in text
+    assert "image_gen" in text
+    assert "gateway" in text
+    assert "direct" in text
+    assert "firecrawl.example.com" in text
+    assert "throughput only:2" in text
+    assert "openrouter/google/gemini-2.5-flash" in text
+    assert "anthropic/claude-sonnet-4-20250514" in text
+    assert "midnight" in text
+    assert "supermemory" in text
 
 
 def test_overview_panel_detail():
@@ -174,6 +352,18 @@ def test_logs_panel_detail_errors():
     assert "[errors]" in text
 
 
+def test_logs_panel_detail_cron():
+    state = DashboardState(
+        logs=LogState(
+            cron_lines=[LogLine(message="cron output line")],
+        ),
+    )
+    panel = render_panel(8, state, Theme(), detail=True, log_sub_view="cron")
+    text = _render_to_str(panel)
+    assert "cron output line" in text
+    assert "[cron]" in text
+
+
 def test_logs_panel_detail_scroll_offset():
     state = DashboardState(
         logs=LogState(
@@ -188,6 +378,68 @@ def test_logs_panel_detail_scroll_offset():
     assert "line-0" not in text
     assert "line-5" in text
     assert "j/k scroll" in text
+
+
+def test_logs_panel_detail_filter_query():
+    state = DashboardState(
+        logs=LogState(
+            agent_lines=[
+                LogLine(
+                    timestamp="15:42:03",
+                    component="hermes",
+                    level="INFO",
+                    session_id="sess-alpha",
+                    message="session saved",
+                ),
+                LogLine(
+                    timestamp="15:42:04",
+                    component="gateway",
+                    level="ERROR",
+                    session_id="sess-beta",
+                    message="provider timeout",
+                ),
+            ]
+        ),
+    )
+    panel = render_panel(8, state, Theme(), detail=True, log_sub_view="agent", filter_query="error")
+    text = _render_to_str(panel)
+    assert "Filter:" in text
+    assert "provider timeout" in text
+    assert "session saved" not in text
+
+
+def test_logs_panel_detail_structured_filter_query():
+    state = DashboardState(
+        logs=LogState(
+            agent_lines=[
+                LogLine(
+                    timestamp="15:42:03",
+                    component="hermes",
+                    level="INFO",
+                    session_id="sess-alpha",
+                    message="session saved",
+                ),
+                LogLine(
+                    timestamp="15:42:04",
+                    component="gateway",
+                    level="ERROR",
+                    session_id="sess-beta",
+                    message="provider timeout",
+                ),
+            ]
+        ),
+    )
+    panel = render_panel(
+        8,
+        state,
+        Theme(),
+        detail=True,
+        log_sub_view="agent",
+        filter_query="level:error component:gateway session:sess-beta",
+    )
+    text = _render_to_str(panel)
+    assert "provider timeout" in text
+    assert "session saved" not in text
 
 
 # ── Empty state tests ──────────────────────────────────────────────────

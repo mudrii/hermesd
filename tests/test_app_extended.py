@@ -1,8 +1,10 @@
+import io
 from pathlib import Path
 
 from rich.console import Console
 
 from hermesd.app import DashboardApp
+from hermesd.models import HealthSummary, RuntimeStatus
 
 
 def test_handle_key_refresh(populated_hermes_home: Path):
@@ -20,6 +22,37 @@ def test_handle_key_help_toggle(populated_hermes_home: Path):
     assert app._view.show_help is True
     app._handle_key("?")
     assert app._view.show_help is False
+    app.close()
+
+
+def test_handle_key_c_copies_current_view(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    buffer = io.StringIO()
+    app._console = Console(file=buffer, width=120, height=40, force_terminal=True, no_color=True)
+    app._handle_key("c")
+    copied = buffer.getvalue()
+    assert "]52;c;" in copied
+    app.close()
+
+
+def test_handle_key_f_toggles_focus_mode(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._handle_key("f")
+    assert app._view.mode == "detail"
+    assert app._view.detail_panel == 1
+    app._handle_key("f")
+    assert app._view.mode == "overview"
+    app.close()
+
+
+def test_handle_key_f_reuses_last_selected_panel(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._handle_key("5")
+    app._handle_key("f")
+    assert app._view.mode == "overview"
+    app._handle_key("f")
+    assert app._view.mode == "detail"
+    assert app._view.detail_panel == 5
     app.close()
 
 
@@ -44,6 +77,8 @@ def test_handle_key_tab_cycles_log_view(populated_hermes_home: Path):
     assert app._view.log_sub_view == "gateway"
     app._handle_key("\t")
     assert app._view.log_sub_view == "errors"
+    app._handle_key("\t")
+    assert app._view.log_sub_view == "cron"
     app.close()
 
 
@@ -55,6 +90,97 @@ def test_handle_key_tab_ignored_outside_logs(populated_hermes_home: Path):
     app.close()
 
 
+def test_handle_key_slash_enters_filter_mode_in_sessions(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._handle_key("2")
+    app._handle_key("/")
+    assert app._view.filter_edit_mode is True
+    assert app._view.filter_query == ""
+    app.close()
+
+
+def test_handle_key_filter_text_and_enter(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._handle_key("8")
+    app._handle_key("/")
+    app._handle_key("e")
+    app._handle_key("r")
+    app._handle_key("r")
+    assert app._view.filter_query == "err"
+    assert app._view.filter_edit_mode is True
+    app._handle_key("\r")
+    assert app._view.filter_edit_mode is False
+    assert app._view.filter_query == "err"
+    app.close()
+
+
+def test_handle_key_filter_backspace(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._handle_key("2")
+    app._handle_key("/")
+    app._handle_key("a")
+    app._handle_key("b")
+    app._handle_key("\x7f")
+    assert app._view.filter_query == "a"
+    app.close()
+
+
+def test_handle_key_escape_exits_filter_mode_before_detail(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._handle_key("2")
+    app._handle_key("/")
+    app._handle_key("x")
+    app._handle_key("\x1b")
+    assert app._view.mode == "detail"
+    assert app._view.detail_panel == 2
+    assert app._view.filter_edit_mode is False
+    assert app._view.filter_query == "x"
+    app.close()
+
+
+def test_handle_key_slash_ignored_outside_filter_panels(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._handle_key("5")
+    app._handle_key("/")
+    assert app._view.filter_edit_mode is False
+    assert app._view.filter_query == ""
+    app.close()
+
+
+def test_handle_key_s_cycles_session_sort(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._handle_key("2")
+    assert app._view.session_sort == "recent"
+    app._handle_key("s")
+    assert app._view.session_sort == "cost"
+    app._handle_key("s")
+    assert app._view.session_sort == "tokens"
+    app._handle_key("s")
+    assert app._view.session_sort == "recent"
+    app.close()
+
+
+def test_handle_key_s_ignored_outside_sessions(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._handle_key("8")
+    app._handle_key("s")
+    assert app._view.session_sort == "recent"
+    app.close()
+
+
+def test_handle_key_g_and_big_g_jump_scroll(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._handle_key("8")
+    app._handle_key("j")
+    app._handle_key("j")
+    assert app._view.scroll_offset == 2
+    app._handle_key("G")
+    assert app._view.scroll_offset == 999_999
+    app._handle_key("g")
+    assert app._view.scroll_offset == 0
+    app.close()
+
+
 def test_handle_key_invalid_returns_none(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     result = app._handle_key("x")
@@ -62,17 +188,19 @@ def test_handle_key_invalid_returns_none(populated_hermes_home: Path):
     app.close()
 
 
-def test_handle_key_digit_0_ignored(populated_hermes_home: Path):
+def test_handle_key_digit_0_enters_memory_detail(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app._handle_key("0")
-    assert app._view.mode == "overview"
+    assert app._view.mode == "detail"
+    assert app._view.detail_panel == 10
     app.close()
 
 
-def test_handle_key_digit_9_ignored(populated_hermes_home: Path):
+def test_handle_key_digit_9_enters_profiles_detail(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app._handle_key("9")
-    assert app._view.mode == "overview"
+    assert app._view.mode == "detail"
+    assert app._view.detail_panel == 9
     app.close()
 
 
@@ -101,11 +229,49 @@ def test_handle_key_multi_char_ignored(populated_hermes_home: Path):
     app.close()
 
 
+def test_handle_key_p_cycles_profile_view_in_profiles_panel(profiled_hermes_home: Path):
+    app = DashboardApp(profiled_hermes_home, refresh_rate=5)
+    app._handle_key("9")
+    assert app._view.profile_cycle_index == 0
+    app._handle_key("p")
+    assert app._view.profile_cycle_index == 1
+    app.close()
+
+
+def test_handle_key_p_ignored_outside_profiles_panel(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._handle_key("3")
+    app._handle_key("p")
+    assert app._view.profile_cycle_index == 0
+    app.close()
+
+
 def test_build_help_panel(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app._view.show_help = True
     layout = app._build_layout()
     assert layout is not None
+    app.close()
+
+
+def test_build_help_panel_uses_dynamic_panel_range(populated_hermes_home: Path, monkeypatch):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    monkeypatch.setattr(
+        "hermesd.app.PANEL_NAMES",
+        {
+            1: "Gateway & Platforms",
+            2: "Sessions",
+            3: "Tokens / Cost",
+            4: "Tools",
+            5: "Config",
+            6: "Cron",
+            7: "Skills / Integrations",
+            8: "Logs",
+            9: "Profiles",
+        },
+    )
+    panel = app._build_help()
+    assert "1-9" in panel.renderable.plain
     app.close()
 
 
@@ -149,6 +315,31 @@ def test_build_footer_overview(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     footer = app._build_footer(app._state)
     assert footer is not None
+    assert "[1-9,0]" in footer.plain
+    assert "[f]" in footer.plain
+    assert "[c]" in footer.plain
+    assert "0/0" in footer.plain
+    app.close()
+
+
+def test_build_footer_overview_uses_dynamic_panel_range(populated_hermes_home: Path, monkeypatch):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    monkeypatch.setattr(
+        "hermesd.app.PANEL_NAMES",
+        {
+            1: "Gateway & Platforms",
+            2: "Sessions",
+            3: "Tokens / Cost",
+            4: "Tools",
+            5: "Config",
+            6: "Cron",
+            7: "Skills / Integrations",
+            8: "Logs",
+            9: "Profiles",
+        },
+    )
+    footer = app._build_footer(app._state)
+    assert "[1-9]" in footer.plain
     app.close()
 
 
@@ -159,6 +350,32 @@ def test_build_footer_detail_logs(populated_hermes_home: Path):
     from rich.text import Text
 
     assert isinstance(footer, Text)
+    assert "[f]" in footer.plain
+    assert "[c]" in footer.plain
+    assert "[/]" in footer.plain
+    assert "[g/G]" in footer.plain
+    app.close()
+
+
+def test_build_footer_detail_sessions_shows_sort(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._view.enter_detail(2)
+    footer = app._build_footer(app._state)
+    assert "[s]" in footer.plain
+    assert "sort=recent" in footer.plain
+    app.close()
+
+
+def test_build_help_panel_shows_filter_shortcut(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    panel = app._build_help()
+    assert "1-9,0" in panel.renderable.plain
+    assert "Toggle focus mode" in panel.renderable.plain
+    assert "Copy the current rendered view" in panel.renderable.plain
+    assert "/" in panel.renderable.plain
+    assert "detail filter" in panel.renderable.plain
+    assert "Cycle session sort" in panel.renderable.plain
+    assert "Jump to top/bottom" in panel.renderable.plain
     app.close()
 
 
@@ -167,6 +384,41 @@ def test_build_footer_shows_input_error(populated_hermes_home: Path):
     app._input_error = "input failure"
     footer = app._build_footer(app._state)
     assert "input failure" in footer.plain
+    app.close()
+
+
+def test_build_footer_shows_health_failures(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    state = app._state.model_copy(
+        update={
+            "health": HealthSummary(
+                total_sources=16, ok_sources=14, failed_sources=["logs", "cron"]
+            )
+        }
+    )
+    footer = app._build_footer(state)
+    assert "14/16" in footer.plain
+    assert "logs,cron" in footer.plain
+    app.close()
+
+
+def test_build_header_shows_offline_banner(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    state = app._state.model_copy(
+        update={"runtime": RuntimeStatus(agent_running=False, banner="AGENT OFFLINE")}
+    )
+    header = app._build_header(state)
+    assert "AGENT OFFLINE" in header.plain
+    app.close()
+
+
+def test_build_footer_shows_offline_banner(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    state = app._state.model_copy(
+        update={"runtime": RuntimeStatus(agent_running=False, banner="AGENT OFFLINE")}
+    )
+    footer = app._build_footer(state)
+    assert "agent offline" in footer.plain
     app.close()
 
 
@@ -181,7 +433,48 @@ def test_compact_overview_renders_tools_and_skills_panels(populated_hermes_home:
     text = cap.get()
 
     assert "Tools" in text
-    assert "Skills / Providers" in text
+    assert "Skills / Integrations" in text
+    assert "Memory" in text
+    app.close()
+
+
+def test_wide_overview_renders_existing_panels(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._console = Console(width=120, height=40, force_terminal=True)
+    state = app._collector.collect()
+    overview = app._build_overview(state)
+
+    with app._console.capture() as cap:
+        app._console.print(overview)
+    text = cap.get()
+
+    assert "Gateway & Platforms" in text
+    assert "Sessions" in text
+    assert "Tokens / Cost" in text
+    assert "Tools" in text
+    assert "Config" in text
+    assert "Cron" in text
+    assert "Skills / Integrations" in text
+    assert "Logs" in text
+    assert "Memory" in text
+    app.close()
+
+
+def test_tall_narrow_overview_uses_single_column_rows(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._console = Console(width=90, height=55, force_terminal=True)
+    state = app._collector.collect()
+    overview = app._build_overview(state)
+
+    assert len(overview.children) == 10
+
+    with app._console.capture() as cap:
+        app._console.print(overview)
+    text = cap.get()
+
+    assert "Gateway & Platforms" in text
+    assert "Profiles" in text
+    assert "Memory" in text
     app.close()
 
 
@@ -211,3 +504,25 @@ def test_app_requires_positive_refresh_rate(populated_hermes_home: Path):
         assert "refresh_rate must be positive" in str(exc)
     else:
         raise AssertionError("DashboardApp should reject non-positive refresh_rate")
+
+
+def test_copy_current_view_returns_overview_text(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    buffer = io.StringIO()
+    app._console = Console(file=buffer, width=120, height=40, force_terminal=True, no_color=True)
+    copied = app.copy_current_view()
+    assert "Gateway & Platforms" in copied
+    assert "Memory" in copied
+    app.close()
+
+
+def test_copy_current_view_returns_detail_text(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    buffer = io.StringIO()
+    app._console = Console(file=buffer, width=120, height=40, force_terminal=True, no_color=True)
+    app._set_state(app._collector.collect())
+    app._handle_key("2")
+    copied = app.copy_current_view()
+    assert "[2] Sessions" in copied
+    assert "sess_001" in copied
+    app.close()

@@ -10,6 +10,7 @@ def test_parse_args_defaults():
     assert args.hermes_home is None
     assert args.refresh_rate == 5
     assert args.no_color is False
+    assert args.snapshot is False
 
 
 def test_parse_args_custom():
@@ -17,6 +18,27 @@ def test_parse_args_custom():
     assert args.hermes_home == Path("/tmp/h")
     assert args.refresh_rate == 10
     assert args.no_color is True
+
+
+def test_parse_args_snapshot():
+    args = parse_args(["--snapshot"])
+    assert args.snapshot is True
+
+
+def test_parse_args_snapshot_file():
+    args = parse_args(["--snapshot-file", "/tmp/hermesd.txt"])
+    assert args.snapshot_file == Path("/tmp/hermesd.txt")
+
+
+def test_parse_args_snapshot_panel():
+    args = parse_args(["--snapshot-panel", "10"])
+    assert args.snapshot_panel == 10
+
+
+@pytest.mark.parametrize("value", ["0", "11"])
+def test_parse_args_rejects_invalid_snapshot_panel(value: str):
+    with pytest.raises(SystemExit):
+        parse_args(["--snapshot-panel", value])
 
 
 @pytest.mark.parametrize("value", ["0", "-1"])
@@ -51,6 +73,69 @@ def test_main_exits_on_missing_dir(tmp_path):
     with pytest.raises(SystemExit) as exc:
         main(["--hermes-home", str(missing)])
     assert exc.value.code == 1
+
+
+def test_main_exits_on_missing_profile(populated_hermes_home: Path):
+    with pytest.raises(SystemExit) as exc:
+        main(["--hermes-home", str(populated_hermes_home), "--profile", "missing"])
+    assert exc.value.code == 1
+
+
+def test_main_snapshot_outputs_overview(populated_hermes_home: Path, capsys):
+    main(["--hermes-home", str(populated_hermes_home), "--snapshot", "--no-color"])
+    out = capsys.readouterr().out
+    assert "Gateway & Platforms" in out
+    assert "Sessions" in out
+    assert "Logs" in out
+
+
+def test_main_snapshot_file_writes_output(populated_hermes_home: Path, tmp_path: Path):
+    output_path = tmp_path / "snapshot.txt"
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-file",
+            str(output_path),
+            "--no-color",
+        ]
+    )
+    text = output_path.read_text()
+    assert "Gateway & Platforms" in text
+    assert "Memory" in text
+
+
+def test_main_snapshot_panel_outputs_detail(populated_hermes_home: Path, capsys):
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-panel",
+            "10",
+            "--no-color",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert "[10] Memory" in out
+    assert "SOUL.md" in out
+
+
+def test_main_snapshot_panel_file_writes_detail(populated_hermes_home: Path, tmp_path: Path):
+    output_path = tmp_path / "memory-panel.txt"
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-panel",
+            "2",
+            "--snapshot-file",
+            str(output_path),
+            "--no-color",
+        ]
+    )
+    text = output_path.read_text()
+    assert "[2] Sessions" in text
+    assert "sess_001" in text
 
 
 def test_parse_args_version(capsys):

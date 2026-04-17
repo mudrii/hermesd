@@ -63,11 +63,12 @@ class HermesDB:
             return self._cached_sessions
         try:
             cur = conn.execute(
-                "SELECT id, source, user_id, model, started_at, ended_at, "
+                "SELECT id, source, user_id, model, parent_session_id, started_at, ended_at, "
                 "end_reason, message_count, tool_call_count, "
                 "input_tokens, output_tokens, cache_read_tokens, "
                 "cache_write_tokens, reasoning_tokens, "
-                "estimated_cost_usd, actual_cost_usd, title "
+                "estimated_cost_usd, actual_cost_usd, "
+                "billing_provider, cost_status, pricing_version, title "
                 "FROM sessions ORDER BY started_at DESC"
             )
             self._cached_sessions = [dict(row) for row in cur.fetchall()]

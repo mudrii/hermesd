@@ -142,3 +142,71 @@ def test_collector_no_jobs_json(hermes_home: Path):
     assert state.cron.job_count == 0
     assert state.cron.jobs == []
     c.close()
+
+
+def test_collector_enriches_cron_jobs_with_delivery_and_output(hermes_home: Path):
+    (hermes_home / "channel_directory.json").write_text(
+        json.dumps(
+            {
+                "updated_at": "2026-04-09T19:00:00",
+                "platforms": {
+                    "telegram": [
+                        {"id": "-1001", "name": "My Group", "type": "group"},
+                    ]
+                },
+            }
+        )
+    )
+    (hermes_home / "cron" / "jobs.json").write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "j1",
+                        "name": "test-cron",
+                        "schedule_display": "every 10m",
+                        "state": "scheduled",
+                        "enabled": True,
+                        "deliver": "telegram:My Group",
+                    }
+                ],
+            }
+        )
+    )
+    output_dir = hermes_home / "cron" / "output" / "j1"
+    output_dir.mkdir(parents=True)
+    (output_dir / "2026-04-09T19-00-00.md").write_text("[SILENT]\nNo changes to report.\n")
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    job = state.cron.jobs[0]
+    assert job.delivery_target_label == "telegram:My Group"
+    assert job.silent_run is True
+    assert "No changes to report" in job.latest_output_excerpt
+    c.close()
+
+
+def test_cron_detail_shows_delivery_and_output_metadata():
+    state = DashboardState(
+        cron=CronState(
+            job_count=1,
+            jobs=[
+                CronJob(
+                    job_id="j1",
+                    name="meeting-reminder",
+                    schedule_display="once in 2m",
+                    state="scheduled",
+                    enabled=True,
+                    deliver="telegram:My Group",
+                    delivery_target_label="telegram:My Group",
+                    latest_output_excerpt="No changes to report.",
+                    silent_run=True,
+                )
+            ],
+        ),
+    )
+    panel = render_panel(6, state, Theme(), detail=True)
+    text = _render_to_str(panel)
+    assert "telegram:My Group" in text
+    assert "[SILENT]" in text
+    assert "No changes to report." in text

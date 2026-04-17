@@ -184,3 +184,86 @@ def test_collector_total_cost_estimates_missing_sessions_when_db_has_mixed_costs
     expected_missing = _estimate_cost(100_000, 5_000, 50_000, 0)
     assert state.tokens_total.total_cost_usd >= 0.42 + expected_missing
     c.close()
+
+
+def test_collector_builds_token_analytics_windows_and_breakdowns(hermes_home: Path):
+    """Analytics should summarize recent windows plus model/provider breakdowns."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
+            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
+            started_at REAL NOT NULL, ended_at REAL, end_reason TEXT,
+            message_count INTEGER, tool_call_count INTEGER,
+            input_tokens INTEGER, output_tokens INTEGER,
+            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
+            reasoning_tokens INTEGER, billing_provider TEXT,
+            billing_base_url TEXT, billing_mode TEXT,
+            estimated_cost_usd REAL, actual_cost_usd REAL,
+            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
+            title TEXT
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
+            tool_calls TEXT, tool_name TEXT, timestamp REAL,
+            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
+            reasoning_details TEXT, codex_reasoning_items TEXT
+        );
+    """)
+    now = time.time()
+    conn.execute(
+        "INSERT INTO sessions (id, source, model, started_at, input_tokens, output_tokens, "
+        "cache_read_tokens, billing_provider, estimated_cost_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "s_recent_a",
+            "cli",
+            "gpt-5.4",
+            now - 2 * 86400,
+            100_000,
+            5_000,
+            50_000,
+            "openai-codex",
+            0.42,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO sessions (id, source, model, started_at, input_tokens, output_tokens, "
+        "cache_read_tokens, billing_provider, estimated_cost_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "s_recent_b",
+            "cli",
+            "claude-sonnet",
+            now - 10 * 86400,
+            80_000,
+            6_000,
+            20_000,
+            "anthropic",
+            0.31,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO sessions (id, source, model, started_at, input_tokens, output_tokens, "
+        "cache_read_tokens, billing_provider, estimated_cost_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("s_old", "cli", "gpt-5.4", now - 45 * 86400, 60_000, 4_000, 10_000, "openai-codex", 0.21),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    windows = {window.label: window for window in state.token_analytics.windows}
+    assert windows["7d"].session_count == 1
+    assert windows["7d"].input_tokens == 100_000
+    assert windows["30d"].session_count == 2
+    assert windows["30d"].input_tokens == 180_000
+
+    models = {entry.label: entry for entry in state.token_analytics.by_model}
+    assert models["gpt-5.4"].session_count == 2
+    assert models["gpt-5.4"].input_tokens == 160_000
+    providers = {entry.label: entry for entry in state.token_analytics.by_provider}
+    assert providers["openai-codex"].session_count == 2
+    assert providers["anthropic"].session_count == 1
+    c.close()

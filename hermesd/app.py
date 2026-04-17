@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import signal
 import sys
 import threading
@@ -18,31 +19,72 @@ from hermesd.models import DashboardState
 from hermesd.panels import PANEL_NAMES, render_panel
 from hermesd.theme import Theme, load_theme
 
-_LOG_VIEWS = ("agent", "gateway", "errors")
+_LOG_VIEWS = ("agent", "gateway", "errors", "cron")
 _DOTS_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 _PANEL_NUMBERS = tuple(sorted(PANEL_NAMES))
 _LOG_PANEL_NUM = next(
     panel_num for panel_num, panel_name in PANEL_NAMES.items() if panel_name == "Logs"
 )
+_SESSIONS_PANEL_NUM = next(
+    panel_num for panel_num, panel_name in PANEL_NAMES.items() if panel_name == "Sessions"
+)
+_PROFILES_PANEL_NUM = next(
+    panel_num for panel_num, panel_name in PANEL_NAMES.items() if panel_name == "Profiles"
+)
+_WIDE_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
+    ("row1", 4, (1,)),
+    ("row2", None, (2, 3)),
+    ("row3", None, (4, 5)),
+    ("row4", None, (6, 7)),
+    ("row5", 7, (8, 9)),
+    ("row6", 6, (10,)),
+)
+_COMPACT_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
+    ("row1", 3, (1,)),
+    ("row2", 4, (2,)),
+    ("row3", 4, (3,)),
+    ("row4", 4, (4, 5)),
+    ("row5", 4, (6, 7)),
+    ("row6", 4, (8, 9)),
+    ("row7", None, (10,)),
+)
+_TALL_NARROW_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = tuple(
+    (f"row{panel_num}", None, (panel_num,)) for panel_num in _PANEL_NUMBERS
+)
+_SESSION_SORTS = ("recent", "cost", "tokens")
 
 
 class ViewState:
     def __init__(self) -> None:
         self.mode: str = "overview"
         self.detail_panel: int | None = None
+        self.focus_panel: int = _PANEL_NUMBERS[0]
         self.scroll_offset: int = 0
         self.log_sub_view: str = "agent"
         self.show_help: bool = False
+        self.profile_cycle_index: int = 0
+        self.filter_query: str = ""
+        self.filter_edit_mode: bool = False
+        self.session_sort: str = "recent"
 
     def enter_detail(self, panel_num: int) -> None:
         self.mode = "detail"
         self.detail_panel = panel_num
+        self.focus_panel = panel_num
         self.scroll_offset = 0
+        self.profile_cycle_index = 0
+        self.filter_query = ""
+        self.filter_edit_mode = False
+        self.session_sort = "recent"
 
     def exit_detail(self) -> None:
         self.mode = "overview"
         self.detail_panel = None
         self.scroll_offset = 0
+        self.profile_cycle_index = 0
+        self.filter_query = ""
+        self.filter_edit_mode = False
+        self.session_sort = "recent"
 
     def scroll_down(self) -> None:
         self.scroll_offset += 1
@@ -54,17 +96,60 @@ class ViewState:
         idx = _LOG_VIEWS.index(self.log_sub_view)
         self.log_sub_view = _LOG_VIEWS[(idx + 1) % len(_LOG_VIEWS)]
 
+    def cycle_profile_view(self) -> None:
+        self.profile_cycle_index += 1
+
+    def start_filter(self) -> None:
+        self.filter_edit_mode = True
+
+    def stop_filter(self) -> None:
+        self.filter_edit_mode = False
+
+    def append_filter_char(self, char: str) -> None:
+        self.filter_query += char
+
+    def pop_filter_char(self) -> None:
+        self.filter_query = self.filter_query[:-1]
+
+    def cycle_session_sort(self) -> None:
+        idx = _SESSION_SORTS.index(self.session_sort)
+        self.session_sort = _SESSION_SORTS[(idx + 1) % len(_SESSION_SORTS)]
+
+    def jump_top(self) -> None:
+        self.scroll_offset = 0
+
+    def jump_bottom(self) -> None:
+        self.scroll_offset = 999_999
+
+    def toggle_focus(self) -> None:
+        if self.mode == "detail":
+            self.exit_detail()
+            return
+        self.enter_detail(self.focus_panel)
+
 
 class DashboardApp:
-    def __init__(self, hermes_home: Path, refresh_rate: int = 5, no_color: bool = False) -> None:
+    def __init__(
+        self,
+        hermes_home: Path,
+        refresh_rate: int = 5,
+        no_color: bool = False,
+        profile_name: str | None = None,
+    ) -> None:
         if refresh_rate <= 0:
             raise ValueError("refresh_rate must be positive")
         self._home = hermes_home
         self._refresh_rate = refresh_rate
-        self._collector = Collector(hermes_home)
+        self._no_color = no_color
+        self._collector = Collector(hermes_home, profile_name=profile_name)
         self._theme = load_theme(hermes_home)
         self._view = ViewState()
-        self._state: DashboardState = DashboardState(hermes_home=hermes_home)
+        profile_mode_label = "root" if profile_name is None else f"profile:{profile_name}"
+        self._state: DashboardState = DashboardState(
+            hermes_home=hermes_home,
+            selected_profile=profile_name,
+            profile_mode_label=profile_mode_label,
+        )
         self._running = threading.Event()
         self._force_refresh = threading.Event()
         self._lock = threading.Lock()
@@ -99,6 +184,82 @@ class DashboardApp:
         finally:
             self._running.clear()
             self.close()
+
+    def _capture_layout_text(self, panel_num: int | None = None, refresh: bool = False) -> str:
+        if refresh:
+            self._set_state(self._collector.collect())
+        snapshot_console = Console(
+            width=max(self._console.width, 120),
+            height=max(self._console.height, 48),
+            force_terminal=not self._no_color,
+            no_color=self._no_color,
+        )
+        original_console = self._console
+        original_view = self._snapshot_view_state()
+        self._console = snapshot_console
+        try:
+            if panel_num is not None:
+                self._view.enter_detail(panel_num)
+            with snapshot_console.capture() as capture:
+                snapshot_console.print(self._build_layout())
+            return capture.get()
+        finally:
+            self._restore_view_state(original_view)
+            self._console = original_console
+
+    def render_snapshot_text(self, panel_num: int | None = None) -> str:
+        return self._capture_layout_text(panel_num=panel_num, refresh=True)
+
+    def render_current_view_text(self) -> str:
+        panel_num = None
+        with self._view_lock:
+            if self._view.mode == "detail":
+                panel_num = self._view.detail_panel
+        return self._capture_layout_text(panel_num=panel_num, refresh=False)
+
+    def render_snapshot(self, panel_num: int | None = None) -> None:
+        self._console.print(self.render_snapshot_text(panel_num=panel_num), end="")
+
+    def copy_current_view(self) -> str:
+        copied_text = self.render_current_view_text()
+        sequence = _osc52_sequence(copied_text)
+        self._console.file.write(sequence)
+        self._console.file.flush()
+        return copied_text
+
+    def _snapshot_view_state(self) -> dict[str, object]:
+        with self._view_lock:
+            return {
+                "mode": self._view.mode,
+                "detail_panel": self._view.detail_panel,
+                "focus_panel": self._view.focus_panel,
+                "scroll_offset": self._view.scroll_offset,
+                "log_sub_view": self._view.log_sub_view,
+                "show_help": self._view.show_help,
+                "profile_cycle_index": self._view.profile_cycle_index,
+                "filter_query": self._view.filter_query,
+                "filter_edit_mode": self._view.filter_edit_mode,
+                "session_sort": self._view.session_sort,
+            }
+
+    def _restore_view_state(self, snapshot: dict[str, object]) -> None:
+        with self._view_lock:
+            self._view.mode = str(snapshot["mode"])
+            detail_panel = snapshot["detail_panel"]
+            self._view.detail_panel = detail_panel if isinstance(detail_panel, int) else None
+            focus_panel = snapshot["focus_panel"]
+            self._view.focus_panel = focus_panel if isinstance(focus_panel, int) else 1
+            scroll_offset = snapshot["scroll_offset"]
+            self._view.scroll_offset = scroll_offset if isinstance(scroll_offset, int) else 0
+            self._view.log_sub_view = str(snapshot["log_sub_view"])
+            self._view.show_help = bool(snapshot["show_help"])
+            profile_cycle_index = snapshot["profile_cycle_index"]
+            self._view.profile_cycle_index = (
+                profile_cycle_index if isinstance(profile_cycle_index, int) else 0
+            )
+            self._view.filter_query = str(snapshot["filter_query"])
+            self._view.filter_edit_mode = bool(snapshot["filter_edit_mode"])
+            self._view.session_sort = str(snapshot["session_sort"])
 
     def close(self) -> None:
         self._running.clear()
@@ -167,6 +328,20 @@ class DashboardApp:
     def _handle_key(self, key: str) -> str | None:
         if not key:
             return None
+        if key[0] == "\x1b":
+            if len(key) == 1 and self._view.filter_edit_mode:
+                self._view.stop_filter()
+            elif len(key) == 1 and self._view.mode == "detail":
+                self._view.exit_detail()
+            return None
+        if self._view.filter_edit_mode:
+            if key in ("\r", "\n"):
+                self._view.stop_filter()
+            elif key in ("\x7f", "\b"):
+                self._view.pop_filter_char()
+            elif len(key) == 1 and key.isprintable():
+                self._view.append_filter_char(key)
+            return None
         if key == "q":
             return "quit"
         if key == "r":
@@ -175,12 +350,29 @@ class DashboardApp:
         if key == "?":
             self._view.show_help = not self._view.show_help
             return None
-        if key[0] == "\x1b":
-            if len(key) == 1 and self._view.mode == "detail":
-                self._view.exit_detail()
+        if key == "f":
+            self._view.toggle_focus()
+            return None
+        if key == "c":
+            self.copy_current_view()
             return None
         if key == "\t" and self._view.detail_panel == _LOG_PANEL_NUM:
             self._view.cycle_log_view()
+            return None
+        if key == "/" and self._view.detail_panel in {_SESSIONS_PANEL_NUM, _LOG_PANEL_NUM}:
+            self._view.start_filter()
+            return None
+        if key == "s" and self._view.detail_panel == _SESSIONS_PANEL_NUM:
+            self._view.cycle_session_sort()
+            return None
+        if key == "p" and self._view.detail_panel == _PROFILES_PANEL_NUM:
+            self._view.cycle_profile_view()
+            return None
+        if key == "g":
+            self._view.jump_top()
+            return None
+        if key == "G":
+            self._view.jump_bottom()
             return None
         if key in ("j",):
             self._view.scroll_down()
@@ -189,7 +381,7 @@ class DashboardApp:
             self._view.scroll_up()
             return None
         if len(key) == 1 and key.isdigit():
-            panel_num = int(key)
+            panel_num = 10 if key == "0" and 10 in _PANEL_NUMBERS else int(key)
             if panel_num in _PANEL_NUMBERS:
                 self._view.enter_detail(panel_num)
             return None
@@ -206,6 +398,10 @@ class DashboardApp:
             scroll_offset = self._view.scroll_offset
             log_sub_view = self._view.log_sub_view
             show_help = self._view.show_help
+            profile_view_index = self._view.profile_cycle_index
+            filter_query = self._view.filter_query
+            filter_edit_mode = self._view.filter_edit_mode
+            session_sort = self._view.session_sort
 
         layout = Layout()
         layout.split_column(
@@ -226,6 +422,9 @@ class DashboardApp:
                 detail=True,
                 log_sub_view=log_sub_view,
                 scroll_offset=scroll_offset,
+                profile_view_index=profile_view_index,
+                filter_query=filter_query,
+                session_sort=session_sort,
             )
             layout["body"].update(panel)
         else:
@@ -238,6 +437,9 @@ class DashboardApp:
                 input_error=input_error,
                 view_mode=mode,
                 detail_panel=detail_panel,
+                filter_query=filter_query,
+                filter_edit_mode=filter_edit_mode,
+                session_sort=session_sort,
             )
         )
         return layout
@@ -247,9 +449,17 @@ class DashboardApp:
         now = datetime.now().strftime("%H:%M:%S")
         t = Text(style="on #1A1A2E")
         t.append(" ⚕ hermesd ", style=f"bold {active_theme.banner_title} on #1A1A2E")
-        skin_label = f"{state.active_skin} skin" if state.active_skin != "default" else ""
-        padding = " " * max(1, 60 - len(skin_label) - len(now))
-        t.append(f"{padding}{skin_label}   {now} ", style=f"{active_theme.banner_dim} on #1A1A2E")
+        if state.runtime.banner:
+            t.append(
+                f" {state.runtime.banner} ",
+                style=f"bold {active_theme.ui_warn} on #1A1A2E",
+            )
+        right_labels = [state.profile_mode_label]
+        if state.active_skin != "default":
+            right_labels.insert(0, f"{state.active_skin} skin")
+        right_text = "   ".join(right_labels)
+        padding = " " * max(1, 60 - len(right_text) - len(now))
+        t.append(f"{padding}{right_text}   {now} ", style=f"{active_theme.banner_dim} on #1A1A2E")
         return t
 
     def _build_footer(
@@ -259,6 +469,9 @@ class DashboardApp:
         input_error: str | None = None,
         view_mode: str | None = None,
         detail_panel: int | None = None,
+        filter_query: str | None = None,
+        filter_edit_mode: bool | None = None,
+        session_sort: str | None = None,
     ) -> Text:
         active_theme = theme or self._theme
         if input_error is None:
@@ -266,36 +479,90 @@ class DashboardApp:
                 footer_error = self._input_error
         else:
             footer_error = input_error
-        if view_mode is None or detail_panel is None:
+        if (
+            view_mode is None
+            or detail_panel is None
+            or filter_query is None
+            or filter_edit_mode is None
+            or session_sort is None
+        ):
             with self._view_lock:
                 mode = self._view.mode if view_mode is None else view_mode
                 panel = self._view.detail_panel if detail_panel is None else detail_panel
+                query = self._view.filter_query if filter_query is None else filter_query
+                editing = (
+                    self._view.filter_edit_mode if filter_edit_mode is None else filter_edit_mode
+                )
+                sort_mode = self._view.session_sort if session_sort is None else session_sort
         else:
             mode = view_mode
             panel = detail_panel
+            query = filter_query
+            editing = filter_edit_mode
+            sort_mode = session_sort
         t = Text(style="on #1A1A2E")
         if mode == "overview":
-            t.append(" [1-8]", style=f"bold {active_theme.banner_title} on #1A1A2E")
+            t.append(
+                f" [{_panel_shortcut_label()}]",
+                style=f"bold {active_theme.banner_title} on #1A1A2E",
+            )
             t.append(" Expand  ", style=f"{active_theme.session_border} on #1A1A2E")
             t.append("[r]", style=f"bold {active_theme.banner_title} on #1A1A2E")
             t.append(" Refresh  ", style=f"{active_theme.session_border} on #1A1A2E")
             t.append("[q]", style=f"bold {active_theme.banner_title} on #1A1A2E")
             t.append(" Quit  ", style=f"{active_theme.session_border} on #1A1A2E")
             t.append("[?]", style=f"bold {active_theme.banner_title} on #1A1A2E")
-            t.append(" Help", style=f"{active_theme.session_border} on #1A1A2E")
+            t.append(" Help  ", style=f"{active_theme.session_border} on #1A1A2E")
+            t.append("[f]", style=f"bold {active_theme.banner_title} on #1A1A2E")
+            t.append(" Focus  ", style=f"{active_theme.session_border} on #1A1A2E")
+            t.append("[c]", style=f"bold {active_theme.banner_title} on #1A1A2E")
+            t.append(" Copy", style=f"{active_theme.session_border} on #1A1A2E")
         else:
             t.append(" [Esc]", style=f"bold {active_theme.banner_title} on #1A1A2E")
             t.append(" Back  ", style=f"{active_theme.session_border} on #1A1A2E")
+            t.append("[f]", style=f"bold {active_theme.banner_title} on #1A1A2E")
+            t.append(" Toggle focus  ", style=f"{active_theme.session_border} on #1A1A2E")
+            t.append("[c]", style=f"bold {active_theme.banner_title} on #1A1A2E")
+            t.append(" Copy  ", style=f"{active_theme.session_border} on #1A1A2E")
             t.append("[j/k]", style=f"bold {active_theme.banner_title} on #1A1A2E")
             t.append(" Scroll  ", style=f"{active_theme.session_border} on #1A1A2E")
             if panel == _LOG_PANEL_NUM:
                 t.append("[Tab]", style=f"bold {active_theme.banner_title} on #1A1A2E")
                 t.append(" Switch log  ", style=f"{active_theme.session_border} on #1A1A2E")
+            if panel in {_SESSIONS_PANEL_NUM, _LOG_PANEL_NUM}:
+                t.append("[/]", style=f"bold {active_theme.banner_title} on #1A1A2E")
+                t.append(" Filter  ", style=f"{active_theme.session_border} on #1A1A2E")
+            if panel == _SESSIONS_PANEL_NUM:
+                t.append("[s]", style=f"bold {active_theme.banner_title} on #1A1A2E")
+                t.append(" Sort  ", style=f"{active_theme.session_border} on #1A1A2E")
+                t.append(f"sort={sort_mode}  ", style=f"{active_theme.banner_dim} on #1A1A2E")
+            if panel in {7, _LOG_PANEL_NUM}:
+                t.append("[g/G]", style=f"bold {active_theme.banner_title} on #1A1A2E")
+                t.append(" Top/bottom  ", style=f"{active_theme.session_border} on #1A1A2E")
+            if panel == _PROFILES_PANEL_NUM:
+                t.append("[p]", style=f"bold {active_theme.banner_title} on #1A1A2E")
+                t.append(" Cycle profile  ", style=f"{active_theme.session_border} on #1A1A2E")
+            if editing:
+                t.append("[Enter]", style=f"bold {active_theme.banner_title} on #1A1A2E")
+                t.append(" Apply  ", style=f"{active_theme.session_border} on #1A1A2E")
+            if query:
+                t.append(f"filter={query}  ", style=f"{active_theme.banner_dim} on #1A1A2E")
             t.append("[q]", style=f"bold {active_theme.banner_title} on #1A1A2E")
             t.append(" Quit", style=f"{active_theme.session_border} on #1A1A2E")
 
         spinner = _DOTS_FRAMES[self._spinner_idx]
         stale = " (stale)" if state.is_stale else ""
+        t.append("  ", style=f"{active_theme.session_border} on #1A1A2E")
+        t.append("●", style=f"{_health_style(state)} on #1A1A2E")
+        t.append(
+            f" {state.health.ok_sources}/{state.health.total_sources}",
+            style=f"{active_theme.session_border} on #1A1A2E",
+        )
+        if state.health.failed_sources:
+            failed = ",".join(state.health.failed_sources[:3])
+            if len(state.health.failed_sources) > 3:
+                failed = f"{failed},+{len(state.health.failed_sources) - 3}"
+            t.append(f" {failed}", style=f"{active_theme.banner_dim} on #1A1A2E")
         t.append(
             f"   {spinner} {self._refresh_rate}s{stale}",
             style=f"{active_theme.session_border} on #1A1A2E",
@@ -303,6 +570,9 @@ class DashboardApp:
         if footer_error:
             t.append("  ", style=f"{active_theme.session_border} on #1A1A2E")
             t.append(footer_error, style=f"{active_theme.ui_error} on #1A1A2E")
+        elif state.runtime.banner:
+            t.append("  ", style=f"{active_theme.session_border} on #1A1A2E")
+            t.append(state.runtime.banner.lower(), style=f"{active_theme.ui_warn} on #1A1A2E")
         return t
 
     def _build_overview(self, state: DashboardState, theme: Theme | None = None) -> Layout:
@@ -310,74 +580,35 @@ class DashboardApp:
         width = self._console.width
         height = self._console.height
 
+        if width < 100 and height >= 50:
+            return self._build_overview_from_spec(state, active_theme, _TALL_NARROW_LAYOUT_SPEC)
         if width < 100 or height < 30:
-            return self._build_overview_compact(state, active_theme)
-        return self._build_overview_wide(state, active_theme)
+            return self._build_overview_from_spec(state, active_theme, _COMPACT_LAYOUT_SPEC)
+        return self._build_overview_from_spec(state, active_theme, _WIDE_LAYOUT_SPEC)
 
-    def _build_overview_wide(self, state: DashboardState, theme: Theme) -> Layout:
+    def _build_overview_from_spec(
+        self,
+        state: DashboardState,
+        theme: Theme,
+        spec: tuple[tuple[str, int | None, tuple[int, ...]], ...],
+    ) -> Layout:
         body = Layout()
-        body.split_column(
-            Layout(name="row1", size=4),
-            Layout(name="row2"),
-            Layout(name="row3"),
-            Layout(name="row4"),
-            Layout(name="row5", size=7),
-        )
-        body["row1"].update(render_panel(1, state, theme))
-
-        body["row2"].split_row(
-            Layout(name="r2l"),
-            Layout(name="r2r"),
-        )
-        body["row2"]["r2l"].update(render_panel(2, state, theme))
-        body["row2"]["r2r"].update(render_panel(3, state, theme))
-
-        body["row3"].split_row(
-            Layout(name="r3l"),
-            Layout(name="r3r"),
-        )
-        body["row3"]["r3l"].update(render_panel(4, state, theme))
-        body["row3"]["r3r"].update(render_panel(5, state, theme))
-
-        body["row4"].split_row(
-            Layout(name="r4l"),
-            Layout(name="r4r"),
-        )
-        body["row4"]["r4l"].update(render_panel(6, state, theme))
-        body["row4"]["r4r"].update(render_panel(7, state, theme))
-
-        body["row5"].update(render_panel(8, state, theme))
-        return body
-
-    def _build_overview_compact(self, state: DashboardState, theme: Theme) -> Layout:
-        body = Layout()
-        body.split_column(
-            Layout(name="row1", size=3),
-            Layout(name="row2", size=4),
-            Layout(name="row3", size=4),
-            Layout(name="row4", size=4),
-            Layout(name="row5", size=4),
-            Layout(name="row6"),
-        )
-        body["row1"].update(render_panel(1, state, theme))
-        body["row2"].update(render_panel(2, state, theme))
-        body["row3"].update(render_panel(3, state, theme))
-
-        body["row4"].split_row(
-            Layout(name="r4l"),
-            Layout(name="r4r"),
-        )
-        body["row4"]["r4l"].update(render_panel(4, state, theme))
-        body["row4"]["r4r"].update(render_panel(5, state, theme))
-
-        body["row5"].split_row(
-            Layout(name="r5l"),
-            Layout(name="r5r"),
-        )
-        body["row5"]["r5l"].update(render_panel(6, state, theme))
-        body["row5"]["r5r"].update(render_panel(7, state, theme))
-
-        body["row6"].update(render_panel(8, state, theme))
+        rows = [
+            Layout(name=row_name, size=row_size) if row_size is not None else Layout(name=row_name)
+            for row_name, row_size, _ in spec
+        ]
+        body.split_column(*rows)
+        for row_name, _, panel_nums in spec:
+            row = body[row_name]
+            if len(panel_nums) == 1:
+                row.update(render_panel(panel_nums[0], state, theme))
+                continue
+            row_children = [
+                Layout(name=f"{row_name}_{index}") for index, _ in enumerate(panel_nums, start=1)
+            ]
+            row.split_row(*row_children)
+            for index, panel_num in enumerate(panel_nums, start=1):
+                row[f"{row_name}_{index}"].update(render_panel(panel_num, state, theme))
         return body
 
     def _build_help(self, theme: Theme | None = None) -> Panel:
@@ -387,10 +618,16 @@ class DashboardApp:
         lines = Text()
         lines.append("  Keyboard Shortcuts\n\n", style=f"bold {active_theme.banner_title}")
         shortcuts = [
-            ("1-8", "Expand panel to full-screen"),
+            (_panel_shortcut_label(), "Expand panel to full-screen"),
             ("Esc", "Return to overview"),
+            ("f", "Toggle focus mode for the last selected panel"),
+            ("c", "Copy the current rendered view as plain text via OSC 52"),
             ("j/k", "Scroll down/up (detail mode)"),
             ("Tab", "Cycle log sub-view (logs panel)"),
+            ("/", "Edit detail filter (sessions/logs)"),
+            ("s", "Cycle session sort (Sessions panel)"),
+            ("g/G", "Jump to top/bottom in scrollable detail views"),
+            ("p", "Cycle viewed profile (Profiles panel)"),
             ("r", "Force refresh"),
             ("q", "Quit"),
             ("?", "Toggle this help"),
@@ -405,3 +642,39 @@ class DashboardApp:
             box=rich.box.HORIZONTALS,
             padding=(1, 2),
         )
+
+
+def _panel_range_label() -> str:
+    panel_numbers = sorted(PANEL_NAMES)
+    if not panel_numbers:
+        return ""
+    if panel_numbers == list(range(panel_numbers[0], panel_numbers[-1] + 1)):
+        return f"{panel_numbers[0]}-{panel_numbers[-1]}"
+    return ",".join(str(panel_num) for panel_num in panel_numbers)
+
+
+def _panel_shortcut_label() -> str:
+    panel_numbers = sorted(PANEL_NAMES)
+    if not panel_numbers:
+        return ""
+    if panel_numbers == list(range(1, 11)):
+        return "1-9,0"
+    if panel_numbers == list(range(panel_numbers[0], panel_numbers[-1] + 1)):
+        return f"{panel_numbers[0]}-{panel_numbers[-1]}"
+    shortcuts = ["0" if panel_num == 10 else str(panel_num) for panel_num in panel_numbers]
+    return ",".join(shortcuts)
+
+
+def _health_style(state: DashboardState) -> str:
+    if state.health.total_sources == 0:
+        return "#B8B8C7"
+    if state.health.ok_sources == state.health.total_sources:
+        return "#65D38A"
+    if state.health.ok_sources >= (state.health.total_sources // 2):
+        return "#F2C94C"
+    return "#FF6B6B"
+
+
+def _osc52_sequence(text: str) -> str:
+    encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    return f"\033]52;c;{encoded}\a"

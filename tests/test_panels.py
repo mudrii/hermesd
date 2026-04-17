@@ -144,13 +144,13 @@ def test_overview_panel_compact():
         skills_memory=SkillsMemory(
             skill_count=70,
             skill_categories=28,
-            memory_file_count=0,
             providers=[ProviderInfo(name="openai-codex", is_active=True)],
         ),
     )
     panel = render_panel(7, state, Theme(), detail=False)
     text = _render_to_str(panel)
     assert "70" in text
+    assert "Skills / Integrations" in text
 
 
 def test_logs_panel_compact():
@@ -162,3 +162,10 @@ def test_logs_panel_compact():
     panel = render_panel(8, state, Theme(), detail=False)
     text = _render_to_str(panel)
     assert "Session saved" in text
+
+
+def test_memory_panel_empty():
+    state = DashboardState()
+    panel = render_panel(10, state, Theme(), detail=False)
+    text = _render_to_str(panel)
+    assert "Memory" in text

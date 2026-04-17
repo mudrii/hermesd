@@ -8,7 +8,7 @@ from rich.text import Text
 from hermesd.models import DashboardState
 from hermesd.theme import Theme
 
-PanelRenderer = Callable[[DashboardState, Theme, bool, str, int], Panel]
+PanelRenderer = Callable[[DashboardState, Theme, bool, str, int, int, str, str], Panel]
 
 
 def _render_gateway_panel(
@@ -17,6 +17,9 @@ def _render_gateway_panel(
     detail: bool,
     log_sub_view: str,
     scroll_offset: int,
+    profile_view_index: int,
+    filter_query: str,
+    session_sort: str,
 ) -> Panel:
     from hermesd.panels.gateway import render_gateway
 
@@ -29,10 +32,19 @@ def _render_sessions_panel(
     detail: bool,
     log_sub_view: str,
     scroll_offset: int,
+    profile_view_index: int,
+    filter_query: str,
+    session_sort: str,
 ) -> Panel:
     from hermesd.panels.sessions import render_sessions
 
-    return render_sessions(state, theme, detail=detail)
+    return render_sessions(
+        state,
+        theme,
+        detail=detail,
+        filter_query=filter_query,
+        session_sort=session_sort,
+    )
 
 
 def _render_tokens_panel(
@@ -41,6 +53,9 @@ def _render_tokens_panel(
     detail: bool,
     log_sub_view: str,
     scroll_offset: int,
+    profile_view_index: int,
+    filter_query: str,
+    session_sort: str,
 ) -> Panel:
     from hermesd.panels.tokens import render_tokens
 
@@ -53,6 +68,9 @@ def _render_tools_panel(
     detail: bool,
     log_sub_view: str,
     scroll_offset: int,
+    profile_view_index: int,
+    filter_query: str,
+    session_sort: str,
 ) -> Panel:
     from hermesd.panels.tools import render_tools
 
@@ -65,6 +83,9 @@ def _render_config_panel(
     detail: bool,
     log_sub_view: str,
     scroll_offset: int,
+    profile_view_index: int,
+    filter_query: str,
+    session_sort: str,
 ) -> Panel:
     from hermesd.panels.config_panel import render_config
 
@@ -77,6 +98,9 @@ def _render_cron_panel(
     detail: bool,
     log_sub_view: str,
     scroll_offset: int,
+    profile_view_index: int,
+    filter_query: str,
+    session_sort: str,
 ) -> Panel:
     from hermesd.panels.cron import render_cron
 
@@ -89,6 +113,9 @@ def _render_overview_panel(
     detail: bool,
     log_sub_view: str,
     scroll_offset: int,
+    profile_view_index: int,
+    filter_query: str,
+    session_sort: str,
 ) -> Panel:
     from hermesd.panels.overview import render_overview
 
@@ -101,6 +128,9 @@ def _render_logs_panel(
     detail: bool,
     log_sub_view: str,
     scroll_offset: int,
+    profile_view_index: int,
+    filter_query: str,
+    session_sort: str,
 ) -> Panel:
     from hermesd.panels.logs import render_logs
 
@@ -110,7 +140,43 @@ def _render_logs_panel(
         detail=detail,
         sub_view=log_sub_view,
         scroll_offset=scroll_offset,
+        filter_query=filter_query,
     )
+
+
+def _render_profiles_panel(
+    state: DashboardState,
+    theme: Theme,
+    detail: bool,
+    log_sub_view: str,
+    scroll_offset: int,
+    profile_view_index: int,
+    filter_query: str,
+    session_sort: str,
+) -> Panel:
+    from hermesd.panels.profiles import render_profiles
+
+    return render_profiles(
+        state,
+        theme,
+        detail=detail,
+        profile_view_index=profile_view_index,
+    )
+
+
+def _render_memory_panel(
+    state: DashboardState,
+    theme: Theme,
+    detail: bool,
+    log_sub_view: str,
+    scroll_offset: int,
+    profile_view_index: int,
+    filter_query: str,
+    session_sort: str,
+) -> Panel:
+    from hermesd.panels.memory_panel import render_memory
+
+    return render_memory(state, theme, detail=detail)
 
 
 PANEL_NAMES = {
@@ -120,8 +186,10 @@ PANEL_NAMES = {
     4: "Tools",
     5: "Config",
     6: "Cron",
-    7: "Skills / Providers",
+    7: "Skills / Integrations",
     8: "Logs",
+    9: "Profiles",
+    10: "Memory",
 }
 
 # Deferred imports keep panel modules unloaded until they are actually rendered.
@@ -134,6 +202,8 @@ _RENDERERS: dict[int, PanelRenderer] = {
     6: _render_cron_panel,
     7: _render_overview_panel,
     8: _render_logs_panel,
+    9: _render_profiles_panel,
+    10: _render_memory_panel,
 }
 
 
@@ -144,8 +214,20 @@ def render_panel(
     detail: bool = False,
     log_sub_view: str = "agent",
     scroll_offset: int = 0,
+    profile_view_index: int = 0,
+    filter_query: str = "",
+    session_sort: str = "recent",
 ) -> Panel:
     renderer = _RENDERERS.get(panel_num)
     if renderer is None:
         return Panel(Text("Unknown panel"), title="?", border_style=theme.panel_border_style)
-    return renderer(state, theme, detail, log_sub_view, scroll_offset)
+    return renderer(
+        state,
+        theme,
+        detail,
+        log_sub_view,
+        scroll_offset,
+        profile_view_index,
+        filter_query,
+        session_sort,
+    )

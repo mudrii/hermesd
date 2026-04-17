@@ -184,6 +184,54 @@ def test_collect_config_personality_fallback(hermes_home: Path):
     c.close()
 
 
+def test_collect_config_tool_gateway_routes(hermes_home: Path, monkeypatch):
+    import yaml
+
+    cfg = hermes_home / "config.yaml"
+    cfg.write_text(
+        yaml.dump(
+            {
+                "model": {"default": "gpt-5.4", "provider": "openai-codex"},
+                "web": {"use_gateway": True},
+                "image_gen": {"use_gateway": False},
+                "tts": {"use_gateway": True},
+                "browser": {"use_gateway": False},
+            }
+        )
+    )
+    monkeypatch.setenv("TOOL_GATEWAY_DOMAIN", "gateway.example.com")
+    monkeypatch.setenv("TOOL_GATEWAY_SCHEME", "https")
+    monkeypatch.setenv("TOOL_GATEWAY_USER_TOKEN", "secret-token")
+    monkeypatch.setenv("FIRECRAWL_GATEWAY_URL", "https://firecrawl.example.com")
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    routes = {route.tool: route for route in state.config.tool_gateway_routes}
+    assert routes["web"].mode == "gateway"
+    assert routes["image_gen"].mode == "direct"
+    assert routes["tts"].mode == "gateway"
+    assert routes["browser"].mode == "direct"
+    assert all(route.token_present for route in routes.values())
+    assert state.config.tool_gateway_domain == "gateway.example.com"
+    assert state.config.tool_gateway_scheme == "https"
+    assert state.config.firecrawl_gateway_url == "https://firecrawl.example.com"
+    c.close()
+
+
+def test_collect_config_richer_agent_settings(populated_hermes_home: Path):
+    c = Collector(populated_hermes_home)
+    state = c.collect()
+    assert state.config.provider_routing_summary == "throughput only:2"
+    assert state.config.smart_model_routing_enabled is True
+    assert state.config.smart_model_routing_cheap_model == "openrouter/google/gemini-2.5-flash"
+    assert state.config.fallback_model_label == "anthropic/claude-sonnet-4-20250514"
+    assert state.config.dashboard_theme == "midnight"
+    assert state.config.session_reset_mode == "both"
+    assert state.config.memory_provider == "supermemory"
+    c.close()
+
+
 def test_collect_gateway_preserves_last_good_mapping_on_non_mapping_json(hermes_home: Path):
     gw = hermes_home / "gateway_state.json"
     gw.write_text(
@@ -240,6 +288,7 @@ def test_collect_logs_parses_format(hermes_home: Path, sample_logs: Path):
     assert len(state.logs.agent_lines) == 3
     line = state.logs.agent_lines[0]
     assert line.level == "INFO"
+    assert line.component == "hermes"
     assert "web_search" in line.message
     c.close()
 
