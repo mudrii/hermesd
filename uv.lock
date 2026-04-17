@@ -181,7 +181,7 @@ wheels = [
 
 [[package]]
 name = "hermesd"
-version = "2026.4.9"
+version = "2026.4.17"
 source = { editable = "." }
 dependencies = [
     { name = "pydantic" },

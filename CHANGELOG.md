@@ -7,56 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2026.4.17] - 2026-04-17
+
+### Added
+
+- Added two new read-only dashboard panels: **Profiles** for profile-scoped runtime inspection and **Memory** for persisted memory-file visibility.
+- Added one-shot snapshot export for automation and bug reports with `--snapshot`, `--snapshot-panel`, `--snapshot-file`, and `--snapshot-format json`.
+- Added richer detail-view controls: `f` focus toggle, `/` inline filters for Sessions and Logs, `s` session sorting, `g` / `G` jump navigation, `p` profile cycling, and `c` clipboard export via OSC 52.
+- Added deeper operational visibility across existing panels, including background processes, filesystem checkpoints, credential pools, Tool Gateway routing, token analytics, cron output summaries, and hooks/plugins/MCP/BOOT.md inventory.
+
 ### Changed
 
-- `--refresh-rate` now rejects non-positive values at argument parsing time instead of allowing a busy collector loop.
-- hermesd can now read profile-scoped runtime data with `--profile NAME` or `HERMES_PROFILE=NAME` while keeping root-only mode as the default; shared files still come from the root Hermes home.
-- Collector reads are more defensive against malformed Hermes files: gateway state, config, auth, and update metadata now ignore invalid shapes and continue rendering with the last valid data they can recover.
-- Log tailing now preserves the last good lines when a log file temporarily disappears or cannot be read, matching the dashboard's cache-preservation behavior.
-- The logs detail view now supports `j`/`k` scrolling, and compact overview mode now keeps panels 4 and 7 visible instead of dropping them on smaller terminals.
-- The dashboard theme now refreshes live when the active skin changes in `config.yaml`, so the header label and panel colors stay in sync.
-- Available tool discovery now unions tool names across session files instead of stopping at the first session entry that contains a `tools` list.
-- The overview layout is now driven by declarative layout specs, and footer/help panel-range hints derive from the panel registry instead of hardcoded `1-8` assumptions.
-- Added a read-only Profiles panel with per-profile session counts, log freshness, skill counts, DB size, SOUL excerpts, and panel-local `p` cycling that does not change the selected data source.
-- Sessions detail now surfaces `billing_provider`, `cost_status`, and `pricing_version` from the existing SQLite schema.
-- Panel 7 now shows redacted credential-pool metadata from `auth.json`, including auth type, source, status, request counts, cooldowns, and token presence without ever rendering secret values.
-- Panel 5 now surfaces Tool Gateway routing for `web`, `image_gen`, `tts`, and `browser`, including domain, scheme, Firecrawl endpoint, and token presence from config plus environment.
-- Panel 4 now shows read-only background-process checkpoint data from `processes.json`, including PID, notify-on-complete, watch-pattern summary, start time, and command for running processes.
-- Panel 3 now includes lightweight analytics in detail view: `7d`/`30d` token windows plus per-model and per-provider cost breakdowns derived from the existing session table.
-- Panel 2 now surfaces `parent_session_id` lineage in Sessions detail so child/compressed sessions are visible directly in the dashboard.
-- Panel 5 now shows additional config metadata already present in `config.yaml`, including provider routing summary, smart routing, fallback model, dashboard theme, session reset mode, and memory provider.
-- Panel 6 now enriches cron jobs with delivery targets plus latest saved output summaries from `cron/output/`, including explicit `[SILENT]` runs.
-- Panel 8 now includes a fourth `cron` tab that tails the most recent saved cron output file.
-- Panel 7 now surfaces read-only integration inventory from the Hermes home: user hooks, installed plugins, configured MCP servers, and `BOOT.md` presence alongside providers, credential pools, and skills.
-- Panel 4 now shows filesystem checkpoint repos from `checkpoints/`, including workdir name, commit depth, and the latest checkpoint reason.
-- Added a dedicated Memory panel that surfaces the configured memory provider, `MEMORY.md` and `USER.md` word counts, `SOUL.md` size/excerpt, and memory file inventory without conflating that data with skills/integrations.
-- Panels 2 and 8 now support richer inline detail filtering with `/`, including live query editing, persisted filters after `Enter`, and field-aware queries for sessions/logs.
-- Sessions detail now supports `s` sort cycling for recent/cost/token views, and scrollable detail views support `g`/`G` jump-to-top/jump-to-bottom navigation.
-- Added `f` as a focus toggle for the last selected panel, reusing the full-screen detail view as a quick overview/detail switch instead of requiring digit re-entry every time.
-- Narrow but tall terminals now get a dedicated single-column 10-row overview layout instead of the denser compact mixed grid, which improves readability in vertical tmux splits.
-- The footer now shows a collector health indicator with `ok/total` source counts and degraded-source names, while preserving the last good source data if one collector slice raises unexpectedly during refresh.
-- The header and footer now surface an `AGENT OFFLINE` banner when the gateway is down and there has been no recent runtime activity under the selected profile, making “idle because stopped” clearer than a merely quiet dashboard.
-- hermesd now supports `--snapshot` for one-shot overview rendering to stdout without entering the live TUI loop, `--snapshot-panel N` for selecting a text detail view or annotating JSON snapshot output, and `--snapshot-file PATH` for writing either form to disk.
-- Pressing `c` now copies the current rendered view as plain text via OSC 52, so overview and detail panels can be pasted directly into bug reports or chats from compatible terminals.
-- Sessions detail search now supports `message:term` / `msg:term`, using SQLite-backed message-content lookup to find sessions by conversation text instead of only session metadata.
-- Logs detail search now supports `minlevel:` severity thresholds in addition to exact `level:` matching, so warning-or-higher and error-only views are easier to isolate.
-- SQLite cache invalidation now tracks `PRAGMA data_version` per cached reader, so sessions, tool stats, and repeated message-search queries all refresh correctly after database writes.
-- Log tailing is now configurable with `--log-tail-bytes`, making large log files cheaper to monitor without changing the rendered panel behavior.
-- Snapshot export now supports `--snapshot-format json`, producing a machine-readable full-state payload with optional selected-panel metadata for automation and bug-report attachments.
-- Panel expansion shortcuts now match the actual keyboard contract: use `1`-`9` for panels 1-9 and `0` for panel 10.
-- `HermesDB` now serializes shared SQLite connection access across the collector and render threads, preventing concurrent read/search races against the same read-only connection and keeping cache metadata consistent.
-- Collector health counts now derive from the actual `safe_collect` calls, so the footer reflects all 18 sources instead of a stale hardcoded denominator.
-- Gateway version parsing now reads `project.version` from `pyproject.toml`, skill descriptions now parse YAML frontmatter correctly, and log tails preserve the last good content when a rotated file is briefly empty or a saved cron output disappears.
-- Panel 5 now labels Tool Gateway environment-derived values as dashboard-local env data instead of implying they came from Hermes Agent runtime state.
-- Removed unused helpers `HermesDB.read_token_totals()`, `Collector.set_profile()`, and `app._panel_range_label()` to keep the codebase aligned with live production paths.
-- `--snapshot-panel 0` now aliases panel 10 in snapshot mode, matching the documented interactive shortcut and deriving validity from the live panel registry instead of a hardcoded range.
-- View-state snapshot/restore now uses a typed dataclass, logs reject unknown `minlevel:` values instead of silently showing the full stream, and filter parsers use typed criteria instead of `dict[str, object]` plus runtime asserts.
-- Unknown skins now normalize to `default` at collection time, preventing per-refresh theme reload churn and keeping the header/footer skin label aligned with the active theme.
-- `LastGoodFileCache` now remembers invalid-shape mtimes for JSON/YAML reads so repeated polls reuse the last good value without reparsing the same bad file until it changes again.
-- Sessions message-search extraction now follows the existing “last field wins” filter semantics when multiple `message:` / `msg:` clauses are present.
-- Tool Gateway env values and MCP server targets now redact secret-bearing URL query params and command arguments before rendering them in dashboard panels or snapshots.
-- Sessions message search now falls back to SQL `LIKE` matching when FTS yields no matches for punctuation-heavy queries, reducing false negatives in detail filters.
-- Panel 4 now labels its first detail column generically to match both per-tool and fallback per-session call summaries.
+- hermesd can now read profile-scoped runtime data with `--profile NAME` or `HERMES_PROFILE=NAME` while keeping root-only reads as the default.
+- The dashboard now supports a full 10-panel overview, including a dedicated tall single-column layout for narrow but high terminals such as vertical tmux splits.
+- Panel shortcuts now match the live UI contract: `1`-`9` open panels 1-9 and `0` opens panel 10, including snapshot mode.
+- Sessions detail now exposes billing metadata and parent-session lineage, making cost attribution and compression chains visible without querying SQLite directly.
+- Logs now include a fourth `cron` tab, field-aware filtering, severity-threshold filtering via `minlevel:`, and more consistent scrolling behavior.
+- The header and footer now surface clearer runtime state with an offline banner, collector health counts, and degraded-source names when a refresh partially fails.
+- Theme updates now reload live from `config.yaml`, and unknown skins normalize to `default` so the rendered theme stays stable.
+
+### Fixed
+
+- Collector reads are now more defensive against malformed Hermes files and keep the last good state instead of blanking panels on transient bad input.
+- SQLite access is now serialized across threads and cache invalidation now tracks `PRAGMA data_version`, which fixes stale session, tool, and message-search reads after database updates.
+- Log reads now preserve the last good content when files rotate, disappear briefly, or saved cron output becomes temporarily unavailable.
+- Session message search now falls back to SQL `LIKE` when FTS misses punctuation-heavy queries, reducing false negatives in Sessions filtering.
+- Tool Gateway and MCP metadata now redact secret-bearing query params and command arguments before rendering them in panels or snapshots.
+- `--refresh-rate` and `--log-tail-bytes` now reject non-positive values at argument parsing time instead of allowing invalid runtime behavior.
 
 ### Developer tooling
 

@@ -21,12 +21,20 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 2. **Write the failing test first** — acceptance-level if user-visible, unit-level otherwise
 3. **Implement the minimum change** that makes the test pass
 4. **Refactor while green** — improve naming/cohesion without changing behavior
-5. **Run the full suite** — `uv run pytest tests/ -v` (all 306+ tests must pass)
+5. **Run the full suite** — `uv run pytest tests/ -v`
 6. **Run lint + type + audit** — `uv run ruff check . && uv run ruff format --check . && uv run mypy hermesd && uv run pip-audit`
 7. **Test the TUI manually** — run `hermesd` and verify your changes look correct
    Consider both text and JSON snapshot paths when you change CLI/render surfaces (`--snapshot-format json`).
 8. **Update `CHANGELOG.md`** for user-visible changes
 9. **Open a PR** with a clear description
+
+## Release Checklist
+
+1. Merge the release PR only after the full local and CI gate set passes.
+2. Make sure `README.md`, `CHANGELOG.md`, and any affected contributor docs match the shipped behavior.
+3. Move the current user-facing notes from `[Unreleased]` into a dated release section in `CHANGELOG.md`.
+4. Bump the package version in `pyproject.toml` and the editable-package entry in `uv.lock`.
+5. Create and publish a GitHub Release tagged `vYYYY.M.D`; PyPI publishing runs from `.github/workflows/python-publish.yml` after the release is published.
 
 ## Code Guidelines
 

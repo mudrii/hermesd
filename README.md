@@ -304,7 +304,7 @@ uv pip install -e ".[dev]"
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy hermesd
-uv run pytest tests/ -v          # 300+ tests
+uv run pytest tests/ -v
 uv run pip-audit
 
 # Run the dashboard
@@ -312,6 +312,10 @@ hermesd
 ```
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full TDD-first contributor workflow.
+
+### Releases
+
+User-facing release notes live in [`CHANGELOG.md`](CHANGELOG.md). PyPI publishing is driven from GitHub Releases: tag the release as `vYYYY.M.D`, publish the release on GitHub, and the `python-publish` workflow will build and upload the package after the full CI gate passes.
 
 ### Project Structure
 
@@ -339,7 +343,7 @@ hermesd/
     profiles.py        [9] Profiles
     memory_panel.py    [10] Memory
     logs.py            [8] Logs
-tests/                 300+ tests: panels, data, resilience, edge cases
+tests/                 Test suite: panels, data, resilience, edge cases
 ```
 
 ### Adding a Panel

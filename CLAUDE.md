@@ -12,7 +12,7 @@
 uv venv .venv --python 3.11
 source .venv/bin/activate
 uv pip install -e ".[dev]"
-uv run pytest tests/ -v             # 306 tests
+uv run pytest tests/ -v             # full suite
 hermesd                              # run the dashboard
 hermesd --hermes-home /path          # custom hermes home
 hermesd --profile coding             # opt-in profile-scoped runtime data
