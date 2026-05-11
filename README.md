@@ -193,7 +193,7 @@ hermesd --no-color
 # Show version
 hermesd --version
 
-# Write a one-shot overview snapshot to a file
+# Write a one-shot overview snapshot outside the Hermes home
 hermesd --snapshot-file /tmp/hermesd.txt
 
 # Export a single panel detail snapshot

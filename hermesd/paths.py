@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
 
 
 @dataclass(frozen=True, slots=True)
@@ -12,7 +12,12 @@ class HermesPaths:
     def __post_init__(self) -> None:
         if self.profile_name is None:
             return
-        profile_home = self.root_home / "profiles" / self.profile_name
+        if not _is_valid_profile_name(self.profile_name):
+            raise ValueError(f"Invalid profile name '{self.profile_name}'")
+        profiles_home = (self.root_home / "profiles").resolve(strict=False)
+        profile_home = (profiles_home / self.profile_name).resolve(strict=False)
+        if not profile_home.is_relative_to(profiles_home):
+            raise ValueError(f"Invalid profile name '{self.profile_name}'")
         if not profile_home.is_dir():
             raise ValueError(f"Profile '{self.profile_name}' does not exist")
 
@@ -37,3 +42,9 @@ class HermesPaths:
 
     def profile_path(self, *parts: str) -> Path:
         return self.profile_home.joinpath(*parts)
+
+
+def _is_valid_profile_name(profile_name: str) -> bool:
+    if profile_name in {"", ".", ".."}:
+        return False
+    return PurePath(profile_name).name == profile_name

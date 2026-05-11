@@ -8,7 +8,7 @@ import time
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import yaml
@@ -49,6 +49,8 @@ from hermesd.models import (
 from hermesd.paths import HermesPaths
 from hermesd.theme import normalize_skin_name
 
+T = TypeVar("T")
+
 
 class Collector:
     def __init__(
@@ -68,17 +70,18 @@ class Collector:
         self._available_tools_cache_mtime: float | None = None
         self._available_tools_cache_value: tuple[int, list[str]] = (0, [])
         self._last_state: DashboardState | None = None
+        self._last_session_rows: list[dict[str, Any]] = []
 
     def collect(self) -> DashboardState:
         failed_sources: list[str] = []
         total_sources = 0
 
         def safe_collect(
-            fallback: Callable[[], Any],
+            fallback: Callable[[], T],
             source_name: str,
-            fn: Callable[[], Any],
-            default_factory: Callable[[], Any],
-        ) -> Any:
+            fn: Callable[[], T],
+            default_factory: Callable[[], T],
+        ) -> T:
             nonlocal total_sources
             total_sources += 1
             try:
@@ -89,6 +92,9 @@ class Collector:
                     return fallback()
                 except Exception:
                     return default_factory()
+
+        def empty_session_rows() -> list[dict[str, Any]]:
+            return []
 
         available_tools = safe_collect(
             lambda: (
@@ -104,12 +110,21 @@ class Collector:
             lambda: (0, []),
         )
         tool_count, tool_names = available_tools
-        sessions = safe_collect(
-            lambda: self._last_state.sessions if self._last_state is not None else [],
+        session_rows = safe_collect(
+            lambda: self._last_session_rows,
             "sessions",
-            self._collect_sessions,
-            list,
+            self._db.read_sessions,
+            empty_session_rows,
         )
+        self._last_session_rows = session_rows
+        sessions = self._collect_sessions(session_rows)
+        session_rows_stale = "sessions" in failed_sources
+
+        def fresh_session_rows() -> list[dict[str, Any]]:
+            if session_rows_stale:
+                raise RuntimeError("session rows are stale")
+            return session_rows
+
         state = DashboardState(
             hermes_home=self._paths.root_home,
             selected_profile=self._paths.profile_name,
@@ -131,7 +146,7 @@ class Collector:
                     else TokenSummary()
                 ),
                 "tokens_today",
-                self._collect_tokens_today,
+                lambda: self._collect_tokens_today(fresh_session_rows()),
                 TokenSummary,
             ),
             tokens_total=safe_collect(
@@ -141,7 +156,7 @@ class Collector:
                     else TokenSummary()
                 ),
                 "tokens_total",
-                self._collect_tokens_total,
+                lambda: self._collect_tokens_total(fresh_session_rows()),
                 TokenSummary,
             ),
             token_analytics=safe_collect(
@@ -151,19 +166,22 @@ class Collector:
                     else TokenAnalytics()
                 ),
                 "token_analytics",
-                self._collect_token_analytics,
+                lambda: self._collect_token_analytics(fresh_session_rows()),
                 TokenAnalytics,
             ),
             tool_stats=safe_collect(
                 lambda: self._last_state.tool_stats if self._last_state is not None else [],
                 "tool_stats",
-                self._collect_tool_stats,
+                lambda: self._collect_tool_stats(
+                    session_rows,
+                    session_rows_stale=session_rows_stale,
+                ),
                 list,
             ),
             total_tool_calls=safe_collect(
                 lambda: self._last_state.total_tool_calls if self._last_state is not None else 0,
                 "tool_call_total",
-                self._collect_total_tool_calls,
+                lambda: self._collect_total_tool_calls(fresh_session_rows()),
                 int,
             ),
             available_tools=tool_count,
@@ -345,8 +363,9 @@ class Collector:
             behind = _coerce_int(update_check.get("behind"))
         return version, behind
 
-    def _collect_sessions(self) -> list[SessionInfo]:
-        rows = self._db.read_sessions()
+    def _collect_sessions(self, rows: list[dict[str, Any]] | None = None) -> list[SessionInfo]:
+        if rows is None:
+            rows = self._db.read_sessions()
         return [
             SessionInfo(
                 session_id=r["id"],
@@ -372,17 +391,22 @@ class Collector:
             for r in rows
         ]
 
-    def _collect_tokens_today(self) -> TokenSummary:
+    def _collect_tokens_today(self, rows: list[dict[str, Any]] | None = None) -> TokenSummary:
+        if rows is None:
+            rows = self._db.read_sessions()
         return _summarize_tokens(
-            self._db.read_sessions(),
+            rows,
             started_at_min=_today_epoch(),
         )
 
-    def _collect_tokens_total(self) -> TokenSummary:
-        return _summarize_tokens(self._db.read_sessions())
+    def _collect_tokens_total(self, rows: list[dict[str, Any]] | None = None) -> TokenSummary:
+        if rows is None:
+            rows = self._db.read_sessions()
+        return _summarize_tokens(rows)
 
-    def _collect_token_analytics(self) -> TokenAnalytics:
-        rows = self._db.read_sessions()
+    def _collect_token_analytics(self, rows: list[dict[str, Any]] | None = None) -> TokenAnalytics:
+        if rows is None:
+            rows = self._db.read_sessions()
         return TokenAnalytics(
             windows=[
                 _summarize_window("7d", rows, days=7),
@@ -392,13 +416,19 @@ class Collector:
             by_provider=_summarize_breakdown(rows, key_name="billing_provider"),
         )
 
-    def _collect_tool_stats(self) -> list[ToolStats]:
+    def _collect_tool_stats(
+        self,
+        session_rows: list[dict[str, Any]] | None = None,
+        session_rows_stale: bool = False,
+    ) -> list[ToolStats]:
         # Try messages table first (has per-tool breakdown)
         rows = self._db.read_tool_stats()
         if rows:
             return [ToolStats(name=r["tool_name"], call_count=r["call_count"]) for r in rows]
         # Fall back to per-session tool_call_count
-        sessions = self._db.read_sessions()
+        if session_rows_stale:
+            raise RuntimeError("session rows are stale")
+        sessions = session_rows if session_rows is not None else self._db.read_sessions()
         stats = []
         for s in sessions:
             tc = s.get("tool_call_count") or 0
@@ -409,8 +439,10 @@ class Collector:
                 stats.append(ToolStats(name=label, call_count=tc))
         return sorted(stats, key=lambda t: t.call_count, reverse=True)
 
-    def _collect_total_tool_calls(self) -> int:
-        return sum(r.get("tool_call_count") or 0 for r in self._db.read_sessions())
+    def _collect_total_tool_calls(self, rows: list[dict[str, Any]] | None = None) -> int:
+        if rows is None:
+            rows = self._db.read_sessions()
+        return sum(r.get("tool_call_count") or 0 for r in rows)
 
     def _collect_background_processes(self) -> list[BackgroundProcessInfo]:
         entries = self._read_json_list_cached(self._paths.shared_path("processes.json"))

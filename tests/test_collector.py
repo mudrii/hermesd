@@ -238,3 +238,81 @@ def test_collect_preserves_last_good_source_on_failure(populated_hermes_home: Pa
     assert "tool_stats" in state2.health.failed_sources
     assert state2.health.ok_sources == state2.health.total_sources - 1
     c.close()
+
+
+def test_collect_reads_session_rows_once_per_cycle(hermes_home: Path):
+    class CountingDB:
+        def __init__(self) -> None:
+            self.session_reads = 0
+
+        def read_sessions(self) -> list[dict[str, object]]:
+            self.session_reads += 1
+            return [
+                {
+                    "id": "sess_once",
+                    "source": "cli",
+                    "model": "gpt-5.4",
+                    "parent_session_id": None,
+                    "billing_provider": "openai",
+                    "cost_status": "",
+                    "pricing_version": "",
+                    "message_count": 2,
+                    "tool_call_count": 3,
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_read_tokens": 25,
+                    "cache_write_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "estimated_cost_usd": 0.01,
+                    "started_at": time.time(),
+                    "ended_at": None,
+                    "title": "Session once",
+                }
+            ]
+
+        def read_tool_stats(self) -> list[dict[str, object]]:
+            return []
+
+        def close(self) -> None:
+            pass
+
+    db = CountingDB()
+    c = Collector(hermes_home)
+    c._db = db
+
+    state = c.collect()
+
+    assert db.session_reads == 1
+    assert state.sessions[0].session_id == "sess_once"
+    assert state.tokens_total.input_tokens == 100
+    assert state.total_tool_calls == 3
+    assert state.tool_stats[0].name == "cli:s_once"
+    c.close()
+
+
+def test_collect_marks_session_derived_sources_failed_when_session_read_fails(
+    populated_hermes_home: Path,
+    monkeypatch,
+):
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    state1 = c.collect()
+
+    def boom() -> list[dict[str, object]]:
+        raise RuntimeError("sessions unavailable")
+
+    monkeypatch.setattr(c._db, "read_sessions", boom)
+    monkeypatch.setattr(c._db, "read_tool_stats", lambda: [])
+
+    state2 = c.collect()
+
+    assert state2.sessions == state1.sessions
+    assert state2.tokens_total == state1.tokens_total
+    assert set(state2.health.failed_sources) >= {
+        "sessions",
+        "tokens_today",
+        "tokens_total",
+        "token_analytics",
+        "tool_stats",
+        "tool_call_total",
+    }
+    c.close()

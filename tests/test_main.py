@@ -129,6 +129,24 @@ def test_main_snapshot_file_writes_output(populated_hermes_home: Path, tmp_path:
     assert "Memory" in text
 
 
+def test_main_rejects_snapshot_file_under_hermes_home(populated_hermes_home: Path):
+    output_path = populated_hermes_home / "snapshot.txt"
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "--hermes-home",
+                str(populated_hermes_home),
+                "--snapshot-file",
+                str(output_path),
+                "--no-color",
+            ]
+        )
+
+    assert exc.value.code == 1
+    assert not output_path.exists()
+
+
 def test_main_snapshot_panel_outputs_detail(populated_hermes_home: Path, capsys):
     main(
         [

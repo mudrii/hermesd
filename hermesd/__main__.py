@@ -109,12 +109,24 @@ def resolve_profile_name(args: argparse.Namespace) -> str | None:
     return None
 
 
+def _snapshot_file_inside_hermes_home(snapshot_file: Path, hermes_home: Path) -> bool:
+    output_path = snapshot_file.expanduser().resolve(strict=False)
+    home_path = hermes_home.expanduser().resolve(strict=False)
+    return output_path == home_path or output_path.is_relative_to(home_path)
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     hermes_home = resolve_hermes_home(args)
     profile_name = resolve_profile_name(args)
     if not hermes_home.is_dir():
         print(f"Error: {hermes_home} does not exist", file=sys.stderr)
+        sys.exit(1)
+    if args.snapshot_file is not None and _snapshot_file_inside_hermes_home(
+        args.snapshot_file,
+        hermes_home,
+    ):
+        print("Error: --snapshot-file must not write under hermes home", file=sys.stderr)
         sys.exit(1)
     from hermesd.app import DashboardApp
 

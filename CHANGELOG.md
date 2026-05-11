@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `--snapshot-file` now rejects output paths under the Hermes home to preserve hermesd's read-only observer contract.
+- Profile names from `--profile` and `HERMES_PROFILE` are now validated as single path segments before profile-scoped reads are resolved.
+
+### Fixed
+
+- SQLite read-only URIs now handle Hermes home paths containing URI metacharacters such as `?` and `#`.
+- Collector health now marks session-derived summaries as degraded when session rows are served from stale cache after a read failure.
+- The developer workflow docs now point at the active `.codex` rule and skill paths.
+
 ## [2026.4.17] - 2026-04-17
 
 ### Added

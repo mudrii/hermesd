@@ -36,7 +36,7 @@ class HermesDB:
             self._conn = None
         if not self._path.exists():
             return
-        self._uri = f"file:{self._path}?mode=ro"
+        self._uri = f"{self._path.resolve().as_uri()}?mode=ro"
         try:
             self._conn = sqlite3.connect(self._uri, uri=True, timeout=2, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row

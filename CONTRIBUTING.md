@@ -15,7 +15,7 @@ uv run pytest tests/ -v
 
 ## Development Workflow
 
-This project uses **TDD/ATDD** — write the failing test first, then the smallest implementation that makes it pass, then refactor while green. See `.claude/skills/py-rig/SKILL.md` for the full discipline.
+This project uses **TDD/ATDD** — write the failing test first, then the smallest implementation that makes it pass, then refactor while green. See `.codex/skills/py-rig/SKILL.md` for the full discipline.
 
 1. **Create a branch** from `main`
 2. **Write the failing test first** — acceptance-level if user-visible, unit-level otherwise
@@ -38,7 +38,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 
 ## Code Guidelines
 
-- **Python 3.11+** — see `.claude/rules/python-idioms.md` for version-safe modern syntax
+- **Python 3.11+** — see `.codex/rules/python-idioms.md` for version-safe modern syntax
 - **`from __future__ import annotations`** at the top of every module
 - **Type annotations** on all public functions; `mypy` enforces this in CI
 - **Pydantic models** for data structures; `@dataclass(frozen=True, slots=True)` for value objects
