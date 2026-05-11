@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 
 from hermesd.db import HermesDB
+from tests.conftest import create_state_db_tables
 
 
 def test_tool_stats_with_data(sample_db, hermes_home):
@@ -18,28 +19,7 @@ def test_tool_stats_with_data(sample_db, hermes_home):
 def test_sessions_empty_db(hermes_home):
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
-    conn.executescript("""
-        CREATE TABLE sessions (
-            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
-            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
-            started_at REAL, ended_at REAL, end_reason TEXT,
-            message_count INTEGER, tool_call_count INTEGER,
-            input_tokens INTEGER, output_tokens INTEGER,
-            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
-            reasoning_tokens INTEGER, billing_provider TEXT,
-            billing_base_url TEXT, billing_mode TEXT,
-            estimated_cost_usd REAL, actual_cost_usd REAL,
-            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
-            title TEXT
-        );
-        CREATE TABLE messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
-            tool_calls TEXT, tool_name TEXT, timestamp REAL,
-            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
-            reasoning_details TEXT, codex_reasoning_items TEXT
-        );
-    """)
+    create_state_db_tables(conn, include_schema_version=False)
     conn.close()
     db = HermesDB(hermes_home / "state.db")
     sessions = db.read_sessions()
@@ -47,31 +27,27 @@ def test_sessions_empty_db(hermes_home):
     db.close()
 
 
+def test_read_only_uri_is_immutable_and_does_not_create_sidecars(tmp_path: Path):
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.execute("INSERT INTO sessions (id, source, started_at) VALUES ('sess_001', 'cli', 1.0)")
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path)
+    assert db.read_sessions()[0]["id"] == "sess_001"
+    assert "mode=ro&immutable=1" in db._uri
+    assert not db_path.with_name("state.db-wal").exists()
+    assert not db_path.with_name("state.db-shm").exists()
+    db.close()
+
+
 def test_empty_sessions_are_cached(hermes_home, monkeypatch):
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
-    conn.executescript("""
-        CREATE TABLE sessions (
-            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
-            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
-            started_at REAL, ended_at REAL, end_reason TEXT,
-            message_count INTEGER, tool_call_count INTEGER,
-            input_tokens INTEGER, output_tokens INTEGER,
-            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
-            reasoning_tokens INTEGER, billing_provider TEXT,
-            billing_base_url TEXT, billing_mode TEXT,
-            estimated_cost_usd REAL, actual_cost_usd REAL,
-            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
-            title TEXT
-        );
-        CREATE TABLE messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
-            tool_calls TEXT, tool_name TEXT, timestamp REAL,
-            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
-            reasoning_details TEXT, codex_reasoning_items TEXT
-        );
-    """)
+    create_state_db_tables(conn, include_schema_version=False)
     conn.close()
     db = HermesDB(db_path)
     reads = 0
@@ -93,28 +69,7 @@ def test_empty_sessions_are_cached(hermes_home, monkeypatch):
 def test_empty_tool_stats_are_cached(hermes_home):
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
-    conn.executescript("""
-        CREATE TABLE sessions (
-            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
-            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
-            started_at REAL, ended_at REAL, end_reason TEXT,
-            message_count INTEGER, tool_call_count INTEGER,
-            input_tokens INTEGER, output_tokens INTEGER,
-            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
-            reasoning_tokens INTEGER, billing_provider TEXT,
-            billing_base_url TEXT, billing_mode TEXT,
-            estimated_cost_usd REAL, actual_cost_usd REAL,
-            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
-            title TEXT
-        );
-        CREATE TABLE messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
-            tool_calls TEXT, tool_name TEXT, timestamp REAL,
-            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
-            reasoning_details TEXT, codex_reasoning_items TEXT
-        );
-    """)
+    create_state_db_tables(conn, include_schema_version=False)
     conn.close()
     db = HermesDB(db_path)
     reads = 0
@@ -137,27 +92,8 @@ def test_read_only_uri_handles_uri_metacharacters(tmp_path: Path):
     hermes_home.mkdir()
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
     conn.executescript("""
-        CREATE TABLE sessions (
-            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
-            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
-            started_at REAL, ended_at REAL, end_reason TEXT,
-            message_count INTEGER, tool_call_count INTEGER,
-            input_tokens INTEGER, output_tokens INTEGER,
-            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
-            reasoning_tokens INTEGER, billing_provider TEXT,
-            billing_base_url TEXT, billing_mode TEXT,
-            estimated_cost_usd REAL, actual_cost_usd REAL,
-            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
-            title TEXT
-        );
-        CREATE TABLE messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
-            tool_calls TEXT, tool_name TEXT, timestamp REAL,
-            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
-            reasoning_details TEXT, codex_reasoning_items TEXT
-        );
         INSERT INTO sessions (id, source, started_at) VALUES ('sess_uri', 'cli', 1.0);
     """)
     conn.close()
@@ -165,8 +101,8 @@ def test_read_only_uri_handles_uri_metacharacters(tmp_path: Path):
     db = HermesDB(db_path)
     sessions = db.read_sessions()
     assert [row["id"] for row in sessions] == ["sess_uri"]
-    assert "mode=ro" in db._uri
-    assert "?" not in db._uri.removeprefix("file://").split("?mode=ro", 1)[0]
+    assert "mode=ro&immutable=1" in db._uri
+    assert "?" not in db._uri.removeprefix("file://").split("?mode=ro&immutable=1", 1)[0]
     db.close()
 
 
@@ -342,27 +278,8 @@ def test_search_session_ids_by_message_refreshes_same_query_after_write(sample_d
 def test_search_session_ids_by_message_falls_back_to_like_when_fts_misses(hermes_home):
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
     conn.executescript("""
-        CREATE TABLE sessions (
-            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
-            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
-            started_at REAL, ended_at REAL, end_reason TEXT,
-            message_count INTEGER, tool_call_count INTEGER,
-            input_tokens INTEGER, output_tokens INTEGER,
-            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
-            reasoning_tokens INTEGER, billing_provider TEXT,
-            billing_base_url TEXT, billing_mode TEXT,
-            estimated_cost_usd REAL, actual_cost_usd REAL,
-            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
-            title TEXT
-        );
-        CREATE TABLE messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
-            tool_calls TEXT, tool_name TEXT, timestamp REAL,
-            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
-            reasoning_details TEXT, codex_reasoning_items TEXT
-        );
         INSERT INTO sessions VALUES (
             'sess_001', 'cli', NULL, 'gpt-5.4',
             NULL, NULL, NULL,

@@ -3,8 +3,13 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
+
+T = TypeVar("T")
+_RECONNECT_ERROR_THRESHOLD = 3
+_CONNECT_BACKOFF_READS = 2
 
 
 class HermesDB:
@@ -15,39 +20,89 @@ class HermesDB:
         self._current_data_version: int | None = None
         self._cached_sessions: list[dict[str, Any]] = []
         self._cached_sessions_version: int | None = None
+        self._cached_sessions_initialized = False
         self._cached_session_count = 0
         self._cached_session_count_version: int | None = None
+        self._cached_session_count_initialized = False
         self._cached_tool_stats: list[dict[str, Any]] = []
         self._cached_tool_stats_version: int | None = None
+        self._cached_tool_stats_initialized = False
+        self._last_read_sessions_stale = False
+        self._last_read_session_count_stale = False
+        self._last_read_tool_stats_stale = False
         self._cached_message_search_query: str = ""
         self._cached_message_search_results: set[str] = set()
         self._cached_message_search_version: int | None = None
+        self._cached_message_search_initialized = False
+        self._last_message_search_stale = False
         self._cache_hits = 0
         self._uri = ""
         self._consecutive_errors = 0
+        self._connect_backoff_reads = 0
+        self._connected_mtime_ns: int | None = None
         self._messages_fts_supports_session_id: bool | None = None
         self._messages_fts_available: bool | None = None
         self._connect()
 
     def _connect(self) -> None:
         if self._conn:
-            with contextlib.suppress(sqlite3.Error, sqlite3.ProgrammingError):
+            with contextlib.suppress(sqlite3.Error):
                 self._conn.close()
             self._conn = None
         if not self._path.exists():
+            self._connected_mtime_ns = None
             return
-        self._uri = f"{self._path.resolve().as_uri()}?mode=ro"
+        self._uri = f"{self._path.resolve().as_uri()}?mode=ro&immutable=1"
         try:
             self._conn = sqlite3.connect(self._uri, uri=True, timeout=2, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             self._current_data_version = None
+            self._cached_sessions_version = None
+            self._cached_session_count_version = None
+            self._cached_tool_stats_version = None
+            self._cached_message_search_version = None
             self._consecutive_errors = 0
+            self._connect_backoff_reads = 0
+            self._connected_mtime_ns = self._source_mtime_ns()
+            self._messages_fts_supports_session_id = None
+            self._messages_fts_available = None
         except sqlite3.OperationalError:
             self._conn = None
+            self._connected_mtime_ns = None
+            self._connect_backoff_reads = _CONNECT_BACKOFF_READS
+            self._mark_cached_reads_stale()
+
+    def _source_mtime_ns(self) -> int | None:
+        mtimes = []
+        for path in (self._path, self._path.with_name(f"{self._path.name}-wal")):
+            try:
+                mtimes.append(path.stat().st_mtime_ns)
+            except OSError:
+                continue
+        return max(mtimes) if mtimes else None
+
+    def _source_changed(self) -> bool:
+        current_mtime = self._source_mtime_ns()
+        return current_mtime is not None and current_mtime != self._connected_mtime_ns
+
+    def _mark_cached_reads_stale(self) -> None:
+        if self._cached_sessions_initialized:
+            self._last_read_sessions_stale = True
+        if self._cached_session_count_initialized:
+            self._last_read_session_count_stale = True
+        if self._cached_tool_stats_initialized:
+            self._last_read_tool_stats_stale = True
+        if self._cached_message_search_initialized:
+            self._last_message_search_stale = True
 
     def _ensure_connection(self) -> sqlite3.Connection | None:
+        if self._conn and self._source_changed():
+            self._connect()
         if self._conn:
             return self._conn
+        if self._connect_backoff_reads > 0:
+            self._connect_backoff_reads -= 1
+            return None
         self._connect()
         return self._conn
 
@@ -70,22 +125,35 @@ class HermesDB:
 
     def read_sessions(self) -> list[dict[str, Any]]:
         with self._lock:
-            conn = self._ensure_connection()
-            if conn is None:
-                return self._cached_sessions
-            version = self._current_version()
-            if version is not None and self._cached_sessions_version == version:
-                return self._cached_sessions
-            try:
-                self._cached_sessions = self._read_all_sessions(conn)
-                if version is not None:
-                    self._cached_sessions_version = version
-                self._consecutive_errors = 0
-            except sqlite3.Error:
-                self._consecutive_errors += 1
-                if self._consecutive_errors >= 3:
-                    self._connect()
+            self._cached_sessions = self._read_cached(
+                cached_value=self._cached_sessions,
+                get_cached_version=lambda: self._cached_sessions_version,
+                set_cached_version=lambda version: setattr(
+                    self,
+                    "_cached_sessions_version",
+                    version,
+                ),
+                set_stale=lambda stale: setattr(self, "_last_read_sessions_stale", stale),
+                mark_initialized=lambda: setattr(self, "_cached_sessions_initialized", True),
+                reader=self._read_all_sessions,
+            )
             return self._cached_sessions
+
+    @property
+    def last_read_sessions_stale(self) -> bool:
+        return self._last_read_sessions_stale
+
+    @property
+    def last_read_session_count_stale(self) -> bool:
+        return self._last_read_session_count_stale
+
+    @property
+    def last_read_tool_stats_stale(self) -> bool:
+        return self._last_read_tool_stats_stale
+
+    @property
+    def last_message_search_stale(self) -> bool:
+        return self._last_message_search_stale
 
     def _read_all_sessions(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
         cur = conn.execute(
@@ -101,21 +169,22 @@ class HermesDB:
 
     def read_session_count(self) -> int:
         with self._lock:
-            conn = self._ensure_connection()
-            if conn is None:
-                return self._cached_session_count
-            version = self._current_version()
-            if version is not None and self._cached_session_count_version == version:
-                return self._cached_session_count
-            try:
-                self._cached_session_count = self._read_session_count(conn)
-                if version is not None:
-                    self._cached_session_count_version = version
-                self._consecutive_errors = 0
-            except sqlite3.Error:
-                self._consecutive_errors += 1
-                if self._consecutive_errors >= 3:
-                    self._connect()
+            self._cached_session_count = self._read_cached(
+                cached_value=self._cached_session_count,
+                get_cached_version=lambda: self._cached_session_count_version,
+                set_cached_version=lambda version: setattr(
+                    self,
+                    "_cached_session_count_version",
+                    version,
+                ),
+                set_stale=lambda stale: setattr(self, "_last_read_session_count_stale", stale),
+                mark_initialized=lambda: setattr(
+                    self,
+                    "_cached_session_count_initialized",
+                    True,
+                ),
+                reader=self._read_session_count,
+            )
             return self._cached_session_count
 
     def _read_session_count(self, conn: sqlite3.Connection) -> int:
@@ -125,21 +194,18 @@ class HermesDB:
 
     def read_tool_stats(self) -> list[dict[str, Any]]:
         with self._lock:
-            conn = self._ensure_connection()
-            if conn is None:
-                return self._cached_tool_stats
-            version = self._current_version()
-            if version is not None and self._cached_tool_stats_version == version:
-                return self._cached_tool_stats
-            try:
-                self._cached_tool_stats = self._read_tool_stats(conn)
-                if version is not None:
-                    self._cached_tool_stats_version = version
-                self._consecutive_errors = 0
-            except sqlite3.Error:
-                self._consecutive_errors += 1
-                if self._consecutive_errors >= 3:
-                    self._connect()
+            self._cached_tool_stats = self._read_cached(
+                cached_value=self._cached_tool_stats,
+                get_cached_version=lambda: self._cached_tool_stats_version,
+                set_cached_version=lambda version: setattr(
+                    self,
+                    "_cached_tool_stats_version",
+                    version,
+                ),
+                set_stale=lambda stale: setattr(self, "_last_read_tool_stats_stale", stale),
+                mark_initialized=lambda: setattr(self, "_cached_tool_stats_initialized", True),
+                reader=self._read_tool_stats,
+            )
             return self._cached_tool_stats
 
     def _read_tool_stats(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -166,6 +232,7 @@ class HermesDB:
                 and self._cached_message_search_version == version
                 and self._cached_message_search_query == normalized
             ):
+                self._last_message_search_stale = False
                 return self._cached_message_search_results
             try:
                 if self._messages_fts_enabled(conn):
@@ -180,14 +247,52 @@ class HermesDB:
                     session_ids = self._search_session_ids_by_like(conn, normalized)
                 self._cached_message_search_query = normalized
                 self._cached_message_search_results = session_ids
+                self._cached_message_search_initialized = True
                 if version is not None:
                     self._cached_message_search_version = version
                 self._consecutive_errors = 0
+                self._last_message_search_stale = False
             except sqlite3.Error:
-                self._consecutive_errors += 1
-                if self._consecutive_errors >= 3:
-                    self._connect()
+                self._last_message_search_stale = self._cached_message_search_initialized
+                self._record_read_error()
             return self._cached_message_search_results
+
+    def _read_cached(
+        self,
+        *,
+        cached_value: T,
+        get_cached_version: Callable[[], int | None],
+        set_cached_version: Callable[[int], None],
+        set_stale: Callable[[bool], None],
+        mark_initialized: Callable[[], None],
+        reader: Callable[[sqlite3.Connection], T],
+    ) -> T:
+        conn = self._ensure_connection()
+        if conn is None:
+            return cached_value
+        version = self._current_version()
+        if version is not None and get_cached_version() == version:
+            set_stale(False)
+            return cached_value
+        try:
+            value = reader(conn)
+        except sqlite3.Error:
+            set_stale(True)
+            self._record_read_error()
+            return cached_value
+        if version is not None:
+            set_cached_version(version)
+        self._consecutive_errors = 0
+        set_stale(False)
+        mark_initialized()
+        return value
+
+    def _record_read_error(self) -> None:
+        self._consecutive_errors += 1
+        if self._consecutive_errors >= _RECONNECT_ERROR_THRESHOLD:
+            self._connect()
+            if self._conn is None:
+                self._consecutive_errors = 0
 
     def _messages_fts_enabled(self, conn: sqlite3.Connection) -> bool:
         if self._messages_fts_available is not None:
@@ -202,6 +307,7 @@ class HermesDB:
         return self._messages_fts_available
 
     def _search_session_ids_by_fts(self, conn: sqlite3.Connection, query: str) -> set[str]:
+        fts_query = _quote_fts_query(query)
         if self._messages_fts_supports_session_id is None:
             cur = conn.execute("PRAGMA table_info(messages_fts)")
             columns = {str(row[1]) for row in cur.fetchall()}
@@ -209,7 +315,7 @@ class HermesDB:
         if self._messages_fts_supports_session_id:
             cur = conn.execute(
                 "SELECT DISTINCT session_id FROM messages_fts WHERE messages_fts MATCH ?",
-                (query,),
+                (fts_query,),
             )
         else:
             cur = conn.execute(
@@ -217,7 +323,7 @@ class HermesDB:
                 "FROM messages_fts "
                 "JOIN messages ON messages.id = messages_fts.rowid "
                 "WHERE messages_fts MATCH ?",
-                (query,),
+                (fts_query,),
             )
         return {str(row[0]) for row in cur.fetchall() if row[0]}
 
@@ -235,6 +341,11 @@ class HermesDB:
     def close(self) -> None:
         with self._lock:
             if self._conn:
-                with contextlib.suppress(sqlite3.ProgrammingError):
+                with contextlib.suppress(sqlite3.Error):
                     self._conn.close()
                 self._conn = None
+
+
+def _quote_fts_query(query: str) -> str:
+    escaped = query.replace('"', '""')
+    return f'"{escaped}"'

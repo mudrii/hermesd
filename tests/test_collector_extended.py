@@ -19,6 +19,7 @@ from hermesd.collector import (
     _redact_secret_args,
     _today_epoch,
 )
+from tests.conftest import create_state_db_tables
 
 
 @pytest.mark.parametrize(
@@ -90,6 +91,25 @@ def test_redact_secret_args_handles_mixed_and_nested_values():
     assert "--api-key [REDACTED]" in text
     assert "[REDACTED]" in text
     assert "ok=yes" in text
+
+
+def test_redact_secret_args_handles_aliases_headers_and_dicts():
+    redacted = _redact_secret_args(
+        [
+            "--bearer",
+            "secret-token",
+            "-H",
+            "Authorization: Bearer secret-token",
+            "--client-secret=client-secret",
+            {"Authorization": "Bearer secret-token"},
+            ["--x-api-key", "secret-token"],
+        ]
+    )
+
+    text = " ".join(redacted)
+    assert "secret-token" not in text
+    assert "client-secret=client-secret" not in text
+    assert text.count("[REDACTED]") >= 5
 
 
 def test_delivery_target_label_branches():
@@ -439,8 +459,9 @@ def test_collect_mcp_servers_redacts_secret_targets(hermes_home: Path):
             {
                 "mcp_servers": {
                     "local-demo": {
-                        "command": "python",
+                        "command": "python --token command-secret",
                         "args": ["server.py", "--api-key", "sk-test-secret"],
+                        "env": {"AUTHORIZATION": "Bearer env-secret"},
                     },
                     "remote-demo": {
                         "url": "https://example.com/mcp?token=secret123&mode=full",
@@ -454,7 +475,12 @@ def test_collect_mcp_servers_redacts_secret_targets(hermes_home: Path):
     state = c.collect()
 
     servers = {server.name: server for server in state.skills_memory.mcp_servers}
-    assert servers["local-demo"].target == "python server.py --api-key [REDACTED]"
+    assert "command-secret" not in servers["local-demo"].target
+    assert "sk-test-secret" not in servers["local-demo"].target
+    assert "env-secret" not in servers["local-demo"].target
+    assert servers["local-demo"].target == (
+        "env:[REDACTED] python --token [REDACTED] server.py --api-key [REDACTED]"
+    )
     assert servers["remote-demo"].target == "https://example.com/mcp?token=[REDACTED]&mode=full"
     c.close()
 
@@ -836,34 +862,9 @@ def test_session_active_detection(hermes_home: Path, sample_db: Path):
 
 def test_session_ended_detection(hermes_home: Path):
     """Sessions with ended_at set should not be marked active."""
-    import sqlite3
-
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
-    conn.executescript("""
-        CREATE TABLE schema_version (version INTEGER NOT NULL);
-        INSERT INTO schema_version VALUES (6);
-        CREATE TABLE sessions (
-            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
-            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
-            started_at REAL NOT NULL, ended_at REAL, end_reason TEXT,
-            message_count INTEGER, tool_call_count INTEGER,
-            input_tokens INTEGER, output_tokens INTEGER,
-            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
-            reasoning_tokens INTEGER, billing_provider TEXT,
-            billing_base_url TEXT, billing_mode TEXT,
-            estimated_cost_usd REAL, actual_cost_usd REAL,
-            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
-            title TEXT
-        );
-        CREATE TABLE messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
-            tool_calls TEXT, tool_name TEXT, timestamp REAL,
-            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
-            reasoning_details TEXT, codex_reasoning_items TEXT
-        );
-    """)
+    create_state_db_tables(conn)
     now = time.time()
     conn.execute(
         "INSERT INTO sessions (id, source, started_at, ended_at) VALUES (?, ?, ?, ?)",

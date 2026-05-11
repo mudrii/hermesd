@@ -19,7 +19,7 @@ from hermesd.theme import Theme
 
 
 def _render_to_str(panel, width: int = 100) -> str:
-    console = Console(width=width, force_terminal=True)
+    console = Console(width=width, force_terminal=True, no_color=True)
     with console.capture() as cap:
         console.print(panel)
     return cap.get()

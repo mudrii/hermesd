@@ -9,13 +9,18 @@ from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import DashboardState, SessionInfo
-from hermesd.panels.formatting import fmt_tokens
+from hermesd.panels.formatting import fmt_tokens, fmt_usd
 from hermesd.theme import Theme
 
 
 class SessionFilterCriteria(TypedDict):
-    fields: dict[str, str]
+    fields: dict[str, list[str]]
     terms: list[str]
+
+
+_EXACT_SESSION_FILTER_FIELDS = {"id", "source", "parent", "provider", "status", "pricing"}
+_ACTIVE_TRUE_VALUES = {"1", "true", "yes", "active"}
+_ACTIVE_FALSE_VALUES = {"0", "false", "no", "inactive"}
 
 
 def render_sessions(
@@ -101,7 +106,7 @@ def _render_detail(
             str(s.tool_call_count),
             fmt_tokens(s.input_tokens),
             fmt_tokens(s.output_tokens),
-            f"${s.estimated_cost_usd:.2f}",
+            fmt_usd(s.estimated_cost_usd),
         )
 
     header = Text()
@@ -151,9 +156,10 @@ def _session_matches(
     message_match_ids: set[str],
 ) -> bool:
     fields = criteria["fields"]
-    for field_name, expected in fields.items():
-        if not _match_session_field(session, field_name, expected, message_match_ids):
-            return False
+    for field_name, expected_values in fields.items():
+        for expected in expected_values:
+            if not _match_session_field(session, field_name, expected, message_match_ids):
+                return False
 
     haystack = " ".join(
         [
@@ -179,7 +185,9 @@ def _match_session_field(
 ) -> bool:
     value = str(expected).lower()
     if field_name == "active":
-        is_active = value in {"1", "true", "yes", "active"}
+        if value not in _ACTIVE_TRUE_VALUES | _ACTIVE_FALSE_VALUES:
+            return False
+        is_active = value in _ACTIVE_TRUE_VALUES
         return session.is_active is is_active
     if field_name == "message":
         return session.session_id in message_match_ids
@@ -193,11 +201,14 @@ def _match_session_field(
         "pricing": session.pricing_version,
         "title": session.title or "",
     }
-    return value in field_map.get(field_name, "").lower()
+    actual = field_map.get(field_name, "").lower()
+    if field_name in _EXACT_SESSION_FILTER_FIELDS:
+        return actual == value
+    return value in actual
 
 
 def _parse_session_filter(filter_query: str) -> SessionFilterCriteria:
-    fields: dict[str, str] = {}
+    fields: dict[str, list[str]] = {}
     terms: list[str] = []
     for token in filter_query.split():
         if ":" not in token:
@@ -218,9 +229,9 @@ def _parse_session_filter(filter_query: str) -> SessionFilterCriteria:
             "active",
             "message",
         }:
-            fields[key] = value
+            fields.setdefault(key, []).append(value)
         elif key == "msg":
-            fields["message"] = value
+            fields.setdefault("message", []).append(value)
         elif key == "text":
             if value:
                 terms.append(value)
@@ -264,4 +275,8 @@ def _sort_sessions(sessions: list[SessionInfo], session_sort: str) -> list[Sessi
             ),
             reverse=True,
         )
-    return sorted(sessions, key=lambda session: session.started_at, reverse=True)
+    return sorted(
+        sessions,
+        key=lambda session: (session.started_at, session.session_id),
+        reverse=True,
+    )

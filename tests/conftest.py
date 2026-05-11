@@ -21,18 +21,26 @@ def hermes_home(tmp_path: Path) -> Path:
     return home
 
 
-@pytest.fixture
-def sample_db(hermes_home: Path) -> Path:
-    """Create a state.db with sample sessions and messages."""
-    db_path = hermes_home / "state.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.executescript("""
-        CREATE TABLE schema_version (version INTEGER NOT NULL);
-        INSERT INTO schema_version VALUES (6);
-
+def create_state_db_tables(
+    conn: sqlite3.Connection,
+    *,
+    include_schema_version: bool = True,
+    source_required: bool = True,
+) -> None:
+    """Create the session/message tables used by collector and DB tests."""
+    schema_version_sql = (
+        "CREATE TABLE schema_version (version INTEGER NOT NULL);\n"
+        "INSERT INTO schema_version VALUES (6);\n"
+        if include_schema_version
+        else ""
+    )
+    source_column = "source TEXT NOT NULL" if source_required else "source TEXT"
+    conn.executescript(
+        f"""
+        {schema_version_sql}
         CREATE TABLE sessions (
             id TEXT PRIMARY KEY,
-            source TEXT NOT NULL,
+            {source_column},
             user_id TEXT,
             model TEXT,
             model_config TEXT,
@@ -74,7 +82,16 @@ def sample_db(hermes_home: Path) -> Path:
             reasoning_details TEXT,
             codex_reasoning_items TEXT
         );
-    """)
+        """
+    )
+
+
+@pytest.fixture
+def sample_db(hermes_home: Path) -> Path:
+    """Create a state.db with sample sessions and messages."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn)
     now = time.time()
     conn.execute(
         "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -545,51 +562,7 @@ def populated_hermes_home(
 
 def _write_minimal_state_db(db_path: Path, session_id: str, source: str) -> None:
     conn = sqlite3.connect(str(db_path))
-    conn.executescript("""
-        CREATE TABLE sessions (
-            id TEXT PRIMARY KEY,
-            source TEXT NOT NULL,
-            user_id TEXT,
-            model TEXT,
-            model_config TEXT,
-            system_prompt TEXT,
-            parent_session_id TEXT,
-            started_at REAL NOT NULL,
-            ended_at REAL,
-            end_reason TEXT,
-            message_count INTEGER DEFAULT 0,
-            tool_call_count INTEGER DEFAULT 0,
-            input_tokens INTEGER DEFAULT 0,
-            output_tokens INTEGER DEFAULT 0,
-            cache_read_tokens INTEGER DEFAULT 0,
-            cache_write_tokens INTEGER DEFAULT 0,
-            reasoning_tokens INTEGER DEFAULT 0,
-            billing_provider TEXT,
-            billing_base_url TEXT,
-            billing_mode TEXT,
-            estimated_cost_usd REAL,
-            actual_cost_usd REAL,
-            cost_status TEXT,
-            cost_source TEXT,
-            pricing_version TEXT,
-            title TEXT
-        );
-        CREATE TABLE messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT,
-            tool_call_id TEXT,
-            tool_calls TEXT,
-            tool_name TEXT,
-            timestamp REAL NOT NULL,
-            token_count INTEGER,
-            finish_reason TEXT,
-            reasoning TEXT,
-            reasoning_details TEXT,
-            codex_reasoning_items TEXT
-        );
-    """)
+    create_state_db_tables(conn, include_schema_version=False)
     conn.execute(
         "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (

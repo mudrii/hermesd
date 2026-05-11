@@ -89,7 +89,7 @@ def test_cron_detail_shows_job_table():
     assert "meeting-reminder" in text
     assert "once in 2m" in text
     assert "daily-backup" in text
-    assert "2026-04-09T18:21:49" in text
+    assert "2026-04-09 18:21:49" in text
 
 
 def test_cron_detail_empty():

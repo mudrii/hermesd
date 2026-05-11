@@ -7,6 +7,7 @@ from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import DashboardState
+from hermesd.panels.formatting import fmt_iso_timestamp
 from hermesd.theme import Theme
 
 
@@ -21,7 +22,8 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines = Text()
     if c.last_tick_ago_seconds is not None:
         lines.append("  Last tick: ", style=theme.ui_label)
-        lines.append(f"{int(c.last_tick_ago_seconds)}s ago\n", style=theme.ui_accent)
+        tick_age = max(0, int(c.last_tick_ago_seconds))
+        lines.append(f"{tick_age}s ago\n", style=theme.ui_accent)
     else:
         lines.append("  Last tick: ", style=theme.ui_label)
         lines.append("—\n", style=theme.banner_dim)
@@ -56,7 +58,8 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
 
     header = Text()
     if c.last_tick_ago_seconds is not None:
-        header.append(f"Last tick: {int(c.last_tick_ago_seconds)}s ago", style=theme.ui_accent)
+        tick_age = max(0, int(c.last_tick_ago_seconds))
+        header.append(f"Last tick: {tick_age}s ago", style=theme.ui_accent)
     else:
         header.append("Last tick: —", style=theme.banner_dim)
     header.append(f"   Jobs: {c.job_count}   Errors: {c.error_count}\n\n", style=theme.banner_text)
@@ -96,7 +99,9 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
                 line = Text()
                 line.append(f"  {j.name or j.job_id[:8]}: ", style=theme.ui_label)
                 if j.next_run_at:
-                    line.append(f"next {j.next_run_at[:19]}  ", style=theme.banner_dim)
+                    line.append(
+                        f"next {fmt_iso_timestamp(j.next_run_at)}  ", style=theme.banner_dim
+                    )
                 if j.silent_run:
                     line.append("[SILENT] ", style=theme.ui_warn)
                 line.append(j.latest_output_excerpt or "—", style=theme.banner_text)

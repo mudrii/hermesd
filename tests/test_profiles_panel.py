@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 
 from hermesd.collector import Collector
@@ -92,6 +93,25 @@ def test_profiles_panel_detail_renders_profile_rows():
     assert "coding" in text
     assert "research" in text
     assert "Research soul" in text
+
+
+def test_profiles_panel_detail_formats_large_sizes_and_future_timestamps():
+    state = DashboardState(
+        profiles=ProfilesState(
+            profile_count=1,
+            profiles=[
+                ProfileSummary(
+                    name="future",
+                    db_size_bytes=5 * 1024 * 1024 * 1024,
+                    latest_log_mtime=time.time() + 3600,
+                ),
+            ],
+        ),
+    )
+    panel = render_panel(9, state, Theme(), detail=True)
+    text = _render_to_str(panel)
+    assert "5.0 GB" in text
+    assert "(future)" in text
 
 
 def test_profiles_panel_detail_handles_no_profiles():

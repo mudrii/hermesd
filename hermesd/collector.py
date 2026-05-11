@@ -4,7 +4,9 @@ import json
 import math
 import os
 import re
+import shlex
 import subprocess
+import threading
 import time
 import tomllib
 from collections.abc import Callable, Mapping
@@ -63,6 +65,11 @@ class _CollectionHealth:
     errors: dict[str, str] = field(default_factory=dict)
     total_sources: int = 0
 
+    def mark_failed(self, source_name: str, error: str) -> None:
+        if source_name not in self.failed_sources:
+            self.failed_sources.append(source_name)
+        self.errors[source_name] = error
+
     def collect(
         self,
         fallback: Callable[[], T],
@@ -74,12 +81,13 @@ class _CollectionHealth:
         try:
             return fn()
         except Exception as exc:
-            self.failed_sources.append(source_name)
-            self.errors[source_name] = repr(exc)
+            self.mark_failed(source_name, _safe_exception_text(exc))
             try:
                 return fallback()
             except Exception as fallback_exc:
-                self.errors[source_name] = f"{exc!r}; fallback={fallback_exc!r}"
+                self.errors[source_name] = (
+                    f"{_safe_exception_text(exc)}; fallback={_safe_exception_text(fallback_exc)}"
+                )
                 return default_factory()
 
 
@@ -106,14 +114,17 @@ class Collector:
         self._available_tools_cache_value: tuple[int, list[str]] = (0, [])
         self._last_state: DashboardState | None = None
         self._last_session_rows: list[dict[str, Any]] = []
+        self._lock = threading.RLock()
 
     def collect(self) -> DashboardState:
-        health = _CollectionHealth()
-        session_rows = self._collect_session_rows(health)
-        sessions = self._collect_sessions(session_rows)
-        state = self._build_dashboard_state(health, session_rows, sessions)
-        self._last_state = state
-        return state
+        with self._lock:
+            health = _CollectionHealth()
+            session_rows = self._collect_session_rows(health)
+            sessions = self._collect_sessions(session_rows)
+            state = self._build_dashboard_state(health, session_rows, sessions)
+            if not health.failed_sources:
+                self._last_state = state
+            return state
 
     def _build_dashboard_state(
         self,
@@ -331,6 +342,8 @@ class Collector:
             self._db.read_sessions,
             empty_rows,
         )
+        if self._db.last_read_sessions_stale:
+            health.mark_failed("sessions", "read_sessions returned cached rows after sqlite error")
         self._last_session_rows = session_rows
         return session_rows
 
@@ -344,7 +357,11 @@ class Collector:
         return self._file_cache.read_yaml_mapping(self._paths.shared_path("config.yaml"))
 
     def search_session_ids_by_message(self, query: str) -> set[str]:
-        return self._db.search_session_ids_by_message(query)
+        with self._lock:
+            session_ids = self._db.search_session_ids_by_message(query)
+            if self._db.last_message_search_stale:
+                raise RuntimeError("message search returned cached rows after sqlite error")
+            return session_ids
 
     def _session_rows_or_read(self, rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
         return rows if rows is not None else self._db.read_sessions()
@@ -488,6 +505,8 @@ class Collector:
     ) -> list[ToolStats]:
         # Try messages table first (has per-tool breakdown)
         rows = self._db.read_tool_stats()
+        if self._db.last_read_tool_stats_stale:
+            raise RuntimeError("tool stats are stale")
         if rows:
             return [ToolStats(name=r["tool_name"], call_count=r["call_count"]) for r in rows]
         # Fall back to per-session tool_call_count
@@ -801,15 +820,17 @@ class Collector:
             if not server:
                 continue
             args = server.get("args") or []
-            command = str(server.get("command") or "")
+            command = _redact_command_string(str(server.get("command") or ""))
+            env = _as_dict(server.get("env") or server.get("environment"))
             url = _redact_secret_url(str(server.get("url") or ""))
             target = url
             transport = "url" if url else ""
             if not target and command:
+                rendered_env = "env:[REDACTED]" if _has_secret_material(env) else ""
                 rendered_args = (
                     " ".join(_redact_secret_args(args)) if isinstance(args, list) else ""
                 )
-                target = " ".join(part for part in [command, rendered_args] if part)
+                target = " ".join(part for part in [rendered_env, command, rendered_args] if part)
                 transport = "command"
             result.append(
                 MCPServerInfo(
@@ -1115,6 +1136,10 @@ def _estimate_cost(
     cache_read_tokens: int,
     reasoning_tokens: int,
 ) -> float:
+    input_tokens = _bounded_token_count(input_tokens)
+    output_tokens = _bounded_token_count(output_tokens)
+    cache_read_tokens = _bounded_token_count(cache_read_tokens)
+    reasoning_tokens = _bounded_token_count(reasoning_tokens)
     return (
         input_tokens * _COST_PER_M["input"]
         + output_tokens * _COST_PER_M["output"]
@@ -1124,17 +1149,24 @@ def _estimate_cost(
 
 
 def _resolved_session_cost(row: dict[str, Any]) -> float:
-    cost = row.get("estimated_cost_usd")
-    if str(row.get("cost_status") or "") == "reported":
-        return float(cost or 0.0)
+    raw_cost = row.get("estimated_cost_usd")
+    cost = _coerce_float(raw_cost)
+    if str(row.get("cost_status") or "") == "reported" and raw_cost is not None:
+        return cost
     if cost:
-        return float(cost)
+        return cost
     return _estimate_cost(
         row.get("input_tokens") or 0,
         row.get("output_tokens") or 0,
         row.get("cache_read_tokens") or 0,
         row.get("reasoning_tokens") or 0,
     )
+
+
+def _bounded_token_count(value: int) -> int:
+    if value <= 0:
+        return 0
+    return min(value, 10**15)
 
 
 def _latest_log_mtime(logs_dir: Path) -> float | None:
@@ -1387,9 +1419,19 @@ _SECRET_FIELD_NAMES = {
     "api_key",
     "id_token",
     "access_token",
+    "authorization",
+    "bearer",
+    "client_secret",
+    "credential",
+    "pass",
+    "passwd",
+    "pin",
+    "pwd",
     "refresh_token",
     "secret",
     "token",
+    "x_api_key",
+    "x-api-key",
     "user_token",
 }
 
@@ -1400,12 +1442,22 @@ _SECRET_URL_QUERY_KEYS = {
     "api_key",
     "auth",
     "auth_token",
+    "authorization",
+    "bearer",
+    "client_secret",
+    "credential",
     "id_token",
     "key",
+    "pass",
+    "passwd",
     "password",
+    "pin",
+    "pwd",
     "refresh_token",
     "secret",
     "token",
+    "x_api_key",
+    "x-api-key",
     "user_token",
 }
 _SECRET_OPTION_NAMES = {
@@ -1414,12 +1466,26 @@ _SECRET_OPTION_NAMES = {
     "apikey",
     "auth",
     "auth-token",
+    "authorization",
+    "bearer",
+    "client-secret",
+    "credential",
+    "h",
+    "header",
     "id-token",
+    "k",
     "key",
+    "p",
+    "pass",
+    "passwd",
     "password",
+    "pin",
+    "pwd",
     "refresh-token",
     "secret",
+    "t",
     "token",
+    "x-api-key",
     "user-token",
 }
 
@@ -1469,6 +1535,10 @@ def _normalize_secret_option_name(option: str) -> str:
     return option.lstrip("-").lower().replace("_", "-")
 
 
+def _secret_key_name(value: object) -> str:
+    return str(value).strip().lower().replace("_", "-")
+
+
 def _redact_secret_url(value: str) -> str:
     if not value:
         return ""
@@ -1496,7 +1566,7 @@ def _redact_secret_args(args: object) -> list[str]:
             redact_next = False
             continue
         if isinstance(raw_arg, list):
-            redacted.append(" ".join(_redact_secret_args(raw_arg)))
+            redacted.extend(_redact_secret_args(raw_arg))
             continue
         if isinstance(raw_arg, dict) and _has_secret_material(raw_arg):
             redacted.append("[REDACTED]")
@@ -1519,11 +1589,59 @@ def _redact_secret_args(args: object) -> list[str]:
 
 
 def _has_secret_material(data: dict[str, Any]) -> bool:
-    for key in _SECRET_FIELD_NAMES:
-        value = data.get(key)
-        if isinstance(value, str) and value.strip():
+    for key, value in data.items():
+        key_name = _secret_key_name(key)
+        if (
+            key_name in _SECRET_FIELD_NAMES
+            or key_name in _SECRET_OPTION_NAMES
+            or key_name in _SECRET_URL_QUERY_KEYS
+        ) and value not in (None, ""):
+            return True
+        if isinstance(value, str) and _looks_like_secret_value(value):
+            return True
+        if isinstance(value, dict) and _has_secret_material(value):
+            return True
+        if isinstance(value, list) and any(_contains_secret_material(item) for item in value):
             return True
     return False
+
+
+def _contains_secret_material(value: object) -> bool:
+    if isinstance(value, dict):
+        return _has_secret_material(value)
+    if isinstance(value, list):
+        return any(_contains_secret_material(item) for item in value)
+    return isinstance(value, str) and _looks_like_secret_value(value)
+
+
+def _looks_like_secret_value(value: str) -> bool:
+    lowered = value.lower()
+    return "bearer " in lowered or "authorization:" in lowered or "x-api-key" in lowered
+
+
+def _redact_secret_text(value: str) -> str:
+    redacted = re.sub(r"(?i)(bearer)\s+[^,\s]+", r"\1 [REDACTED]", value)
+    return re.sub(
+        r"(?i)(access[-_]?token|api[-_]?key|authorization|client[-_]?secret|credential|"
+        r"pass(?:word|wd)?|pwd|pin|refresh[-_]?token|secret|token|x[-_]?api[-_]?key)"
+        r"([=:]\s*)[^,\s]+",
+        r"\1\2[REDACTED]",
+        redacted,
+    )
+
+
+def _safe_exception_text(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {_redact_secret_text(str(exc))[:200]}"
+
+
+def _redact_command_string(command: str) -> str:
+    if not command:
+        return ""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return _redact_secret_text(command)
+    return " ".join(_redact_secret_args(parts))
 
 
 def _credential_auth_type(entry: dict[str, Any], provider_entry: dict[str, Any]) -> str:

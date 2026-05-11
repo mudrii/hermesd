@@ -5,37 +5,22 @@ import time
 from pathlib import Path
 
 from hermesd.db import HermesDB
+from tests.conftest import create_state_db_tables
 
 
 def _create_db(path: Path) -> None:
     conn = sqlite3.connect(str(path))
-    conn.executescript("""
-        CREATE TABLE sessions (
-            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
-            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
-            started_at REAL NOT NULL, ended_at REAL, end_reason TEXT,
-            message_count INTEGER, tool_call_count INTEGER,
-            input_tokens INTEGER, output_tokens INTEGER,
-            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
-            reasoning_tokens INTEGER, billing_provider TEXT,
-            billing_base_url TEXT, billing_mode TEXT,
-            estimated_cost_usd REAL, actual_cost_usd REAL,
-            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
-            title TEXT
-        );
-        CREATE TABLE messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
-            tool_calls TEXT, tool_name TEXT, timestamp REAL,
-            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
-            reasoning_details TEXT, codex_reasoning_items TEXT
-        );
-    """)
+    create_state_db_tables(conn, include_schema_version=False)
     now = time.time()
     conn.execute(
         "INSERT INTO sessions (id, source, started_at, message_count, tool_call_count, "
         "input_tokens, output_tokens) VALUES (?, ?, ?, ?, ?, ?, ?)",
         ("s1", "cli", now, 10, 5, 5000, 3000),
+    )
+    conn.execute(
+        "INSERT INTO messages (session_id, role, content, tool_name, timestamp) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("s1", "assistant", "used a tool", "shell_exec", now),
     )
     conn.commit()
     conn.close()
@@ -62,13 +47,36 @@ def test_cache_preserved_on_query_error(tmp_path, monkeypatch):
     db.close()
 
 
+def test_read_sessions_stale_flag_clears_on_recovered_cache_hit(tmp_path, monkeypatch):
+    """A transient read error must not keep later cached reads marked stale."""
+    db_path = tmp_path / "state.db"
+    _create_db(db_path)
+    db = HermesDB(db_path)
+    sessions = db.read_sessions()
+    cached_version = db._cached_sessions_version
+
+    def fail_read(conn: sqlite3.Connection) -> list[dict[str, object]]:
+        raise sqlite3.OperationalError("query failed")
+
+    monkeypatch.setattr(db, "_current_version", lambda: None)
+    monkeypatch.setattr(db, "_read_all_sessions", fail_read)
+
+    assert db.read_sessions() == sessions
+    assert db.last_read_sessions_stale is True
+
+    monkeypatch.setattr(db, "_current_version", lambda: cached_version)
+
+    assert db.read_sessions() == sessions
+    assert db.last_read_sessions_stale is False
+    db.close()
+
+
 def test_cache_preserved_for_tool_stats(tmp_path, monkeypatch):
     db_path = tmp_path / "state.db"
     _create_db(db_path)
     db = HermesDB(db_path)
     stats = db.read_tool_stats()
-    # Empty tool_name in messages, so returns []
-    assert isinstance(stats, list)
+    assert stats == [{"tool_name": "shell_exec", "call_count": 1}]
 
     def fail_read(conn: sqlite3.Connection) -> list[dict[str, object]]:
         raise sqlite3.OperationalError("query failed")

@@ -1,4 +1,7 @@
 import io
+import json
+import threading
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -184,6 +187,21 @@ def test_handle_key_s_cycles_session_sort(populated_hermes_home: Path):
     app.close()
 
 
+def test_digit_key_for_current_detail_panel_preserves_filter_state(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._handle_key("2")
+    app._view.filter_query = "source:cli"
+    app._view.scroll_offset = 3
+    app._view.session_sort = "cost"
+
+    app._handle_key("2")
+
+    assert app._view.filter_query == "source:cli"
+    assert app._view.scroll_offset == 3
+    assert app._view.session_sort == "cost"
+    app.close()
+
+
 def test_handle_key_s_ignored_outside_sessions(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app._handle_key("8")
@@ -199,7 +217,7 @@ def test_handle_key_g_and_big_g_jump_scroll(populated_hermes_home: Path):
     app._handle_key("j")
     assert app._view.scroll_offset == 2
     app._handle_key("G")
-    assert app._view.scroll_offset == 999_999
+    assert app._view.scroll_offset > 2
     app._handle_key("g")
     assert app._view.scroll_offset == 0
     app.close()
@@ -348,6 +366,28 @@ def test_build_detail_layout_does_not_block_on_session_message_search(
     app.close()
 
 
+def test_session_message_search_error_is_distinct_from_no_matches(
+    populated_hermes_home: Path,
+    monkeypatch,
+):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._set_state(app._collector.collect())
+    app._view.enter_detail(2)
+    app._view.filter_query = "message:response"
+
+    def fail_search(query: str) -> set[str]:
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(app._collector, "search_session_ids_by_message", fail_search)
+    app._build_layout()
+    app._message_search_thread.join(timeout=1)
+
+    assert app._input_error == "message search error: RuntimeError"
+    assert app._state.session_message_match_query == "response"
+    assert app._state.session_message_match_ids == set()
+    app.close()
+
+
 def test_decode_input_keys_splits_escape_with_trailing_digit():
     assert _decode_input_keys(b"\x1b1") == ["\x1b", "1"]
 
@@ -389,13 +429,25 @@ def test_render_snapshot_json_rejects_invalid_panel(populated_hermes_home: Path)
         app.close()
 
 
+def test_render_snapshot_json_sorts_set_backed_fields(populated_hermes_home: Path, monkeypatch):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    state = app._collector.collect().model_copy(
+        update={"session_message_match_ids": {"sess_b", "sess_a", "sess_c"}}
+    )
+    monkeypatch.setattr(app._collector, "collect", lambda: state)
+
+    payload = json.loads(app.render_snapshot_json())
+
+    assert payload["state"]["session_message_match_ids"] == ["sess_a", "sess_b", "sess_c"]
+    app.close()
+
+
 def test_collector_loop_marks_state_stale_on_collect_error(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app._set_state(app._collector.collect())
 
     class FailingCollector:
         def collect(self):
-            app._running.clear()
             raise RuntimeError("collector failed")
 
         def close(self):
@@ -405,9 +457,17 @@ def test_collector_loop_marks_state_stale_on_collect_error(populated_hermes_home
     app._running.set()
     app._force_refresh.set()
 
-    app._collector_loop()
+    thread = threading.Thread(target=app._collector_loop)
+    thread.start()
+    deadline = time.monotonic() + 1
+    while not app._state.is_stale and time.monotonic() < deadline:
+        time.sleep(0.01)
+    app._running.clear()
+    app._force_refresh.set()
+    thread.join(timeout=1)
 
     assert app._state.is_stale is True
+    assert not thread.is_alive()
     app.close()
 
 

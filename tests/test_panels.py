@@ -16,7 +16,7 @@ from hermesd.models import (
     TokenSummary,
     ToolStats,
 )
-from hermesd.panels import render_panel
+from hermesd.panels import _RENDERERS, PANEL_NAMES, render_panel
 from hermesd.theme import Theme
 
 
@@ -25,6 +25,10 @@ def _render_to_str(panel) -> str:
     with console.capture() as cap:
         console.print(panel)
     return cap.get()
+
+
+def test_panel_registry_matches_names():
+    assert set(_RENDERERS) == set(PANEL_NAMES)
 
 
 def test_gateway_panel_compact():

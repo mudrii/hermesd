@@ -1,10 +1,12 @@
 import json
 import os
+import sqlite3
 import time
 from pathlib import Path
 
 from hermesd.collector import Collector, _CollectionHealth
 from hermesd.models import DashboardState
+from tests.conftest import create_state_db_tables
 
 
 def test_collect_full(populated_hermes_home: Path):
@@ -154,35 +156,9 @@ def test_collect_checkpoints(populated_hermes_home: Path):
 
 def test_collect_sessions_with_null_columns(hermes_home: Path):
     """Sessions with NULL model, source, and token columns must not crash."""
-    import sqlite3
-
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
-    conn.executescript("""
-        CREATE TABLE schema_version (version INTEGER NOT NULL);
-        INSERT INTO schema_version VALUES (6);
-        CREATE TABLE sessions (
-            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
-            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
-            started_at REAL NOT NULL, ended_at REAL, end_reason TEXT,
-            message_count INTEGER, tool_call_count INTEGER,
-            input_tokens INTEGER, output_tokens INTEGER,
-            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
-            reasoning_tokens INTEGER, billing_provider TEXT,
-            billing_base_url TEXT, billing_mode TEXT,
-            estimated_cost_usd REAL, actual_cost_usd REAL,
-            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
-            title TEXT
-        );
-        CREATE TABLE messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL REFERENCES sessions(id),
-            role TEXT NOT NULL, content TEXT, tool_call_id TEXT,
-            tool_calls TEXT, tool_name TEXT, timestamp REAL NOT NULL,
-            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
-            reasoning_details TEXT, codex_reasoning_items TEXT
-        );
-    """)
+    create_state_db_tables(conn, source_required=False)
     conn.execute(
         "INSERT INTO sessions (id, source, model, started_at) VALUES (?, NULL, NULL, ?)",
         ("sess_null", time.time()),
@@ -225,12 +201,32 @@ def test_collect_does_not_mutate_hermes_home(populated_hermes_home: Path):
     assert _file_mtimes(populated_hermes_home) == before
 
 
-def test_collect_mtime_cache(populated_hermes_home: Path):
+def test_collect_mtime_cache(populated_hermes_home: Path, monkeypatch):
+    sessions_dir = populated_hermes_home / "sessions"
+    sessions_dir.mkdir(exist_ok=True)
+    (sessions_dir / "sessions.json").write_text(json.dumps({"one": {"session_id": "one"}}))
+    (sessions_dir / "session_one.json").write_text(
+        json.dumps({"session_id": "one", "tools": [{"name": "cached_tool"}]})
+    )
     c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
-    s1 = c.collect()
-    s2 = c.collect()
-    assert s1.gateway.pid == s2.gateway.pid
-    c.close()
+    read_count = 0
+    original_read = c._read_json_cached
+
+    def counting_read(path: Path):
+        nonlocal read_count
+        read_count += 1
+        return original_read(path)
+
+    monkeypatch.setattr(c, "_read_json_cached", counting_read)
+    try:
+        tools1 = c._collect_available_tools()
+        reads_after_first_call = read_count
+        tools2 = c._collect_available_tools()
+    finally:
+        c.close()
+
+    assert tools2 == tools1
+    assert read_count == reads_after_first_call
 
 
 def _file_mtimes(root: Path) -> dict[Path, int]:
@@ -249,7 +245,7 @@ def test_collection_health_uses_default_when_fallback_also_fails():
 
     assert health.collect(fail, "source", fail, lambda: "default") == "default"
     assert health.failed_sources == ["source"]
-    assert "RuntimeError('unavailable')" in health.errors["source"]
+    assert "RuntimeError: unavailable" in health.errors["source"]
     assert health.total_sources == 1
 
 
@@ -279,7 +275,7 @@ def test_collect_preserves_last_good_source_on_failure(populated_hermes_home: Pa
 
     assert state2.tool_stats == state1.tool_stats
     assert "tool_stats" in state2.health.failed_sources
-    assert "RuntimeError('tool stats unavailable')" in state2.health.errors["tool_stats"]
+    assert "RuntimeError: tool stats unavailable" in state2.health.errors["tool_stats"]
     assert state2.health.ok_sources == state2.health.total_sources - 1
     c.close()
 
@@ -316,6 +312,14 @@ def test_collect_reads_session_rows_once_per_cycle(hermes_home: Path):
 
         def read_tool_stats(self) -> list[dict[str, object]]:
             return []
+
+        @property
+        def last_read_sessions_stale(self) -> bool:
+            return False
+
+        @property
+        def last_read_tool_stats_stale(self) -> bool:
+            return False
 
         def close(self) -> None:
             pass
@@ -359,6 +363,37 @@ def test_collect_marks_session_derived_sources_failed_when_session_read_fails(
         "tool_stats",
         "tool_call_total",
     }
+    c.close()
+
+
+def test_collect_marks_session_derived_sources_failed_when_db_returns_stale_cache(
+    populated_hermes_home: Path,
+    monkeypatch,
+):
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    state1 = c.collect()
+
+    def fail_read(conn: sqlite3.Connection) -> list[dict[str, object]]:
+        raise sqlite3.OperationalError("db unavailable")
+
+    monkeypatch.setattr(c._db, "_current_version", lambda: 999)
+    monkeypatch.setattr(c._db, "_read_all_sessions", fail_read)
+    monkeypatch.setattr(c._db, "read_tool_stats", lambda: [])
+
+    state2 = c.collect()
+
+    assert state2.sessions == state1.sessions
+    assert set(state2.health.failed_sources) >= {
+        "sessions",
+        "tokens_today",
+        "tokens_total",
+        "token_analytics",
+        "tool_stats",
+        "tool_call_total",
+    }
+    assert (
+        state2.health.errors["sessions"] == "read_sessions returned cached rows after sqlite error"
+    )
     c.close()
 
 

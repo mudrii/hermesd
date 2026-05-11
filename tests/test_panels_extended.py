@@ -160,6 +160,46 @@ def test_sessions_panel_detail_active_false_filter():
     assert "sess_done"[-8:] in text
 
 
+def test_sessions_panel_filter_exact_fields_duplicate_keys_and_invalid_active():
+    state = DashboardState(
+        sessions=[
+            SessionInfo(session_id="sess_cli", source="cli", is_active=True),
+            SessionInfo(session_id="sess_cli_tool", source="cli-tool", is_active=True),
+            SessionInfo(session_id="sess_gateway", source="gateway", is_active=False),
+        ],
+    )
+
+    exact_panel = render_panel(2, state, Theme(), detail=True, filter_query="source:cli")
+    exact_text = _render_to_str(exact_panel)
+    assert "sess_cli"[-8:] in exact_text
+    assert "cli-tool" not in exact_text
+
+    duplicate_panel = render_panel(
+        2,
+        state,
+        Theme(),
+        detail=True,
+        filter_query="source:cli source:gateway",
+    )
+    assert "No matching sessions" in _render_to_str(duplicate_panel)
+
+    invalid_active_panel = render_panel(2, state, Theme(), detail=True, filter_query="active:t")
+    assert "No matching sessions" in _render_to_str(invalid_active_panel)
+
+
+def test_sessions_panel_formats_negative_cost_and_recent_tiebreaker():
+    state = DashboardState(
+        sessions=[
+            SessionInfo(session_id="sess_b", source="cli", started_at=10, estimated_cost_usd=0.1),
+            SessionInfo(session_id="sess_a", source="cli", started_at=10, estimated_cost_usd=-0.5),
+        ],
+    )
+    panel = render_panel(2, state, Theme(), detail=True)
+    text = _render_to_str(panel)
+    assert "-$0.50" in text
+    assert text.find("sess_b") < text.find("sess_a")
+
+
 def test_sessions_panel_detail_unknown_structured_filter_matches_as_text():
     state = DashboardState(
         sessions=[

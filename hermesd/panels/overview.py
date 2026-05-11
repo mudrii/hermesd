@@ -33,7 +33,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append(f"{len(sm.plugins)} plug  {len(sm.mcp_servers)} mcp\n", style=theme.banner_text)
     for p in sm.providers[:4]:
         sym = "✓" if p.is_active else "✗"
-        color = theme.ui_ok
+        color = theme.ui_ok if p.is_active else theme.banner_dim
         lines.append(f"  {sym} ", style=color)
         lines.append(f"{p.name} ", style=theme.banner_text)
 

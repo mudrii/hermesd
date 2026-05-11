@@ -171,12 +171,12 @@ class Theme:
 
     def context_color(self, ratio: float) -> str:
         if ratio >= 0.95:
-            return "#FF6B6B"
+            return self.ui_error
         if ratio > 0.80:
-            return "#FF8C00"
+            return self.ui_warn
         if ratio >= 0.50:
-            return "#FFD700"
-        return "#8FBC8F"
+            return self.banner_title
+        return self.ui_ok
 
 
 def load_theme(hermes_home: Path) -> Theme:

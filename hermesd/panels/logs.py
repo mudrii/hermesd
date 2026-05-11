@@ -11,7 +11,7 @@ from hermesd.theme import Theme
 
 
 class LogFilterCriteria(TypedDict):
-    fields: dict[str, str]
+    fields: dict[str, list[str]]
     terms: list[str]
 
 
@@ -23,6 +23,7 @@ _LOG_LEVEL_RANK = {
     "error": 40,
     "critical": 50,
 }
+_DETAIL_VISIBLE_LOG_LINES = 10
 
 
 def render_logs(
@@ -93,8 +94,9 @@ def _render_detail(
     unfiltered_lines = log_map.get(sub_view, state.logs.agent_lines)
     log_lines = _filter_log_lines(unfiltered_lines, filter_query)
     total = len(log_lines)
-    offset = min(scroll_offset, max(0, total - 1))
-    visible_lines = log_lines[offset:]
+    max_offset = max(0, total - _DETAIL_VISIBLE_LOG_LINES)
+    offset = min(scroll_offset, max_offset)
+    visible_lines = log_lines[offset : offset + _DETAIL_VISIBLE_LOG_LINES]
 
     lines = Text()
     tab_bar = Text()
@@ -113,8 +115,9 @@ def _render_detail(
             style=theme.banner_dim,
         )
     if total:
+        visible_end = min(total, offset + len(visible_lines))
         lines.append("\n")
-        lines.append(f" [{offset + 1}-{total}/{total}] ", style=theme.ui_label)
+        lines.append(f" [{offset + 1}-{visible_end}/{total}] ", style=theme.ui_label)
         if offset > 0:
             lines.append("↑ ", style=theme.ui_accent)
         if total > 1:
@@ -150,20 +153,21 @@ def _filter_log_lines(log_lines: list[LogLine], filter_query: str) -> list[LogLi
 
 def _log_line_matches(line: LogLine, criteria: LogFilterCriteria) -> bool:
     fields = criteria["fields"]
-    for field_name, expected in fields.items():
-        value = str(expected).lower()
-        if field_name == "level" and value not in line.level.lower():
-            return False
-        if field_name == "minlevel":
-            threshold = _log_level_rank(value)
-            if threshold == 0 and value != "debug":
+    for field_name, expected_values in fields.items():
+        for expected in expected_values:
+            value = str(expected).lower()
+            if field_name == "level" and value not in line.level.lower():
                 return False
-            if _log_level_rank(line.level) < threshold:
+            if field_name == "minlevel":
+                threshold = _log_level_rank(value)
+                if threshold == 0 and value != "debug":
+                    return False
+                if _log_level_rank(line.level) < threshold:
+                    return False
+            if field_name == "component" and value not in line.component.lower():
                 return False
-        if field_name == "component" and value not in line.component.lower():
-            return False
-        if field_name == "session" and value not in line.session_id.lower():
-            return False
+            if field_name == "session" and value not in line.session_id.lower():
+                return False
 
     haystack = (
         f"{line.timestamp} {line.component} {line.level} {line.session_id} {line.message}".lower()
@@ -173,7 +177,7 @@ def _log_line_matches(line: LogLine, criteria: LogFilterCriteria) -> bool:
 
 
 def _parse_log_filter(filter_query: str) -> LogFilterCriteria:
-    fields: dict[str, str] = {}
+    fields: dict[str, list[str]] = {}
     terms: list[str] = []
     for token in filter_query.split():
         if ":" not in token:
@@ -183,7 +187,7 @@ def _parse_log_filter(filter_query: str) -> LogFilterCriteria:
         key = key.lower().strip()
         value = value.strip().lower()
         if key in {"level", "component", "session", "minlevel"}:
-            fields[key] = value
+            fields.setdefault(key, []).append(value)
         elif key == "text":
             if value:
                 terms.append(value)

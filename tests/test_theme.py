@@ -66,7 +66,15 @@ def test_theme_rich_style():
 
 def test_theme_context_color():
     t = Theme()
-    assert t.context_color(0.3) == "#8FBC8F"
-    assert t.context_color(0.5) == "#FFD700"
-    assert t.context_color(0.85) == "#FF8C00"
-    assert t.context_color(0.96) == "#FF6B6B"
+    assert t.context_color(0.3) == t.ui_ok
+    assert t.context_color(0.5) == t.banner_title
+    assert t.context_color(0.85) == t.ui_warn
+    assert t.context_color(0.96) == t.ui_error
+
+
+def test_theme_context_color_uses_active_skin():
+    t = Theme("ares")
+    assert t.context_color(0.3) == t.ui_ok
+    assert t.context_color(0.5) == t.banner_title
+    assert t.context_color(0.85) == t.ui_warn
+    assert t.context_color(0.96) == t.ui_error

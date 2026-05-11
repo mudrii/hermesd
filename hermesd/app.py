@@ -5,13 +5,13 @@ import json
 import signal
 import sys
 import threading
-import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import FrameType
 from typing import TypeAlias
 
+from rich.cells import cell_len
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
@@ -192,6 +192,7 @@ class DashboardApp:
         self._input_thread: threading.Thread | None = None
         self._message_search_thread: threading.Thread | None = None
         self._message_search_inflight = ""
+        self._closed = threading.Event()
         self._console = Console(force_terminal=not no_color, no_color=no_color)
 
     def run(self) -> None:
@@ -212,7 +213,9 @@ class DashboardApp:
                 self._build_layout(), console=self._console, refresh_per_second=2, screen=True
             ) as live:
                 while self._running.is_set():
-                    time.sleep(0.5)
+                    self._running.wait(0.5)
+                    if not self._running.is_set():
+                        break
                     self._spinner_idx = (self._spinner_idx + 1) % len(_DOTS_FRAMES)
                     live.update(self._build_layout())
         except KeyboardInterrupt:
@@ -252,12 +255,14 @@ class DashboardApp:
         if panel_num is not None and panel_num not in PANEL_NAMES:
             raise ValueError(f"Unknown snapshot panel: {panel_num}")
         panel_name = PANEL_NAMES[panel_num] if panel_num is not None else ""
+        state_payload = state.model_dump(mode="json")
+        state_payload["session_message_match_ids"] = sorted(state.session_message_match_ids)
         payload = {
             "panel_num": panel_num,
             "panel_name": panel_name,
-            "state": state.model_dump(mode="json"),
+            "state": state_payload,
         }
-        return json.dumps(payload, indent=2)
+        return json.dumps(_normalize_json_payload(payload), indent=2, sort_keys=True)
 
     def render_current_view_text(self) -> str:
         return self._capture_layout_text(refresh=False)
@@ -301,8 +306,11 @@ class DashboardApp:
             self._view.session_sort = snapshot.session_sort
 
     def close(self) -> None:
+        self._closed.set()
         self._running.clear()
         self._force_refresh.set()
+        with self._lock:
+            self._message_search_inflight = ""
         current_thread = threading.current_thread()
         for thread in (self._collector_thread, self._input_thread, self._message_search_thread):
             if thread is not None and thread is not current_thread and thread.is_alive():
@@ -438,15 +446,17 @@ class DashboardApp:
         if key == "G":
             self._view.jump_bottom()
             return None
-        if key in ("j",):
+        if key == "j":
             self._view.scroll_down()
             return None
-        if key in ("k",):
+        if key == "k":
             self._view.scroll_up()
             return None
         if len(key) == 1 and key.isdigit():
             panel_num = 10 if key == "0" and 10 in _PANEL_NUMBERS else int(key)
-            if panel_num in _PANEL_NUMBERS:
+            if panel_num in _PANEL_NUMBERS and (
+                self._view.mode != "detail" or self._view.detail_panel != panel_num
+            ):
                 self._view.enter_detail(panel_num)
             return None
         return None
@@ -521,38 +531,47 @@ class DashboardApp:
 
     def _ensure_session_message_search(self, message_query: str) -> None:
         with self._lock:
+            if self._closed.is_set():
+                return
             if self._state.session_message_match_query == message_query:
                 return
-            if (
-                self._message_search_inflight == message_query
-                and self._message_search_thread is not None
-                and self._message_search_thread.is_alive()
-            ):
-                return
             self._message_search_inflight = message_query
+            if self._message_search_thread is not None and self._message_search_thread.is_alive():
+                return
             thread = threading.Thread(
-                target=self._search_session_messages,
-                args=(message_query,),
+                target=self._search_session_messages_worker,
                 daemon=True,
             )
             self._message_search_thread = thread
         thread.start()
 
-    def _search_session_messages(self, message_query: str) -> None:
-        try:
-            match_ids = self._collector.search_session_ids_by_message(message_query)
-        except Exception:
-            match_ids = set()
-        with self._lock:
-            if self._message_search_inflight != message_query:
+    def _search_session_messages_worker(self) -> None:
+        while not self._closed.is_set():
+            with self._lock:
+                message_query = self._message_search_inflight
+            if not message_query:
                 return
-            self._state = self._state.model_copy(
-                update={
-                    "session_message_match_query": message_query,
-                    "session_message_match_ids": match_ids,
-                }
-            )
-            self._message_search_inflight = ""
+            search_error = ""
+            try:
+                match_ids = self._collector.search_session_ids_by_message(message_query)
+            except Exception as exc:
+                match_ids = set()
+                search_error = f"message search error: {type(exc).__name__}"
+            with self._lock:
+                if self._message_search_inflight != message_query:
+                    continue
+                self._state = self._state.model_copy(
+                    update={
+                        "session_message_match_query": message_query,
+                        "session_message_match_ids": match_ids,
+                    }
+                )
+                if search_error:
+                    self._input_error = search_error
+                elif self._input_error and self._input_error.startswith("message search error:"):
+                    self._input_error = None
+                self._message_search_inflight = ""
+                return
 
     def _build_header(self, state: DashboardState, theme: Theme | None = None) -> Text:
         active_theme = theme or self._theme
@@ -570,7 +589,7 @@ class DashboardApp:
             right_labels.insert(0, f"{state.active_skin} skin")
         right_text = "   ".join(right_labels)
         right_segment = f"{right_text}   {now} "
-        padding_width = max(1, self._console.width - len(t.plain) - len(right_segment))
+        padding_width = max(1, self._console.width - cell_len(t.plain) - cell_len(right_segment))
         t.append(
             f"{' ' * padding_width}{right_segment}",
             style=f"{active_theme.banner_dim} on {bg}",
@@ -825,7 +844,8 @@ def _decode_input_keys(data: bytes) -> list[str]:
 
 def _health_style(state: DashboardState, theme: Theme | None = None) -> str:
     if state.health.total_sources == 0:
-        return "#B8B8C7"
+        active_theme = theme or Theme()
+        return active_theme.banner_dim
     if theme is None:
         theme = Theme()
     if state.health.ok_sources == state.health.total_sources:
@@ -833,6 +853,16 @@ def _health_style(state: DashboardState, theme: Theme | None = None) -> str:
     if state.health.ok_sources >= (state.health.total_sources // 2):
         return theme.ui_warn
     return theme.ui_error
+
+
+def _normalize_json_payload(value: object) -> object:
+    if isinstance(value, dict):
+        return {key: _normalize_json_payload(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_normalize_json_payload(item) for item in value]
+    if isinstance(value, set):
+        return sorted(value)
+    return value
 
 
 def _osc52_sequence(text: str) -> str:

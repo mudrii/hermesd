@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime
 
 import rich.box
@@ -104,9 +105,12 @@ def _render_detail(state: DashboardState, theme: Theme, profile_view_index: int)
 
 
 def _format_timestamp(value: float | None) -> str:
-    if value is None:
+    if value is None or value <= 0:
         return "—"
-    return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M")
+    formatted = datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M")
+    if value > time.time() + 60:
+        return f"{formatted} (future)"
+    return formatted
 
 
 def _format_size(size_bytes: int) -> str:
@@ -114,4 +118,8 @@ def _format_size(size_bytes: int) -> str:
         return f"{size_bytes} B"
     if size_bytes < 1024 * 1024:
         return f"{size_bytes / 1024:.1f} KB"
-    return f"{size_bytes / (1024 * 1024):.1f} MB"
+    if size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    if size_bytes < 1024 * 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+    return f"{size_bytes / (1024 * 1024 * 1024 * 1024):.1f} TB"
