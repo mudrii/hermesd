@@ -7,16 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2026.5.12] - 2026-05-12
+
 ### Changed
 
 - `--snapshot-file` now rejects output paths under the Hermes home to preserve hermesd's read-only observer contract.
 - Profile names from `--profile` and `HERMES_PROFILE` are now validated as single path segments before profile-scoped reads are resolved.
+- SQLite WAL-backed databases are now read from temporary snapshots when needed, preserving hermesd's read-only contract without missing uncheckpointed Hermes data.
+- Session and log filters now preserve duplicate field filters instead of silently overwriting earlier values.
+- Session filters now use exact matching for ID-like fields and stricter boolean parsing for `active:`.
 
 ### Fixed
 
 - SQLite read-only URIs now handle Hermes home paths containing URI metacharacters such as `?` and `#`.
 - Collector health now marks session-derived summaries as degraded when session rows are served from stale cache after a read failure.
 - The developer workflow docs now point at the active `.codex` rule and skill paths.
+- SQLite cache staleness is now surfaced for session counts, tool stats, and message search, not only full session reads.
+- Collector refreshes are now serialized so snapshot rendering and the polling thread cannot race while updating last-good state.
+- Failed first collection cycles no longer poison the last-good dashboard state with default values.
+- Session message search now runs off the render path, coalesces rapid query changes, reports search errors distinctly from no matches, and cancels cleanly during shutdown.
+- The live render loop now wakes promptly on shutdown signals instead of sleeping through the next refresh tick.
+- JSON snapshots now sort set-backed fields for deterministic output.
+- Sessions, logs, cron, gateway, profiles, overview, and token/cost formatting now handle the validated display edge cases from the audit, including negative costs, large token rollovers, non-ISO timestamps, profile size tiers, log scroll ranges, inactive provider color, and deterministic session sort ties.
+
+### Security
+
+- Secret redaction now covers additional common option names, header-style secrets, nested argument lists, dict-shaped arguments, MCP command strings, and MCP environment values before rendering panel or snapshot output.
+- Collector health diagnostics now redact secret-like exception text before exposing it in JSON snapshots.
+
+### Developer tooling
+
+- Hardened audit coverage for read-only SQLite behavior, WAL snapshots, DB stale-cache paths, collector lifecycle, message-search threading, panel filter semantics, formatting boundaries, and ANSI-stable panel assertions.
+- Refreshed vulnerable transitive dependencies in `uv.lock`; `pip-audit` reports no known vulnerabilities for this branch.
 
 ## [2026.4.17] - 2026-04-17
 
