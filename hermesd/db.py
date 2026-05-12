@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import contextlib
+import shutil
 import sqlite3
+import tempfile
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -42,18 +44,17 @@ class HermesDB:
         self._connected_mtime_ns: int | None = None
         self._messages_fts_supports_session_id: bool | None = None
         self._messages_fts_available: bool | None = None
+        self._snapshot_dir: tempfile.TemporaryDirectory[str] | None = None
         self._connect()
 
     def _connect(self) -> None:
-        if self._conn:
-            with contextlib.suppress(sqlite3.Error):
-                self._conn.close()
-            self._conn = None
+        self._close_connection()
         if not self._path.exists():
             self._connected_mtime_ns = None
             return
-        self._uri = f"{self._path.resolve().as_uri()}?mode=ro&immutable=1"
         try:
+            db_path, uri_params = self._open_target()
+            self._uri = f"{db_path.resolve().as_uri()}?{uri_params}"
             self._conn = sqlite3.connect(self._uri, uri=True, timeout=2, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             self._current_data_version = None
@@ -66,11 +67,41 @@ class HermesDB:
             self._connected_mtime_ns = self._source_mtime_ns()
             self._messages_fts_supports_session_id = None
             self._messages_fts_available = None
-        except sqlite3.OperationalError:
-            self._conn = None
+        except (OSError, sqlite3.OperationalError):
+            self._close_connection()
             self._connected_mtime_ns = None
             self._connect_backoff_reads = _CONNECT_BACKOFF_READS
             self._mark_cached_reads_stale()
+
+    def _close_connection(self) -> None:
+        if self._conn:
+            with contextlib.suppress(sqlite3.Error):
+                self._conn.close()
+            self._conn = None
+        if self._snapshot_dir is not None:
+            self._snapshot_dir.cleanup()
+            self._snapshot_dir = None
+
+    def _open_target(self) -> tuple[Path, str]:
+        if not self._path.with_name(f"{self._path.name}-wal").exists():
+            return self._path, "mode=ro&immutable=1"
+        return self._snapshot_wal_database(), "mode=ro"
+
+    def _snapshot_wal_database(self) -> Path:
+        snapshot_dir = tempfile.TemporaryDirectory(prefix="hermesd-state-")
+        snapshot_root = Path(snapshot_dir.name)
+        snapshot_db = snapshot_root / self._path.name
+        try:
+            shutil.copy2(self._path, snapshot_db)
+            for suffix in ("-wal", "-shm"):
+                source = self._path.with_name(f"{self._path.name}{suffix}")
+                if source.exists():
+                    shutil.copy2(source, snapshot_root / source.name)
+        except OSError:
+            snapshot_dir.cleanup()
+            raise
+        self._snapshot_dir = snapshot_dir
+        return snapshot_db
 
     def _source_mtime_ns(self) -> int | None:
         mtimes = []
@@ -340,10 +371,7 @@ class HermesDB:
 
     def close(self) -> None:
         with self._lock:
-            if self._conn:
-                with contextlib.suppress(sqlite3.Error):
-                    self._conn.close()
-                self._conn = None
+            self._close_connection()
 
 
 def _quote_fts_query(query: str) -> str:

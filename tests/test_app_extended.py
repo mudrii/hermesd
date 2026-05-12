@@ -388,6 +388,37 @@ def test_session_message_search_error_is_distinct_from_no_matches(
     app.close()
 
 
+def test_close_cancels_inflight_message_search_without_state_write(
+    populated_hermes_home: Path,
+    monkeypatch,
+):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._set_state(app._collector.collect())
+    app._view.enter_detail(2)
+    app._view.filter_query = "message:response"
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_search(query: str) -> set[str]:
+        started.set()
+        release.wait(timeout=2)
+        return {"sess_001"}
+
+    monkeypatch.setattr(app._collector, "search_session_ids_by_message", slow_search)
+    app._build_layout()
+    assert started.wait(timeout=1)
+
+    close_thread = threading.Thread(target=app.close)
+    close_thread.start()
+    assert app._closed.wait(timeout=1)
+    release.set()
+    close_thread.join(timeout=1)
+
+    assert not close_thread.is_alive()
+    assert app._state.session_message_match_query == ""
+    assert app._state.session_message_match_ids == set()
+
+
 def test_decode_input_keys_splits_escape_with_trailing_digit():
     assert _decode_input_keys(b"\x1b1") == ["\x1b", "1"]
 

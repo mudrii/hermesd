@@ -558,6 +558,9 @@ class DashboardApp:
                 match_ids = set()
                 search_error = f"message search error: {type(exc).__name__}"
             with self._lock:
+                if self._closed.is_set():
+                    self._message_search_inflight = ""
+                    return
                 if self._message_search_inflight != message_query:
                     continue
                 self._state = self._state.model_copy(

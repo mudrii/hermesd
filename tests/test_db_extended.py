@@ -1,3 +1,4 @@
+import shutil
 import sqlite3
 import threading
 import time
@@ -42,6 +43,33 @@ def test_read_only_uri_is_immutable_and_does_not_create_sidecars(tmp_path: Path)
     assert not db_path.with_name("state.db-wal").exists()
     assert not db_path.with_name("state.db-shm").exists()
     db.close()
+
+
+def test_wal_snapshot_reads_uncheckpointed_data_without_home_sidecars(tmp_path: Path):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source_db = source_dir / "state.db"
+    writer = sqlite3.connect(str(source_db))
+    writer.execute("PRAGMA journal_mode=WAL")
+    create_state_db_tables(writer, include_schema_version=False)
+    writer.execute("INSERT INTO sessions (id, source, started_at) VALUES ('sess_wal', 'cli', 1.0)")
+    writer.commit()
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    db_path = hermes_home / "state.db"
+    shutil.copy2(source_db, db_path)
+    shutil.copy2(source_db.with_name("state.db-wal"), db_path.with_name("state.db-wal"))
+    assert not db_path.with_name("state.db-shm").exists()
+
+    db = HermesDB(db_path)
+    try:
+        assert [row["id"] for row in db.read_sessions()] == ["sess_wal"]
+        assert db._uri.endswith("?mode=ro")
+        assert not db_path.with_name("state.db-shm").exists()
+    finally:
+        db.close()
+        writer.close()
 
 
 def test_empty_sessions_are_cached(hermes_home, monkeypatch):
