@@ -7,9 +7,14 @@ from hermesd.models import (
     CronState,
     DashboardState,
     GatewayState,
+    KanbanState,
+    KanbanTaskSummary,
     LogLine,
     LogState,
+    ModelCacheSummary,
+    OperationsState,
     PlatformStatus,
+    PRMonitorSummary,
     ProviderInfo,
     SessionInfo,
     SkillsMemory,
@@ -50,6 +55,8 @@ def test_gateway_panel_compact():
 
 
 def test_gateway_panel_detail():
+    from hermesd.models import ChannelDirectoryState, ChannelPlatformInfo
+
     state = DashboardState(
         gateway=GatewayState(
             pid=12345,
@@ -61,10 +68,24 @@ def test_gateway_panel_detail():
                 ),
             ],
         ),
+        channels=ChannelDirectoryState(
+            platform_count=2,
+            platforms=[
+                ChannelPlatformInfo(name="telegram", entry_count=1, connected=True),
+                ChannelPlatformInfo(
+                    name="feishu",
+                    entry_count=0,
+                    capabilities=["meeting invites"],
+                ),
+            ],
+        ),
     )
     panel = render_panel(1, state, Theme(), detail=True)
     text = _render_to_str(panel)
     assert "telegram" in text.lower()
+    assert "Channel Directory" in text
+    assert "feishu" in text
+    assert "meeting invites" in text
 
 
 def test_gateway_panel_stopped():
@@ -175,3 +196,71 @@ def test_memory_panel_empty():
     panel = render_panel(10, state, Theme(), detail=False)
     text = _render_to_str(panel)
     assert "Memory" in text
+
+
+def test_kanban_panel_detail():
+    state = DashboardState(
+        kanban=KanbanState(
+            db_present=True,
+            task_count=2,
+            run_count=1,
+            event_count=1,
+            comment_count=1,
+            dispatch_in_gateway=False,
+            status_counts={"blocked": 1, "in_progress": 1},
+            active_tasks=[
+                KanbanTaskSummary(
+                    task_id="t_active",
+                    title="Implement dashboard auth visibility",
+                    status="in_progress",
+                    assignee="coding",
+                    worker_pid=4242,
+                )
+            ],
+            problem_tasks=[
+                KanbanTaskSummary(
+                    task_id="t_blocked",
+                    title="Fix worker profile",
+                    status="blocked",
+                    consecutive_failures=2,
+                    last_failure_error="missing credentials",
+                )
+            ],
+        )
+    )
+    panel = render_panel(11, state, Theme(), detail=True)
+    text = _render_to_str(panel)
+    assert "Kanban" in text
+    assert "t_active" in text
+    assert "t_blocked" in text
+    assert "Status Counts" in text
+
+
+def test_operations_panel_detail():
+    state = DashboardState(
+        operations=OperationsState(
+            dashboard_process_count=1,
+            model_caches=[
+                ModelCacheSummary(
+                    name="models_dev_cache.json",
+                    provider_count=2,
+                    model_count=3,
+                    size_bytes=1200,
+                )
+            ],
+            pr_monitors=[
+                PRMonitorSummary(
+                    filename="pr-monitor-nousresearch-hermes-agent.json",
+                    repo="NousResearch/hermes-agent",
+                    monitored_count=2,
+                    tracked_count=2,
+                    author_pr_count=1,
+                )
+            ],
+        )
+    )
+    panel = render_panel(12, state, Theme(), detail=True)
+    text = _render_to_str(panel)
+    assert "Operations" in text
+    assert "models_dev_cache.json" in text
+    assert "PR Monitors" in text

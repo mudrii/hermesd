@@ -20,7 +20,8 @@ def _snapshot_panel_num(value: str) -> int:
 
     parsed = 10 if value == "0" else int(value)
     if parsed not in PANEL_NAMES:
-        raise argparse.ArgumentTypeError("snapshot panel must be 1-9 or 0 (panel 10)")
+        available = ", ".join(str(panel) for panel in sorted(PANEL_NAMES))
+        raise argparse.ArgumentTypeError(f"snapshot panel must be one of: {available}")
     return parsed
 
 
@@ -67,7 +68,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--snapshot-panel",
         type=_snapshot_panel_num,
         default=None,
-        help="Select panel 1-9 or 0 (panel 10); text snapshots render that detail view, JSON snapshots annotate full-state output",
+        help="Select a panel by number (0 aliases panel 10); text snapshots render that detail view, JSON snapshots annotate full-state output",
     )
     parser.add_argument(
         "--snapshot-format",

@@ -18,7 +18,16 @@ class SessionFilterCriteria(TypedDict):
     terms: list[str]
 
 
-_EXACT_SESSION_FILTER_FIELDS = {"id", "source", "parent", "provider", "status", "pricing"}
+_EXACT_SESSION_FILTER_FIELDS = {
+    "id",
+    "source",
+    "parent",
+    "provider",
+    "status",
+    "pricing",
+    "archived",
+    "handoff",
+}
 _ACTIVE_TRUE_VALUES = {"1", "true", "yes", "active"}
 _ACTIVE_FALSE_VALUES = {"0", "false", "no", "inactive"}
 
@@ -122,11 +131,17 @@ def _render_detail(
     if filter_query or session_sort != "recent":
         header.append("\n\n", style=theme.banner_dim)
 
+    sections = [
+        header,
+        table if sessions else Text("  No matching sessions\n", style=theme.banner_dim),
+    ]
+    runtime_table = _runtime_table(sessions, theme)
+    if runtime_table is not None:
+        sections.append(Text("\nRuntime\n", style=f"bold {theme.ui_label}"))
+        sections.append(runtime_table)
+
     return Panel(
-        Group(
-            header,
-            table if sessions else Text("  No matching sessions\n", style=theme.banner_dim),
-        ),
+        Group(*sections),
         title=f"[{theme.panel_title_style}]\\[2] Sessions[/]",
         title_align="left",
         border_style=theme.panel_border_style,
@@ -170,6 +185,10 @@ def _session_matches(
             session.billing_provider,
             session.cost_status,
             session.pricing_version,
+            session.cwd,
+            session.handoff_state,
+            session.handoff_platform,
+            session.handoff_error,
             session.title or "",
         ]
     ).lower()
@@ -191,6 +210,11 @@ def _match_session_field(
         return session.is_active is is_active
     if field_name == "message":
         return session.session_id in message_match_ids
+    if field_name == "archived":
+        if value not in _ACTIVE_TRUE_VALUES | _ACTIVE_FALSE_VALUES:
+            return False
+        expected_archived = value in _ACTIVE_TRUE_VALUES
+        return session.archived is expected_archived
     field_map = {
         "id": session.session_id,
         "source": session.source,
@@ -199,6 +223,9 @@ def _match_session_field(
         "provider": session.billing_provider,
         "status": session.cost_status,
         "pricing": session.pricing_version,
+        "cwd": session.cwd,
+        "handoff": session.handoff_state,
+        "platform": session.handoff_platform,
         "title": session.title or "",
     }
     actual = field_map.get(field_name, "").lower()
@@ -226,6 +253,10 @@ def _parse_session_filter(filter_query: str) -> SessionFilterCriteria:
             "status",
             "pricing",
             "title",
+            "cwd",
+            "archived",
+            "handoff",
+            "platform",
             "active",
             "message",
         }:
@@ -280,3 +311,54 @@ def _sort_sessions(sessions: list[SessionInfo], session_sort: str) -> list[Sessi
         key=lambda session: (session.started_at, session.session_id),
         reverse=True,
     )
+
+
+def _cwd_label(cwd: str) -> str:
+    if not cwd:
+        return "—"
+    return cwd.rstrip("/").split("/")[-1] or cwd
+
+
+def _runtime_table(sessions: list[SessionInfo], theme: Theme) -> Table | None:
+    runtime_sessions = [
+        session
+        for session in sessions[:10]
+        if session.api_call_count
+        or session.cwd
+        or session.archived
+        or session.rewind_count
+        or session.handoff_state
+        or session.handoff_platform
+        or session.handoff_error
+    ]
+    if not runtime_sessions:
+        return None
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("ID", style=theme.session_label)
+    table.add_column("API", justify="right", style=theme.ui_accent)
+    table.add_column("CWD", style=theme.banner_text)
+    table.add_column("Flags", style=theme.banner_dim)
+    table.add_column("Handoff", style=theme.banner_text)
+    for session in runtime_sessions:
+        flags = []
+        if session.archived:
+            flags.append("archived")
+        if session.rewind_count:
+            flags.append(f"rewind:{session.rewind_count}")
+        handoff = " ".join(
+            part
+            for part in [
+                session.handoff_state,
+                session.handoff_platform,
+                session.handoff_error[:40],
+            ]
+            if part
+        )
+        table.add_row(
+            session.session_id[-8:],
+            str(session.api_call_count),
+            _cwd_label(session.cwd),
+            ", ".join(flags) if flags else "—",
+            handoff or "—",
+        )
+    return table

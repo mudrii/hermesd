@@ -31,7 +31,9 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append(f"{c.job_count}", style=theme.banner_text)
     lines.append("  Errors: ", style=theme.ui_label)
     err_color = theme.ui_error if c.error_count > 0 else theme.banner_text
-    lines.append(f"{c.error_count}", style=err_color)
+    lines.append(f"{c.error_count}\n", style=err_color)
+    lines.append("  Parallel: ", style=theme.ui_label)
+    lines.append(str(c.max_parallel_jobs or "—"), style=theme.banner_text)
 
     if c.jobs:
         lines.append("\n")
@@ -63,6 +65,11 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     else:
         header.append("Last tick: —", style=theme.banner_dim)
     header.append(f"   Jobs: {c.job_count}   Errors: {c.error_count}\n\n", style=theme.banner_text)
+    header.append(
+        f"Config: max_parallel={c.max_parallel_jobs or '—'} "
+        f"wrap_response={'yes' if c.wrap_response else 'no'}\n\n",
+        style=theme.banner_dim,
+    )
     sections.append(header)
 
     if c.jobs:
@@ -73,6 +80,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         table.add_column("Deliver", style=theme.ui_label)
         table.add_column("State", style=theme.ui_label)
         table.add_column("Last", style=theme.banner_text)
+        table.add_column("Error", style=theme.ui_error)
 
         for j in c.jobs:
             sym = (
@@ -90,6 +98,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
                 j.delivery_target_label or j.deliver or "—",
                 Text(j.state, style=state_color),
                 Text(last, style=last_style),
+                j.last_error[:80] if j.last_error else "—",
             )
         sections.append(table)
 
@@ -104,6 +113,8 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
                     )
                 if j.silent_run:
                     line.append("[SILENT] ", style=theme.ui_warn)
+                if j.latest_output_path:
+                    line.append(f"{j.latest_output_path}  ", style=theme.banner_dim)
                 line.append(j.latest_output_excerpt or "—", style=theme.banner_text)
                 line.append("\n")
                 sections.append(line)

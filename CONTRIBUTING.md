@@ -46,6 +46,8 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 - **Read-only** — hermesd must never write to `~/.hermes/`
 - **No hermes-agent imports** — hermesd reads files directly, zero dependency on hermes-agent code
 - **Error resilience** — never crash on missing/corrupt data; show last known good state (cache-preservation pattern)
+- **User-facing text stays documented** — update `README.md`, `CHANGELOG.md`, and affected tests when CLI help, snapshot output, panel labels, or header/footer text changes
+- **Package version source** — `hermesd.__version__` is derived from installed package metadata; bump `pyproject.toml` for releases rather than hardcoding version text in the UI
 
 ## Adding a New Panel
 

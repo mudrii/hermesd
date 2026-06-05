@@ -28,6 +28,41 @@ def test_sessions_empty_db(hermes_home):
     db.close()
 
 
+def test_read_sessions_excludes_private_payload_columns(hermes_home):
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.execute(
+        "INSERT INTO sessions ("
+        "id, source, started_at, message_count, input_tokens, "
+        "system_prompt, model_config, billing_base_url"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "sess_private",
+            "cli",
+            1.0,
+            3,
+            42,
+            "very large prompt",
+            '{"secret": "shape"}',
+            "https://billing.example.test/private",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path)
+    row = db.read_sessions()[0]
+
+    assert row["id"] == "sess_private"
+    assert row["message_count"] == 3
+    assert row["input_tokens"] == 42
+    assert "system_prompt" not in row
+    assert "model_config" not in row
+    assert "billing_base_url" not in row
+    db.close()
+
+
 def test_read_only_uri_is_immutable_and_does_not_create_sidecars(tmp_path: Path):
     db_path = tmp_path / "state.db"
     conn = sqlite3.connect(str(db_path))

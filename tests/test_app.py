@@ -108,6 +108,19 @@ def test_app_handle_key_zero_opens_panel_ten(populated_hermes_home: Path):
     app.close()
 
 
+def test_app_handle_bracket_navigation_reaches_new_panels(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    for _ in range(10):
+        app._handle_key("]")
+    assert app._view.mode == "detail"
+    assert app._view.detail_panel == 11
+    app._handle_key("]")
+    assert app._view.detail_panel == 12
+    app._handle_key("[")
+    assert app._view.detail_panel == 11
+    app.close()
+
+
 def test_app_handle_key_escape(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app._handle_key("3")

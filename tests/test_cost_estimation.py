@@ -11,6 +11,7 @@ from hermesd.collector import (
     _estimate_cost,
     _resolved_session_cost,
     _summarize_breakdown,
+    _summarize_tokens,
 )
 from tests.conftest import create_state_db_tables
 
@@ -93,6 +94,74 @@ def test_resolved_session_cost_corners(
     }
 
     assert _resolved_session_cost(row) == expected
+
+
+def test_summarize_tokens_coerces_null_columns_to_zero():
+    rows = [
+        {
+            "input_tokens": None,
+            "output_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "reasoning_tokens": None,
+            "estimated_cost_usd": None,
+            "cost_status": None,
+            "started_at": None,
+        }
+    ]
+
+    totals = _summarize_tokens(rows)
+
+    assert totals.input_tokens == 0
+    assert totals.output_tokens == 0
+    assert totals.cache_read_tokens == 0
+    assert totals.cache_write_tokens == 0
+    assert totals.reasoning_tokens == 0
+    assert totals.total_cost_usd == 0.0
+
+
+def test_summarize_tokens_excludes_rows_before_started_at_min():
+    rows = [
+        {"input_tokens": 10, "started_at": 50.0},  # before cutoff — excluded
+        {"input_tokens": 20, "started_at": 150.0},  # at/after cutoff — counted
+    ]
+
+    totals = _summarize_tokens(rows, started_at_min=100.0)
+
+    assert totals.input_tokens == 20
+
+
+def test_summarize_tokens_accumulates_fields_and_resolves_cost_per_row():
+    rows = [
+        {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "cache_read_tokens": 2,
+            "cache_write_tokens": 1,
+            "reasoning_tokens": 3,
+            "estimated_cost_usd": 1.5,
+            "cost_status": "reported",  # reported cost preserved verbatim
+        },
+        {
+            "input_tokens": 20,
+            "output_tokens": 7,
+            "cache_read_tokens": 4,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 6,
+            "estimated_cost_usd": None,  # falls back to estimate
+            "cost_status": "estimated",
+        },
+    ]
+
+    totals = _summarize_tokens(rows)
+
+    assert totals.input_tokens == 30
+    assert totals.output_tokens == 12
+    assert totals.cache_read_tokens == 6
+    assert totals.cache_write_tokens == 1
+    assert totals.reasoning_tokens == 9
+    expected_cost = 1.5 + _estimate_cost(20, 7, 4, 6)
+    assert abs(totals.total_cost_usd - expected_cost) < 1e-9
 
 
 def test_summarize_breakdown_sorts_equal_labels_ascending():

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import rich.box
-from rich.console import Group
+from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -42,6 +42,9 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             lines.append(f"{p.name}:", style=theme.ui_label)
             lines.append(" ● ", style=f"bold {dot_color}")
             lines.append(" ")
+    if state.channels.platform_count:
+        lines.append("\n  Directory: ", style=theme.ui_label)
+        lines.append(f"{state.channels.platform_count} platforms", style=theme.banner_text)
 
     return Panel(
         lines,
@@ -85,7 +88,26 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
             header.append("  (up to date)", style=theme.ui_ok)
     header.append("\n\n")
 
-    content = Group(header, table)
+    sections: list[RenderableType] = [header, table]
+
+    if state.channels.platforms:
+        channel_header = Text()
+        channel_header.append("\nChannel Directory\n", style=f"bold {theme.ui_label}")
+        sections.append(channel_header)
+
+        channel_table = Table(box=None, show_header=True, padding=(0, 2))
+        channel_table.add_column("Platform", style=theme.ui_label)
+        channel_table.add_column("Entries", justify="right", style=theme.ui_accent)
+        channel_table.add_column("States", style=theme.banner_text)
+        channel_table.add_column("Capabilities", style=theme.banner_dim)
+        for platform in state.channels.platforms:
+            states = ", ".join(platform.states) if platform.states else "—"
+            capabilities = ", ".join(platform.capabilities) if platform.capabilities else "—"
+            name = Text(platform.name, style=theme.ui_ok if platform.connected else theme.ui_label)
+            channel_table.add_row(name, str(platform.entry_count), states, capabilities)
+        sections.append(channel_table)
+
+    content = Group(*sections)
 
     return Panel(
         content,

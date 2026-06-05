@@ -110,6 +110,18 @@ def _render_memory_panel(ctx: PanelRenderContext) -> Panel:
     return render_memory(ctx.state, ctx.theme, detail=ctx.detail)
 
 
+def _render_kanban_panel(ctx: PanelRenderContext) -> Panel:
+    from hermesd.panels.kanban import render_kanban
+
+    return render_kanban(ctx.state, ctx.theme, detail=ctx.detail)
+
+
+def _render_operations_panel(ctx: PanelRenderContext) -> Panel:
+    from hermesd.panels.operations import render_operations
+
+    return render_operations(ctx.state, ctx.theme, detail=ctx.detail)
+
+
 PANEL_NAMES = {
     1: "Gateway & Platforms",
     2: "Sessions",
@@ -121,6 +133,8 @@ PANEL_NAMES = {
     8: "Logs",
     9: "Profiles",
     10: "Memory",
+    11: "Kanban",
+    12: "Operations",
 }
 
 # Deferred imports keep panel modules unloaded until they are actually rendered.
@@ -135,6 +149,8 @@ _RENDERERS: dict[int, PanelRenderer] = {
     8: _render_logs_panel,
     9: _render_profiles_panel,
     10: _render_memory_panel,
+    11: _render_kanban_panel,
+    12: _render_operations_panel,
 }
 
 

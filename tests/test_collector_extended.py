@@ -612,10 +612,14 @@ def test_latest_cron_output_excerpt_ignores_file_that_disappears_during_stat(
 
     monkeypatch.setattr(Path, "stat", flaky_stat)
 
-    excerpt, silent = _latest_cron_output_excerpt(hermes_home / "cron" / "output", "job-1")
+    excerpt, silent, output_path, output_mtime = _latest_cron_output_excerpt(
+        hermes_home / "cron" / "output", "job-1"
+    )
 
     assert excerpt == "fresh output"
     assert silent is False
+    assert output_path == "latest.md"
+    assert output_mtime is not None
 
 
 def test_git_checkpoint_summary_sets_timeouts(monkeypatch):

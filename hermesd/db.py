@@ -44,6 +44,7 @@ class HermesDB:
         self._connected_mtime_ns: int | None = None
         self._messages_fts_supports_session_id: bool | None = None
         self._messages_fts_available: bool | None = None
+        self._session_column_names: set[str] | None = None
         self._snapshot_dir: tempfile.TemporaryDirectory[str] | None = None
         self._connect()
 
@@ -67,6 +68,7 @@ class HermesDB:
             self._connected_mtime_ns = self._source_mtime_ns()
             self._messages_fts_supports_session_id = None
             self._messages_fts_available = None
+            self._session_column_names = None
         except (OSError, sqlite3.OperationalError):
             self._close_connection()
             self._connected_mtime_ns = None
@@ -187,16 +189,42 @@ class HermesDB:
         return self._last_message_search_stale
 
     def _read_all_sessions(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
-        cur = conn.execute(
-            "SELECT id, source, user_id, model, parent_session_id, started_at, ended_at, "
-            "end_reason, message_count, tool_call_count, "
-            "input_tokens, output_tokens, cache_read_tokens, "
-            "cache_write_tokens, reasoning_tokens, "
-            "estimated_cost_usd, actual_cost_usd, "
-            "billing_provider, cost_status, pricing_version, title "
-            "FROM sessions ORDER BY started_at DESC"
-        )
+        columns = ", ".join(self._session_columns(conn))
+        cur = conn.execute(f"SELECT {columns} FROM sessions ORDER BY started_at DESC")
         return [dict(row) for row in cur.fetchall()]
+
+    def _session_columns(self, conn: sqlite3.Connection) -> list[str]:
+        wanted_columns = [
+            "id",
+            "source",
+            "model",
+            "parent_session_id",
+            "started_at",
+            "ended_at",
+            "message_count",
+            "tool_call_count",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+            "billing_provider",
+            "estimated_cost_usd",
+            "cost_status",
+            "pricing_version",
+            "title",
+            "api_call_count",
+            "cwd",
+            "rewind_count",
+            "archived",
+            "handoff_state",
+            "handoff_platform",
+            "handoff_error",
+        ]
+        if self._session_column_names is None:
+            cur = conn.execute("PRAGMA table_info(sessions)")
+            self._session_column_names = {str(row["name"]) for row in cur.fetchall()}
+        return [column for column in wanted_columns if column in self._session_column_names]
 
     def read_session_count(self) -> int:
         with self._lock:

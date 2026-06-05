@@ -233,7 +233,30 @@ def sample_config(hermes_home: Path) -> Path:
                 },
                 "memory": {"provider": "supermemory"},
                 "session_reset": {"mode": "both"},
-                "dashboard": {"theme": "midnight"},
+                "dashboard": {"theme": "midnight", "auth_provider": "basic"},
+                "tools": {
+                    "tool_search": {
+                        "enabled": "auto",
+                        "threshold_pct": 10,
+                        "search_default_limit": 5,
+                        "max_search_limit": 20,
+                    }
+                },
+                "toolsets": ["hermes-cli"],
+                "code_execution": {"mode": "confirm", "timeout": 120, "max_tool_calls": 16},
+                "kanban": {
+                    "dispatch_in_gateway": False,
+                    "dispatch_interval_seconds": 60,
+                    "auto_decompose": True,
+                    "failure_limit": 2,
+                },
+                "gateway": {
+                    "strict": True,
+                    "trust_recent_files": True,
+                    "trust_recent_files_seconds": 30,
+                },
+                "cron": {"max_parallel_jobs": 3, "wrap_response": True},
+                "auxiliary": {"session_search": "gpt-5.4", "skills_hub": "gpt-5.4"},
                 "plugins": {"disabled": ["disabled-plugin"]},
                 "mcp_servers": {
                     "playwright": {
@@ -360,6 +383,12 @@ def sample_processes(hermes_home: Path) -> Path:
                     "task_id": "task-1",
                     "session_key": "telegram:123",
                     "watcher_interval": 30,
+                    "watcher_platform": "telegram",
+                    "watcher_chat_id": "123",
+                    "watcher_user_id": "u1",
+                    "watcher_user_name": "Operator",
+                    "watcher_thread_id": "thread-1",
+                    "watcher_message_id": "msg-1",
                     "notify_on_complete": True,
                     "watch_patterns": ["ERROR", "listening on port"],
                 },
@@ -540,6 +569,187 @@ def sample_cron_tick(hermes_home: Path) -> Path:
 
 
 @pytest.fixture
+def sample_channel_directory(hermes_home: Path) -> Path:
+    path = hermes_home / "channel_directory.json"
+    path.write_text(
+        json.dumps(
+            {
+                "updated_at": "2026-06-04T17:14:31Z",
+                "platforms": {
+                    "telegram": [{"id": "123", "name": "Ops", "state": "connected"}],
+                    "feishu": [],
+                    "discord": [],
+                },
+            }
+        )
+    )
+    return path
+
+
+@pytest.fixture
+def sample_model_caches(hermes_home: Path) -> list[Path]:
+    models_dev = hermes_home / "models_dev_cache.json"
+    models_dev.write_text(
+        json.dumps(
+            {
+                "openai": {"models": {"gpt-5.4": {}, "gpt-5.5": {}}},
+                "minimax": {"models": {"MiniMax-M3": {}}},
+            }
+        )
+    )
+    provider_models = hermes_home / "provider_models_cache.json"
+    provider_models.write_text(json.dumps({"openai-codex": {"models": ["gpt-5.4", "gpt-5.5"]}}))
+    return [models_dev, provider_models]
+
+
+@pytest.fixture
+def sample_pr_monitor(hermes_home: Path) -> Path:
+    path = hermes_home / "pr-monitor-nousresearch-hermes-agent.json"
+    path.write_text(
+        json.dumps(
+            {
+                "repo": "NousResearch/hermes-agent",
+                "checkedAt": "2026-06-04T17:14:31Z",
+                "monitored": [1, 2],
+                "tracked": {"1": {}, "2": {}},
+                "author_prs": {"3": {}},
+            }
+        )
+    )
+    return path
+
+
+@pytest.fixture
+def sample_kanban_db(hermes_home: Path) -> Path:
+    db_path = hermes_home / "kanban.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            claim_expires INTEGER,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            worker_pid INTEGER,
+            last_failure_error TEXT,
+            last_heartbeat_at INTEGER,
+            current_run_id INTEGER,
+            skills TEXT,
+            model_override TEXT,
+            branch_name TEXT,
+            session_id TEXT
+        );
+        CREATE TABLE task_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            profile TEXT,
+            status TEXT NOT NULL,
+            worker_pid INTEGER,
+            started_at INTEGER NOT NULL,
+            ended_at INTEGER,
+            outcome TEXT,
+            summary TEXT,
+            error TEXT
+        );
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            run_id INTEGER,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE task_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            author TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        """
+    )
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "t_active",
+            "Implement dashboard auth visibility",
+            "coding",
+            "in_progress",
+            1,
+            now - 600,
+            now - 300,
+            None,
+            now + 600,
+            0,
+            4242,
+            None,
+            now - 30,
+            1,
+            '["kanban-worker"]',
+            "gpt-5.4",
+            "feature/ops",
+            "sess_kanban",
+        ),
+    )
+    conn.execute(
+        "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "t_blocked",
+            "Fix failed worker profile",
+            "ops",
+            "blocked",
+            0,
+            now - 1200,
+            now - 900,
+            None,
+            None,
+            2,
+            None,
+            "missing credentials",
+            now - 800,
+            None,
+            "",
+            "",
+            "",
+            "",
+        ),
+    )
+    conn.execute(
+        "INSERT INTO task_runs VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (
+            1,
+            "t_active",
+            "coding",
+            "running",
+            4242,
+            now - 300,
+            None,
+            None,
+            "",
+            "",
+        ),
+    )
+    conn.execute(
+        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+        ("t_blocked", None, "blocked", "{}", now - 700),
+    )
+    conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+        ("t_blocked", "operator", "retry with another profile", now - 650),
+    )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+@pytest.fixture
 def populated_hermes_home(
     hermes_home,
     sample_db,
@@ -555,6 +765,10 @@ def populated_hermes_home(
     sample_boot_md,
     sample_checkpoints,
     sample_cron_tick,
+    sample_channel_directory,
+    sample_model_caches,
+    sample_pr_monitor,
+    sample_kanban_db,
 ) -> Path:
     """A fully populated mock ~/.hermes."""
     return hermes_home

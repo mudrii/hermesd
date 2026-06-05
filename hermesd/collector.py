@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
 import re
 import shlex
+import shutil
+import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 import tomllib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
@@ -21,6 +25,8 @@ from hermesd.db import HermesDB
 from hermesd.file_cache import LastGoodFileCache
 from hermesd.models import (
     BackgroundProcessInfo,
+    ChannelDirectoryState,
+    ChannelPlatformInfo,
     CheckpointInfo,
     ConfigSummary,
     CredentialPoolEntry,
@@ -30,12 +36,19 @@ from hermesd.models import (
     GatewayState,
     HealthSummary,
     HookInfo,
+    KanbanRunSummary,
+    KanbanState,
+    KanbanTaskSummary,
     LogLine,
     LogState,
+    LogStream,
     MCPServerInfo,
     MemoryOverview,
+    ModelCacheSummary,
+    OperationsState,
     PlatformStatus,
     PluginInfo,
+    PRMonitorSummary,
     ProfilesState,
     ProfileSummary,
     ProviderInfo,
@@ -247,6 +260,30 @@ class Collector:
             self._collect_cron,
             CronState,
         )
+        channels = safe_collect(
+            lambda: (
+                self._last_state.channels
+                if self._last_state is not None
+                else ChannelDirectoryState()
+            ),
+            "channels",
+            lambda: self._collect_channels(gateway),
+            ChannelDirectoryState,
+        )
+        kanban = safe_collect(
+            lambda: self._last_state.kanban if self._last_state is not None else KanbanState(),
+            "kanban",
+            self._collect_kanban,
+            KanbanState,
+        )
+        operations = safe_collect(
+            lambda: (
+                self._last_state.operations if self._last_state is not None else OperationsState()
+            ),
+            "operations",
+            lambda: self._collect_operations(background_processes),
+            OperationsState,
+        )
         skills_memory = safe_collect(
             lambda: (
                 self._last_state.skills_memory if self._last_state is not None else SkillsMemory()
@@ -312,6 +349,9 @@ class Collector:
             checkpoints=checkpoints,
             config=config,
             cron=cron,
+            channels=channels,
+            kanban=kanban,
+            operations=operations,
             skills_memory=skills_memory,
             memory=memory,
             profiles=profiles,
@@ -468,10 +508,17 @@ class Collector:
                 cache_write_tokens=r.get("cache_write_tokens") or 0,
                 reasoning_tokens=r.get("reasoning_tokens") or 0,
                 estimated_cost_usd=_resolved_session_cost(r),
+                api_call_count=r.get("api_call_count") or 0,
+                cwd=r.get("cwd") or "",
+                archived=bool(r.get("archived") or 0),
+                rewind_count=r.get("rewind_count") or 0,
+                handoff_state=r.get("handoff_state") or "",
+                handoff_platform=r.get("handoff_platform") or "",
+                handoff_error=r.get("handoff_error") or "",
                 started_at=r.get("started_at") or 0.0,
                 ended_at=r.get("ended_at"),
                 title=r.get("title"),
-                is_active=r.get("ended_at") is None,
+                is_active=r.get("ended_at") is None and not bool(r.get("archived") or 0),
             )
             for r in rows
         ]
@@ -540,6 +587,12 @@ class Collector:
                 task_id=str(entry.get("task_id") or ""),
                 session_key=str(entry.get("session_key") or ""),
                 notify_on_complete=bool(entry.get("notify_on_complete")),
+                watcher_platform=str(entry.get("watcher_platform") or ""),
+                watcher_chat_id=str(entry.get("watcher_chat_id") or ""),
+                watcher_user_id=str(entry.get("watcher_user_id") or ""),
+                watcher_user_name=str(entry.get("watcher_user_name") or ""),
+                watcher_thread_id=str(entry.get("watcher_thread_id") or ""),
+                watcher_message_id=str(entry.get("watcher_message_id") or ""),
                 watcher_interval=_coerce_int(entry.get("watcher_interval")),
                 watch_patterns=[str(item) for item in entry.get("watch_patterns") or []],
             )
@@ -591,11 +644,24 @@ class Collector:
         dashboard_cfg = _as_dict(cfg.get("dashboard"))
         session_reset_cfg = _as_dict(cfg.get("session_reset"))
         memory_cfg = _as_dict(cfg.get("memory"))
+        tool_search_cfg = _as_dict(cfg.get("tools")).get("tool_search")
+        if not isinstance(tool_search_cfg, dict):
+            tool_search_cfg = _as_dict(cfg.get("tool_search"))
+        tool_search = _as_dict(tool_search_cfg)
+        code_execution_cfg = _as_dict(cfg.get("code_execution"))
+        kanban_cfg = _as_dict(cfg.get("kanban"))
+        gateway_cfg = _as_dict(cfg.get("gateway"))
+        auxiliary_cfg = _as_dict(cfg.get("auxiliary"))
         personality = agent_cfg.get("active_personality", "")
         if not personality:
             personalities = _as_dict(agent_cfg.get("personalities"))
             if personalities:
                 personality = next(iter(personalities))
+        dashboard_auth_provider = str(
+            dashboard_cfg.get("auth_provider")
+            or dashboard_cfg.get("auth")
+            or self._env.get("HERMES_DASHBOARD_AUTH_PROVIDER", "")
+        )
         return ConfigSummary(
             model=model_cfg.get("default", ""),
             provider=model_cfg.get("provider", ""),
@@ -619,6 +685,34 @@ class Collector:
             tool_gateway_scheme=self._env.get("TOOL_GATEWAY_SCHEME", ""),
             firecrawl_gateway_url=_redact_secret_url(self._env.get("FIRECRAWL_GATEWAY_URL", "")),
             tool_gateway_routes=self._collect_tool_gateway_routes(cfg),
+            tool_search_enabled=str(tool_search.get("enabled") or ""),
+            tool_search_threshold_pct=_coerce_int(tool_search.get("threshold_pct")),
+            tool_search_default_limit=_coerce_int(tool_search.get("search_default_limit")),
+            tool_search_max_limit=_coerce_int(tool_search.get("max_search_limit")),
+            toolsets=[str(item) for item in cfg.get("toolsets") or [] if item],
+            code_execution_mode=str(code_execution_cfg.get("mode") or ""),
+            code_execution_timeout=_coerce_int(code_execution_cfg.get("timeout")),
+            code_execution_max_tool_calls=_coerce_int(code_execution_cfg.get("max_tool_calls")),
+            dashboard_public_url=_redact_secret_url(str(dashboard_cfg.get("public_url") or "")),
+            dashboard_auth_provider=dashboard_auth_provider,
+            dashboard_basic_auth_configured=(
+                bool(self._env.get("HERMES_DASHBOARD_BASIC_AUTH_USERNAME"))
+                or bool(self._env.get("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"))
+                or dashboard_auth_provider.endswith("basic")
+                or dashboard_auth_provider == "basic"
+            ),
+            kanban_dispatch_in_gateway=bool(kanban_cfg.get("dispatch_in_gateway")),
+            kanban_auto_decompose=bool(kanban_cfg.get("auto_decompose")),
+            kanban_dispatch_interval_seconds=_coerce_int(
+                kanban_cfg.get("dispatch_interval_seconds")
+            ),
+            kanban_failure_limit=_coerce_int(kanban_cfg.get("failure_limit")),
+            gateway_strict_media_delivery=bool(gateway_cfg.get("strict")),
+            gateway_trust_recent_files=bool(gateway_cfg.get("trust_recent_files")),
+            gateway_trust_recent_files_seconds=_coerce_int(
+                gateway_cfg.get("trust_recent_files_seconds")
+            ),
+            auxiliary_slots=sorted(str(name) for name in auxiliary_cfg if name),
         )
 
     def _collect_tool_gateway_routes(self, cfg: dict[str, Any]) -> list[ToolGatewayRoute]:
@@ -637,6 +731,8 @@ class Collector:
         return routes
 
     def _collect_cron(self) -> CronState:
+        cfg = self._read_yaml_cached()
+        cron_cfg = _as_dict(cfg.get("cron"))
         tick_path = self._paths.shared_path("cron", ".tick.lock")
         last_tick: float | None = None
         if tick_path.exists():
@@ -657,7 +753,7 @@ class Collector:
                 state = j.get("state", "")
                 if j.get("last_status") == "error" or j.get("last_error"):
                     error_count += 1
-                output_excerpt, silent_run = _latest_cron_output_excerpt(
+                output_excerpt, silent_run, output_path, output_mtime = _latest_cron_output_excerpt(
                     self._paths.shared_path("cron", "output"),
                     str(j.get("id") or ""),
                 )
@@ -674,9 +770,12 @@ class Collector:
                             str(j.get("deliver") or ""),
                         ),
                         latest_output_excerpt=output_excerpt,
+                        latest_output_path=output_path,
+                        latest_output_mtime=output_mtime,
                         silent_run=silent_run,
                         next_run_at=j.get("next_run_at", ""),
                         last_status=j.get("last_status"),
+                        last_error=str(j.get("last_error") or ""),
                     )
                 )
 
@@ -684,8 +783,122 @@ class Collector:
             last_tick_ago_seconds=last_tick,
             job_count=len(jobs),
             error_count=error_count,
+            max_parallel_jobs=_coerce_int(cron_cfg.get("max_parallel_jobs")),
+            wrap_response=bool(cron_cfg.get("wrap_response")),
             jobs=jobs,
         )
+
+    def _collect_channels(self, gateway: GatewayState) -> ChannelDirectoryState:
+        directory = self._read_json_cached(self._paths.shared_path("channel_directory.json"))
+        platforms = _as_dict(directory.get("platforms"))
+        gateway_states = {platform.name: platform.state for platform in gateway.platforms}
+        platform_infos: list[ChannelPlatformInfo] = []
+        for name, raw_entries in sorted(platforms.items()):
+            entries = raw_entries if isinstance(raw_entries, list) else []
+            states = sorted(
+                {
+                    str(_as_dict(entry).get("state") or "")
+                    for entry in entries
+                    if str(_as_dict(entry).get("state") or "")
+                }
+            )
+            gateway_state = gateway_states.get(str(name), "")
+            if gateway_state and gateway_state not in states:
+                states.append(gateway_state)
+            platform_infos.append(
+                ChannelPlatformInfo(
+                    name=str(name),
+                    entry_count=len(entries),
+                    states=states,
+                    connected=gateway_state == "connected",
+                    capabilities=_channel_capabilities(str(name)),
+                )
+            )
+        return ChannelDirectoryState(
+            updated_at=str(directory.get("updated_at") or ""),
+            platform_count=len(platform_infos),
+            platforms=platform_infos,
+        )
+
+    def _collect_kanban(self) -> KanbanState:
+        cfg = self._read_yaml_cached()
+        kanban_cfg = _as_dict(cfg.get("kanban"))
+        base_state = KanbanState(
+            db_present=self._paths.shared_path("kanban.db").exists(),
+            dispatch_in_gateway=bool(kanban_cfg.get("dispatch_in_gateway")),
+            dispatch_interval_seconds=_coerce_int(kanban_cfg.get("dispatch_interval_seconds")),
+            auto_decompose=bool(kanban_cfg.get("auto_decompose")),
+            failure_limit=_coerce_int(kanban_cfg.get("failure_limit")),
+        )
+        db_path = self._paths.shared_path("kanban.db")
+        if not db_path.exists():
+            return base_state
+        return _read_kanban_state(db_path, base_state)
+
+    def _collect_operations(
+        self,
+        background_processes: list[BackgroundProcessInfo],
+    ) -> OperationsState:
+        dashboard_process_count = sum(
+            1 for process in background_processes if "hermes dashboard" in process.command
+        )
+        desktop_stamp = self._read_json_cached(self._paths.shared_path("desktop-build-stamp.json"))
+        stamp_label = str(
+            desktop_stamp.get("version")
+            or desktop_stamp.get("stamp")
+            or desktop_stamp.get("built_at")
+            or desktop_stamp.get("created_at")
+            or ""
+        )
+        return OperationsState(
+            dashboard_process_count=dashboard_process_count,
+            desktop_build_stamp=stamp_label,
+            model_caches=self._collect_model_caches(),
+            pr_monitors=self._collect_pr_monitors(),
+        )
+
+    def _collect_model_caches(self) -> list[ModelCacheSummary]:
+        cache_names = [
+            "models_dev_cache.json",
+            "provider_models_cache.json",
+            "ollama_cloud_models_cache.json",
+        ]
+        summaries = []
+        for cache_name in cache_names:
+            path = self._paths.shared_path(cache_name)
+            data = self._read_json_cached(path)
+            if not data and not path.exists():
+                continue
+            provider_count, model_count = _model_cache_counts(data)
+            summaries.append(
+                ModelCacheSummary(
+                    name=cache_name,
+                    provider_count=provider_count,
+                    model_count=model_count,
+                    size_bytes=_file_size(path),
+                    mtime=_mtime(path),
+                )
+            )
+        return summaries
+
+    def _collect_pr_monitors(self) -> list[PRMonitorSummary]:
+        monitors = []
+        for path in sorted(self._paths.shared_path().glob("pr-monitor-*.json")):
+            data = self._read_json_cached(path)
+            if not data:
+                continue
+            monitors.append(
+                PRMonitorSummary(
+                    filename=path.name,
+                    repo=str(data.get("repo") or ""),
+                    checked_at=str(data.get("checkedAt") or data.get("checked_at") or ""),
+                    monitored_count=_len_if_sized(data.get("monitored")),
+                    tracked_count=_len_if_sized(data.get("tracked")),
+                    author_pr_count=_len_if_sized(data.get("author_prs"))
+                    or _len_if_sized(data.get("author_pr_numbers")),
+                )
+            )
+        return monitors
 
     def _collect_skills_memory(self) -> SkillsMemory:
         categories: set[str] = set()
@@ -942,11 +1155,38 @@ class Collector:
         return entries
 
     def _collect_logs(self) -> LogState:
+        stream_specs = [
+            ("agent", self._paths.profile_path("logs", "agent.log"), 20),
+            ("gateway", self._paths.profile_path("logs", "gateway.log"), 20),
+            ("errors", self._paths.profile_path("logs", "errors.log"), 10),
+            ("desktop", self._paths.shared_path("logs", "desktop.log"), 20),
+            ("dashboard", self._paths.shared_path("logs", "dashboard.log"), 20),
+            ("gui", self._paths.shared_path("logs", "gui.log"), 20),
+            ("update", self._paths.shared_path("logs", "update.log"), 20),
+            ("gateway.error", self._paths.shared_path("logs", "gateway.error.log"), 20),
+            ("tui crash", self._paths.shared_path("logs", "tui_gateway_crash.log"), 20),
+        ]
+        streams = [
+            self._tail_log_stream(name, path, max_lines)
+            for name, path, max_lines in stream_specs
+            if path.exists() or str(path) in self._log_cache
+        ]
+        cron_lines = self._tail_latest_cron_output(self._paths.shared_path("cron", "output"), 20)
+        if cron_lines:
+            streams.append(
+                LogStream(
+                    name="cron",
+                    path="cron/output",
+                    lines=cron_lines,
+                )
+            )
+        stream_map = {stream.name: stream.lines for stream in streams}
         return LogState(
-            agent_lines=self._tail_log(self._paths.profile_path("logs", "agent.log"), 20),
-            gateway_lines=self._tail_log(self._paths.profile_path("logs", "gateway.log"), 20),
-            error_lines=self._tail_log(self._paths.profile_path("logs", "errors.log"), 10),
-            cron_lines=self._tail_latest_cron_output(self._paths.shared_path("cron", "output"), 20),
+            agent_lines=stream_map.get("agent", []),
+            gateway_lines=stream_map.get("gateway", []),
+            error_lines=stream_map.get("errors", []),
+            cron_lines=cron_lines,
+            streams=streams,
         )
 
     def _collect_profiles(self) -> ProfilesState:
@@ -993,9 +1233,14 @@ class Collector:
         )
 
     def _tail_log(self, path: Path, max_lines: int) -> list[LogLine]:
+        return self._tail_log_stream(path.name, path, max_lines).lines
+
+    def _tail_log_stream(self, name: str, path: Path, max_lines: int) -> LogStream:
         key = str(path)
         if not path.exists():
-            return self._log_cache.get(key, [])
+            return LogStream(name=name, path=path.name, lines=self._log_cache.get(key, []))
+        size_bytes = _file_size(path)
+        mtime = _mtime(path)
         try:
             with open(path, "rb") as f:
                 f.seek(0, 2)
@@ -1022,10 +1267,22 @@ class Collector:
                     result.append(LogLine(message=line.strip()))
             if result:
                 self._log_cache[key] = result
-                return result
-            return self._log_cache.get(key, [])
+                return LogStream(
+                    name=name,
+                    path=path.name,
+                    size_bytes=size_bytes,
+                    mtime=mtime,
+                    lines=result,
+                )
+            return LogStream(
+                name=name,
+                path=path.name,
+                size_bytes=size_bytes,
+                mtime=mtime,
+                lines=self._log_cache.get(key, []),
+            )
         except OSError:
-            return self._log_cache.get(key, [])
+            return LogStream(name=name, path=path.name, lines=self._log_cache.get(key, []))
 
     def _tail_latest_cron_output(self, output_root: Path, max_lines: int) -> list[LogLine]:
         key = f"cron:{output_root}"
@@ -1064,18 +1321,30 @@ def _summarize_tokens(
     rows: list[dict[str, Any]],
     started_at_min: float | None = None,
 ) -> TokenSummary:
-    totals = TokenSummary()
+    input_tokens = 0
+    output_tokens = 0
+    cache_read_tokens = 0
+    cache_write_tokens = 0
+    reasoning_tokens = 0
+    total_cost_usd = 0.0
     for row in rows:
         started_at = row.get("started_at") or 0.0
         if started_at_min is not None and started_at < started_at_min:
             continue
-        totals.input_tokens += row.get("input_tokens") or 0
-        totals.output_tokens += row.get("output_tokens") or 0
-        totals.cache_read_tokens += row.get("cache_read_tokens") or 0
-        totals.cache_write_tokens += row.get("cache_write_tokens") or 0
-        totals.reasoning_tokens += row.get("reasoning_tokens") or 0
-        totals.total_cost_usd += _resolved_session_cost(row)
-    return totals
+        input_tokens += row.get("input_tokens") or 0
+        output_tokens += row.get("output_tokens") or 0
+        cache_read_tokens += row.get("cache_read_tokens") or 0
+        cache_write_tokens += row.get("cache_write_tokens") or 0
+        reasoning_tokens += row.get("reasoning_tokens") or 0
+        total_cost_usd += _resolved_session_cost(row)
+    return TokenSummary(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+        reasoning_tokens=reasoning_tokens,
+        total_cost_usd=total_cost_usd,
+    )
 
 
 def _summarize_window(label: str, rows: list[dict[str, Any]], days: int) -> TokenWindowSummary:
@@ -1315,12 +1584,15 @@ def _delivery_target_label(directory: dict[str, Any], deliver: str) -> str:
     return deliver
 
 
-def _latest_cron_output_excerpt(output_root: Path, job_id: str) -> tuple[str, bool]:
+def _latest_cron_output_excerpt(
+    output_root: Path,
+    job_id: str,
+) -> tuple[str, bool, str, float | None]:
     if not job_id:
-        return "", False
+        return "", False, "", None
     job_output_dir = output_root / job_id
     if not job_output_dir.is_dir():
-        return "", False
+        return "", False, "", None
     files = []
     for path in job_output_dir.iterdir():
         try:
@@ -1329,18 +1601,19 @@ def _latest_cron_output_excerpt(output_root: Path, job_id: str) -> tuple[str, bo
         except OSError:
             continue
     if not files:
-        return "", False
+        return "", False, "", None
     latest = max(files, key=_safe_mtime)
+    latest_mtime = _mtime(latest)
     try:
         lines = latest.read_text(errors="replace").splitlines()
     except OSError:
-        return "", False
+        return "", False, "", None
     silent = any("[SILENT]" in line.upper() for line in lines)
     for line in lines:
         stripped = line.strip()
         if stripped and "[SILENT]" not in stripped.upper():
-            return stripped[:80], silent
-    return "", silent
+            return stripped[:80], silent, latest.name, latest_mtime
+    return "", silent, latest.name, latest_mtime
 
 
 def _tail_latest_cron_output(output_root: Path, max_lines: int, max_bytes: int) -> list[LogLine]:
@@ -1372,6 +1645,156 @@ def _tail_latest_cron_output(output_root: Path, max_lines: int, max_bytes: int) 
     except OSError:
         return []
     return [LogLine(message=line.strip()) for line in lines if line.strip()]
+
+
+def _read_kanban_state(db_path: Path, base_state: KanbanState) -> KanbanState:
+    with _connect_readonly_sqlite(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        status_counts = _count_by(conn, "SELECT status, COUNT(*) FROM tasks GROUP BY status")
+        assignee_counts = _count_by(
+            conn,
+            "SELECT COALESCE(NULLIF(assignee, ''), 'unassigned'), COUNT(*) "
+            "FROM tasks GROUP BY COALESCE(NULLIF(assignee, ''), 'unassigned')",
+        )
+        active_rows = _query_rows(
+            conn,
+            "SELECT * FROM tasks "
+            "WHERE status IN ('in_progress', 'running', 'claimed') "
+            "OR current_run_id IS NOT NULL OR worker_pid IS NOT NULL "
+            "ORDER BY COALESCE(last_heartbeat_at, started_at, created_at, 0) DESC LIMIT 10",
+        )
+        problem_rows = _query_rows(
+            conn,
+            "SELECT * FROM tasks "
+            "WHERE status IN ('blocked', 'failed', 'error') "
+            "OR consecutive_failures > 0 OR COALESCE(last_failure_error, '') != '' "
+            "ORDER BY COALESCE(last_heartbeat_at, started_at, created_at, 0) DESC LIMIT 10",
+        )
+        run_rows = _query_rows(
+            conn,
+            "SELECT * FROM task_runs ORDER BY started_at DESC, id DESC LIMIT 10",
+        )
+        return base_state.model_copy(
+            update={
+                "db_present": True,
+                "task_count": _table_count(conn, "tasks"),
+                "run_count": _table_count(conn, "task_runs"),
+                "event_count": _table_count(conn, "task_events"),
+                "comment_count": _table_count(conn, "task_comments"),
+                "status_counts": status_counts,
+                "assignee_counts": assignee_counts,
+                "active_tasks": [_kanban_task_from_row(row) for row in active_rows],
+                "problem_tasks": [_kanban_task_from_row(row) for row in problem_rows],
+                "recent_runs": [_kanban_run_from_row(row) for row in run_rows],
+            }
+        )
+
+
+@contextlib.contextmanager
+def _connect_readonly_sqlite(db_path: Path) -> Iterator[sqlite3.Connection]:
+    conn: sqlite3.Connection | None = None
+    snapshot_dir: tempfile.TemporaryDirectory[str] | None = None
+    if db_path.with_name(f"{db_path.name}-wal").exists():
+        snapshot_dir = tempfile.TemporaryDirectory(prefix="hermesd-kanban-")
+        snapshot_root = Path(snapshot_dir.name)
+        snapshot_db = snapshot_root / db_path.name
+        try:
+            shutil.copy2(db_path, snapshot_db)
+            for suffix in ("-wal", "-shm"):
+                source = db_path.with_name(f"{db_path.name}{suffix}")
+                if source.exists():
+                    shutil.copy2(source, snapshot_root / source.name)
+            conn = sqlite3.connect(f"{snapshot_db.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
+            yield conn
+            return
+        finally:
+            if conn is not None:
+                conn.close()
+            snapshot_dir.cleanup()
+    conn = sqlite3.connect(
+        f"{db_path.resolve().as_uri()}?mode=ro&immutable=1",
+        uri=True,
+        timeout=2,
+    )
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _query_rows(conn: sqlite3.Connection, sql: str) -> list[dict[str, Any]]:
+    cur = conn.execute(sql)
+    return [dict(row) for row in cur.fetchall()]
+
+
+def _table_count(conn: sqlite3.Connection, table_name: str) -> int:
+    cur = conn.execute(f"SELECT COUNT(*) FROM {table_name}")
+    row = cur.fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def _count_by(conn: sqlite3.Connection, sql: str) -> dict[str, int]:
+    cur = conn.execute(sql)
+    return {str(row[0] or "unknown"): int(row[1] or 0) for row in cur.fetchall()}
+
+
+def _kanban_task_from_row(row: dict[str, Any]) -> KanbanTaskSummary:
+    return KanbanTaskSummary(
+        task_id=str(row.get("id") or ""),
+        title=str(row.get("title") or ""),
+        assignee=str(row.get("assignee") or ""),
+        status=str(row.get("status") or ""),
+        priority=_coerce_int(row.get("priority")),
+        consecutive_failures=_coerce_int(row.get("consecutive_failures")),
+        worker_pid=_coerce_int(row.get("worker_pid")),
+        session_id=str(row.get("session_id") or ""),
+        last_failure_error=str(row.get("last_failure_error") or ""),
+        last_heartbeat_at=_coerce_int(row.get("last_heartbeat_at")),
+        claim_expires=_coerce_int(row.get("claim_expires")),
+        current_run_id=_coerce_int(row.get("current_run_id")),
+        model_override=str(row.get("model_override") or ""),
+        branch_name=str(row.get("branch_name") or ""),
+        skills=str(row.get("skills") or ""),
+    )
+
+
+def _kanban_run_from_row(row: dict[str, Any]) -> KanbanRunSummary:
+    return KanbanRunSummary(
+        run_id=_coerce_int(row.get("id")),
+        task_id=str(row.get("task_id") or ""),
+        profile=str(row.get("profile") or ""),
+        status=str(row.get("status") or ""),
+        outcome=str(row.get("outcome") or ""),
+        worker_pid=_coerce_int(row.get("worker_pid")),
+        started_at=_coerce_int(row.get("started_at")),
+        ended_at=_coerce_int(row.get("ended_at")),
+        error=str(row.get("error") or ""),
+        summary=str(row.get("summary") or ""),
+    )
+
+
+def _model_cache_counts(data: dict[str, Any]) -> tuple[int, int]:
+    if not data:
+        return 0, 0
+    model_count = 0
+    for provider_data in data.values():
+        provider = _as_dict(provider_data)
+        models = provider.get("models")
+        if isinstance(models, dict | list):
+            model_count += len(models)
+    return len(data), model_count
+
+
+def _channel_capabilities(name: str) -> list[str]:
+    if name == "feishu":
+        return ["meeting invites"]
+    return []
+
+
+def _len_if_sized(value: object) -> int:
+    if isinstance(value, dict | list | tuple | set):
+        return len(value)
+    return 0
 
 
 def _git_checkpoint_summary(repo_dir: Path) -> tuple[int, float | None, str]:
