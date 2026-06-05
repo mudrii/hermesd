@@ -19,6 +19,7 @@ hermesd --profile coding             # opt-in profile-scoped runtime data
 hermesd --snapshot                   # one-shot overview to stdout
 hermesd --snapshot-panel 10          # one-shot detail snapshot in text mode
 hermesd --snapshot-panel 0           # panel 10 alias matching the interactive shortcut
+hermesd --snapshot-panel 12          # one-shot detail snapshot for any registered panel
 hermesd --snapshot-format json       # machine-readable full-state snapshot
 hermesd --log-tail-bytes 8192        # cap per-refresh log reads for large files
 ```
@@ -35,7 +36,7 @@ hermesd/
   models.py       Pydantic models for DashboardState
   paths.py        Profile-scoped path resolution
   theme.py        Skin/color system (inherits from hermes config.yaml)
-  panels/         10 panel renderers (compact + detail views)
+  panels/         12 panel renderers (compact + detail views)
 ```
 
 ### Data Flow

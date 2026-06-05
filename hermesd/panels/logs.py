@@ -61,7 +61,7 @@ def _log_line_text(line: LogLine, theme: Theme) -> Text:
 
 def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines = Text()
-    recent_lines = state.logs.agent_lines[-5:]
+    recent_lines = _lines_for_stream(state, "agent")[-5:]
     if not recent_lines:
         lines.append("  No log lines", style=theme.banner_dim)
     for log_line in recent_lines:
@@ -85,12 +85,9 @@ def _render_detail(
     scroll_offset: int,
     filter_query: str,
 ) -> Panel:
-    log_map = {
-        "agent": state.logs.agent_lines,
-        "gateway": state.logs.gateway_lines,
-        "errors": state.logs.error_lines,
-        "cron": state.logs.cron_lines,
-    }
+    log_map = _log_stream_map(state)
+    if sub_view not in log_map:
+        sub_view = next(iter(log_map), "agent")
     unfiltered_lines = log_map.get(sub_view, state.logs.agent_lines)
     log_lines = _filter_log_lines(unfiltered_lines, filter_query)
     total = len(log_lines)
@@ -100,7 +97,7 @@ def _render_detail(
 
     lines = Text()
     tab_bar = Text()
-    for name in ("agent", "gateway", "errors", "cron"):
+    for name in log_map:
         if name == sub_view:
             tab_bar.append(f" [{name}] ", style=f"bold {theme.ui_accent}")
         else:
@@ -198,3 +195,18 @@ def _parse_log_filter(filter_query: str) -> LogFilterCriteria:
 
 def _log_level_rank(level: str) -> int:
     return _LOG_LEVEL_RANK.get(level.lower(), 0)
+
+
+def _log_stream_map(state: DashboardState) -> dict[str, list[LogLine]]:
+    if state.logs.streams:
+        return {stream.name: stream.lines for stream in state.logs.streams}
+    return {
+        "agent": state.logs.agent_lines,
+        "gateway": state.logs.gateway_lines,
+        "errors": state.logs.error_lines,
+        "cron": state.logs.cron_lines,
+    }
+
+
+def _lines_for_stream(state: DashboardState, name: str) -> list[LogLine]:
+    return _log_stream_map(state).get(name, [])

@@ -18,6 +18,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
 
+from hermesd import __version__
 from hermesd.collector import Collector
 from hermesd.models import DashboardState
 from hermesd.panels import PANEL_NAMES, render_panel
@@ -45,7 +46,8 @@ _WIDE_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
     ("row3", None, (4, 5)),
     ("row4", None, (6, 7)),
     ("row5", 7, (8, 9)),
-    ("row6", 6, (10,)),
+    ("row6", 6, (10, 11)),
+    ("row7", 6, (12,)),
 )
 _COMPACT_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
     ("row1", 3, (1,)),
@@ -54,7 +56,8 @@ _COMPACT_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
     ("row4", 4, (4, 5)),
     ("row5", 4, (6, 7)),
     ("row6", 4, (8, 9)),
-    ("row7", None, (10,)),
+    ("row7", 4, (10, 11)),
+    ("row8", None, (12,)),
 )
 _TALL_NARROW_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = tuple(
     (f"row{panel_num}", None, (panel_num,)) for panel_num in _PANEL_NUMBERS
@@ -118,8 +121,16 @@ class ViewState:
         self.scroll_offset = max(0, self.scroll_offset - 1)
 
     def cycle_log_view(self) -> None:
-        idx = _LOG_VIEWS.index(self.log_sub_view)
-        self.log_sub_view = _LOG_VIEWS[(idx + 1) % len(_LOG_VIEWS)]
+        self.cycle_log_view_in(_LOG_VIEWS)
+
+    def cycle_log_view_in(self, views: tuple[str, ...]) -> None:
+        if not views:
+            return
+        if self.log_sub_view not in views:
+            self.log_sub_view = views[0]
+            return
+        idx = views.index(self.log_sub_view)
+        self.log_sub_view = views[(idx + 1) % len(views)]
 
     def cycle_profile_view(self) -> None:
         self.profile_cycle_index += 1
@@ -139,6 +150,14 @@ class ViewState:
     def cycle_session_sort(self) -> None:
         idx = _SESSION_SORTS.index(self.session_sort)
         self.session_sort = _SESSION_SORTS[(idx + 1) % len(_SESSION_SORTS)]
+
+    def focus_next(self) -> None:
+        idx = _PANEL_NUMBERS.index(self.focus_panel)
+        self.enter_detail(_PANEL_NUMBERS[(idx + 1) % len(_PANEL_NUMBERS)])
+
+    def focus_previous(self) -> None:
+        idx = _PANEL_NUMBERS.index(self.focus_panel)
+        self.enter_detail(_PANEL_NUMBERS[(idx - 1) % len(_PANEL_NUMBERS)])
 
     def jump_top(self) -> None:
         self.scroll_offset = 0
@@ -428,8 +447,14 @@ class DashboardApp:
         if key == "c":
             self.copy_current_view()
             return None
+        if key == "]":
+            self._view.focus_next()
+            return None
+        if key == "[":
+            self._view.focus_previous()
+            return None
         if key == "\t" and self._view.detail_panel == _LOG_PANEL_NUM:
-            self._view.cycle_log_view()
+            self._view.cycle_log_view_in(self._current_log_views())
             return None
         if key == "/" and self._view.detail_panel in {_SESSIONS_PANEL_NUM, _LOG_PANEL_NUM}:
             self._view.start_filter()
@@ -460,6 +485,13 @@ class DashboardApp:
                 self._view.enter_detail(panel_num)
             return None
         return None
+
+    def _current_log_views(self) -> tuple[str, ...]:
+        with self._lock:
+            streams = self._state.logs.streams
+        if streams:
+            return tuple(stream.name for stream in streams)
+        return _LOG_VIEWS
 
     def _build_layout(self) -> Layout:
         with self._lock:
@@ -581,10 +613,10 @@ class DashboardApp:
         bg = active_theme.status_bar_bg
         now = datetime.now().strftime("%H:%M:%S")
         t = Text(style=f"on {bg}")
-        t.append(" ⚕ hermesd ", style=f"bold {active_theme.banner_title} on {bg}")
+        t.append(f" ⚕ hermesd {__version__}", style=f"bold {active_theme.banner_title} on {bg}")
         if state.runtime.banner:
             t.append(
-                f" {state.runtime.banner} ",
+                f"  {state.runtime.banner}",
                 style=f"bold {active_theme.ui_warn} on {bg}",
             )
         right_labels = [state.profile_mode_label]
@@ -593,10 +625,18 @@ class DashboardApp:
         right_text = "   ".join(right_labels)
         right_segment = f"{right_text}   {now} "
         padding_width = max(1, self._console.width - cell_len(t.plain) - cell_len(right_segment))
-        t.append(
-            f"{' ' * padding_width}{right_segment}",
-            style=f"{active_theme.banner_dim} on {bg}",
-        )
+        if cell_len(t.plain) + cell_len(right_segment) < self._console.width:
+            t.append(
+                f"{' ' * padding_width}{right_segment}",
+                style=f"{active_theme.banner_dim} on {bg}",
+            )
+        if cell_len(t.plain) > self._console.width:
+            t.truncate(self._console.width, overflow="crop")
+        elif cell_len(t.plain) < self._console.width:
+            t.append(
+                " " * (self._console.width - cell_len(t.plain)),
+                style=f"{active_theme.banner_dim} on {bg}",
+            )
         return t
 
     def _build_footer(
@@ -665,6 +705,7 @@ class DashboardApp:
 
     def _append_overview_footer_actions(self, text: Text, theme: Theme) -> None:
         self._append_footer_action(text, theme, f" [{_panel_shortcut_label()}]", " Expand  ")
+        self._append_footer_action(text, theme, "[]", " Prev/next  ")
         self._append_footer_action(text, theme, "[r]", " Refresh  ")
         self._append_footer_action(text, theme, "[q]", " Quit  ")
         self._append_footer_action(text, theme, "[?]", " Help  ")
@@ -683,6 +724,7 @@ class DashboardApp:
         self._append_footer_action(text, theme, " [Esc]", " Back  ")
         self._append_footer_action(text, theme, "[f]", " Toggle focus  ")
         self._append_footer_action(text, theme, "[c]", " Copy  ")
+        self._append_footer_action(text, theme, "[]", " Prev/next  ")
         self._append_footer_action(text, theme, "[j/k]", " Scroll  ")
         if panel == _LOG_PANEL_NUM:
             self._append_footer_action(text, theme, "[Tab]", " Switch log  ")
@@ -777,6 +819,7 @@ class DashboardApp:
         lines.append("  Keyboard Shortcuts\n\n", style=f"bold {active_theme.banner_title}")
         shortcuts = [
             (_panel_shortcut_label(), "Expand panel to full-screen"),
+            ("[]", "Move to previous/next panel"),
             ("Esc", "Return to overview"),
             ("f", "Toggle focus mode for the last selected panel"),
             ("c", "Copy the current rendered view as plain text via OSC 52"),
@@ -808,6 +851,8 @@ def _panel_shortcut_label() -> str:
         return ""
     if panel_numbers == list(range(1, 11)):
         return "1-9,0"
+    if panel_numbers == list(range(1, panel_numbers[-1] + 1)) and panel_numbers[-1] > 10:
+        return "1-9,0,[]"
     if panel_numbers == list(range(panel_numbers[0], panel_numbers[-1] + 1)):
         return f"{panel_numbers[0]}-{panel_numbers[-1]}"
     shortcuts = ["0" if panel_num == 10 else str(panel_num) for panel_num in panel_numbers]

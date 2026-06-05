@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2026.6.5] - 2026-06-05
+
+### Added
+
+- Added read-only Kanban visibility from `~/.hermes/kanban.db`, including task/run/event/comment counts, status and assignee breakdowns, active workers, blocked/failing tasks, recent runs, and config-derived dispatch state.
+- Added an Operations panel for dashboard process counts, Desktop build metadata, model-cache freshness/counts, and PR monitor summaries.
+- Added channel-directory inventory to Gateway & Platforms, expanded log streams for Desktop/Dashboard/GUI/update/gateway-error/crash logs, and richer session fields including cwd, API call count, archived state, rewind count, and handoff metadata.
+
+### Changed
+
+- The overview now supports 12 panels. `1`-`9` and `0` still open panels 1-10 directly, while `[` and `]` move between panels so Kanban and Operations are reachable interactively; `--snapshot-panel` accepts the new panel numbers.
+- Config and Cron panels now surface newer Hermes Agent settings such as Tool Search, toolsets, code execution, dashboard auth mode, kanban dispatch settings, gateway media trust, cron parallelism, last cron error, and latest output file metadata.
+- The top-left dashboard header now shows the installed `hermesd` package version next to the app name.
+- Documentation and CLI help now describe the 12-panel dashboard, higher-numbered snapshot panels, and current panel registry.
+
 ## [2026.6.3] - 2026-06-03
 
 ### Security

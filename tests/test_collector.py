@@ -24,7 +24,14 @@ def test_collect_full(populated_hermes_home: Path):
     assert state.tokens_total.input_tokens > 0
     assert state.config.model == "gpt-5.4"
     assert state.config.provider == "openai-codex"
+    assert state.config.tool_search_enabled == "auto"
+    assert state.config.kanban_auto_decompose is True
+    assert state.config.dashboard_basic_auth_configured is True
     assert state.skills_memory.skill_count == 15
+    assert state.channels.platform_count == 3
+    assert state.kanban.task_count == 2
+    assert state.operations.dashboard_process_count == 0
+    assert len(state.operations.model_caches) == 2
     assert len(state.logs.agent_lines) > 0
     assert state.active_skin == "default"
     c.close()
@@ -100,6 +107,8 @@ def test_collect_background_processes(populated_hermes_home: Path):
     assert len(state.background_processes) == 2
     assert state.background_processes[0].session_id == "proc_alpha"
     assert state.background_processes[0].notify_on_complete is True
+    assert state.background_processes[0].watcher_platform == "telegram"
+    assert state.background_processes[0].watcher_user_name == "Operator"
     assert state.background_processes[0].watch_patterns == ["ERROR", "listening on port"]
     assert state.background_processes[1].command == "npm run dev"
     c.close()
@@ -184,7 +193,97 @@ def test_collect_sessions_with_null_columns(hermes_home: Path):
     assert s.cache_write_tokens == 0
     assert s.reasoning_tokens == 0
     assert s.estimated_cost_usd == 0.0
+    assert s.api_call_count == 0
+    assert s.cwd == ""
+    assert s.archived is False
+    assert s.rewind_count == 0
+    assert s.handoff_state == ""
     assert s.title is None
+    c.close()
+
+
+def test_collect_sessions_reads_newer_runtime_columns(hermes_home: Path):
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn)
+    conn.executescript(
+        """
+        ALTER TABLE sessions ADD COLUMN api_call_count INTEGER DEFAULT 0;
+        ALTER TABLE sessions ADD COLUMN cwd TEXT;
+        ALTER TABLE sessions ADD COLUMN rewind_count INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE sessions ADD COLUMN handoff_state TEXT;
+        ALTER TABLE sessions ADD COLUMN handoff_platform TEXT;
+        ALTER TABLE sessions ADD COLUMN handoff_error TEXT;
+        """
+    )
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, api_call_count, cwd, rewind_count, "
+        "archived, handoff_state, handoff_platform, handoff_error) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "sess_new",
+            "cli",
+            time.time(),
+            8,
+            "/tmp/project",
+            2,
+            1,
+            "pending",
+            "telegram",
+            "delivery failed",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    session = state.sessions[0]
+
+    assert session.api_call_count == 8
+    assert session.cwd == "/tmp/project"
+    assert session.rewind_count == 2
+    assert session.archived is True
+    assert session.is_active is False
+    assert session.handoff_state == "pending"
+    assert session.handoff_platform == "telegram"
+    assert session.handoff_error == "delivery failed"
+    c.close()
+
+
+def test_collect_kanban_state(populated_hermes_home: Path):
+    c = Collector(populated_hermes_home)
+    state = c.collect()
+
+    assert state.kanban.db_present is True
+    assert state.kanban.task_count == 2
+    assert state.kanban.run_count == 1
+    assert state.kanban.event_count == 1
+    assert state.kanban.comment_count == 1
+    assert state.kanban.status_counts == {"blocked": 1, "in_progress": 1}
+    assert state.kanban.active_tasks[0].task_id == "t_active"
+    assert state.kanban.problem_tasks[0].task_id == "t_blocked"
+    assert state.kanban.problem_tasks[0].last_failure_error == "missing credentials"
+    c.close()
+
+
+def test_collect_channels_and_operations(populated_hermes_home: Path):
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    state = c.collect()
+
+    assert state.channels.updated_at == "2026-06-04T17:14:31Z"
+    assert state.channels.platform_count == 3
+    platforms = {platform.name: platform for platform in state.channels.platforms}
+    assert platforms["telegram"].entry_count == 1
+    assert platforms["telegram"].connected is True
+    assert platforms["feishu"].capabilities == ["meeting invites"]
+
+    caches = {cache.name: cache for cache in state.operations.model_caches}
+    assert caches["models_dev_cache.json"].provider_count == 2
+    assert caches["models_dev_cache.json"].model_count == 3
+    assert state.operations.pr_monitors[0].repo == "NousResearch/hermes-agent"
+    assert state.operations.pr_monitors[0].monitored_count == 2
     c.close()
 
 

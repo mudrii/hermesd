@@ -6,7 +6,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from hermesd.models import DashboardState
+from hermesd.models import ConfigSummary, DashboardState
 from hermesd.theme import Theme
 
 
@@ -29,7 +29,9 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append("  Compress: ", style=theme.ui_label)
     lines.append(f"{c.compression_threshold}\n", style=theme.banner_text)
     lines.append("  Gateway Tools: ", style=theme.ui_label)
-    lines.append(f"{gateway_count}/{len(c.tool_gateway_routes)}", style=theme.banner_text)
+    lines.append(f"{gateway_count}/{len(c.tool_gateway_routes)}\n", style=theme.banner_text)
+    lines.append("  Tool Search: ", style=theme.ui_label)
+    lines.append(c.tool_search_enabled or "—", style=theme.banner_text)
 
     return Panel(
         lines,
@@ -62,8 +64,16 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     table.add_row("Cheap Model", c.smart_model_routing_cheap_model or "—")
     table.add_row("Fallback Model", c.fallback_model_label or "—")
     table.add_row("Dashboard Theme", c.dashboard_theme or "—")
+    table.add_row("Dashboard Auth", _dashboard_auth_label(c))
+    table.add_row("Dashboard URL", c.dashboard_public_url or "—")
     table.add_row("Session Reset", c.session_reset_mode or "—")
     table.add_row("Memory Provider", c.memory_provider or "—")
+    table.add_row("Tool Search", _tool_search_label(c))
+    table.add_row("Toolsets", ", ".join(c.toolsets) if c.toolsets else "—")
+    table.add_row("Code Execution", _code_execution_label(c))
+    table.add_row("Kanban Dispatch", _kanban_config_label(c))
+    table.add_row("Gateway Media", _gateway_media_label(c))
+    table.add_row("Auxiliary Slots", str(len(c.auxiliary_slots)))
     sections.append(table)
 
     if c.tool_gateway_routes:
@@ -99,3 +109,50 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         box=rich.box.HORIZONTALS,
         padding=(1, 2),
     )
+
+
+def _dashboard_auth_label(config: ConfigSummary) -> str:
+    provider = config.dashboard_auth_provider or "—"
+    if config.dashboard_basic_auth_configured:
+        return f"{provider} basic-configured"
+    return provider
+
+
+def _tool_search_label(config: ConfigSummary) -> str:
+    if not config.tool_search_enabled:
+        return "—"
+    return (
+        f"{config.tool_search_enabled} "
+        f"threshold={config.tool_search_threshold_pct}% "
+        f"limit={config.tool_search_default_limit}/{config.tool_search_max_limit}"
+    )
+
+
+def _code_execution_label(config: ConfigSummary) -> str:
+    if not config.code_execution_mode:
+        return "—"
+    parts = [config.code_execution_mode]
+    if config.code_execution_timeout:
+        parts.append(f"{config.code_execution_timeout}s")
+    if config.code_execution_max_tool_calls:
+        parts.append(f"{config.code_execution_max_tool_calls} calls")
+    return " ".join(parts)
+
+
+def _kanban_config_label(config: ConfigSummary) -> str:
+    dispatch = "gateway" if config.kanban_dispatch_in_gateway else "manual"
+    parts = [dispatch]
+    if config.kanban_dispatch_interval_seconds:
+        parts.append(f"{config.kanban_dispatch_interval_seconds}s")
+    if config.kanban_failure_limit:
+        parts.append(f"fail={config.kanban_failure_limit}")
+    if config.kanban_auto_decompose:
+        parts.append("auto-decompose")
+    return " ".join(parts)
+
+
+def _gateway_media_label(config: ConfigSummary) -> str:
+    parts = ["strict" if config.gateway_strict_media_delivery else "relaxed"]
+    if config.gateway_trust_recent_files:
+        parts.append(f"trust-recent={config.gateway_trust_recent_files_seconds}s")
+    return " ".join(parts)

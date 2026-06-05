@@ -6,8 +6,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from rich.cells import cell_len
 from rich.console import Console
 
+from hermesd import __version__
 from hermesd.app import (
     _LOG_PANEL_NUM,
     _PROFILES_PANEL_NUM,
@@ -648,6 +650,24 @@ def test_build_header_pads_to_console_width(populated_hermes_home: Path):
     app.close()
 
 
+def test_build_header_shows_hermesd_version(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    header = app._build_header(app._state)
+
+    assert f"hermesd {__version__}" in header.plain
+    app.close()
+
+
+def test_build_header_fits_narrow_console(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._console = Console(width=20, height=24, force_terminal=True)
+    header = app._build_header(app._state)
+
+    assert cell_len(header.plain) == app._console.width
+    assert f"hermesd {__version__}" in header.plain
+    app.close()
+
+
 def test_app_refreshes_theme_when_skin_changes(populated_hermes_home: Path):
     import yaml
 
@@ -685,7 +705,8 @@ def test_build_footer_overview(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     footer = app._build_footer(app._state)
     assert footer is not None
-    assert "[1-9,0]" in footer.plain
+    assert "1-9,0" in footer.plain
+    assert "Prev/next" in footer.plain
     assert "[f]" in footer.plain
     assert "[c]" in footer.plain
     assert "0/0" in footer.plain
@@ -841,7 +862,7 @@ def test_tall_narrow_overview_uses_single_column_rows(populated_hermes_home: Pat
     state = app._collector.collect()
     overview = app._build_overview(state)
 
-    assert len(overview.children) == 10
+    assert len(overview.children) == len(PANEL_NAMES)
 
     with app._console.capture() as cap:
         app._console.print(overview)

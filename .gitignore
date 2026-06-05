@@ -19,6 +19,10 @@ env/
 htmlcov/
 .mypy_cache/
 
+# Generated repository analysis artifacts
+.graphify_*
+graphify-out/
+
 # IDE
 .vscode/
 .idea/
