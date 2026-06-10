@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import re
 
-from rich.console import Console
-
 from hermesd.models import (
     CredentialPoolEntry,
     DashboardState,
@@ -18,13 +16,7 @@ from hermesd.models import (
 )
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
-
-
-def _render_to_str(panel, width: int = 100) -> str:
-    console = Console(width=width, force_terminal=True, no_color=True)
-    with console.capture() as cap:
-        console.print(panel)
-    return cap.get()
+from tests.conftest import render_to_str
 
 
 def test_skills_detail_shows_providers_table():
@@ -37,7 +29,7 @@ def test_skills_detail_shows_providers_table():
         ),
     )
     panel = render_panel(7, state, Theme(), detail=True)
-    text = _render_to_str(panel, width=200)
+    text = render_to_str(panel, width=200, no_color=True)
     assert "Providers" in text
     assert "openai-codex" in text
     assert "anthropic" in text
@@ -58,7 +50,7 @@ def test_skills_detail_shows_skills_by_category():
         ),
     )
     panel = render_panel(7, state, Theme(), detail=True)
-    text = _render_to_str(panel, width=200)
+    text = render_to_str(panel, width=200, no_color=True)
     assert "Skills (4 in 2 categories)" in text
     assert "dev" in text
     assert "lint" in text
@@ -96,7 +88,7 @@ def test_skills_detail_shows_credential_pools_without_secrets():
         ),
     )
     panel = render_panel(7, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=100, no_color=True)
     assert "Credential Pools" in text
     assert "Primary Codex" in text
     assert "Fallback Anthropic" in text
@@ -127,7 +119,7 @@ def test_skills_detail_uses_dash_for_missing_priority():
     )
 
     panel = render_panel(7, state, Theme(), detail=True)
-    text = _render_to_str(panel, width=140)
+    text = render_to_str(panel, width=140, no_color=True)
     line = next(
         rendered_line for rendered_line in text.splitlines() if "Primary Codex" in rendered_line
     )
@@ -142,7 +134,7 @@ def test_skills_detail_no_skills():
         ),
     )
     panel = render_panel(7, state, Theme(), detail=True)
-    text = _render_to_str(panel, width=200)
+    text = render_to_str(panel, width=200, no_color=True)
     assert "Providers" in text
     assert "anthropic" in text
     # No skills section when empty
@@ -157,7 +149,7 @@ def test_skills_compact_shows_summary():
         ),
     )
     panel = render_panel(7, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=100, no_color=True)
     assert re.search(r"Skills:\s+77\s+\(39 cat\)", text)
     assert "openai-codex" in text
 
@@ -183,7 +175,7 @@ def test_skills_detail_shows_description_column():
         ),
     )
     panel = render_panel(7, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=100, no_color=True)
     assert "Description" in text
     assert "Manage Apple Notes" in text
     assert "Manage Apple Reminders" in text
@@ -224,7 +216,7 @@ def test_skills_detail_shows_integrations_sections():
         ),
     )
     panel = render_panel(7, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=100, no_color=True)
     assert "Hooks" in text
     assert "startup-check" in text
     assert "Plugins" in text
@@ -249,7 +241,7 @@ def test_skills_detail_scroll_offset():
     )
     # Scroll to offset 5
     panel = render_panel(7, state, Theme(), detail=True, scroll_offset=5)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=100, no_color=True)
     # Should show "↑" indicator for scrolled content
     assert "↑" in text
     # First visible should be skill-5
@@ -269,7 +261,7 @@ def test_skills_detail_scroll_offset_zero():
         ),
     )
     panel = render_panel(7, state, Theme(), detail=True, scroll_offset=0)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=100, no_color=True)
     assert "skill-0" in text
 
 
@@ -287,7 +279,7 @@ def test_skills_detail_uses_dash_for_empty_descriptions_after_scrolling():
     )
 
     panel = render_panel(7, state, Theme(), detail=True, scroll_offset=1)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=100, no_color=True)
 
     assert "—" in text
 
@@ -304,6 +296,6 @@ def test_skills_detail_does_not_truncate_long_descriptions():
     )
 
     panel = render_panel(7, state, Theme(), detail=True)
-    text = _render_to_str(panel, width=200)
+    text = render_to_str(panel, width=200, no_color=True)
 
     assert long_description in text

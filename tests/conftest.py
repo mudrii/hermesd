@@ -1,12 +1,32 @@
 from __future__ import annotations
 
 import json
+import signal
 import sqlite3
 import subprocess
 import time
 from pathlib import Path
 
 import pytest
+from rich.console import Console
+
+
+def render_to_str(panel, width: int = 120, no_color: bool = False) -> str:
+    """Render a Rich renderable to a string for assertion."""
+    console = Console(width=width, force_terminal=True, no_color=no_color)
+    with console.capture() as cap:
+        console.print(panel)
+    return cap.get()
+
+
+@pytest.fixture
+def restore_signal_handlers():
+    """Save SIGINT/SIGTERM handlers and restore them after the test."""
+    old_int = signal.getsignal(signal.SIGINT)
+    old_term = signal.getsignal(signal.SIGTERM)
+    yield
+    signal.signal(signal.SIGINT, old_int)
+    signal.signal(signal.SIGTERM, old_term)
 
 
 @pytest.fixture

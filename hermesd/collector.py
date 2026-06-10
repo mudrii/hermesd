@@ -170,14 +170,19 @@ class Collector:
         def empty_sessions() -> list[SessionInfo]:
             return []
 
+        def derived(name: str, compute: Callable[[list[dict[str, Any]]], T]) -> Callable[[], T]:
+            # Shared shape for every session-row-derived source: memoized via
+            # _derived_from_rows on fresh (non-stale) rows.
+            return lambda: self._derived_from_rows(
+                name,
+                self._fresh_session_rows(session_rows, session_rows_stale),
+                compute,
+            )
+
         sessions = safe_collect(
             lambda: self._last_state.sessions if self._last_state is not None else empty_sessions(),
             "session_models",
-            lambda: self._derived_from_rows(
-                "sessions",
-                self._fresh_session_rows(session_rows, session_rows_stale),
-                self._collect_sessions,
-            ),
+            derived("sessions", self._collect_sessions),
             empty_sessions,
         )
         available_tools = safe_collect(
@@ -205,11 +210,7 @@ class Collector:
                 self._last_state.tokens_today if self._last_state is not None else TokenSummary()
             ),
             "tokens_today",
-            lambda: self._derived_from_rows(
-                "tokens_today",
-                self._fresh_session_rows(session_rows, session_rows_stale),
-                self._collect_tokens_today,
-            ),
+            derived("tokens_today", self._collect_tokens_today),
             TokenSummary,
         )
         tokens_total = safe_collect(
@@ -217,11 +218,7 @@ class Collector:
                 self._last_state.tokens_total if self._last_state is not None else TokenSummary()
             ),
             "tokens_total",
-            lambda: self._derived_from_rows(
-                "tokens_total",
-                self._fresh_session_rows(session_rows, session_rows_stale),
-                self._collect_tokens_total,
-            ),
+            derived("tokens_total", self._collect_tokens_total),
             TokenSummary,
         )
         token_analytics = safe_collect(
@@ -231,11 +228,7 @@ class Collector:
                 else TokenAnalytics()
             ),
             "token_analytics",
-            lambda: self._derived_from_rows(
-                "token_analytics",
-                self._fresh_session_rows(session_rows, session_rows_stale),
-                self._collect_token_analytics,
-            ),
+            derived("token_analytics", self._collect_token_analytics),
             TokenAnalytics,
         )
         tool_stats = safe_collect(
@@ -252,11 +245,7 @@ class Collector:
         total_tool_calls = safe_collect(
             lambda: self._last_state.total_tool_calls if self._last_state is not None else 0,
             "tool_call_total",
-            lambda: self._derived_from_rows(
-                "tool_call_total",
-                self._fresh_session_rows(session_rows, session_rows_stale),
-                self._collect_total_tool_calls,
-            ),
+            derived("tool_call_total", self._collect_total_tool_calls),
             int,
         )
         background_processes = safe_collect(
@@ -1305,11 +1294,7 @@ class Collector:
         ):
             return cached_stream[2]
         try:
-            with open(path, "rb") as f:
-                f.seek(0, 2)
-                size = f.tell()
-                f.seek(max(0, size - self._log_tail_bytes))
-                text = f.read().decode("utf-8", errors="replace")
+            text = _read_tail_text(path, self._log_tail_bytes)
             lines = text.strip().splitlines()[-max_lines:]
             result = []
             for line in lines:
@@ -1330,21 +1315,13 @@ class Collector:
                     result.append(LogLine(message=line.strip()))
             if result:
                 self._log_cache[key] = result
-                stream = LogStream(
-                    name=name,
-                    path=path.name,
-                    size_bytes=size_bytes,
-                    mtime=mtime,
-                    lines=result,
-                )
-            else:
-                stream = LogStream(
-                    name=name,
-                    path=path.name,
-                    size_bytes=size_bytes,
-                    mtime=mtime,
-                    lines=self._log_cache.get(key, []),
-                )
+            stream = LogStream(
+                name=name,
+                path=path.name,
+                size_bytes=size_bytes,
+                mtime=mtime,
+                lines=result if result else self._log_cache.get(key, []),
+            )
             self._log_stream_cache[key] = (mtime, size_bytes, stream)
             return stream
         except OSError:
@@ -1589,6 +1566,15 @@ def _read_soul_excerpt(path: Path) -> str:
     return ""
 
 
+def _read_tail_text(path: Path, max_bytes: int) -> str:
+    """Read at most the last max_bytes of path, decoded with replacement."""
+    with path.open("rb") as handle:
+        handle.seek(0, 2)
+        size = handle.tell()
+        handle.seek(max(0, size - max_bytes))
+        return handle.read().decode("utf-8", errors="replace")
+
+
 def _mtime(path: Path) -> float | None:
     try:
         return path.stat().st_mtime
@@ -1698,11 +1684,7 @@ def _latest_cron_output_excerpt(
     latest = max(files, key=_safe_mtime)
     latest_mtime = _mtime(latest)
     try:
-        with latest.open("rb") as handle:
-            handle.seek(0, 2)
-            size = handle.tell()
-            handle.seek(max(0, size - max_bytes))
-            lines = handle.read().decode("utf-8", errors="replace").splitlines()
+        lines = _read_tail_text(latest, max_bytes).splitlines()
     except OSError:
         return "", False, "", None
     silent = any("[SILENT]" in line.upper() for line in lines)
@@ -1734,11 +1716,7 @@ def _tail_latest_cron_output(output_root: Path, max_lines: int, max_bytes: int) 
     if latest_file is None:
         return []
     try:
-        with latest_file.open("rb") as handle:
-            handle.seek(0, 2)
-            size = handle.tell()
-            handle.seek(max(0, size - max_bytes))
-            lines = handle.read().decode("utf-8", errors="replace").splitlines()[-max_lines:]
+        lines = _read_tail_text(latest_file, max_bytes).splitlines()[-max_lines:]
     except OSError:
         return []
     return [LogLine(message=line.strip()) for line in lines if line.strip()]

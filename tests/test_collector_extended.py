@@ -1435,3 +1435,121 @@ def test_session_ended_detection(hermes_home: Path):
     assert by_id["sess_ended"].is_active is False
     assert by_id["sess_active"].is_active is True
     c.close()
+
+
+def test_collector_reads_jobs_json(hermes_home: Path):
+    (hermes_home / "cron" / "jobs.json").write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "j1",
+                        "name": "test-cron",
+                        "schedule_display": "every 10m",
+                        "state": "scheduled",
+                        "enabled": True,
+                        "next_run_at": "2026-04-09T19:00:00",
+                        "last_status": None,
+                        "last_error": None,
+                    },
+                    {
+                        "id": "j2",
+                        "name": "failed-job",
+                        "schedule_display": "every 1h",
+                        "state": "error",
+                        "enabled": True,
+                        "last_status": "error",
+                        "last_error": "timeout",
+                    },
+                ],
+            }
+        )
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.cron.job_count == 2
+    assert state.cron.error_count == 1
+    assert state.cron.jobs[0].name == "test-cron"
+    assert state.cron.jobs[1].name == "failed-job"
+    c.close()
+
+
+def test_collector_no_jobs_json(hermes_home: Path):
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.cron.job_count == 0
+    assert state.cron.jobs == []
+    c.close()
+
+
+def test_collector_enriches_cron_jobs_with_delivery_and_output(hermes_home: Path):
+    (hermes_home / "channel_directory.json").write_text(
+        json.dumps(
+            {
+                "updated_at": "2026-04-09T19:00:00",
+                "platforms": {
+                    "telegram": [
+                        {"id": "-1001", "name": "My Group", "type": "group"},
+                    ]
+                },
+            }
+        )
+    )
+    (hermes_home / "cron" / "jobs.json").write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "j1",
+                        "name": "test-cron",
+                        "schedule_display": "every 10m",
+                        "state": "scheduled",
+                        "enabled": True,
+                        "deliver": "telegram:My Group",
+                    }
+                ],
+            }
+        )
+    )
+    output_dir = hermes_home / "cron" / "output" / "j1"
+    output_dir.mkdir(parents=True)
+    (output_dir / "2026-04-09T19-00-00.md").write_text("[SILENT]\nNo changes to report.\n")
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    job = state.cron.jobs[0]
+    assert job.delivery_target_label == "telegram:My Group"
+    assert job.silent_run is True
+    assert "No changes to report" in job.latest_output_excerpt
+    c.close()
+
+
+def test_collect_profiles_empty_when_no_profiles_dir(hermes_home: Path):
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.profiles.profile_count == 0
+    assert state.profiles.profiles == []
+    c.close()
+
+
+def test_collect_profiles_lists_profile_directories(profiled_hermes_home: Path):
+    c = Collector(profiled_hermes_home)
+    state = c.collect()
+    assert state.profiles.profile_count == 1
+    profile = state.profiles.profiles[0]
+    assert profile.name == "coding"
+    assert profile.session_count == 1
+    assert profile.skill_count == 1
+    assert profile.db_size_bytes > 0
+    assert profile.soul_excerpt == ""
+    assert profile.latest_log_mtime is not None
+    c.close()
+
+
+def test_collect_profiles_reads_soul_excerpt_when_present(profiled_hermes_home: Path):
+    soul = profiled_hermes_home / "profiles" / "coding" / "SOUL.md"
+    soul.write_text("Profile soul line one\nProfile soul line two\n")
+    c = Collector(profiled_hermes_home)
+    state = c.collect()
+    assert state.profiles.profiles[0].soul_excerpt == "Profile soul line one"
+    c.close()

@@ -3,8 +3,6 @@ from __future__ import annotations
 import re
 import time
 
-from rich.console import Console
-
 from hermesd.models import (
     ConfigSummary,
     CronState,
@@ -27,20 +25,7 @@ from hermesd.models import (
 )
 from hermesd.panels import _RENDERERS, PANEL_NAMES, render_panel
 from hermesd.theme import Theme
-
-
-def _render_to_str(panel) -> str:
-    console = Console(width=80, force_terminal=True)
-    with console.capture() as cap:
-        console.print(panel)
-    return cap.get()
-
-
-def _render_to_plain(panel) -> str:
-    console = Console(width=80, force_terminal=True, no_color=True)
-    with console.capture() as cap:
-        console.print(panel)
-    return cap.get()
+from tests.conftest import render_to_str
 
 
 def test_panel_registry_matches_names():
@@ -60,7 +45,7 @@ def test_gateway_panel_compact():
         ),
     )
     panel = render_panel(1, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=80)
     assert "Gateway" in text
     assert "Running" in text
 
@@ -92,7 +77,7 @@ def test_gateway_panel_detail():
         ),
     )
     panel = render_panel(1, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=80)
     assert "telegram" in text.lower()
     assert "Channel Directory" in text
     assert "feishu" in text
@@ -104,7 +89,7 @@ def test_gateway_panel_stopped():
         gateway=GatewayState(running=False, state="stopped"),
     )
     panel = render_panel(1, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=80)
     assert "Stopped" in text or "stopped" in text
 
 
@@ -119,7 +104,7 @@ def test_gateway_panel_compact_shows_version_and_updates_behind():
         ),
     )
     panel = render_panel(1, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=80)
     assert "v1.2.3" in text
     assert "(4 behind)" in text
 
@@ -135,7 +120,7 @@ def test_gateway_panel_detail_updates_behind_warns():
         ),
     )
     panel = render_panel(1, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=80)
     assert "Hermes v1.2.3" in text
     assert "2 commits behind" in text
     assert "hermes update" in text
@@ -151,7 +136,7 @@ def test_gateway_panel_detail_stopped_up_to_date():
         ),
     )
     panel = render_panel(1, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=80)
     assert "Stopped" in text
     assert "(up to date)" in text
 
@@ -159,7 +144,7 @@ def test_gateway_panel_detail_stopped_up_to_date():
 def test_render_panel_invalid_number():
     state = DashboardState()
     panel = render_panel(99, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=80)
     assert "Unknown panel" in text
 
 
@@ -177,7 +162,7 @@ def test_sessions_panel_compact():
         ],
     )
     panel = render_panel(2, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=80)
     assert "#ss_001" in text
     assert "cli" in text
 
@@ -188,7 +173,7 @@ def test_tokens_panel_compact():
         tokens_total=TokenSummary(input_tokens=45100, output_tokens=32000, total_cost_usd=2.18),
     )
     panel = render_panel(3, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=80)
     assert re.search(r"In:\s+12\.4K", text)
     assert "Today:~$0.42" in text
 
@@ -203,7 +188,7 @@ def test_tokens_panel_compact_reported_cost_uses_plain_prefix():
         ),
     )
     panel = render_panel(3, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=80)
     assert "Today:$0.42" in text
     assert "Total:$2.18" in text
     assert "~$" not in text
@@ -212,7 +197,7 @@ def test_tokens_panel_compact_reported_cost_uses_plain_prefix():
 def test_tokens_panel_compact_empty_state():
     state = DashboardState()
     panel = render_panel(3, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=80)
     assert "Today:~$0.00" in text
     assert "Total:~$0.00" in text
     assert re.search(r"In:\s+0\b", text)
@@ -228,7 +213,7 @@ def test_tools_panel_compact():
         available_tools=29,
     )
     panel = render_panel(4, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=80)
     assert "shell_exec" in text
 
 
@@ -239,14 +224,14 @@ def test_config_panel_compact():
         ),
     )
     panel = render_panel(5, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=80)
     assert "gpt-5.4" in text
 
 
 def test_config_panel_compact_empty_config():
     state = DashboardState()
     panel = render_panel(5, state, Theme(), detail=False)
-    text = _render_to_plain(panel)
+    text = render_to_str(panel, width=80, no_color=True)
     assert "Config" in text
     assert "Model: —" in text
     assert "Provider: —" in text
@@ -255,7 +240,7 @@ def test_config_panel_compact_empty_config():
 def test_cron_panel_compact():
     state = DashboardState(cron=CronState(last_tick_ago_seconds=42.0, job_count=0))
     panel = render_panel(6, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=80)
     assert "42s ago" in text
 
 
@@ -268,7 +253,7 @@ def test_overview_panel_compact():
         ),
     )
     panel = render_panel(7, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=80)
     assert "70" in text
     assert "Skills / Integrations" in text
 
@@ -280,14 +265,14 @@ def test_logs_panel_compact():
         ),
     )
     panel = render_panel(8, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=80)
     assert "Session saved" in text
 
 
 def test_memory_panel_empty():
     state = DashboardState()
     panel = render_panel(10, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=80)
     assert "Memory" in text
 
 
@@ -302,7 +287,7 @@ def test_kanban_panel_compact():
         )
     )
     panel = render_panel(11, state, Theme(), detail=False)
-    text = _render_to_plain(panel)
+    text = render_to_str(panel, width=80, no_color=True)
     assert "Tasks: 5" in text
     assert "Runs: 3" in text
     assert "Dispatch: gateway" in text
@@ -312,14 +297,14 @@ def test_kanban_panel_compact():
 def test_kanban_panel_compact_empty():
     state = DashboardState()
     panel = render_panel(11, state, Theme(), detail=False)
-    text = _render_to_plain(panel)
+    text = render_to_str(panel, width=80, no_color=True)
     assert "No kanban.db" in text
 
 
 def test_kanban_panel_detail_empty():
     state = DashboardState()
     panel = render_panel(11, state, Theme(), detail=True)
-    text = _render_to_plain(panel)
+    text = render_to_str(panel, width=80, no_color=True)
     assert "missing" in text
     assert "Kanban is not initialized" in text
 
@@ -355,7 +340,7 @@ def test_kanban_panel_detail():
         )
     )
     panel = render_panel(11, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=80)
     assert "Kanban" in text
     assert "t_active" in text
     assert "t_blocked" in text
@@ -385,7 +370,7 @@ def test_kanban_panel_detail_recent_runs():
         )
     )
     panel = render_panel(11, state, Theme(), detail=True)
-    text = _render_to_plain(panel)
+    text = render_to_str(panel, width=80, no_color=True)
     assert "Recent Runs" in text
     assert "t_done" in text
     assert "coding" in text
@@ -414,7 +399,7 @@ def test_kanban_panel_detail_heartbeat_age_labels():
         )
     )
     panel = render_panel(11, state, Theme(), detail=True)
-    text = _render_to_plain(panel)
+    text = render_to_str(panel, width=80, no_color=True)
     assert re.search(r"\b\d+s\b", text)
     assert "5m" in text
     assert "2h" in text
@@ -431,7 +416,7 @@ def test_operations_panel_compact():
         )
     )
     panel = render_panel(12, state, Theme(), detail=False)
-    text = _render_to_plain(panel)
+    text = render_to_str(panel, width=80, no_color=True)
     assert "Dashboard: 2 proc" in text
     assert "1 files  7 models" in text
     assert "PR Monitors: 1" in text
@@ -440,7 +425,7 @@ def test_operations_panel_compact():
 def test_operations_panel_compact_empty():
     state = DashboardState()
     panel = render_panel(12, state, Theme(), detail=False)
-    text = _render_to_plain(panel)
+    text = render_to_str(panel, width=80, no_color=True)
     assert "Dashboard: 0 proc" in text
     assert "0 files  0 models" in text
     assert "PR Monitors: 0" in text
@@ -449,7 +434,7 @@ def test_operations_panel_compact_empty():
 def test_operations_panel_detail_empty():
     state = DashboardState()
     panel = render_panel(12, state, Theme(), detail=True)
-    text = _render_to_plain(panel)
+    text = render_to_str(panel, width=80, no_color=True)
     assert "No operations artifacts found" in text
 
 
@@ -477,7 +462,7 @@ def test_operations_panel_detail():
         )
     )
     panel = render_panel(12, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=80)
     assert "Operations" in text
     assert "models_dev_cache.json" in text
     assert "PR Monitors" in text
@@ -501,7 +486,7 @@ def test_operations_panel_detail_size_and_age_labels():
         )
     )
     panel = render_panel(12, state, Theme(), detail=True)
-    text = _render_to_plain(panel)
+    text = render_to_str(panel, width=80, no_color=True)
     assert "2.5M" in text
     assert "500" in text
     assert "1.2K" in text

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import signal
 import sys
@@ -296,7 +297,10 @@ class DashboardApp:
         console = self._console
         # Hold the console's render lock so the raw OSC52 write cannot
         # interleave with a Live frame being flushed by the render loop.
-        with console._lock:
+        # Console._lock is Rich-private; fall back to an unguarded write if a
+        # future Rich version renames it (worst case: one garbled frame).
+        render_lock = getattr(console, "_lock", None) or contextlib.nullcontext()
+        with render_lock:
             console.file.write(sequence)
             console.file.flush()
         return copied_text
@@ -935,23 +939,13 @@ def _detail_max_scroll_offset(
 ) -> int | None:
     """Effective max scroll offset for scrollable detail panels, else None.
 
-    Mirrors the display clamps in hermesd/panels/logs.py and
-    hermesd/panels/overview.py so the stored ViewState offset can be clamped
-    without modifying the panel renderers.
+    Logs delegates to the panel's own clamp; skills mirrors the row clamp in
+    hermesd/panels/overview.py.
     """
     if panel_num == _LOG_PANEL_NUM:
-        from hermesd.panels.logs import (
-            _DETAIL_VISIBLE_LOG_LINES,
-            _filter_log_lines,
-            _log_stream_map,
-        )
+        from hermesd.panels.logs import max_detail_scroll_offset
 
-        log_map = _log_stream_map(state)
-        sub_view = log_sub_view
-        if sub_view not in log_map:
-            sub_view = next(iter(log_map), "agent")
-        log_lines = _filter_log_lines(log_map.get(sub_view, state.logs.agent_lines), filter_query)
-        return max(0, len(log_lines) - _DETAIL_VISIBLE_LOG_LINES)
+        return max_detail_scroll_offset(state, log_sub_view, filter_query)
     if panel_num == _SKILLS_PANEL_NUM:
         return max(0, len(state.skills_memory.skills) - 1)
     return None

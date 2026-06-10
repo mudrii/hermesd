@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from rich.console import Console
-
 from hermesd.models import (
     CheckpointInfo,
     ConfigSummary,
@@ -24,14 +22,7 @@ from hermesd.models import (
 from hermesd.panels import render_panel
 from hermesd.panels.sessions import extract_message_search_query
 from hermesd.theme import Theme
-
-
-def _render_to_str(panel) -> str:
-    console = Console(width=120, force_terminal=True)
-    with console.capture() as cap:
-        console.print(panel)
-    return cap.get()
-
+from tests.conftest import render_to_str
 
 # ── Detail view tests ──────────────────────────────────────────────────
 
@@ -69,7 +60,7 @@ def test_sessions_panel_detail():
         ],
     )
     panel = render_panel(2, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "cli" in text
     assert "telegram" in text
     assert "0.42" in text
@@ -86,7 +77,7 @@ def test_sessions_panel_detail_filter_query():
         ],
     )
     panel = render_panel(2, state, Theme(), detail=True, filter_query="telegram")
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "Filter:" in text
     assert "telegram" in text
     assert "claude" in text
@@ -122,7 +113,7 @@ def test_sessions_panel_detail_structured_filter_and_sort():
         filter_query="source:cli provider:openai",
         session_sort="cost",
     )
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "source:cli provider:openai" in text
     assert "Sort:" in text
     assert "sess_alpha"[-8:] in text
@@ -144,7 +135,7 @@ def test_sessions_panel_detail_message_filter():
         filter_query="message:timeout",
         session_message_match_ids={"sess_beta"},
     )
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "message:timeout" in text
     assert "sess_beta"[-8:] in text
     assert "sess_alpha"[-8:] not in text
@@ -167,7 +158,7 @@ def test_sessions_panel_detail_multiple_message_tokens_last_wins():
         filter_query="message:foo message:bar",
         session_message_match_ids={"sess_beta"},
     )
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "sess_beta"[-8:] in text
     assert "sess_alpha"[-8:] not in text
 
@@ -180,7 +171,7 @@ def test_sessions_panel_detail_active_false_filter():
         ],
     )
     panel = render_panel(2, state, Theme(), detail=True, filter_query="active:false")
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "ss_active" not in text
     assert "sess_done"[-8:] in text
 
@@ -195,7 +186,7 @@ def test_sessions_panel_filter_exact_fields_duplicate_keys_and_invalid_active():
     )
 
     exact_panel = render_panel(2, state, Theme(), detail=True, filter_query="source:cli")
-    exact_text = _render_to_str(exact_panel)
+    exact_text = render_to_str(exact_panel)
     assert "sess_cli"[-8:] in exact_text
     assert "cli-tool" not in exact_text
 
@@ -206,10 +197,10 @@ def test_sessions_panel_filter_exact_fields_duplicate_keys_and_invalid_active():
         detail=True,
         filter_query="source:cli source:gateway",
     )
-    assert "No matching sessions" in _render_to_str(duplicate_panel)
+    assert "No matching sessions" in render_to_str(duplicate_panel)
 
     invalid_active_panel = render_panel(2, state, Theme(), detail=True, filter_query="active:t")
-    assert "No matching sessions" in _render_to_str(invalid_active_panel)
+    assert "No matching sessions" in render_to_str(invalid_active_panel)
 
 
 def test_sessions_panel_formats_negative_cost_and_recent_tiebreaker():
@@ -220,7 +211,7 @@ def test_sessions_panel_formats_negative_cost_and_recent_tiebreaker():
         ],
     )
     panel = render_panel(2, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "-$0.50" in text
     assert text.find("sess_b") < text.find("sess_a")
 
@@ -232,7 +223,7 @@ def test_sessions_panel_detail_unknown_structured_filter_matches_as_text():
         ],
     )
     panel = render_panel(2, state, Theme(), detail=True, filter_query="unknown:value")
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "No matching sessions" in text
     assert "ss_alpha" not in text
 
@@ -259,7 +250,7 @@ def test_sessions_panel_detail_text_filter_and_token_sort_order():
     panel = render_panel(
         2, state, Theme(), detail=True, filter_query="text:deploy", session_sort="tokens"
     )
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert text.find("ss_high") < text.find("sess_low")
 
 
@@ -279,12 +270,12 @@ def test_sessions_panel_detail_archived_filter():
         ],
     )
     panel = render_panel(2, state, Theme(), detail=True, filter_query="archived:true")
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "sess_archived"[-8:] in text
     assert "sess_live"[-8:] not in text
 
     invalid_panel = render_panel(2, state, Theme(), detail=True, filter_query="archived:x")
-    assert "No matching sessions" in _render_to_str(invalid_panel)
+    assert "No matching sessions" in render_to_str(invalid_panel)
 
 
 def test_sessions_panel_detail_substring_field_filter():
@@ -295,7 +286,7 @@ def test_sessions_panel_detail_substring_field_filter():
         ],
     )
     panel = render_panel(2, state, Theme(), detail=True, filter_query="model:gpt")
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "sess_gpt"[-8:] in text
     assert "sess_claude"[-8:] not in text
 
@@ -322,7 +313,7 @@ def test_sessions_panel_detail_runtime_table():
         ],
     )
     panel = render_panel(2, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "Runtime" in text
     assert "project-alpha" in text
     assert "archived" in text
@@ -338,7 +329,7 @@ def test_sessions_panel_detail_no_runtime_section_without_runtime_data():
         sessions=[SessionInfo(session_id="sess_plain", source="cli")],
     )
     panel = render_panel(2, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "Runtime" not in text
 
 
@@ -354,7 +345,7 @@ def test_sessions_panel_detail_shows_parent_session_id():
         ],
     )
     panel = render_panel(2, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "ent_sess" in text
 
 
@@ -396,7 +387,7 @@ def test_tokens_panel_detail():
         ),
     )
     panel = render_panel(3, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "12.4K" in text
     assert "$0.42" in text
     assert "Recent Windows" in text
@@ -423,7 +414,7 @@ def test_tokens_panel_detail_cost_prefix_estimated_vs_reported():
         ],
     )
     panel = render_panel(3, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "$0.42" in text
     assert "~$0.42" not in text
     assert "~$0.31" in text
@@ -448,7 +439,7 @@ def _analytics_state(*, cost_is_estimated: bool) -> DashboardState:
 
 
 def test_tokens_panel_detail_aggregate_tables_estimated_prefix():
-    text = _render_to_str(
+    text = render_to_str(
         render_panel(3, _analytics_state(cost_is_estimated=True), Theme(), detail=True)
     )
     assert "~$0.42" in text
@@ -456,7 +447,7 @@ def test_tokens_panel_detail_aggregate_tables_estimated_prefix():
 
 
 def test_tokens_panel_detail_aggregate_tables_reported_prefix():
-    text = _render_to_str(
+    text = render_to_str(
         render_panel(3, _analytics_state(cost_is_estimated=False), Theme(), detail=True)
     )
     assert "$0.42" in text
@@ -474,7 +465,7 @@ def test_tools_panel_detail():
         ],
     )
     panel = render_panel(4, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "shell_exec" in text
     assert "23" in text
     assert "read_file" in text
@@ -497,7 +488,7 @@ def test_tools_panel_detail_shows_background_processes():
         ]
     )
     panel = render_panel(4, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "Background Processes" in text
     assert "proc_alpha" in text
     assert "pytest -q" in text
@@ -519,7 +510,7 @@ def test_tools_panel_detail_shows_checkpoints():
         ]
     )
     panel = render_panel(4, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "Checkpoints" in text
     assert "project-alpha" in text
     assert "Refine config panel" in text
@@ -540,7 +531,7 @@ def test_config_panel_detail():
         ),
     )
     panel = render_panel(5, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "gpt-5.4" in text
     assert "192" in text
     assert "medium" in text
@@ -568,7 +559,7 @@ def test_config_panel_detail_shows_tool_gateway_routes():
         ),
     )
     panel = render_panel(5, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "Tool Gateway" in text
     assert "dashboard-local env" in text
     assert "gateway.example.com" in text
@@ -608,7 +599,7 @@ def test_config_panel_detail_feature_labels():
         ),
     )
     panel = render_panel(5, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "oauth basic-configured" in text
     assert "auto threshold=80% limit=5/20" in text
     assert "sandbox 120s 50 calls" in text
@@ -632,7 +623,7 @@ def test_overview_panel_detail():
         ),
     )
     panel = render_panel(7, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "openai-codex" in text
     assert "dev" in text
 
@@ -645,7 +636,7 @@ def test_logs_panel_detail_agent():
         ),
     )
     panel = render_panel(8, state, Theme(), detail=True, log_sub_view="agent")
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "Session saved" in text
     assert "[agent]" in text
 
@@ -658,7 +649,7 @@ def test_logs_panel_detail_gateway():
         ),
     )
     panel = render_panel(8, state, Theme(), detail=True, log_sub_view="gateway")
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "Connected" in text
     assert "[gateway]" in text
 
@@ -670,7 +661,7 @@ def test_logs_panel_detail_errors():
         ),
     )
     panel = render_panel(8, state, Theme(), detail=True, log_sub_view="errors")
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "Crash" in text
     assert "[errors]" in text
 
@@ -682,7 +673,7 @@ def test_logs_panel_detail_cron():
         ),
     )
     panel = render_panel(8, state, Theme(), detail=True, log_sub_view="cron")
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "cron output line" in text
     assert "[cron]" in text
 
@@ -694,7 +685,7 @@ def test_logs_panel_detail_unknown_sub_view_falls_back_to_first_stream():
         ),
     )
     panel = render_panel(8, state, Theme(), detail=True, log_sub_view="bogus")
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "[agent]" in text
     assert "Session saved" in text
 
@@ -709,7 +700,7 @@ def test_logs_panel_detail_scroll_offset():
         ),
     )
     panel = render_panel(8, state, Theme(), detail=True, log_sub_view="agent", scroll_offset=5)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "line-0" not in text
     assert "line-5" in text
     assert "j/k scroll" in text
@@ -737,7 +728,7 @@ def test_logs_panel_detail_filter_query():
         ),
     )
     panel = render_panel(8, state, Theme(), detail=True, log_sub_view="agent", filter_query="error")
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "Filter:" in text
     assert "provider timeout" in text
     assert "session saved" not in text
@@ -772,7 +763,7 @@ def test_logs_panel_detail_structured_filter_query():
         log_sub_view="agent",
         filter_query="level:error component:gateway session:sess-beta",
     )
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "provider timeout" in text
     assert "session saved" not in text
 
@@ -789,12 +780,12 @@ def test_logs_panel_detail_component_and_session_filters_exclude_mismatches():
     component_panel = render_panel(
         8, state, Theme(), detail=True, filter_query="component:gateway"
     )
-    component_text = _render_to_str(component_panel)
+    component_text = render_to_str(component_panel)
     assert "provider timeout" in component_text
     assert "session saved" not in component_text
 
     session_panel = render_panel(8, state, Theme(), detail=True, filter_query="session:sess-alpha")
-    session_text = _render_to_str(session_panel)
+    session_text = render_to_str(session_panel)
     assert "session saved" in session_text
     assert "provider timeout" not in session_text
 
@@ -835,7 +826,7 @@ def test_logs_panel_detail_minlevel_filter_query():
         log_sub_view="agent",
         filter_query="minlevel:warning",
     )
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "provider slow" in text
     assert "provider timeout" in text
     assert "session saved" not in text
@@ -865,7 +856,7 @@ def test_logs_panel_detail_unknown_minlevel_shows_all_lines():
         log_sub_view="agent",
         filter_query="minlevel:warnning",
     )
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     # An unknown minlevel value deactivates the filter instead of hiding everything.
     assert "session saved" in text
     assert "provider timeout" in text
@@ -881,7 +872,7 @@ def test_logs_panel_detail_text_filter_query():
         ),
     )
     panel = render_panel(8, state, Theme(), detail=True, filter_query="text:timeout")
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "provider timeout" in text
     assert "session saved" not in text
 
@@ -895,7 +886,7 @@ def test_logs_panel_detail_unknown_structured_filter_matches_as_text():
         ),
     )
     panel = render_panel(8, state, Theme(), detail=True, filter_query="unknown:value")
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "No matching log lines" in text
     assert "provider timeout" not in text
 
@@ -906,7 +897,7 @@ def test_logs_panel_detail_unknown_structured_filter_matches_as_text():
 def test_sessions_panel_empty():
     state = DashboardState(sessions=[])
     panel = render_panel(2, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "Sessions" in text
     assert "0 active" in text
 
@@ -914,28 +905,28 @@ def test_sessions_panel_empty():
 def test_tools_panel_empty():
     state = DashboardState(tool_stats=[], total_tool_calls=0, available_tools=0)
     panel = render_panel(4, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "0 available" in text
 
 
 def test_logs_panel_empty():
     state = DashboardState(logs=LogState())
     panel = render_panel(8, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "Logs" in text
 
 
 def test_cron_panel_no_tick():
     state = DashboardState(cron=CronState())
     panel = render_panel(6, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "Cron" in text
 
 
 def test_overview_panel_no_providers():
     state = DashboardState(skills_memory=SkillsMemory())
     panel = render_panel(7, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "0" in text
 
 
@@ -953,5 +944,5 @@ def test_panels_render_with_ares_skin():
         ),
     )
     panel = render_panel(1, state, Theme("ares"), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel)
     assert "Running" in text

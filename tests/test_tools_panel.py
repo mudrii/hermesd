@@ -2,18 +2,10 @@
 
 from __future__ import annotations
 
-from rich.console import Console
-
 from hermesd.models import DashboardState, ToolStats
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
-
-
-def _render_to_str(panel) -> str:
-    console = Console(width=100, force_terminal=True)
-    with console.capture() as cap:
-        console.print(panel)
-    return cap.get()
+from tests.conftest import render_to_str
 
 
 def test_tools_detail_shows_calls_table():
@@ -27,7 +19,7 @@ def test_tools_detail_shows_calls_table():
         available_tool_names=["terminal", "web_search", "read_file"],
     )
     panel = render_panel(4, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=100)
     assert "Tool Calls" in text
     assert "30 total" in text
     assert "cli:abc123" in text
@@ -44,7 +36,7 @@ def test_tools_detail_shows_available_table():
         available_tool_names=["terminal", "web_search", "read_file"],
     )
     panel = render_panel(4, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=100)
     assert "Available Tools" in text
     assert "terminal" in text
     assert "web_search" in text
@@ -59,7 +51,7 @@ def test_tools_detail_empty_stats_shows_message():
         available_tool_names=[],
     )
     panel = render_panel(4, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=100)
     assert "No tool call data" in text
     assert "No active session" in text
 
@@ -80,7 +72,7 @@ def test_tools_detail_watch_and_checkpoint_fallback_labels():
         checkpoints=[CheckpointInfo(repo_id="repo_no_ts", workdir_name="proj")],
     )
     panel = render_panel(4, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=100)
     # No watch patterns and no checkpoint timestamp render as dashes;
     # patterns without an interval render as a bare count.
     lines = text.splitlines()
@@ -100,6 +92,6 @@ def test_tools_compact_shows_summary():
         available_tools=29,
     )
     panel = render_panel(4, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=100)
     assert "29 available" in text
     assert "10 calls" in text

@@ -146,7 +146,7 @@ def test_app_handle_key_escape_sequence_ignored(populated_hermes_home: Path):
 
 
 def test_run_installs_signal_handlers_before_initial_collect(
-    populated_hermes_home: Path, monkeypatch
+    populated_hermes_home: Path, monkeypatch, restore_signal_handlers
 ):
     """Ctrl+C during a slow first collect must hit the app handler, not the default."""
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
@@ -157,19 +157,17 @@ def test_run_installs_signal_handlers_before_initial_collect(
         raise RuntimeError("stop before live loop")
 
     monkeypatch.setattr(app._collector, "collect", fake_collect)
-    old_int = signal.getsignal(signal.SIGINT)
-    old_term = signal.getsignal(signal.SIGTERM)
     try:
         with pytest.raises(RuntimeError, match="stop before live loop"):
             app.run()
     finally:
-        signal.signal(signal.SIGINT, old_int)
-        signal.signal(signal.SIGTERM, old_term)
         app.close()
     assert seen["sigint_handler"] == app._signal_handler
 
 
-def test_run_live_loop_renders_and_exits_when_running_cleared(populated_hermes_home: Path):
+def test_run_live_loop_renders_and_exits_when_running_cleared(
+    populated_hermes_home: Path, restore_signal_handlers
+):
     """run() drives the Live loop and exits cleanly once the running event clears."""
     import io
 
@@ -179,21 +177,19 @@ def test_run_live_loop_renders_and_exits_when_running_cleared(populated_hermes_h
     buffer = io.StringIO()
     app._console = Console(file=buffer, width=80, height=24, force_terminal=True)
     stopper = threading.Timer(0.2, app._running.clear)
-    old_int = signal.getsignal(signal.SIGINT)
-    old_term = signal.getsignal(signal.SIGTERM)
     stopper.start()
     try:
         app.run()
     finally:
         stopper.cancel()
-        signal.signal(signal.SIGINT, old_int)
-        signal.signal(signal.SIGTERM, old_term)
     assert app._running.is_set() is False
     assert app._closed.is_set() is True
     assert "hermesd" in buffer.getvalue()
 
 
-def test_run_breaks_promptly_when_stopped_during_render_wait(populated_hermes_home: Path):
+def test_run_breaks_promptly_when_stopped_during_render_wait(
+    populated_hermes_home: Path, restore_signal_handlers
+):
     """A signal arriving while the loop waits stops it before the next frame."""
     import io
 
@@ -209,17 +205,13 @@ def test_run_breaks_promptly_when_stopped_during_render_wait(populated_hermes_ho
     app = DashboardApp(populated_hermes_home, refresh_rate=1)
     app._running = ClearsDuringWait()
     app._console = Console(file=io.StringIO(), width=80, height=24, force_terminal=True)
-    old_int = signal.getsignal(signal.SIGINT)
-    old_term = signal.getsignal(signal.SIGTERM)
-    try:
-        app.run()
-    finally:
-        signal.signal(signal.SIGINT, old_int)
-        signal.signal(signal.SIGTERM, old_term)
+    app.run()
     assert app._closed.is_set() is True
 
 
-def test_run_exits_cleanly_on_keyboard_interrupt(populated_hermes_home: Path, monkeypatch):
+def test_run_exits_cleanly_on_keyboard_interrupt(
+    populated_hermes_home: Path, monkeypatch, restore_signal_handlers
+):
     """Ctrl+C inside the Live loop quits without a traceback and closes the app."""
     import io
 
@@ -237,13 +229,7 @@ def test_run_exits_cleanly_on_keyboard_interrupt(populated_hermes_home: Path, mo
         return original_build(console=console)
 
     monkeypatch.setattr(app, "_build_layout", interrupting_build)
-    old_int = signal.getsignal(signal.SIGINT)
-    old_term = signal.getsignal(signal.SIGTERM)
-    try:
-        app.run()  # must not raise
-    finally:
-        signal.signal(signal.SIGINT, old_int)
-        signal.signal(signal.SIGTERM, old_term)
+    app.run()  # must not raise
     assert app._running.is_set() is False
     assert app._closed.is_set() is True
 
