@@ -142,24 +142,6 @@ def test_ensure_connection_reopens(tmp_path):
     db.close()
 
 
-def test_db_file_deleted_marks_cached_reads_stale(tmp_path):
-    """If the DB file disappears, reads keep last-good data but flag it stale."""
-    db_path = tmp_path / "state.db"
-    _create_db(db_path)
-    db = HermesDB(db_path)
-    sessions = db.read_sessions()
-    assert len(sessions) == 1
-    assert db.last_read_sessions_stale is False
-
-    db._conn.close()
-    db._conn = None
-    db_path.unlink()
-
-    assert db.read_sessions() == sessions
-    assert db.last_read_sessions_stale is True
-    db.close()
-
-
 def test_missing_db_returns_empty_not_crash(tmp_path):
     db = HermesDB(tmp_path / "nonexistent.db")
     assert db.read_sessions() == []

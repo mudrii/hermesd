@@ -175,6 +175,8 @@ def test_close_idempotent():
     db = HermesDB(Path("/nonexistent/state.db"))
     db.close()
     db.close()
+    # Post-close reads stay safe: cached (empty) data, no exception.
+    assert db.read_sessions() == []
 
 
 def test_read_after_close_returns_cached(sample_db, hermes_home):

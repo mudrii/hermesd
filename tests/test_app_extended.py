@@ -906,6 +906,7 @@ def test_app_close_idempotent(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app.close()
     app.close()
+    assert app._closed.is_set()
 
 
 def test_app_close_wakes_collector_wait(populated_hermes_home: Path):
