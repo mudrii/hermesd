@@ -6,7 +6,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from hermesd.models import DashboardState
+from hermesd.models import DashboardState, MemoryOverview
 from hermesd.theme import Theme
 
 
@@ -26,7 +26,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append(f"{memory.memory_file_count}", style=theme.ui_accent)
     lines.append("\n")
     lines.append("  SOUL: ", style=theme.ui_label)
-    lines.append("present" if memory.soul_excerpt else "none", style=theme.banner_text)
+    lines.append(_soul_compact_label(memory), style=theme.banner_text)
 
     return Panel(
         lines,
@@ -87,6 +87,14 @@ def _file_role(name: str) -> str:
     if lowered == "user.md":
         return "User profile"
     return "Memory artifact"
+
+
+def _soul_compact_label(memory: MemoryOverview) -> str:
+    if memory.soul_excerpt:
+        return "present"
+    if memory.soul_size_bytes > 0:
+        return "empty"
+    return "none"
 
 
 def _soul_summary(size_bytes: int, excerpt: str) -> str:

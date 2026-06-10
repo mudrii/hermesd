@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from rich.console import Console
 
 from hermesd.models import (
@@ -14,6 +16,7 @@ from hermesd.models import (
     SkillsMemory,
     TokenAnalytics,
     TokenBreakdown,
+    TokenSummary,
     TokenWindowSummary,
     ToolGatewayRoute,
     ToolStats,
@@ -147,6 +150,28 @@ def test_sessions_panel_detail_message_filter():
     assert "sess_alpha"[-8:] not in text
 
 
+def test_sessions_panel_detail_multiple_message_tokens_last_wins():
+    # Last occurrence wins everywhere: only the final message: value is
+    # applied, matching extract_message_search_query.
+    state = DashboardState(
+        sessions=[
+            SessionInfo(session_id="sess_alpha", source="cli"),
+            SessionInfo(session_id="sess_beta", source="telegram"),
+        ],
+    )
+    panel = render_panel(
+        2,
+        state,
+        Theme(),
+        detail=True,
+        filter_query="message:foo message:bar",
+        session_message_match_ids={"sess_beta"},
+    )
+    text = _render_to_str(panel)
+    assert "sess_beta"[-8:] in text
+    assert "sess_alpha"[-8:] not in text
+
+
 def test_sessions_panel_detail_active_false_filter():
     state = DashboardState(
         sessions=[
@@ -242,6 +267,81 @@ def test_extract_message_search_query_uses_last_message_term():
     assert extract_message_search_query("message:timeout message:retry") == "retry"
 
 
+def test_extract_message_search_query_ignores_plain_terms():
+    assert extract_message_search_query("timeout message:retry source:cli") == "retry"
+
+
+def test_sessions_panel_detail_archived_filter():
+    state = DashboardState(
+        sessions=[
+            SessionInfo(session_id="sess_archived", source="cli", archived=True),
+            SessionInfo(session_id="sess_live", source="cli", archived=False),
+        ],
+    )
+    panel = render_panel(2, state, Theme(), detail=True, filter_query="archived:true")
+    text = _render_to_str(panel)
+    assert "sess_archived"[-8:] in text
+    assert "sess_live"[-8:] not in text
+
+    invalid_panel = render_panel(2, state, Theme(), detail=True, filter_query="archived:x")
+    assert "No matching sessions" in _render_to_str(invalid_panel)
+
+
+def test_sessions_panel_detail_substring_field_filter():
+    state = DashboardState(
+        sessions=[
+            SessionInfo(session_id="sess_gpt", source="cli", model="gpt-5.4"),
+            SessionInfo(session_id="sess_claude", source="cli", model="claude"),
+        ],
+    )
+    panel = render_panel(2, state, Theme(), detail=True, filter_query="model:gpt")
+    text = _render_to_str(panel)
+    assert "sess_gpt"[-8:] in text
+    assert "sess_claude"[-8:] not in text
+
+
+def test_sessions_panel_detail_runtime_table():
+    state = DashboardState(
+        sessions=[
+            SessionInfo(
+                session_id="sess_runtime",
+                source="cli",
+                api_call_count=3,
+                cwd="/home/user/project-alpha/",
+                archived=True,
+                rewind_count=2,
+                handoff_state="pending",
+                handoff_platform="telegram",
+                handoff_error="delivery failed",
+            ),
+            SessionInfo(
+                session_id="sess_no_cwd",
+                source="cli",
+                api_call_count=1,
+            ),
+        ],
+    )
+    panel = render_panel(2, state, Theme(), detail=True)
+    text = _render_to_str(panel)
+    assert "Runtime" in text
+    assert "project-alpha" in text
+    assert "archived" in text
+    assert "rewind:2" in text
+    assert "pending" in text
+    assert "delivery failed" in text
+    # Session with no cwd shows a dash instead of an empty cell
+    assert "—" in text
+
+
+def test_sessions_panel_detail_no_runtime_section_without_runtime_data():
+    state = DashboardState(
+        sessions=[SessionInfo(session_id="sess_plain", source="cli")],
+    )
+    panel = render_panel(2, state, Theme(), detail=True)
+    text = _render_to_str(panel)
+    assert "Runtime" not in text
+
+
 def test_sessions_panel_detail_shows_parent_session_id():
     state = DashboardState(
         sessions=[
@@ -305,6 +405,64 @@ def test_tokens_panel_detail():
     assert "gpt-5.4" in text
     assert "By Provider" in text
     assert "openai-codex" in text
+
+
+def test_tokens_panel_detail_cost_prefix_estimated_vs_reported():
+    state = DashboardState(
+        sessions=[
+            SessionInfo(
+                session_id="sess_reported",
+                estimated_cost_usd=0.42,
+                cost_status="reported",
+            ),
+            SessionInfo(
+                session_id="sess_estimated",
+                estimated_cost_usd=0.31,
+                cost_status="estimated",
+            ),
+        ],
+    )
+    panel = render_panel(3, state, Theme(), detail=True)
+    text = _render_to_str(panel)
+    assert "$0.42" in text
+    assert "~$0.42" not in text
+    assert "~$0.31" in text
+
+
+def _analytics_state(*, cost_is_estimated: bool) -> DashboardState:
+    return DashboardState(
+        tokens_total=TokenSummary(cost_is_estimated=cost_is_estimated),
+        token_analytics=TokenAnalytics(
+            windows=[
+                TokenWindowSummary(
+                    label="7d", session_count=1, input_tokens=100, total_cost_usd=0.42
+                ),
+            ],
+            by_model=[
+                TokenBreakdown(
+                    label="gpt-5.4", session_count=1, input_tokens=100, total_cost_usd=0.31
+                ),
+            ],
+        ),
+    )
+
+
+def test_tokens_panel_detail_aggregate_tables_estimated_prefix():
+    text = _render_to_str(
+        render_panel(3, _analytics_state(cost_is_estimated=True), Theme(), detail=True)
+    )
+    assert "~$0.42" in text
+    assert "~$0.31" in text
+
+
+def test_tokens_panel_detail_aggregate_tables_reported_prefix():
+    text = _render_to_str(
+        render_panel(3, _analytics_state(cost_is_estimated=False), Theme(), detail=True)
+    )
+    assert "$0.42" in text
+    assert "~$0.42" not in text
+    assert "$0.31" in text
+    assert "~$0.31" not in text
 
 
 def test_tools_panel_detail():
@@ -427,6 +585,37 @@ def test_config_panel_detail_shows_tool_gateway_routes():
     assert "supermemory" in text
 
 
+def test_config_panel_detail_feature_labels():
+    state = DashboardState(
+        config=ConfigSummary(
+            model="gpt-5.4",
+            dashboard_auth_provider="oauth",
+            dashboard_basic_auth_configured=True,
+            tool_search_enabled="auto",
+            tool_search_threshold_pct=80,
+            tool_search_default_limit=5,
+            tool_search_max_limit=20,
+            code_execution_mode="sandbox",
+            code_execution_timeout=120,
+            code_execution_max_tool_calls=50,
+            kanban_dispatch_in_gateway=True,
+            kanban_dispatch_interval_seconds=30,
+            kanban_failure_limit=3,
+            kanban_auto_decompose=True,
+            gateway_strict_media_delivery=True,
+            gateway_trust_recent_files=True,
+            gateway_trust_recent_files_seconds=90,
+        ),
+    )
+    panel = render_panel(5, state, Theme(), detail=True)
+    text = _render_to_str(panel)
+    assert "oauth basic-configured" in text
+    assert "auto threshold=80% limit=5/20" in text
+    assert "sandbox 120s 50 calls" in text
+    assert "gateway 30s fail=3 auto-decompose" in text
+    assert "strict trust-recent=90s" in text
+
+
 def test_overview_panel_detail():
     from hermesd.models import SkillInfo
 
@@ -496,6 +685,18 @@ def test_logs_panel_detail_cron():
     text = _render_to_str(panel)
     assert "cron output line" in text
     assert "[cron]" in text
+
+
+def test_logs_panel_detail_unknown_sub_view_falls_back_to_first_stream():
+    state = DashboardState(
+        logs=LogState(
+            agent_lines=[LogLine(timestamp="15:42:03", level="INFO", message="Session saved")],
+        ),
+    )
+    panel = render_panel(8, state, Theme(), detail=True, log_sub_view="bogus")
+    text = _render_to_str(panel)
+    assert "[agent]" in text
+    assert "Session saved" in text
 
 
 def test_logs_panel_detail_scroll_offset():
@@ -576,6 +777,28 @@ def test_logs_panel_detail_structured_filter_query():
     assert "session saved" not in text
 
 
+def test_logs_panel_detail_component_and_session_filters_exclude_mismatches():
+    state = DashboardState(
+        logs=LogState(
+            agent_lines=[
+                LogLine(component="hermes", session_id="sess-alpha", message="session saved"),
+                LogLine(component="gateway", session_id="sess-beta", message="provider timeout"),
+            ]
+        ),
+    )
+    component_panel = render_panel(
+        8, state, Theme(), detail=True, filter_query="component:gateway"
+    )
+    component_text = _render_to_str(component_panel)
+    assert "provider timeout" in component_text
+    assert "session saved" not in component_text
+
+    session_panel = render_panel(8, state, Theme(), detail=True, filter_query="session:sess-alpha")
+    session_text = _render_to_str(session_panel)
+    assert "session saved" in session_text
+    assert "provider timeout" not in session_text
+
+
 def test_logs_panel_detail_minlevel_filter_query():
     state = DashboardState(
         logs=LogState(
@@ -618,7 +841,7 @@ def test_logs_panel_detail_minlevel_filter_query():
     assert "session saved" not in text
 
 
-def test_logs_panel_detail_invalid_minlevel_matches_nothing():
+def test_logs_panel_detail_unknown_minlevel_shows_all_lines():
     state = DashboardState(
         logs=LogState(
             agent_lines=[
@@ -643,9 +866,9 @@ def test_logs_panel_detail_invalid_minlevel_matches_nothing():
         filter_query="minlevel:warnning",
     )
     text = _render_to_str(panel)
-    assert "No matching log lines" in text
-    assert "session saved" not in text
-    assert "provider timeout" not in text
+    # An unknown minlevel value deactivates the filter instead of hiding everything.
+    assert "session saved" in text
+    assert "provider timeout" in text
 
 
 def test_logs_panel_detail_text_filter_query():

@@ -157,8 +157,10 @@ def _log_line_matches(line: LogLine, criteria: LogFilterCriteria) -> bool:
                 return False
             if field_name == "minlevel":
                 threshold = _log_level_rank(value)
-                if threshold == 0 and value != "debug":
-                    return False
+                if threshold == 0:
+                    # Unknown minlevel value: treat the filter as inactive
+                    # instead of hiding every line.
+                    continue
                 if _log_level_rank(line.level) < threshold:
                     return False
             if field_name == "component" and value not in line.component.lower():

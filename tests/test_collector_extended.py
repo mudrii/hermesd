@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 import sqlite3
@@ -14,12 +16,16 @@ from hermesd.collector import (
     _coerce_int,
     _delivery_target_label,
     _git_checkpoint_summary,
+    _has_secret_material,
     _latest_cron_output_excerpt,
     _pid_exists,
+    _read_kanban_state,
+    _redact_command_string,
     _redact_secret_args,
     _today_epoch,
 )
-from tests.conftest import create_state_db_tables
+from hermesd.models import KanbanState
+from tests.conftest import create_kanban_db_tables, create_state_db_tables
 
 
 @pytest.mark.parametrize(
@@ -110,6 +116,26 @@ def test_redact_secret_args_handles_aliases_headers_and_dicts():
     assert "secret-token" not in text
     assert "client-secret=client-secret" not in text
     assert text.count("[REDACTED]") >= 5
+
+
+def test_redact_secret_args_non_list_returns_empty():
+    assert _redact_secret_args("--token secret") == []
+    assert _redact_secret_args(None) == []
+
+
+def test_has_secret_material_detects_nested_and_inline_secrets():
+    assert _has_secret_material({"note": "Authorization: Bearer abc"}) is True
+    assert _has_secret_material({"outer": {"token": "abc"}}) is True
+    assert _has_secret_material({"items": [{"api_key": "abc"}]}) is True
+    assert _has_secret_material({"items": ["bearer abc"]}) is True
+    assert _has_secret_material({"items": [["x-api-key: abc"]]}) is True
+    assert _has_secret_material({"plain": "value", "items": ["safe"]}) is False
+
+
+def test_redact_command_string_with_unbalanced_quotes_falls_back_to_text_redaction():
+    redacted = _redact_command_string("run --token=secret-value 'unbalanced")
+    assert "secret-value" not in redacted
+    assert "[REDACTED]" in redacted
 
 
 def test_delivery_target_label_branches():
@@ -278,6 +304,21 @@ def test_collect_available_tools_reuses_cached_index_when_sessions_json_is_uncha
     c.close()
 
 
+def test_collect_available_tools_accepts_string_tool_entries(hermes_home: Path):
+    """A session file may list tools as bare strings instead of objects."""
+    (hermes_home / "sessions" / "sessions.json").write_text(
+        json.dumps({"entry1": {"session_id": "s1"}})
+    )
+    (hermes_home / "sessions" / "session_s1.json").write_text(
+        json.dumps({"session_id": "s1", "tools": ["terminal", "web_search"]})
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.available_tools == 2
+    assert state.available_tool_names == ["terminal", "web_search"]
+    c.close()
+
+
 def test_collect_available_tools_no_sessions_json(hermes_home: Path):
     c = Collector(hermes_home)
     state = c.collect()
@@ -439,6 +480,21 @@ version = "2026.4.10"
     c.close()
 
 
+def test_collect_hermes_version_tolerates_malformed_pyproject(hermes_home: Path):
+    pyproject = hermes_home / "hermes-agent" / "pyproject.toml"
+    pyproject.parent.mkdir(parents=True, exist_ok=True)
+    pyproject.write_text("[project\nversion = broken")
+    (hermes_home / "gateway_state.json").write_text(
+        json.dumps({"pid": 0, "gateway_state": "stopped", "platforms": {}})
+    )
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert "gateway" not in state.health.failed_sources
+    assert state.gateway.hermes_version == ""
+    c.close()
+
+
 def test_collect_config_richer_agent_settings(populated_hermes_home: Path):
     c = Collector(populated_hermes_home)
     state = c.collect()
@@ -506,6 +562,64 @@ def test_collect_gateway_preserves_last_good_mapping_on_non_mapping_json(hermes_
     second = c.collect()
     assert second.gateway.running is True
     assert second.gateway.pid == 12345
+    c.close()
+
+
+def test_collect_operations_handles_empty_caches_and_corrupt_pr_monitor(hermes_home: Path):
+    """An existing-but-empty model cache counts zero; a corrupt pr-monitor file is skipped."""
+    (hermes_home / "models_dev_cache.json").write_text("{}")
+    (hermes_home / "pr-monitor-corrupt.json").write_text("{not valid json")
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert "operations" not in state.health.failed_sources
+    caches = {cache.name: cache for cache in state.operations.model_caches}
+    assert caches["models_dev_cache.json"].provider_count == 0
+    assert caches["models_dev_cache.json"].model_count == 0
+    assert state.operations.pr_monitors == []
+    c.close()
+
+
+def test_collect_ignores_stray_entries_in_scanned_directories(populated_hermes_home: Path):
+    """Stray files / incomplete dirs in skills, hooks, plugins, and checkpoints are skipped."""
+    home = populated_hermes_home
+    # skills: a stray file at category level, a dot-dir, and a file inside a category
+    (home / "skills" / "README.md").write_text("not a category")
+    (home / "skills" / ".hidden").mkdir()
+    (home / "skills" / "dev" / "notes.txt").write_text("not a skill dir")
+    # hooks: a stray file and a hook dir without handler.py
+    (home / "hooks" / "stray.txt").write_text("not a hook")
+    no_handler = home / "hooks" / "no-handler"
+    no_handler.mkdir()
+    (no_handler / "HOOK.yaml").write_text("name: no-handler\nevents: not-a-list\n")
+    # plugins: a stray file and a plugin dir without plugin.yaml
+    (home / "plugins" / "stray.txt").write_text("not a plugin")
+    (home / "plugins" / "no-manifest").mkdir()
+    # checkpoints: a stray file
+    (home / "checkpoints" / "stray.txt").write_text("not a repo")
+
+    c = Collector(home, pid_exists=lambda pid: pid == 12345)
+    state = c.collect()
+
+    assert state.health.failed_sources == []
+    assert state.skills_memory.skill_count == 15
+    assert len(state.skills_memory.hooks) == 2
+    assert {p.name for p in state.skills_memory.plugins} == {"weather", "disabled-plugin"}
+    assert [cp.repo_id for cp in state.checkpoints] == ["abc123def4567890"]
+    c.close()
+
+
+def test_collect_hook_with_non_list_events_gets_empty_events(hermes_home: Path):
+    hook_dir = hermes_home / "hooks" / "odd-events"
+    hook_dir.mkdir(parents=True)
+    (hook_dir / "HOOK.yaml").write_text("name: odd-events\nevents: not-a-list\n")
+    (hook_dir / "handler.py").write_text("def handle(event_type, context):\n    return None\n")
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert len(state.skills_memory.hooks) == 1
+    assert state.skills_memory.hooks[0].events == []
     c.close()
 
 
@@ -594,6 +708,48 @@ def test_collect_cron_logs_preserve_cache_when_latest_output_disappears(hermes_h
     c.close()
 
 
+def test_collect_cron_ignores_non_dict_job_entries(hermes_home: Path):
+    (hermes_home / "cron" / "jobs.json").write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    "not-a-dict",
+                    {"id": "job-real", "name": "Real Job", "state": "scheduled"},
+                ]
+            }
+        )
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert "cron" not in state.health.failed_sources
+    assert state.cron.job_count == 1
+    assert state.cron.jobs[0].job_id == "job-real"
+    c.close()
+
+
+def test_latest_cron_output_excerpt_all_silent_lines(hermes_home: Path):
+    """An all-[SILENT] output yields silent_run=True and no excerpt."""
+    output_dir = hermes_home / "cron" / "output" / "job-1"
+    output_dir.mkdir(parents=True)
+    (output_dir / "latest.md").write_text("[SILENT]\n[silent]\n")
+
+    excerpt, silent, output_path, output_mtime = _latest_cron_output_excerpt(
+        hermes_home / "cron" / "output", "job-1", max_bytes=32768
+    )
+
+    assert excerpt == ""
+    assert silent is True
+    assert output_path == "latest.md"
+    assert output_mtime is not None
+
+
+def test_latest_cron_output_excerpt_empty_job_id_and_empty_dir(hermes_home: Path):
+    empty = ("", False, "", None)
+    assert _latest_cron_output_excerpt(hermes_home / "cron" / "output", "", 1024) == empty
+    (hermes_home / "cron" / "output" / "job-empty").mkdir(parents=True)
+    assert _latest_cron_output_excerpt(hermes_home / "cron" / "output", "job-empty", 1024) == empty
+
+
 def test_latest_cron_output_excerpt_ignores_file_that_disappears_during_stat(
     hermes_home: Path, monkeypatch
 ):
@@ -613,7 +769,7 @@ def test_latest_cron_output_excerpt_ignores_file_that_disappears_during_stat(
     monkeypatch.setattr(Path, "stat", flaky_stat)
 
     excerpt, silent, output_path, output_mtime = _latest_cron_output_excerpt(
-        hermes_home / "cron" / "output", "job-1"
+        hermes_home / "cron" / "output", "job-1", max_bytes=32768
     )
 
     assert excerpt == "fresh output"
@@ -655,6 +811,44 @@ def test_git_checkpoint_summary_empty_repo_skips_log(monkeypatch):
     assert "rev-list" in calls[0]
 
 
+def test_git_checkpoint_summary_handles_missing_git(monkeypatch):
+    def fake_run(*args, **kwargs):
+        raise OSError("git not found")
+
+    monkeypatch.setattr("hermesd.collector.subprocess.run", fake_run)
+    assert _git_checkpoint_summary(Path("/tmp/repo.git")) == (0, None, "")
+
+
+def test_git_checkpoint_summary_log_failure_keeps_commit_count(monkeypatch):
+    def fake_run(*args, **kwargs):
+        if "rev-list" in args[0]:
+            return CompletedProcess(args[0], 0, stdout="3\n")
+        raise OSError("git log failed")
+
+    monkeypatch.setattr("hermesd.collector.subprocess.run", fake_run)
+    assert _git_checkpoint_summary(Path("/tmp/repo.git")) == (3, None, "")
+
+
+def test_git_checkpoint_summary_log_nonzero_exit_keeps_commit_count(monkeypatch):
+    def fake_run(*args, **kwargs):
+        if "rev-list" in args[0]:
+            return CompletedProcess(args[0], 0, stdout="3\n")
+        return CompletedProcess(args[0], 128, stdout="")
+
+    monkeypatch.setattr("hermesd.collector.subprocess.run", fake_run)
+    assert _git_checkpoint_summary(Path("/tmp/repo.git")) == (3, None, "")
+
+
+def test_git_checkpoint_summary_log_without_tab_returns_raw_reason(monkeypatch):
+    def fake_run(*args, **kwargs):
+        if "rev-list" in args[0]:
+            return CompletedProcess(args[0], 0, stdout="3\n")
+        return CompletedProcess(args[0], 0, stdout="no tab here\n")
+
+    monkeypatch.setattr("hermesd.collector.subprocess.run", fake_run)
+    assert _git_checkpoint_summary(Path("/tmp/repo.git")) == (3, None, "no tab here")
+
+
 def test_collect_version_behind(hermes_home: Path):
     (hermes_home / ".update_check").write_text(json.dumps({"behind": 7}))
     c = Collector(hermes_home)
@@ -683,6 +877,58 @@ def test_collect_skin_default(hermes_home: Path):
     c = Collector(hermes_home)
     state = c.collect()
     assert state.active_skin == "default"
+    c.close()
+
+
+def test_collect_skin_empty_value_falls_back_to_default(hermes_home: Path):
+    cfg = hermes_home / "config.yaml"
+    cfg.write_text(yaml.dump({"display": {"skin": ""}}))
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.active_skin == "default"
+    c.close()
+
+
+@pytest.mark.parametrize(
+    ("provider_routing", "expected"),
+    [
+        ({"sort": "price", "ignore": ["a", "b", "c"]}, "price ignore:3"),
+        ({"order": ["a", "b"]}, "order:2"),
+    ],
+)
+def test_collect_config_provider_routing_ignore_and_order(
+    hermes_home: Path,
+    provider_routing: dict[str, object],
+    expected: str,
+):
+    cfg = hermes_home / "config.yaml"
+    cfg.write_text(yaml.dump({"provider_routing": provider_routing}))
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.config.provider_routing_summary == expected
+    c.close()
+
+
+def test_collect_mcp_servers_exclude_tool_filter_and_non_dict_entries(hermes_home: Path):
+    cfg = hermes_home / "config.yaml"
+    cfg.write_text(
+        yaml.dump(
+            {
+                "mcp_servers": {
+                    "filtered": {
+                        "url": "https://example.com/mcp",
+                        "tools": {"exclude": ["a", "b"]},
+                    },
+                    "broken": "not-a-mapping",
+                }
+            }
+        )
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    servers = {server.name: server for server in state.skills_memory.mcp_servers}
+    assert list(servers) == ["filtered"]
+    assert servers["filtered"].tool_filter == "exclude:2"
     c.close()
 
 
@@ -758,6 +1004,11 @@ def test_coerce_int_handles_bool_values():
     assert _coerce_int(False) == 0
 
 
+def test_coerce_int_truncates_float_values():
+    assert _coerce_int(3.9) == 3
+    assert _coerce_int(-2.5) == -2
+
+
 def test_coerce_int_handles_bytes_and_bytearray():
     assert _coerce_int(b"42") == 42
     assert _coerce_int(bytearray(b"7")) == 7
@@ -811,6 +1062,34 @@ def test_gateway_stale_pid_with_launchd_pid(hermes_home: Path):
     c.close()
 
 
+def test_gateway_running_without_recorded_pid_uses_launchd_pid(hermes_home: Path):
+    """gateway_state.json says running with no PID; gateway.pid supplies the live one."""
+    my_pid = os.getpid()
+    (hermes_home / "gateway_state.json").write_text(
+        json.dumps({"gateway_state": "running", "platforms": {}})
+    )
+    (hermes_home / "gateway.pid").write_text(json.dumps({"pid": my_pid}))
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.gateway.running is True
+    assert state.gateway.pid == my_pid
+    c.close()
+
+
+def test_gateway_pid_file_with_plain_integer_content(hermes_home: Path):
+    """gateway.pid may contain a bare integer instead of a JSON object."""
+    my_pid = os.getpid()
+    (hermes_home / "gateway_state.json").write_text(
+        json.dumps({"pid": 999999999, "gateway_state": "running", "platforms": {}})
+    )
+    (hermes_home / "gateway.pid").write_text(str(my_pid))
+    c = Collector(hermes_home, pid_exists=lambda pid: pid != 999999999)
+    state = c.collect()
+    assert state.gateway.running is True
+    assert state.gateway.pid == my_pid
+    c.close()
+
+
 def test_pid_exists_returns_false_for_missing_process(monkeypatch):
     def fake_kill(pid: int, sig: int) -> None:
         raise ProcessLookupError
@@ -846,6 +1125,51 @@ Body
     c.close()
 
 
+@pytest.mark.parametrize(
+    ("skill_md_content", "reason"),
+    [
+        (None, "missing SKILL.md"),
+        ("---\nname: lint\n---\nBody\n", "frontmatter without description"),
+        ("---\ndescription: [unclosed\n---\nBody\n", "malformed YAML frontmatter"),
+        ("No frontmatter at all\n", "no frontmatter delimiter"),
+    ],
+)
+def test_skill_without_usable_frontmatter_gets_empty_description(
+    hermes_home: Path,
+    skill_md_content: str | None,
+    reason: str,
+):
+    skill_dir = hermes_home / "skills" / "dev" / "lint"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    if skill_md_content is not None:
+        (skill_dir / "SKILL.md").write_text(skill_md_content)
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert "skills" not in state.health.failed_sources
+    assert state.skills_memory.skill_count == 1, reason
+    assert state.skills_memory.skills[0].description == "", reason
+    c.close()
+
+
+def test_collect_credential_pool_infers_oauth_auth_type_from_token_fields(hermes_home: Path):
+    """A pool entry without auth_type infers 'oauth' from OAuth token fields."""
+    (hermes_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "active_provider": "codex",
+                "providers": {"codex": {"id_token": "REDACTED"}},
+                "credential_pool": {"codex": {"label": "Codex"}},
+            }
+        )
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    pools = {pool.name: pool for pool in state.skills_memory.credential_pools}
+    assert pools["codex"].auth_type == "oauth"
+    c.close()
+
+
 def test_collect_providers_ignores_non_mapping_auth_json(hermes_home: Path):
     auth = hermes_home / "auth.json"
     auth.write_text(json.dumps(["not", "a", "mapping"]))
@@ -861,6 +1185,231 @@ def test_session_active_detection(hermes_home: Path, sample_db: Path):
     state = c.collect()
     # Both sample sessions have ended_at=NULL
     assert all(s.is_active for s in state.sessions)
+    c.close()
+
+
+def test_latest_cron_output_excerpt_caps_read_bytes(hermes_home: Path):
+    output_dir = hermes_home / "cron" / "output" / "job-1"
+    output_dir.mkdir(parents=True)
+    output_file = output_dir / "latest.md"
+    output_file.write_text("FIRST-MARKER\n" + "\n".join(f"tail filler {i}" for i in range(500)))
+
+    excerpt, silent, output_path, output_mtime = _latest_cron_output_excerpt(
+        hermes_home / "cron" / "output", "job-1", max_bytes=256
+    )
+
+    assert excerpt
+    assert "FIRST-MARKER" not in excerpt
+    assert silent is False
+    assert output_path == "latest.md"
+    assert output_mtime is not None
+
+
+def test_collect_cron_excerpt_respects_log_tail_bytes(hermes_home: Path):
+    (hermes_home / "cron" / "jobs.json").write_text(
+        json.dumps({"jobs": [{"id": "job-1", "name": "Job One", "state": "scheduled"}]})
+    )
+    output_dir = hermes_home / "cron" / "output" / "job-1"
+    output_dir.mkdir(parents=True)
+    (output_dir / "latest.md").write_text(
+        "FIRST-MARKER\n" + "\n".join(f"tail filler {i}" for i in range(2000))
+    )
+
+    c = Collector(hermes_home, log_tail_bytes=1024)
+    state = c.collect()
+
+    assert len(state.cron.jobs) == 1
+    excerpt = state.cron.jobs[0].latest_output_excerpt
+    # The capped read only sees the file tail (possibly starting mid-line),
+    # so the head marker can never be the excerpt.
+    assert excerpt
+    assert "FIRST-MARKER" not in excerpt
+    c.close()
+
+
+def test_tail_log_stream_skips_reread_when_mtime_and_size_unchanged(hermes_home: Path):
+    log = hermes_home / "logs" / "agent.log"
+    log.write_text("2026-04-09 15:41:58,123 - hermes - INFO - original line\n")
+    c = Collector(hermes_home)
+    first = c.collect()
+    assert [line.message for line in first.logs.agent_lines] == ["original line"]
+
+    # Rewrite with identical size and restore the original mtime: an unchanged
+    # mtime+size signature must short-circuit the re-read and return cached lines.
+    stat = log.stat()
+    replacement = "2026-04-09 15:41:58,123 - hermes - INFO - replaced line\n"
+    assert len(replacement) == stat.st_size
+    log.write_text(replacement)
+    os.utime(log, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    second = c.collect()
+    assert [line.message for line in second.logs.agent_lines] == ["original line"]
+
+    # A size change invalidates the cache and the new content is read.
+    log.write_text("2026-04-09 15:41:58,123 - hermes - INFO - a much longer brand new line\n")
+    third = c.collect()
+    assert [line.message for line in third.logs.agent_lines] == ["a much longer brand new line"]
+    c.close()
+
+
+def test_summarize_profile_caches_session_count_by_db_mtime(hermes_home: Path):
+    profile_home = hermes_home / "profiles" / "coding"
+    profile_home.mkdir(parents=True)
+    db_file = profile_home / "state.db"
+    db_file.touch()
+
+    constructed: list[Path] = []
+
+    class CountingFakeDB:
+        def __init__(self, db_path: Path):
+            constructed.append(db_path)
+
+        def read_session_count(self) -> int:
+            return 7
+
+        def close(self) -> None:
+            return None
+
+    c = Collector(hermes_home, db_factory=CountingFakeDB)
+    baseline = len(constructed)  # Collector.__init__ constructs the root DB
+
+    first = c._summarize_profile("coding", profile_home)
+    second = c._summarize_profile("coding", profile_home)
+    assert first.session_count == 7
+    assert second.session_count == 7
+    assert len(constructed) == baseline + 1  # unchanged mtime -> no new DB open
+
+    bumped = time.time() + 10
+    os.utime(db_file, (bumped, bumped))
+    third = c._summarize_profile("coding", profile_home)
+    assert third.session_count == 7
+    assert len(constructed) == baseline + 2
+
+    # WAL-only write: main db mtime unchanged, -wal mtime bumps -> must invalidate.
+    wal_file = profile_home / "state.db-wal"
+    wal_file.touch()
+    wal_bumped = time.time() + 20
+    os.utime(wal_file, (wal_bumped, wal_bumped))
+    fourth = c._summarize_profile("coding", profile_home)
+    assert fourth.session_count == 7
+    assert len(constructed) == baseline + 3
+    c.close()
+
+
+def test_collect_profiles_preserves_last_good_when_profile_db_read_fails(hermes_home: Path):
+    profile_home = hermes_home / "profiles" / "coding"
+    profile_home.mkdir(parents=True)
+    db_file = profile_home / "state.db"
+    db_file.touch()
+
+    class FlakyFakeDB:
+        fail = False
+
+        def __init__(self, db_path: Path):
+            self.db_path = db_path
+
+        def read_sessions(self) -> list[dict[str, object]]:
+            return []
+
+        def read_tool_stats(self) -> list[dict[str, object]]:
+            return []
+
+        def read_session_count(self) -> int:
+            if FlakyFakeDB.fail:
+                raise RuntimeError("profile db unavailable")
+            return 7
+
+        @property
+        def last_read_sessions_stale(self) -> bool:
+            return False
+
+        @property
+        def last_read_tool_stats_stale(self) -> bool:
+            return False
+
+        def close(self) -> None:
+            return None
+
+    c = Collector(hermes_home, db_factory=FlakyFakeDB)
+    state1 = c.collect()
+    assert state1.profiles.profiles[0].session_count == 7
+
+    FlakyFakeDB.fail = True
+    bumped = time.time() + 10
+    os.utime(db_file, (bumped, bumped))
+    state2 = c.collect()
+
+    assert state2.profiles == state1.profiles
+    assert "profiles" in state2.health.failed_sources
+    c.close()
+
+
+def test_collect_kanban_corrupt_db_preserves_last_good(populated_hermes_home: Path):
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    state1 = c.collect()
+    assert state1.kanban.task_count == 3
+
+    (populated_hermes_home / "kanban.db").write_bytes(b"this is not a sqlite database")
+    state2 = c.collect()
+
+    assert state2.kanban == state1.kanban
+    assert "kanban" in state2.health.failed_sources
+    c.close()
+
+
+def test_collect_kanban_corrupt_db_without_history_uses_default(hermes_home: Path):
+    (hermes_home / "kanban.db").write_bytes(b"garbage bytes")
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert "kanban" in state.health.failed_sources
+    assert state.kanban.task_count == 0
+    c.close()
+
+
+def test_read_kanban_state_reads_wal_database(hermes_home: Path):
+    db_path = hermes_home / "kanban.db"
+    writer = sqlite3.connect(str(db_path))
+    writer.execute("PRAGMA journal_mode=WAL")
+    create_kanban_db_tables(writer)
+    writer.execute(
+        "INSERT INTO tasks (id, title, status, created_at, consecutive_failures) "
+        "VALUES ('t_wal', 'WAL task', 'in_progress', ?, 0)",
+        (int(time.time()),),
+    )
+    writer.commit()
+    assert db_path.with_name("kanban.db-wal").exists()
+
+    state = _read_kanban_state(db_path, KanbanState(db_present=True))
+    writer.close()
+
+    assert state.task_count == 1
+    assert state.active_tasks[0].task_id == "t_wal"
+    assert state.status_counts == {"in_progress": 1}
+
+
+def test_collect_kanban_null_columns_coerced(populated_hermes_home: Path):
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    state = c.collect()
+    assert "kanban" not in state.health.failed_sources
+
+    tasks = {task.task_id: task for task in state.kanban.active_tasks}
+    null_task = tasks["t_null"]
+    assert null_task.assignee == ""
+    assert null_task.last_failure_error == ""
+    assert null_task.priority == 0
+    assert null_task.worker_pid == 0
+    assert null_task.session_id == ""
+    assert null_task.model_override == ""
+    assert null_task.branch_name == ""
+    assert state.kanban.assignee_counts.get("unassigned") == 1
+
+    runs = {run.run_id: run for run in state.kanban.recent_runs}
+    null_run = runs[2]
+    assert null_run.profile == ""
+    assert null_run.outcome == ""
+    assert null_run.error == ""
+    assert null_run.summary == ""
+    assert null_run.worker_pid == 0
     c.close()
 
 

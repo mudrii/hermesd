@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import time
 from pathlib import Path
 
@@ -112,6 +114,29 @@ def test_profiles_panel_detail_formats_large_sizes_and_future_timestamps():
     text = _render_to_str(panel)
     assert "5.0 GB" in text
     assert "(future)" in text
+
+
+def test_profiles_panel_detail_formats_small_sizes_and_past_timestamps():
+    mtime = time.time() - 3600
+    state = DashboardState(
+        profiles=ProfilesState(
+            profile_count=3,
+            profiles=[
+                ProfileSummary(name="tiny", db_size_bytes=500, latest_log_mtime=mtime),
+                ProfileSummary(name="medium", db_size_bytes=5 * 1024 * 1024),
+                ProfileSummary(name="huge", db_size_bytes=2 * 1024**4),
+            ],
+        ),
+    )
+    panel = render_panel(9, state, Theme(), detail=True)
+    text = _render_to_str(panel)
+    assert "500 B" in text
+    assert "5.0 MB" in text
+    assert "2.0 TB" in text
+    assert "(future)" not in text
+    from datetime import datetime
+
+    assert datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M") in text
 
 
 def test_profiles_panel_detail_handles_no_profiles():

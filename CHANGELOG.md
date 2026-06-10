@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Token/cost figures now use a `~$` prefix only when costs are estimated and a plain `$` prefix when every contributing session cost is provider-reported, in both the compact and detail views.
+- Cron output excerpts now respect `--log-tail-bytes` instead of reading whole output files.
+- Reduced redundant file and database re-reads per refresh cycle.
+
+### Fixed
+
+- Fixed a deadlock when pressing `G` to jump to the bottom of a scrollable detail view.
+- Fixed the footer health indicator showing yellow when zero collector sources were healthy.
+- An unknown `minlevel:` log filter value now shows all lines instead of none.
+- The memory panel compact view now distinguishes an empty `SOUL.md` from a missing one.
+- Message search no longer blocks the dashboard while a refresh is in progress.
+- SQL `LIKE` wildcard characters are now escaped in message search queries.
+- The stale indicator is now set when the SQLite database file disappears.
+
 ## [2026.6.5] - 2026-06-05
 
 ### Added

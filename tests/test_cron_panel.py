@@ -1,5 +1,7 @@
 """Tests for [6] Cron panel — job listing, compact and detail views."""
 
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
@@ -199,6 +201,7 @@ def test_cron_detail_shows_delivery_and_output_metadata():
                     enabled=True,
                     deliver="telegram:My Group",
                     delivery_target_label="telegram:My Group",
+                    latest_output_path="cron/output/j1/2026-04-09.md",
                     latest_output_excerpt="No changes to report.",
                     silent_run=True,
                 )
@@ -209,4 +212,5 @@ def test_cron_detail_shows_delivery_and_output_metadata():
     text = _render_to_str(panel)
     assert "telegram:My Group" in text
     assert "[SILENT]" in text
+    assert "cron/output/j1/2026-04-09.md" in text
     assert "No changes to report." in text

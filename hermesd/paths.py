@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from pathlib import Path, PurePath
 
 
+def default_hermes_home() -> Path:
+    return Path.home() / ".hermes"
+
+
 @dataclass(frozen=True, slots=True)
 class HermesPaths:
     root_home: Path

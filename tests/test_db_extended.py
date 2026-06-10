@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import shutil
 import sqlite3
 import threading
@@ -143,7 +145,7 @@ def test_empty_tool_stats_are_cached(hermes_home):
         reads += 1
         return original_read_tool_stats(conn)
 
-    db._read_tool_stats = counting_read_tool_stats  # type: ignore[assignment]
+    db._read_tool_stats = counting_read_tool_stats  # type: ignore[assignment]  # test seam: replacing bound method with counting stub
     assert db.read_tool_stats() == []
     assert db.read_tool_stats() == []
     assert reads == 1
@@ -169,7 +171,7 @@ def test_read_only_uri_handles_uri_metacharacters(tmp_path: Path):
     db.close()
 
 
-def test_close_idempotent(hermes_home):
+def test_close_idempotent():
     db = HermesDB(Path("/nonexistent/state.db"))
     db.close()
     db.close()
@@ -189,6 +191,75 @@ def test_search_session_ids_by_message_like(sample_db, hermes_home):
     db = HermesDB(hermes_home / "state.db")
     session_ids = db.search_session_ids_by_message("response 0")
     assert session_ids == {"sess_001"}
+    db.close()
+
+
+def test_search_like_escapes_percent_wildcard(hermes_home):
+    """A literal % in the query must not act as a LIKE wildcard."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.executescript("""
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_pct', 'cli', 1.0);
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_plain', 'cli', 2.0);
+        INSERT INTO messages (session_id, role, content, timestamp)
+            VALUES ('sess_pct', 'assistant', 'progress 100% complete', 1.0);
+        INSERT INTO messages (session_id, role, content, timestamp)
+            VALUES ('sess_plain', 'assistant', 'progress 100x complete', 2.0);
+    """)
+    conn.close()
+    db = HermesDB(db_path)
+    assert db.search_session_ids_by_message("100%") == {"sess_pct"}
+    db.close()
+
+
+def test_search_like_escapes_underscore_wildcard(hermes_home):
+    """A literal _ in the query must not act as a LIKE single-char wildcard."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.executescript("""
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_us', 'cli', 1.0);
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_nous', 'cli', 2.0);
+        INSERT INTO messages (session_id, role, content, timestamp)
+            VALUES ('sess_us', 'assistant', 'run a_b now', 1.0);
+        INSERT INTO messages (session_id, role, content, timestamp)
+            VALUES ('sess_nous', 'assistant', 'run axb now', 2.0);
+    """)
+    conn.close()
+    db = HermesDB(db_path)
+    assert db.search_session_ids_by_message("a_b") == {"sess_us"}
+    db.close()
+
+
+def test_search_blank_query_returns_empty(sample_db, hermes_home):
+    """Empty or whitespace-only queries return no sessions without touching the DB."""
+    db = HermesDB(hermes_home / "state.db")
+    assert db.search_session_ids_by_message("") == set()
+    assert db.search_session_ids_by_message("   ") == set()
+    db.close()
+
+
+def test_search_repeated_same_query_uses_cache(sample_db, hermes_home, monkeypatch):
+    """Same query on unchanged data must be served from cache, not re-queried."""
+    db = HermesDB(hermes_home / "state.db")
+    first = db.search_session_ids_by_message("response 0")
+    assert first == {"sess_001"}
+
+    def fail_like(conn: sqlite3.Connection, query: str) -> set[str]:
+        raise AssertionError("cache hit expected; search re-ran SQL")
+
+    monkeypatch.setattr(db, "_search_session_ids_by_like", fail_like)  # test seam
+    assert db.search_session_ids_by_message("response 0") == {"sess_001"}
+    assert db.last_message_search_stale is False
+    db.close()
+
+
+def test_search_two_distinct_queries_reuse_fts_detection(sample_db, hermes_home):
+    """Consecutive distinct queries both resolve correctly (FTS detection memoized)."""
+    db = HermesDB(hermes_home / "state.db")
+    assert db.search_session_ids_by_message("response 0") == {"sess_001"}
+    assert db.search_session_ids_by_message("no such phrase anywhere") == set()
     db.close()
 
 
@@ -283,7 +354,7 @@ def test_read_session_count_cache_hit_skips_sql(sample_db, hermes_home):
         reads += 1
         return original_read_session_count(conn)
 
-    db._read_session_count = counting_read_session_count  # type: ignore[assignment]
+    db._read_session_count = counting_read_session_count  # type: ignore[assignment]  # test seam: replacing bound method with counting stub
 
     assert db.read_session_count() == 2
     assert db.read_session_count() == 2
@@ -378,6 +449,31 @@ def test_search_session_ids_by_message_falls_back_to_like_when_fts_misses(hermes
     db.close()
 
 
+def test_search_falls_back_to_like_when_fts_returns_no_rows(hermes_home):
+    """A mid-token substring misses in FTS but must still be found via LIKE."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.executescript("""
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_sub', 'cli', 1.0);
+        INSERT INTO messages (session_id, role, content, timestamp)
+            VALUES ('sess_sub', 'user', 'foo:bar', 1.0);
+        CREATE VIRTUAL TABLE messages_fts USING fts5(
+            content, tool_name, session_id UNINDEXED, content='messages', content_rowid='id'
+        );
+        INSERT INTO messages_fts (rowid, content, tool_name, session_id)
+        SELECT id, content, tool_name, session_id FROM messages;
+    """)
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path)
+    # "oo:ba" is not a token prefix, so the quoted FTS phrase finds nothing;
+    # the LIKE fallback matches the substring.
+    assert db.search_session_ids_by_message("oo:ba") == {"sess_sub"}
+    db.close()
+
+
 def test_search_session_ids_by_message_fts_without_session_id_joins_messages(hermes_home):
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
@@ -450,11 +546,11 @@ def test_db_serializes_cross_thread_reads(hermes_home):
         enter_critical()
         return {query}
 
-    db._ensure_connection = lambda: conn  # type: ignore[assignment]
-    db._current_version = lambda: 1  # type: ignore[assignment]
-    db._messages_fts_enabled = lambda _conn: False  # type: ignore[assignment]
-    db._read_all_sessions = fake_read_all_sessions  # type: ignore[assignment]
-    db._search_session_ids_by_like = fake_search  # type: ignore[assignment]
+    db._ensure_connection = lambda: conn  # type: ignore[assignment]  # test seam: replacing bound method with stub
+    db._current_version = lambda: 1  # type: ignore[assignment]  # test seam: replacing bound method with stub
+    db._messages_fts_enabled = lambda _conn: False  # type: ignore[assignment]  # test seam: replacing bound method with stub
+    db._read_all_sessions = fake_read_all_sessions  # type: ignore[assignment]  # test seam: replacing bound method with stub
+    db._search_session_ids_by_like = fake_search  # type: ignore[assignment]  # test seam: replacing bound method with stub
 
     def run_read() -> None:
         try:

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import json
 from pathlib import Path
@@ -317,6 +319,59 @@ def test_main_snapshot_panel_json_file(populated_hermes_home: Path, tmp_path: Pa
     assert payload["panel_num"] == 8
     assert payload["panel_name"] == "Logs"
     assert "logs" in payload["state"]
+
+
+def test_main_runs_dashboard_when_no_snapshot_flags(populated_hermes_home: Path, monkeypatch):
+    from hermesd import __main__ as main_module
+
+    ran = False
+
+    class FakeApp:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self):
+            nonlocal ran
+            ran = True
+
+    monkeypatch.setattr("hermesd.app.DashboardApp", FakeApp)
+
+    main_module.main(["--hermes-home", str(populated_hermes_home), "--no-color"])
+
+    assert ran is True
+
+
+def test_python_dash_m_entry_point(populated_hermes_home: Path):
+    """`python -m hermesd` must reach main() (the __main__ guard)."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-m", "hermesd", "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert "hermesd" in result.stdout
+
+
+def test_version_falls_back_when_package_metadata_missing(monkeypatch):
+    import importlib
+    from importlib.metadata import PackageNotFoundError
+
+    import hermesd
+
+    def missing_package(name: str) -> str:
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr("importlib.metadata.version", missing_package)
+    try:
+        reloaded = importlib.reload(hermesd)
+        assert reloaded.__version__ == "0.0.0"
+    finally:
+        monkeypatch.undo()
+        importlib.reload(hermesd)
 
 
 def test_parse_args_version(capsys):

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 
 from rich.console import Console
@@ -29,6 +31,29 @@ def test_memory_panel_compact():
     assert re.search(r"Files:\s+3\b", text)
 
 
+def test_memory_panel_compact_soul_present():
+    state = DashboardState(
+        memory=MemoryOverview(soul_size_bytes=128, soul_excerpt="Remember the operator.")
+    )
+    panel = render_panel(10, state, Theme(), detail=False)
+    text = _render_to_str(panel)
+    assert "SOUL: present" in text
+
+
+def test_memory_panel_compact_soul_empty_file():
+    state = DashboardState(memory=MemoryOverview(soul_size_bytes=2, soul_excerpt=""))
+    panel = render_panel(10, state, Theme(), detail=False)
+    text = _render_to_str(panel)
+    assert "SOUL: empty" in text
+
+
+def test_memory_panel_compact_soul_missing():
+    state = DashboardState(memory=MemoryOverview(soul_size_bytes=0, soul_excerpt=""))
+    panel = render_panel(10, state, Theme(), detail=False)
+    text = _render_to_str(panel)
+    assert "SOUL: none" in text
+
+
 def test_memory_panel_detail():
     state = DashboardState(
         memory=MemoryOverview(
@@ -47,3 +72,18 @@ def test_memory_panel_detail():
     assert "MEMORY.md" in text
     assert "SOUL Excerpt" in text
     assert "42 words" in text
+
+
+def test_memory_panel_detail_soul_missing():
+    state = DashboardState(memory=MemoryOverview(soul_size_bytes=0, soul_excerpt=""))
+    panel = render_panel(10, state, Theme(), detail=True)
+    text = _render_to_str(panel)
+    assert "missing" in text
+    assert "SOUL Excerpt" not in text
+
+
+def test_memory_panel_detail_soul_empty_file():
+    state = DashboardState(memory=MemoryOverview(soul_size_bytes=2, soul_excerpt=""))
+    panel = render_panel(10, state, Theme(), detail=True)
+    text = _render_to_str(panel)
+    assert "2 bytes (empty)" in text

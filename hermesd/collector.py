@@ -127,14 +127,25 @@ class Collector:
         self._available_tools_cache_value: tuple[int, list[str]] = (0, [])
         self._last_state: DashboardState | None = None
         self._last_session_rows: list[dict[str, Any]] = []
+        self._log_stream_cache: dict[str, tuple[float | None, int, LogStream]] = {}
+        self._profile_count_cache: dict[str, tuple[float | None, int]] = {}
+        self._derived_rows: list[dict[str, Any]] | None = None
+        self._derived_date = ""
+        self._derived_cache: dict[str, Any] = {}
+        # _lock serializes collect() passes and guards the collector-internal
+        # caches mutated during a pass (_file_cache, _log_cache,
+        # _log_stream_cache, _available_tools_cache_*, _profile_count_cache,
+        # _derived_*) plus _last_state/_last_session_rows. It is deliberately
+        # NOT taken by search_session_ids_by_message(): HermesDB serializes its
+        # own access, so a slow collect pass (git subprocesses, per-profile DB
+        # snapshots) must not stall message search.
         self._lock = threading.RLock()
 
     def collect(self) -> DashboardState:
         with self._lock:
             health = _CollectionHealth()
             session_rows = self._collect_session_rows(health)
-            sessions = self._collect_sessions(session_rows)
-            state = self._build_dashboard_state(health, session_rows, sessions)
+            state = self._build_dashboard_state(health, session_rows)
             if not health.failed_sources:
                 self._last_state = state
             return state
@@ -143,7 +154,6 @@ class Collector:
         self,
         health: _CollectionHealth,
         session_rows: list[dict[str, Any]],
-        sessions: list[SessionInfo],
     ) -> DashboardState:
         safe_collect = health.collect
         session_rows_stale = "sessions" in health.failed_sources
@@ -157,6 +167,19 @@ class Collector:
         def empty_checkpoints() -> list[CheckpointInfo]:
             return []
 
+        def empty_sessions() -> list[SessionInfo]:
+            return []
+
+        sessions = safe_collect(
+            lambda: self._last_state.sessions if self._last_state is not None else empty_sessions(),
+            "session_models",
+            lambda: self._derived_from_rows(
+                "sessions",
+                self._fresh_session_rows(session_rows, session_rows_stale),
+                self._collect_sessions,
+            ),
+            empty_sessions,
+        )
         available_tools = safe_collect(
             lambda: (
                 (
@@ -182,8 +205,10 @@ class Collector:
                 self._last_state.tokens_today if self._last_state is not None else TokenSummary()
             ),
             "tokens_today",
-            lambda: self._collect_tokens_today(
-                self._fresh_session_rows(session_rows, session_rows_stale)
+            lambda: self._derived_from_rows(
+                "tokens_today",
+                self._fresh_session_rows(session_rows, session_rows_stale),
+                self._collect_tokens_today,
             ),
             TokenSummary,
         )
@@ -192,8 +217,10 @@ class Collector:
                 self._last_state.tokens_total if self._last_state is not None else TokenSummary()
             ),
             "tokens_total",
-            lambda: self._collect_tokens_total(
-                self._fresh_session_rows(session_rows, session_rows_stale)
+            lambda: self._derived_from_rows(
+                "tokens_total",
+                self._fresh_session_rows(session_rows, session_rows_stale),
+                self._collect_tokens_total,
             ),
             TokenSummary,
         )
@@ -204,8 +231,10 @@ class Collector:
                 else TokenAnalytics()
             ),
             "token_analytics",
-            lambda: self._collect_token_analytics(
-                self._fresh_session_rows(session_rows, session_rows_stale)
+            lambda: self._derived_from_rows(
+                "token_analytics",
+                self._fresh_session_rows(session_rows, session_rows_stale),
+                self._collect_token_analytics,
             ),
             TokenAnalytics,
         )
@@ -223,8 +252,10 @@ class Collector:
         total_tool_calls = safe_collect(
             lambda: self._last_state.total_tool_calls if self._last_state is not None else 0,
             "tool_call_total",
-            lambda: self._collect_total_tool_calls(
-                self._fresh_session_rows(session_rows, session_rows_stale)
+            lambda: self._derived_from_rows(
+                "tool_call_total",
+                self._fresh_session_rows(session_rows, session_rows_stale),
+                self._collect_total_tool_calls,
             ),
             int,
         )
@@ -322,7 +353,12 @@ class Collector:
             self._collect_skin,
             str,
         )
-        runtime = self._collect_runtime_status(gateway, sessions)
+        runtime = safe_collect(
+            lambda: self._last_state.runtime if self._last_state is not None else RuntimeStatus(),
+            "runtime",
+            lambda: self._collect_runtime_status(gateway, sessions),
+            RuntimeStatus,
+        )
         health_summary = HealthSummary(
             total_sources=health.total_sources,
             ok_sources=health.total_sources - len(health.failed_sources),
@@ -369,6 +405,26 @@ class Collector:
             raise RuntimeError("session rows are stale")
         return rows
 
+    def _derived_from_rows(
+        self,
+        name: str,
+        rows: list[dict[str, Any]],
+        compute: Callable[[list[dict[str, Any]]], T],
+    ) -> T:
+        # HermesDB returns the same cached list object while data_version is
+        # unchanged, so row identity is a cheap invalidation key. The local
+        # date is part of the key because "today" aggregates shift at midnight.
+        today = _local_date()
+        if rows is not self._derived_rows or today != self._derived_date:
+            self._derived_cache = {}
+            self._derived_rows = rows
+            self._derived_date = today
+        if name not in self._derived_cache:
+            self._derived_cache[name] = compute(rows)
+        # type-ignore[no-any-return]: heterogeneous per-name cache; each call
+        # site pins T via its compute callable.
+        return self._derived_cache[name]  # type: ignore[no-any-return]
+
     def _collect_session_rows(
         self,
         health: _CollectionHealth,
@@ -397,11 +453,13 @@ class Collector:
         return self._file_cache.read_yaml_mapping(self._paths.shared_path("config.yaml"))
 
     def search_session_ids_by_message(self, query: str) -> set[str]:
-        with self._lock:
-            session_ids = self._db.search_session_ids_by_message(query)
-            if self._db.last_message_search_stale:
-                raise RuntimeError("message search returned cached rows after sqlite error")
-            return session_ids
+        # Intentionally no self._lock here: HermesDB serializes its own reads,
+        # and taking the collect lock would block searches for the full
+        # duration of a slow collect pass (see _lock comment in __init__).
+        session_ids = self._db.search_session_ids_by_message(query)
+        if self._db.last_message_search_stale:
+            raise RuntimeError("message search returned cached rows after sqlite error")
+        return session_ids
 
     def _session_rows_or_read(self, rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
         return rows if rows is not None else self._db.read_sessions()
@@ -564,7 +622,7 @@ class Collector:
         for s in sessions:
             tc = s.get("tool_call_count") or 0
             if tc > 0:
-                sid = s.get("id", "?")
+                sid = str(s.get("id") or "?")
                 src = s.get("source") or "?"
                 label = f"{src}:{sid[-6:]}"
                 stats.append(ToolStats(name=label, call_count=tc))
@@ -756,6 +814,7 @@ class Collector:
                 output_excerpt, silent_run, output_path, output_mtime = _latest_cron_output_excerpt(
                     self._paths.shared_path("cron", "output"),
                     str(j.get("id") or ""),
+                    self._log_tail_bytes,
                 )
                 jobs.append(
                     CronJob(
@@ -987,9 +1046,7 @@ class Collector:
             )
         return hooks
 
-    def _collect_plugins(self, cfg: dict[str, Any] | None = None) -> list[PluginInfo]:
-        if cfg is None:
-            cfg = self._read_yaml_cached()
+    def _collect_plugins(self, cfg: dict[str, Any]) -> list[PluginInfo]:
         plugins_dir = self._paths.shared_path("plugins")
         if not plugins_dir.is_dir():
             return []
@@ -1023,9 +1080,7 @@ class Collector:
             )
         return plugins
 
-    def _collect_mcp_servers(self, cfg: dict[str, Any] | None = None) -> list[MCPServerInfo]:
-        if cfg is None:
-            cfg = self._read_yaml_cached()
+    def _collect_mcp_servers(self, cfg: dict[str, Any]) -> list[MCPServerInfo]:
         servers = _as_dict(cfg.get("mcp_servers"))
         result: list[MCPServerInfo] = []
         for name, raw_server in sorted(servers.items()):
@@ -1114,9 +1169,7 @@ class Collector:
             pass
         return ""
 
-    def _collect_providers(self, data: dict[str, Any] | None = None) -> list[ProviderInfo]:
-        if data is None:
-            data = self._read_json_cached(self._paths.shared_path("auth.json"))
+    def _collect_providers(self, data: dict[str, Any]) -> list[ProviderInfo]:
         if not data:
             return []
         active = str(data.get("active_provider") or "")
@@ -1125,11 +1178,7 @@ class Collector:
         all_names = set(pool.keys()) | set(providers_section.keys())
         return [ProviderInfo(name=name, is_active=(name == active)) for name in sorted(all_names)]
 
-    def _collect_credential_pools(
-        self, data: dict[str, Any] | None = None
-    ) -> list[CredentialPoolEntry]:
-        if data is None:
-            data = self._read_json_cached(self._paths.shared_path("auth.json"))
+    def _collect_credential_pools(self, data: dict[str, Any]) -> list[CredentialPoolEntry]:
         if not data:
             return []
 
@@ -1216,13 +1265,7 @@ class Collector:
 
     def _summarize_profile(self, name: str, profile_home: Path) -> ProfileSummary:
         db_path = profile_home / "state.db"
-        session_count = 0
-        if db_path.exists():
-            db = self._db_factory(db_path)
-            try:
-                session_count = db.read_session_count()
-            finally:
-                db.close()
+        session_count = self._profile_session_count(name, db_path) if db_path.exists() else 0
         return ProfileSummary(
             name=name,
             session_count=session_count,
@@ -1232,8 +1275,20 @@ class Collector:
             soul_excerpt=_read_soul_excerpt(profile_home / "SOUL.md"),
         )
 
-    def _tail_log(self, path: Path, max_lines: int) -> list[LogLine]:
-        return self._tail_log_stream(path.name, path, max_lines).lines
+    def _profile_session_count(self, name: str, db_path: Path) -> int:
+        # Opening a profile DB snapshots WAL files to a temp dir, so only
+        # re-open and re-count when the db (or its -wal) mtime changes.
+        mtime = _profile_db_mtime(db_path)
+        cached = self._profile_count_cache.get(name)
+        if cached is not None and mtime is not None and cached[0] == mtime:
+            return cached[1]
+        db = self._db_factory(db_path)
+        try:
+            session_count = db.read_session_count()
+        finally:
+            db.close()
+        self._profile_count_cache[name] = (mtime, session_count)
+        return session_count
 
     def _tail_log_stream(self, name: str, path: Path, max_lines: int) -> LogStream:
         key = str(path)
@@ -1241,6 +1296,14 @@ class Collector:
             return LogStream(name=name, path=path.name, lines=self._log_cache.get(key, []))
         size_bytes = _file_size(path)
         mtime = _mtime(path)
+        cached_stream = self._log_stream_cache.get(key)
+        if (
+            cached_stream is not None
+            and mtime is not None
+            and cached_stream[0] == mtime
+            and cached_stream[1] == size_bytes
+        ):
+            return cached_stream[2]
         try:
             with open(path, "rb") as f:
                 f.seek(0, 2)
@@ -1267,20 +1330,23 @@ class Collector:
                     result.append(LogLine(message=line.strip()))
             if result:
                 self._log_cache[key] = result
-                return LogStream(
+                stream = LogStream(
                     name=name,
                     path=path.name,
                     size_bytes=size_bytes,
                     mtime=mtime,
                     lines=result,
                 )
-            return LogStream(
-                name=name,
-                path=path.name,
-                size_bytes=size_bytes,
-                mtime=mtime,
-                lines=self._log_cache.get(key, []),
-            )
+            else:
+                stream = LogStream(
+                    name=name,
+                    path=path.name,
+                    size_bytes=size_bytes,
+                    mtime=mtime,
+                    lines=self._log_cache.get(key, []),
+                )
+            self._log_stream_cache[key] = (mtime, size_bytes, stream)
+            return stream
         except OSError:
             return LogStream(name=name, path=path.name, lines=self._log_cache.get(key, []))
 
@@ -1327,10 +1393,15 @@ def _summarize_tokens(
     cache_write_tokens = 0
     reasoning_tokens = 0
     total_cost_usd = 0.0
+    contributing_rows = 0
+    reported_rows = 0
     for row in rows:
         started_at = row.get("started_at") or 0.0
         if started_at_min is not None and started_at < started_at_min:
             continue
+        contributing_rows += 1
+        if _session_cost_is_reported(row):
+            reported_rows += 1
         input_tokens += row.get("input_tokens") or 0
         output_tokens += row.get("output_tokens") or 0
         cache_read_tokens += row.get("cache_read_tokens") or 0
@@ -1344,6 +1415,7 @@ def _summarize_tokens(
         cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
         total_cost_usd=total_cost_usd,
+        cost_is_estimated=contributing_rows == 0 or reported_rows < contributing_rows,
     )
 
 
@@ -1417,10 +1489,17 @@ def _estimate_cost(
     ) / 1_000_000
 
 
+def _session_cost_is_reported(row: dict[str, Any]) -> bool:
+    return (
+        str(row.get("cost_status") or "") == "reported"
+        and row.get("estimated_cost_usd") is not None
+    )
+
+
 def _resolved_session_cost(row: dict[str, Any]) -> float:
     raw_cost = row.get("estimated_cost_usd")
     cost = _coerce_float(raw_cost)
-    if str(row.get("cost_status") or "") == "reported" and raw_cost is not None:
+    if _session_cost_is_reported(row):
         return cost
     if cost:
         return cost
@@ -1521,6 +1600,19 @@ def _safe_mtime(path: Path) -> float:
     return _mtime(path) or 0.0
 
 
+def _profile_db_mtime(db_path: Path) -> float | None:
+    mtimes = [
+        mtime
+        for candidate in (db_path, db_path.with_name(f"{db_path.name}-wal"))
+        if (mtime := _mtime(candidate)) is not None
+    ]
+    return max(mtimes) if mtimes else None
+
+
+def _local_date() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
 def _provider_model_label(cfg: dict[str, Any]) -> str:
     provider = str(cfg.get("provider") or "")
     model = str(cfg.get("model") or "")
@@ -1587,6 +1679,7 @@ def _delivery_target_label(directory: dict[str, Any], deliver: str) -> str:
 def _latest_cron_output_excerpt(
     output_root: Path,
     job_id: str,
+    max_bytes: int,
 ) -> tuple[str, bool, str, float | None]:
     if not job_id:
         return "", False, "", None
@@ -1605,7 +1698,11 @@ def _latest_cron_output_excerpt(
     latest = max(files, key=_safe_mtime)
     latest_mtime = _mtime(latest)
     try:
-        lines = latest.read_text(errors="replace").splitlines()
+        with latest.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes))
+            lines = handle.read().decode("utf-8", errors="replace").splitlines()
     except OSError:
         return "", False, "", None
     silent = any("[SILENT]" in line.upper() for line in lines)

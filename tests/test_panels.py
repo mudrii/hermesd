@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import re
+import time
 
 from rich.console import Console
 
@@ -7,6 +10,7 @@ from hermesd.models import (
     CronState,
     DashboardState,
     GatewayState,
+    KanbanRunSummary,
     KanbanState,
     KanbanTaskSummary,
     LogLine,
@@ -27,6 +31,13 @@ from hermesd.theme import Theme
 
 def _render_to_str(panel) -> str:
     console = Console(width=80, force_terminal=True)
+    with console.capture() as cap:
+        console.print(panel)
+    return cap.get()
+
+
+def _render_to_plain(panel) -> str:
+    console = Console(width=80, force_terminal=True, no_color=True)
     with console.capture() as cap:
         console.print(panel)
     return cap.get()
@@ -97,6 +108,54 @@ def test_gateway_panel_stopped():
     assert "Stopped" in text or "stopped" in text
 
 
+def test_gateway_panel_compact_shows_version_and_updates_behind():
+    state = DashboardState(
+        gateway=GatewayState(
+            pid=12345,
+            running=True,
+            state="running",
+            hermes_version="1.2.3",
+            updates_behind=4,
+        ),
+    )
+    panel = render_panel(1, state, Theme(), detail=False)
+    text = _render_to_str(panel)
+    assert "v1.2.3" in text
+    assert "(4 behind)" in text
+
+
+def test_gateway_panel_detail_updates_behind_warns():
+    state = DashboardState(
+        gateway=GatewayState(
+            pid=12345,
+            running=True,
+            state="running",
+            hermes_version="1.2.3",
+            updates_behind=2,
+        ),
+    )
+    panel = render_panel(1, state, Theme(), detail=True)
+    text = _render_to_str(panel)
+    assert "Hermes v1.2.3" in text
+    assert "2 commits behind" in text
+    assert "hermes update" in text
+
+
+def test_gateway_panel_detail_stopped_up_to_date():
+    state = DashboardState(
+        gateway=GatewayState(
+            running=False,
+            state="stopped",
+            hermes_version="1.2.3",
+            updates_behind=0,
+        ),
+    )
+    panel = render_panel(1, state, Theme(), detail=True)
+    text = _render_to_str(panel)
+    assert "Stopped" in text
+    assert "(up to date)" in text
+
+
 def test_render_panel_invalid_number():
     state = DashboardState()
     panel = render_panel(99, state, Theme(), detail=False)
@@ -134,6 +193,31 @@ def test_tokens_panel_compact():
     assert "Today:~$0.42" in text
 
 
+def test_tokens_panel_compact_reported_cost_uses_plain_prefix():
+    state = DashboardState(
+        tokens_today=TokenSummary(
+            input_tokens=12400, total_cost_usd=0.42, cost_is_estimated=False
+        ),
+        tokens_total=TokenSummary(
+            input_tokens=45100, total_cost_usd=2.18, cost_is_estimated=False
+        ),
+    )
+    panel = render_panel(3, state, Theme(), detail=False)
+    text = _render_to_str(panel)
+    assert "Today:$0.42" in text
+    assert "Total:$2.18" in text
+    assert "~$" not in text
+
+
+def test_tokens_panel_compact_empty_state():
+    state = DashboardState()
+    panel = render_panel(3, state, Theme(), detail=False)
+    text = _render_to_str(panel)
+    assert "Today:~$0.00" in text
+    assert "Total:~$0.00" in text
+    assert re.search(r"In:\s+0\b", text)
+
+
 def test_tools_panel_compact():
     state = DashboardState(
         tool_stats=[
@@ -157,6 +241,15 @@ def test_config_panel_compact():
     panel = render_panel(5, state, Theme(), detail=False)
     text = _render_to_str(panel)
     assert "gpt-5.4" in text
+
+
+def test_config_panel_compact_empty_config():
+    state = DashboardState()
+    panel = render_panel(5, state, Theme(), detail=False)
+    text = _render_to_plain(panel)
+    assert "Config" in text
+    assert "Model: —" in text
+    assert "Provider: —" in text
 
 
 def test_cron_panel_compact():
@@ -198,6 +291,39 @@ def test_memory_panel_empty():
     assert "Memory" in text
 
 
+def test_kanban_panel_compact():
+    state = DashboardState(
+        kanban=KanbanState(
+            db_present=True,
+            task_count=5,
+            run_count=3,
+            dispatch_in_gateway=True,
+            status_counts={"done": 4, "in_progress": 1},
+        )
+    )
+    panel = render_panel(11, state, Theme(), detail=False)
+    text = _render_to_plain(panel)
+    assert "Tasks: 5" in text
+    assert "Runs: 3" in text
+    assert "Dispatch: gateway" in text
+    assert "in_progress: 1" in text
+
+
+def test_kanban_panel_compact_empty():
+    state = DashboardState()
+    panel = render_panel(11, state, Theme(), detail=False)
+    text = _render_to_plain(panel)
+    assert "No kanban.db" in text
+
+
+def test_kanban_panel_detail_empty():
+    state = DashboardState()
+    panel = render_panel(11, state, Theme(), detail=True)
+    text = _render_to_plain(panel)
+    assert "missing" in text
+    assert "Kanban is not initialized" in text
+
+
 def test_kanban_panel_detail():
     state = DashboardState(
         kanban=KanbanState(
@@ -236,6 +362,97 @@ def test_kanban_panel_detail():
     assert "Status Counts" in text
 
 
+def test_kanban_panel_detail_recent_runs():
+    state = DashboardState(
+        kanban=KanbanState(
+            db_present=True,
+            run_count=2,
+            recent_runs=[
+                KanbanRunSummary(
+                    run_id=7,
+                    task_id="t_done",
+                    profile="coding",
+                    status="done",
+                    outcome="success",
+                ),
+                KanbanRunSummary(
+                    run_id=8,
+                    task_id="t_failed",
+                    status="failed",
+                    error="worker crashed with missing credentials",
+                ),
+            ],
+        )
+    )
+    panel = render_panel(11, state, Theme(), detail=True)
+    text = _render_to_plain(panel)
+    assert "Recent Runs" in text
+    assert "t_done" in text
+    assert "coding" in text
+    assert "success" in text
+    assert "t_failed" in text
+    assert "worker crashed" in text
+
+
+def test_kanban_panel_detail_heartbeat_age_labels():
+    now = int(time.time())
+    state = DashboardState(
+        kanban=KanbanState(
+            db_present=True,
+            task_count=3,
+            active_tasks=[
+                KanbanTaskSummary(
+                    task_id="t_seconds", status="in_progress", last_heartbeat_at=now - 5
+                ),
+                KanbanTaskSummary(
+                    task_id="t_minutes", status="in_progress", last_heartbeat_at=now - 300
+                ),
+                KanbanTaskSummary(
+                    task_id="t_hours", status="in_progress", last_heartbeat_at=now - 7200
+                ),
+            ],
+        )
+    )
+    panel = render_panel(11, state, Theme(), detail=True)
+    text = _render_to_plain(panel)
+    assert re.search(r"\b\d+s\b", text)
+    assert "5m" in text
+    assert "2h" in text
+
+
+def test_operations_panel_compact():
+    state = DashboardState(
+        operations=OperationsState(
+            dashboard_process_count=2,
+            model_caches=[
+                ModelCacheSummary(name="models_dev_cache.json", provider_count=2, model_count=7)
+            ],
+            pr_monitors=[PRMonitorSummary(filename="pr-monitor.json")],
+        )
+    )
+    panel = render_panel(12, state, Theme(), detail=False)
+    text = _render_to_plain(panel)
+    assert "Dashboard: 2 proc" in text
+    assert "1 files  7 models" in text
+    assert "PR Monitors: 1" in text
+
+
+def test_operations_panel_compact_empty():
+    state = DashboardState()
+    panel = render_panel(12, state, Theme(), detail=False)
+    text = _render_to_plain(panel)
+    assert "Dashboard: 0 proc" in text
+    assert "0 files  0 models" in text
+    assert "PR Monitors: 0" in text
+
+
+def test_operations_panel_detail_empty():
+    state = DashboardState()
+    panel = render_panel(12, state, Theme(), detail=True)
+    text = _render_to_plain(panel)
+    assert "No operations artifacts found" in text
+
+
 def test_operations_panel_detail():
     state = DashboardState(
         operations=OperationsState(
@@ -264,3 +481,30 @@ def test_operations_panel_detail():
     assert "Operations" in text
     assert "models_dev_cache.json" in text
     assert "PR Monitors" in text
+
+
+def test_operations_panel_detail_size_and_age_labels():
+    now = time.time()
+    state = DashboardState(
+        operations=OperationsState(
+            model_caches=[
+                ModelCacheSummary(
+                    name="big_cache.json", model_count=1, size_bytes=2_500_000, mtime=now - 5
+                ),
+                ModelCacheSummary(
+                    name="small_cache.json", model_count=1, size_bytes=500, mtime=now - 300
+                ),
+                ModelCacheSummary(
+                    name="old_cache.json", model_count=1, size_bytes=1200, mtime=now - 7200
+                ),
+            ],
+        )
+    )
+    panel = render_panel(12, state, Theme(), detail=True)
+    text = _render_to_plain(panel)
+    assert "2.5M" in text
+    assert "500" in text
+    assert "1.2K" in text
+    assert re.search(r"\b\d+s\b", text)
+    assert "5m" in text
+    assert "2h" in text

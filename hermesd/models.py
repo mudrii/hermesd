@@ -5,6 +5,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from hermesd.paths import default_hermes_home
+
 
 class PlatformStatus(BaseModel):
     name: str
@@ -57,6 +59,9 @@ class TokenSummary(BaseModel):
     cache_write_tokens: int = 0
     reasoning_tokens: int = 0
     total_cost_usd: float = 0.0
+    # True unless every contributing session cost was provider-reported.
+    # Zero-session summaries keep the estimated default ("~$" display).
+    cost_is_estimated: bool = True
 
 
 class TokenWindowSummary(BaseModel):
@@ -401,7 +406,7 @@ class RuntimeStatus(BaseModel):
 
 
 class DashboardState(BaseModel):
-    hermes_home: Path = Field(default_factory=lambda: Path.home() / ".hermes")
+    hermes_home: Path = Field(default_factory=default_hermes_home)
     selected_profile: str | None = None
     profile_mode_label: str = "root"
     collected_at: float = Field(default_factory=time.time)

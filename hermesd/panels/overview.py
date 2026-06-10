@@ -195,8 +195,6 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
         )
         if offset > 0:
             skills_header.append("↑ ", style=theme.ui_accent)
-        if offset + len(visible) < total:
-            skills_header.append("j/k scroll", style=theme.banner_dim)
         skills_header.append("\n")
         sections.append(skills_header)
 

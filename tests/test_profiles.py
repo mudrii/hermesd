@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 from pathlib import Path
 
@@ -87,6 +89,18 @@ def test_hermes_paths_rejects_missing_profile_dir(profiled_hermes_home: Path):
 def test_collector_rejects_invalid_profile_names(profiled_hermes_home: Path, profile_name: str):
     with pytest.raises(ValueError, match="Invalid profile name"):
         Collector(profiled_hermes_home, profile_name=profile_name)
+
+
+def test_hermes_paths_rejects_symlinked_profile_escaping_profiles_dir(hermes_home: Path):
+    """A profile dir that is a symlink out of profiles/ must be rejected."""
+    outside = hermes_home.parent / "outside-profile"
+    outside.mkdir()
+    profiles_dir = hermes_home / "profiles"
+    profiles_dir.mkdir()
+    (profiles_dir / "sneaky").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="Invalid profile name 'sneaky'"):
+        HermesPaths(hermes_home, profile_name="sneaky")
 
 
 def test_collector_rejects_profile_traversal_outside_profiles_dir(hermes_home: Path):

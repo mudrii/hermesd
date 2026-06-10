@@ -1,5 +1,10 @@
+from __future__ import annotations
+
+import signal
 import threading
 from pathlib import Path
+
+import pytest
 
 from hermesd.app import DashboardApp, ViewState, _osc52_sequence
 
@@ -49,19 +54,6 @@ def test_view_state_scroll():
     assert vs.scroll_offset == 0
 
 
-def test_view_state_cycle_log_view():
-    vs = ViewState()
-    assert vs.log_sub_view == "agent"
-    vs.cycle_log_view()
-    assert vs.log_sub_view == "gateway"
-    vs.cycle_log_view()
-    assert vs.log_sub_view == "errors"
-    vs.cycle_log_view()
-    assert vs.log_sub_view == "cron"
-    vs.cycle_log_view()
-    assert vs.log_sub_view == "agent"
-
-
 def test_view_state_toggle_focus_uses_last_panel():
     vs = ViewState()
     vs.toggle_focus()
@@ -74,6 +66,20 @@ def test_view_state_toggle_focus_uses_last_panel():
     vs.toggle_focus()
     assert vs.mode == "detail"
     assert vs.detail_panel == 4
+
+
+def test_view_state_cycle_log_view_with_no_views_is_noop():
+    vs = ViewState()
+    vs.cycle_log_view_in(())
+    assert vs.log_sub_view == "agent"
+
+
+def test_view_state_cycle_log_view_resets_when_current_view_unknown():
+    vs = ViewState()
+    vs.cycle_log_view_in(("alpha", "beta"))
+    assert vs.log_sub_view == "alpha"
+    vs.cycle_log_view_in(("alpha", "beta"))
+    assert vs.log_sub_view == "beta"
 
 
 def test_app_build_layout(populated_hermes_home: Path):
@@ -139,11 +145,107 @@ def test_app_handle_key_escape_sequence_ignored(populated_hermes_home: Path):
     app.close()
 
 
-def test_app_uses_event_for_running_state(populated_hermes_home: Path):
+def test_run_installs_signal_handlers_before_initial_collect(
+    populated_hermes_home: Path, monkeypatch
+):
+    """Ctrl+C during a slow first collect must hit the app handler, not the default."""
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    assert isinstance(app._running, threading.Event)
+    seen: dict[str, object] = {}
+
+    def fake_collect():
+        seen["sigint_handler"] = signal.getsignal(signal.SIGINT)
+        raise RuntimeError("stop before live loop")
+
+    monkeypatch.setattr(app._collector, "collect", fake_collect)
+    old_int = signal.getsignal(signal.SIGINT)
+    old_term = signal.getsignal(signal.SIGTERM)
+    try:
+        with pytest.raises(RuntimeError, match="stop before live loop"):
+            app.run()
+    finally:
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
+        app.close()
+    assert seen["sigint_handler"] == app._signal_handler
+
+
+def test_run_live_loop_renders_and_exits_when_running_cleared(populated_hermes_home: Path):
+    """run() drives the Live loop and exits cleanly once the running event clears."""
+    import io
+
+    from rich.console import Console
+
+    app = DashboardApp(populated_hermes_home, refresh_rate=1)
+    buffer = io.StringIO()
+    app._console = Console(file=buffer, width=80, height=24, force_terminal=True)
+    stopper = threading.Timer(0.2, app._running.clear)
+    old_int = signal.getsignal(signal.SIGINT)
+    old_term = signal.getsignal(signal.SIGTERM)
+    stopper.start()
+    try:
+        app.run()
+    finally:
+        stopper.cancel()
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
     assert app._running.is_set() is False
-    app.close()
+    assert app._closed.is_set() is True
+    assert "hermesd" in buffer.getvalue()
+
+
+def test_run_breaks_promptly_when_stopped_during_render_wait(populated_hermes_home: Path):
+    """A signal arriving while the loop waits stops it before the next frame."""
+    import io
+
+    from rich.console import Console
+
+    class ClearsDuringWait(threading.Event):
+        def wait(self, timeout: float | None = None) -> bool:
+            if self.is_set():
+                self.clear()  # simulate _signal_handler firing mid-wait
+                return False
+            return super().wait(timeout)
+
+    app = DashboardApp(populated_hermes_home, refresh_rate=1)
+    app._running = ClearsDuringWait()
+    app._console = Console(file=io.StringIO(), width=80, height=24, force_terminal=True)
+    old_int = signal.getsignal(signal.SIGINT)
+    old_term = signal.getsignal(signal.SIGTERM)
+    try:
+        app.run()
+    finally:
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
+    assert app._closed.is_set() is True
+
+
+def test_run_exits_cleanly_on_keyboard_interrupt(populated_hermes_home: Path, monkeypatch):
+    """Ctrl+C inside the Live loop quits without a traceback and closes the app."""
+    import io
+
+    from rich.console import Console
+
+    app = DashboardApp(populated_hermes_home, refresh_rate=1)
+    app._console = Console(file=io.StringIO(), width=80, height=24, force_terminal=True)
+    original_build = app._build_layout
+    calls: list[int] = []
+
+    def interrupting_build(console=None):
+        calls.append(1)
+        if len(calls) > 1:
+            raise KeyboardInterrupt
+        return original_build(console=console)
+
+    monkeypatch.setattr(app, "_build_layout", interrupting_build)
+    old_int = signal.getsignal(signal.SIGINT)
+    old_term = signal.getsignal(signal.SIGTERM)
+    try:
+        app.run()  # must not raise
+    finally:
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
+    assert app._running.is_set() is False
+    assert app._closed.is_set() is True
 
 
 def test_signal_handler_clears_running_event(populated_hermes_home: Path):

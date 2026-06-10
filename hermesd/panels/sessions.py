@@ -244,7 +244,12 @@ def _parse_session_filter(filter_query: str) -> SessionFilterCriteria:
         key, value = token.split(":", 1)
         key = key.lower().strip()
         value = value.strip().lower()
-        if key in {
+        if key in {"message", "msg"}:
+            # With repeated message:/msg: tokens the last occurrence wins
+            # everywhere, mirroring extract_message_search_query (which feeds
+            # the message-search worker with the same final value).
+            fields["message"] = [value]
+        elif key in {
             "id",
             "source",
             "model",
@@ -258,11 +263,8 @@ def _parse_session_filter(filter_query: str) -> SessionFilterCriteria:
             "handoff",
             "platform",
             "active",
-            "message",
         }:
             fields.setdefault(key, []).append(value)
-        elif key == "msg":
-            fields.setdefault("message", []).append(value)
         elif key == "text":
             if value:
                 terms.append(value)

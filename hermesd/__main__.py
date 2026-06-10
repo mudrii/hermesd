@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from hermesd import __version__
+from hermesd.paths import default_hermes_home
 
 
 def _positive_int(value: str) -> int:
@@ -97,7 +98,7 @@ def resolve_hermes_home(args: argparse.Namespace) -> Path:
     env = os.environ.get("HERMES_HOME")
     if env:
         return Path(env).expanduser()
-    return Path.home() / ".hermes"
+    return default_hermes_home()
 
 
 def resolve_profile_name(args: argparse.Namespace) -> str | None:

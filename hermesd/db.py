@@ -17,6 +17,8 @@ _CONNECT_BACKOFF_READS = 2
 class HermesDB:
     def __init__(self, db_path: Path):
         self._path = db_path
+        # Guards the SQLite connection lifecycle and serializes reads against
+        # the cached last-good result/version state below.
         self._lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
         self._current_data_version: int | None = None
@@ -52,6 +54,7 @@ class HermesDB:
         self._close_connection()
         if not self._path.exists():
             self._connected_mtime_ns = None
+            self._mark_cached_reads_stale()
             return
         try:
             db_path, uri_params = self._open_target()
@@ -387,12 +390,12 @@ class HermesDB:
         return {str(row[0]) for row in cur.fetchall() if row[0]}
 
     def _search_session_ids_by_like(self, conn: sqlite3.Connection, query: str) -> set[str]:
-        pattern = f"%{query.lower()}%"
+        pattern = f"%{_escape_like_pattern(query.lower())}%"
         cur = conn.execute(
             "SELECT DISTINCT session_id "
             "FROM messages "
-            "WHERE LOWER(COALESCE(content, '')) LIKE ? "
-            "OR LOWER(COALESCE(tool_name, '')) LIKE ?",
+            "WHERE LOWER(COALESCE(content, '')) LIKE ? ESCAPE '\\' "
+            "OR LOWER(COALESCE(tool_name, '')) LIKE ? ESCAPE '\\'",
             (pattern, pattern),
         )
         return {str(row[0]) for row in cur.fetchall() if row[0]}
@@ -400,6 +403,10 @@ class HermesDB:
     def close(self) -> None:
         with self._lock:
             self._close_connection()
+
+
+def _escape_like_pattern(query: str) -> str:
+    return query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _quote_fts_query(query: str) -> str:

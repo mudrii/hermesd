@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 from hermesd.db import HermesDB
@@ -31,12 +33,23 @@ def test_read_tool_stats(sample_db, hermes_home):
     db.close()
 
 
-def test_data_version_caching(sample_db, hermes_home):
+def test_data_version_caching(sample_db, hermes_home, monkeypatch):
+    """Unchanged data_version must not trigger a second SQL read."""
     db = HermesDB(hermes_home / "state.db")
+    reads = 0
+    original_read_all_sessions = db._read_all_sessions
+
+    def counting_read_all_sessions(conn):
+        nonlocal reads
+        reads += 1
+        return original_read_all_sessions(conn)
+
+    monkeypatch.setattr(db, "_read_all_sessions", counting_read_all_sessions)
     s1 = db.read_sessions()
     s2 = db.read_sessions()
     assert s1 == s2
-    assert db._cache_hits >= 1
+    assert len(s1) == 2
+    assert reads == 1
     db.close()
 
 

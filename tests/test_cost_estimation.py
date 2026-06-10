@@ -1,5 +1,7 @@
 """Tests for cost estimation when provider doesn't report costs."""
 
+from __future__ import annotations
+
 import sqlite3
 import time
 from pathlib import Path
@@ -162,6 +164,36 @@ def test_summarize_tokens_accumulates_fields_and_resolves_cost_per_row():
     assert totals.reasoning_tokens == 9
     expected_cost = 1.5 + _estimate_cost(20, 7, 4, 6)
     assert abs(totals.total_cost_usd - expected_cost) < 1e-9
+
+
+def test_summarize_tokens_all_reported_rows_clears_estimated_flag():
+    rows = [
+        {"input_tokens": 10, "estimated_cost_usd": 1.0, "cost_status": "reported"},
+        {"input_tokens": 20, "estimated_cost_usd": 0.0, "cost_status": "reported"},
+    ]
+
+    assert _summarize_tokens(rows).cost_is_estimated is False
+
+
+def test_summarize_tokens_mixed_cost_status_stays_estimated():
+    rows = [
+        {"input_tokens": 10, "estimated_cost_usd": 1.0, "cost_status": "reported"},
+        {"input_tokens": 20, "estimated_cost_usd": 0.5, "cost_status": "estimated"},
+    ]
+
+    assert _summarize_tokens(rows).cost_is_estimated is True
+
+
+def test_summarize_tokens_empty_rows_keep_estimated_default():
+    assert _summarize_tokens([]).cost_is_estimated is True
+
+
+def test_summarize_tokens_reported_status_with_null_cost_stays_estimated():
+    # cost_status says "reported" but the stored cost is NULL, so the
+    # resolved cost falls back to an estimate — the flag must reflect that.
+    rows = [{"input_tokens": 10, "estimated_cost_usd": None, "cost_status": "reported"}]
+
+    assert _summarize_tokens(rows).cost_is_estimated is True
 
 
 def test_summarize_breakdown_sorts_equal_labels_ascending():

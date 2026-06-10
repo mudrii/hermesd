@@ -1,5 +1,7 @@
 """Tests for [7] Skills / Integrations panel."""
 
+from __future__ import annotations
+
 import re
 
 from rich.console import Console
