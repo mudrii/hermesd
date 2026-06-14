@@ -1906,6 +1906,56 @@ def test_collect_kanban_null_columns_coerced(populated_hermes_home: Path):
     c.close()
 
 
+def test_collect_kanban_enrichment_fields_and_link_attachment_counts(hermes_home: Path):
+    """Live tasks carry workspace_path/goal_mode/current_step_key; link/attachment
+    tables are counted when present."""
+    db_path = hermes_home / "kanban.db"
+    conn = sqlite3.connect(str(db_path))
+    create_kanban_db_tables(conn)
+    conn.executescript(
+        "ALTER TABLE tasks ADD COLUMN workspace_path TEXT;"
+        "ALTER TABLE tasks ADD COLUMN goal_mode TEXT;"
+        "ALTER TABLE tasks ADD COLUMN current_step_key TEXT;"
+        "CREATE TABLE task_links (parent_id TEXT, child_id TEXT);"
+        "CREATE TABLE task_attachments (id INTEGER PRIMARY KEY, task_id TEXT);"
+    )
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, current_run_id, completed_at, "
+        "branch_name, workspace_path, goal_mode, current_step_key) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "t_goal",
+            "Decompose milestone",
+            "in_progress",
+            now - 100,
+            5,
+            now,
+            "feature/goal",
+            "/work/repo",
+            "autonomous",
+            "step-3",
+        ),
+    )
+    conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES ('t_goal', 't_child')")
+    conn.execute("INSERT INTO task_attachments (task_id) VALUES ('t_goal')")
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert "kanban" not in state.health.failed_sources
+    assert state.kanban.link_count == 1
+    assert state.kanban.attachment_count == 1
+    task = {t.task_id: t for t in state.kanban.active_tasks}["t_goal"]
+    assert task.completed_at == now
+    assert task.workspace_path == "/work/repo"
+    assert task.goal_mode == "autonomous"
+    assert task.current_step_key == "step-3"
+    assert task.branch_name == "feature/goal"
+    c.close()
+
+
 def test_session_ended_detection(hermes_home: Path):
     """Sessions with ended_at set should not be marked active."""
     db_path = hermes_home / "state.db"

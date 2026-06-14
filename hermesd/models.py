@@ -351,6 +351,10 @@ class KanbanTaskSummary(BaseModel):
     model_override: str = ""
     branch_name: str = ""
     skills: str = ""
+    completed_at: int = 0
+    workspace_path: str = ""
+    goal_mode: str = ""
+    current_step_key: str = ""
 
 
 class KanbanRunSummary(BaseModel):
@@ -376,6 +380,8 @@ class KanbanState(BaseModel):
     dispatch_interval_seconds: int = 0
     auto_decompose: bool = False
     failure_limit: int = 0
+    link_count: int = 0
+    attachment_count: int = 0
     status_counts: dict[str, int] = Field(default_factory=dict)
     assignee_counts: dict[str, int] = Field(default_factory=dict)
     active_tasks: list[KanbanTaskSummary] = Field(default_factory=list)

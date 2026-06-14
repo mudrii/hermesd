@@ -1909,6 +1909,8 @@ def _read_kanban_state(db_path: Path, base_state: KanbanState) -> KanbanState:
                 "run_count": _table_count(conn, "task_runs"),
                 "event_count": _table_count(conn, "task_events"),
                 "comment_count": _table_count(conn, "task_comments"),
+                "link_count": _table_count_or_zero(conn, "task_links"),
+                "attachment_count": _table_count_or_zero(conn, "task_attachments"),
                 "status_counts": status_counts,
                 "assignee_counts": assignee_counts,
                 "active_tasks": [_kanban_task_from_row(row) for row in active_rows],
@@ -1989,6 +1991,10 @@ def _kanban_task_from_row(row: dict[str, Any]) -> KanbanTaskSummary:
         model_override=str(row.get("model_override") or ""),
         branch_name=str(row.get("branch_name") or ""),
         skills=str(row.get("skills") or ""),
+        completed_at=_coerce_int(row.get("completed_at")),
+        workspace_path=str(row.get("workspace_path") or ""),
+        goal_mode=str(row.get("goal_mode") or ""),
+        current_step_key=str(row.get("current_step_key") or ""),
     )
 
 

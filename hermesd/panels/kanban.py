@@ -64,6 +64,10 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     summary.add_row("Interval", f"{kanban.dispatch_interval_seconds}s")
     summary.add_row("Failure Limit", str(kanban.failure_limit or "—"))
     summary.add_row("Auto Decompose", "yes" if kanban.auto_decompose else "no")
+    if kanban.link_count:
+        summary.add_row("Decomposition Links", str(kanban.link_count))
+    if kanban.attachment_count:
+        summary.add_row("Attachments", str(kanban.attachment_count))
     sections.append(summary)
 
     if kanban.status_counts:
@@ -126,6 +130,7 @@ def _task_table(tasks: list[KanbanTaskSummary], theme: Theme) -> Table:
     table.add_column("PID", justify="right", style=theme.banner_text)
     table.add_column("Heartbeat", style=theme.banner_dim)
     table.add_column("Failures", justify="right", style=theme.ui_warn)
+    table.add_column("Branch", style=theme.banner_dim)
     table.add_column("Title", style=theme.banner_text, ratio=1)
     for task in tasks:
         table.add_row(
@@ -135,6 +140,7 @@ def _task_table(tasks: list[KanbanTaskSummary], theme: Theme) -> Table:
             str(task.worker_pid) if task.worker_pid else "—",
             _age_label(task.last_heartbeat_at),
             str(task.consecutive_failures),
+            escape(task.branch_name) if task.branch_name else "—",
             escape(task.title),
         )
     return table

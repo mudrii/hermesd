@@ -387,6 +387,36 @@ def test_kanban_panel_detail():
     assert "Status Counts" in text
 
 
+def test_kanban_panel_detail_shows_branch_and_guarded_link_attachment_rows():
+    state = DashboardState(
+        kanban=KanbanState(
+            db_present=True,
+            task_count=1,
+            link_count=3,
+            attachment_count=2,
+            active_tasks=[
+                KanbanTaskSummary(
+                    task_id="t_goal",
+                    title="Decompose milestone",
+                    status="in_progress",
+                    branch_name="feature/goal",
+                )
+            ],
+        )
+    )
+    text = render_to_str(render_panel(11, state, Theme(), detail=True), width=120)
+    assert "feature/goal" in text
+    assert "Decomposition Links" in text
+    assert "Attachments" in text
+
+
+def test_kanban_panel_detail_hides_link_attachment_rows_when_zero():
+    state = DashboardState(kanban=KanbanState(db_present=True, task_count=0))
+    text = render_to_str(render_panel(11, state, Theme(), detail=True), width=120)
+    assert "Decomposition Links" not in text
+    assert "Attachments" not in text
+
+
 def test_kanban_panel_detail_recent_runs():
     state = DashboardState(
         kanban=KanbanState(
