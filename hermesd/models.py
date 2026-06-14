@@ -101,6 +101,7 @@ class TokenAnalytics(BaseModel):
     by_model: list[TokenBreakdown] = Field(default_factory=list)
     by_provider: list[TokenBreakdown] = Field(default_factory=list)
     by_endpoint: list[TokenBreakdown] = Field(default_factory=list)
+    cost_status_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class ToolStats(BaseModel):

@@ -332,6 +332,30 @@ def test_collector_total_cost_estimates_missing_sessions_when_db_has_mixed_costs
     c.close()
 
 
+def test_collector_token_analytics_counts_cost_status(hermes_home: Path):
+    """cost_status distribution is summarized for the reconciliation view."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    now = time.time()
+    statuses = ["unknown", "unknown", "included", "estimated", None]
+    for idx, status in enumerate(statuses):
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, cost_status) VALUES (?, ?, ?, ?)",
+            (f"s{idx}", "cli", now, status),
+        )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    counts = state.token_analytics.cost_status_counts
+    assert counts["unknown"] == 3  # two explicit + one NULL coerced to "unknown"
+    assert counts["included"] == 1
+    assert counts["estimated"] == 1
+    c.close()
+
+
 def test_collector_token_analytics_breaks_down_by_endpoint(hermes_home: Path):
     """Spend/tokens aggregate per billing_base_url, finer than provider."""
     db_path = hermes_home / "state.db"

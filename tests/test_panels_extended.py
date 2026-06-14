@@ -498,6 +498,21 @@ def test_tokens_panel_detail_included_and_exact_cost_use_plain_prefix():
     assert "~$4.20" not in text
 
 
+def test_tokens_panel_detail_shows_cost_status_reconciliation():
+    state = DashboardState(
+        token_analytics=TokenAnalytics(
+            cost_status_counts={"unknown": 1471, "included": 110, "estimated": 10},
+        ),
+    )
+    panel = render_panel(3, state, Theme(), detail=True)
+    text = render_to_str(panel)
+    assert "Cost Status" in text
+    assert "unknown" in text
+    assert "1471" in text
+    assert "included" in text
+    assert "110" in text
+
+
 def _analytics_state(*, cost_is_estimated: bool) -> DashboardState:
     return DashboardState(
         tokens_total=TokenSummary(cost_is_estimated=cost_is_estimated),

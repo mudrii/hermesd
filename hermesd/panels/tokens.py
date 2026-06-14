@@ -113,6 +113,20 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
             _render_breakdown_table(state.token_analytics.by_endpoint, theme, aggregate_prefix)
         )
 
+    if state.token_analytics.cost_status_counts:
+        sections.append(Text("\nCost Status\n", style=f"bold {theme.ui_label}"))
+        ordered = sorted(
+            state.token_analytics.cost_status_counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+        line = Text("  ")
+        for index, (status, count) in enumerate(ordered):
+            if index:
+                line.append("  ·  ", style=theme.banner_dim)
+            line.append(escape(status), style=theme.ui_label)
+            line.append(f" {count}", style=theme.banner_text)
+        sections.append(line)
+
     return Panel(
         Group(*sections),
         title=f"[{theme.panel_title_style}]\\[3] Tokens / Cost[/]",

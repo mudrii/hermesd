@@ -629,6 +629,7 @@ class Collector:
             by_model=_summarize_breakdown(rows, key_name="model"),
             by_provider=_summarize_breakdown(rows, key_name="billing_provider"),
             by_endpoint=_summarize_breakdown(rows, key_name="billing_base_url"),
+            cost_status_counts=_count_cost_statuses(rows),
         )
 
     def _collect_tool_stats(
@@ -1516,6 +1517,14 @@ def _summarize_window(label: str, rows: list[dict[str, Any]], days: int) -> Toke
         total_cost_usd=totals.total_cost_usd,
         cache_ratio=cache_ratio,
     )
+
+
+def _count_cost_statuses(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        status = str(row.get("cost_status") or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    return counts
 
 
 def _summarize_breakdown(rows: list[dict[str, Any]], key_name: str) -> list[TokenBreakdown]:
