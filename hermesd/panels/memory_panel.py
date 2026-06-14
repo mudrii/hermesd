@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import rich.box
 from rich.console import Group, RenderableType
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -45,7 +46,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     summary = Table(box=None, show_header=False, padding=(0, 2))
     summary.add_column("Key", style=theme.ui_label, min_width=14)
     summary.add_column("Value", style=theme.banner_text, ratio=1)
-    summary.add_row("Provider", memory.provider or "builtin")
+    summary.add_row("Provider", escape(memory.provider) if memory.provider else "builtin")
     summary.add_row("Memory Files", str(memory.memory_file_count))
     summary.add_row("MEMORY.md", f"{memory.memory_word_count} words")
     summary.add_row("USER.md", f"{memory.user_word_count} words")
@@ -61,7 +62,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         files_table.add_column("Name", style=theme.ui_accent)
         files_table.add_column("Role", style=theme.banner_text)
         for name in memory.memory_files:
-            files_table.add_row(name, _file_role(name))
+            files_table.add_row(escape(name), _file_role(name))
         sections.append(files_table)
 
     if memory.soul_excerpt:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import rich.box
 from rich.console import Group, RenderableType
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -69,7 +70,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         status = Text()
         status.append("● ", style=f"bold {dot_color}")
         status.append(p.state)
-        table.add_row(p.name, status, fmt_iso_timestamp(p.updated_at))
+        table.add_row(escape(p.name), status, fmt_iso_timestamp(p.updated_at))
 
     header = Text()
     if gw.running:
@@ -101,8 +102,10 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         channel_table.add_column("States", style=theme.banner_text)
         channel_table.add_column("Capabilities", style=theme.banner_dim)
         for platform in state.channels.platforms:
-            states = ", ".join(platform.states) if platform.states else "—"
-            capabilities = ", ".join(platform.capabilities) if platform.capabilities else "—"
+            states = escape(", ".join(platform.states)) if platform.states else "—"
+            capabilities = (
+                escape(", ".join(platform.capabilities)) if platform.capabilities else "—"
+            )
             name = Text(platform.name, style=theme.ui_ok if platform.connected else theme.ui_label)
             channel_table.add_row(name, str(platform.entry_count), states, capabilities)
         sections.append(channel_table)

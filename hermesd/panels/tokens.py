@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import rich.box
 from rich.console import Group, RenderableType
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -60,7 +61,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     for s in state.sessions:
         cost_prefix = "$" if s.cost_status == "reported" else "~$"
         table.add_row(
-            s.session_id[-8:],
+            escape(s.session_id[-8:]),
             fmt_tokens(s.input_tokens),
             fmt_tokens(s.output_tokens),
             fmt_tokens(s.cache_read_tokens),
@@ -85,7 +86,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         windows.add_column("Cost", justify="right", style=theme.ui_accent)
         for window in state.token_analytics.windows:
             windows.add_row(
-                window.label,
+                escape(window.label),
                 str(window.session_count),
                 fmt_tokens(window.input_tokens),
                 fmt_tokens(window.output_tokens),
@@ -116,9 +117,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     )
 
 
-def _render_breakdown_table(
-    entries: list[TokenBreakdown], theme: Theme, cost_prefix: str
-) -> Table:
+def _render_breakdown_table(entries: list[TokenBreakdown], theme: Theme, cost_prefix: str) -> Table:
     table = Table(box=None, show_header=True, padding=(0, 2))
     table.add_column("Label", style=theme.ui_label)
     table.add_column("Sessions", justify="right", style=theme.banner_text)
@@ -128,7 +127,7 @@ def _render_breakdown_table(
     table.add_column("Cost", justify="right", style=theme.ui_accent)
     for entry in entries:
         table.add_row(
-            entry.label,
+            escape(entry.label),
             str(entry.session_count),
             fmt_tokens(entry.input_tokens),
             fmt_tokens(entry.output_tokens),

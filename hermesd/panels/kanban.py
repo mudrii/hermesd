@@ -4,6 +4,7 @@ import time
 
 import rich.box
 from rich.console import Group, RenderableType
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -71,7 +72,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         status_table.add_column("Status", style=theme.ui_accent)
         status_table.add_column("Count", justify="right", style=theme.banner_text)
         for status, count in sorted(kanban.status_counts.items()):
-            status_table.add_row(status, str(count))
+            status_table.add_row(escape(status), str(count))
         sections.append(status_table)
 
     if kanban.active_tasks:
@@ -94,11 +95,11 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         for run in kanban.recent_runs:
             runs.add_row(
                 str(run.run_id),
-                run.task_id,
-                run.profile or "—",
-                run.status,
-                run.outcome or "—",
-                run.error[:80] if run.error else "—",
+                escape(run.task_id),
+                escape(run.profile) if run.profile else "—",
+                escape(run.status),
+                escape(run.outcome) if run.outcome else "—",
+                escape(run.error[:80]) if run.error else "—",
             )
         sections.append(runs)
 
@@ -128,13 +129,13 @@ def _task_table(tasks: list[KanbanTaskSummary], theme: Theme) -> Table:
     table.add_column("Title", style=theme.banner_text, ratio=1)
     for task in tasks:
         table.add_row(
-            task.task_id,
-            task.status,
-            task.assignee or "—",
+            escape(task.task_id),
+            escape(task.status),
+            escape(task.assignee) if task.assignee else "—",
             str(task.worker_pid) if task.worker_pid else "—",
             _age_label(task.last_heartbeat_at),
             str(task.consecutive_failures),
-            task.title,
+            escape(task.title),
         )
     return table
 

@@ -4,6 +4,7 @@ from typing import TypedDict
 
 import rich.box
 from rich.console import Group
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -105,12 +106,12 @@ def _render_detail(
         sid.append(s.session_id[-8:])
         table.add_row(
             sid,
-            s.source,
-            s.model or "—",
-            s.parent_session_id[-8:] if s.parent_session_id else "—",
-            s.billing_provider or "—",
-            s.cost_status or "—",
-            s.pricing_version or "—",
+            escape(s.source),
+            escape(s.model) if s.model else "—",
+            escape(s.parent_session_id[-8:]) if s.parent_session_id else "—",
+            escape(s.billing_provider) if s.billing_provider else "—",
+            escape(s.cost_status) if s.cost_status else "—",
+            escape(s.pricing_version) if s.pricing_version else "—",
             str(s.message_count),
             str(s.tool_call_count),
             fmt_tokens(s.input_tokens),
@@ -357,10 +358,10 @@ def _runtime_table(sessions: list[SessionInfo], theme: Theme) -> Table | None:
             if part
         )
         table.add_row(
-            session.session_id[-8:],
+            escape(session.session_id[-8:]),
             str(session.api_call_count),
-            _cwd_label(session.cwd),
+            escape(_cwd_label(session.cwd)),
             ", ".join(flags) if flags else "—",
-            handoff or "—",
+            escape(handoff) if handoff else "—",
         )
     return table

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import rich.box
 from rich.console import Group, RenderableType
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -65,7 +66,7 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
             if p.is_active
             else Text("○", style=theme.banner_dim)
         )
-        prov_table.add_row(sym, p.name)
+        prov_table.add_row(sym, escape(p.name))
     sections.append(prov_table)
 
     if sm.credential_pools:
@@ -85,14 +86,14 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
         pool_table.add_column("Prio", justify="right", min_width=4)
         for entry in sm.credential_pools:
             pool_table.add_row(
-                entry.name,
-                entry.label,
-                entry.auth_type,
-                entry.source,
+                escape(entry.name),
+                escape(entry.label),
+                escape(entry.auth_type),
+                escape(entry.source),
                 "Yes" if entry.token_present else "No",
-                entry.last_status,
+                escape(entry.last_status),
                 str(entry.request_count),
-                entry.cooldown_remaining,
+                escape(entry.cooldown_remaining),
                 str(entry.priority) if entry.priority else "—",
             )
         sections.append(pool_table)
@@ -108,9 +109,9 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
         hooks_table.add_column("Description", style=theme.banner_dim, ratio=1)
         for hook in sm.hooks:
             hooks_table.add_row(
-                hook.name,
-                ", ".join(hook.events),
-                hook.description,
+                escape(hook.name),
+                escape(", ".join(hook.events)),
+                escape(hook.description),
             )
         sections.append(hooks_table)
 
@@ -129,13 +130,13 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
         plugins_table.add_column("Description", style=theme.banner_dim, ratio=1)
         for plugin in sm.plugins:
             plugins_table.add_row(
-                plugin.name,
-                plugin.version,
+                escape(plugin.name),
+                escape(plugin.version),
                 "Yes" if plugin.enabled else "No",
                 "Yes" if plugin.dashboard_enabled else "No",
                 str(plugin.hook_count),
                 str(plugin.tool_count),
-                plugin.description,
+                escape(plugin.description),
             )
         sections.append(plugins_table)
 
@@ -152,11 +153,11 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
         mcp_table.add_column("Tools", style=theme.banner_dim, ratio=1)
         for server in sm.mcp_servers:
             mcp_table.add_row(
-                server.name,
+                escape(server.name),
                 "Yes" if server.enabled else "No",
-                server.transport or "—",
-                server.target or "—",
-                server.tool_filter or "—",
+                escape(server.transport) if server.transport else "—",
+                escape(server.target) if server.target else "—",
+                escape(server.tool_filter) if server.tool_filter else "—",
             )
         sections.append(mcp_table)
 
@@ -214,7 +215,9 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
                     Text(desc or "—", style=theme.banner_text),
                 )
             else:
-                skills_table.add_row(cat_label, short, desc or "—")
+                skills_table.add_row(
+                    escape(cat_label), escape(short), escape(desc) if desc else "—"
+                )
 
         sections.append(skills_table)
 
