@@ -329,8 +329,9 @@ uv pip install -e ".[dev]"
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy hermesd
-uv run pytest tests/ -v
+uv run pytest tests/ -v -W error::ResourceWarning
 uv run pip-audit
+uv build
 
 # Run the dashboard
 hermesd

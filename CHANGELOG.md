@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2026.6.14] - 2026-06-14
+
 ### Added
 
 - The Kanban panel now reads task `completed_at`, `workspace_path`, `goal_mode`, and `current_step_key`, shows each task's `branch_name` in the worker/problem tables, and surfaces decomposition-link and attachment counts (`task_links`/`task_attachments`) when those tables hold rows.
