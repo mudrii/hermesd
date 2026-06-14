@@ -851,7 +851,7 @@ def test_config_panel_detail_shows_dashboard_toolsets_and_auxiliary_slots():
         ),
     )
     panel = render_panel(5, state, Theme(), detail=True)
-    text = render_to_str(panel)
+    text = render_to_str(panel, no_color=True)
 
     assert re.search(r"Dashboard URL\s+https://dashboard[.]example[.]com", text)
     assert "Toolsets" in text
