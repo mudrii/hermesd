@@ -100,6 +100,7 @@ class TokenAnalytics(BaseModel):
     windows: list[TokenWindowSummary] = Field(default_factory=list)
     by_model: list[TokenBreakdown] = Field(default_factory=list)
     by_provider: list[TokenBreakdown] = Field(default_factory=list)
+    by_endpoint: list[TokenBreakdown] = Field(default_factory=list)
 
 
 class ToolStats(BaseModel):

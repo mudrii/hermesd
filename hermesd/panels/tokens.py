@@ -107,6 +107,12 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
             _render_breakdown_table(state.token_analytics.by_provider, theme, aggregate_prefix)
         )
 
+    if state.token_analytics.by_endpoint:
+        sections.append(Text("\nBy Endpoint\n", style=f"bold {theme.ui_label}"))
+        sections.append(
+            _render_breakdown_table(state.token_analytics.by_endpoint, theme, aggregate_prefix)
+        )
+
     return Panel(
         Group(*sections),
         title=f"[{theme.panel_title_style}]\\[3] Tokens / Cost[/]",

@@ -628,6 +628,7 @@ class Collector:
             ],
             by_model=_summarize_breakdown(rows, key_name="model"),
             by_provider=_summarize_breakdown(rows, key_name="billing_provider"),
+            by_endpoint=_summarize_breakdown(rows, key_name="billing_base_url"),
         )
 
     def _collect_tool_stats(

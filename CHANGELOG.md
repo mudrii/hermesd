@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The Tokens / Cost detail panel now includes a **By Endpoint** breakdown aggregating spend and tokens per billing endpoint (`billing_base_url`) — finer than the existing per-provider view (same provider, different base URLs).
 - New **Curator** panel (panel 13) showing the newest memory-curation run from `~/.hermes/logs/curator/<stamp>/run.json` — skill before/after/delta counts, archived/added/pruned/consolidated totals, the model and provider used, run duration, total tool calls, and the LLM summary (or error). Reach it with `]` from Operations or `--snapshot-panel 13`.
 - The Sessions detail panel now has a Billing & Context table surfacing each session's end reason, billing endpoint (`billing_base_url`), billing mode, and the model's context-window size — joined from `context_length_cache.yaml` on `model@base_url`. (This is the model's context limit against lifetime cumulative tokens, not live context occupancy.)
 - The Gateway panel now surfaces per-platform connection errors (`error_message`/`error_code`), the active-agent count, and a restart-requested marker from `gateway_state.json` — a `⚠` appears in the compact view and a dedicated Error column in the detail view.

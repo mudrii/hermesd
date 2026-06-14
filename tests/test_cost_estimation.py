@@ -332,6 +332,37 @@ def test_collector_total_cost_estimates_missing_sessions_when_db_has_mixed_costs
     c.close()
 
 
+def test_collector_token_analytics_breaks_down_by_endpoint(hermes_home: Path):
+    """Spend/tokens aggregate per billing_base_url, finer than provider."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    now = time.time()
+    rows = [
+        ("e1", "https://api.kimi.test/v1", 100_000, 0.40),
+        ("e2", "https://api.kimi.test/v1", 50_000, 0.10),
+        ("e3", "https://api.minimax.io/v1", 20_000, 0.05),
+    ]
+    for sid, base_url, in_tok, cost in rows:
+        conn.execute(
+            "INSERT INTO sessions (id, source, model, started_at, input_tokens, "
+            "billing_base_url, cost_status, estimated_cost_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (sid, "cli", "m", now, in_tok, base_url, "reported", cost),
+        )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    endpoints = {entry.label: entry for entry in state.token_analytics.by_endpoint}
+    assert endpoints["https://api.kimi.test/v1"].session_count == 2
+    assert endpoints["https://api.kimi.test/v1"].input_tokens == 150_000
+    assert abs(endpoints["https://api.kimi.test/v1"].total_cost_usd - 0.50) < 1e-9
+    assert endpoints["https://api.minimax.io/v1"].session_count == 1
+    c.close()
+
+
 def test_collector_builds_token_analytics_windows_and_breakdowns(hermes_home: Path):
     """Analytics should summarize recent windows plus model/provider breakdowns."""
     db_path = hermes_home / "state.db"
