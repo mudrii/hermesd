@@ -24,7 +24,7 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 
 ## Features
 
-### 12 Dashboard Panels
+### 13 Dashboard Panels
 
 | # | Panel | What It Shows |
 |---|-------|---------------|
@@ -35,21 +35,22 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 | 5 | **Config** | Model, provider, personality, Tool Search, dashboard auth, kanban, code execution, gateway, routing and memory/session settings |
 | 6 | **Cron** | Scheduler tick, cron config, job table with schedule, delivery target, error count, latest error, and output metadata |
 | 7 | **Skills / Integrations** | Provider auth status, credential pools, hooks/plugins/MCP inventory, BOOT.md presence, skills with descriptions |
-| 8 | **Logs** | Tailed agent, gateway, errors, cron, desktop, dashboard, GUI, update, gateway-error, and crash logs with Tab switching and inline filtering |
+| 8 | **Logs** | Tailed agent, gateway, errors, cron, desktop, dashboard, GUI, update, gateway-error, crash, audit, MCP-stderr, and workspace logs with Tab switching and inline filtering |
 | 9 | **Profiles** | Read-only profile discovery with session counts, log freshness, skill counts, DB size, and SOUL excerpts |
 | 10 | **Memory** | Memory provider, MEMORY.md/USER.md word counts, SOUL.md size/excerpt, and memory file inventory |
 | 11 | **Kanban** | Read-only kanban task/run/event/comment counts, dispatch config, active workers, blocked/failing tasks, and recent runs |
 | 12 | **Operations** | Dashboard process count, Desktop build stamp, model-cache summaries, and PR monitor state |
+| 13 | **Curator** | Newest memory-curation run: skill before/after counts, archived/pruned/added totals, model/provider, duration, tool-call total, and LLM summary or error |
 
 ### Key Features
 
 - **Read-only** — hermesd never writes to `~/.hermes/` or modifies Hermes Agent state
 - **Live-updating** — polls every 5 seconds (configurable with `--refresh-rate`)
 - **Snapshot mode** — `--snapshot` renders one overview frame to stdout and exits; `--snapshot-panel N` selects any registered detail panel for text snapshots and annotates JSON snapshots (`0` aliases panel 10); `--snapshot-file PATH` writes either form to disk; `--snapshot-format json` emits machine-readable full-state snapshots
-- **Bounded log reads** — `--log-tail-bytes` caps how much of each log file is read per refresh
+- **Bounded log reads** — `--log-tail-bytes` caps how much of each log file and cron output excerpt is read per refresh
 - **Opt-in profiles** — root mode stays the default; use `--profile NAME` or `HERMES_PROFILE=NAME` to read profile-scoped runtime data
-- **Adaptive layout** — full 12-panel grid on wide terminals, a tall-narrow single-column overview for vertical tmux splits, and a denser all-panel overview on 80x24
-- **Detail views** — press `1`-`9` or `0` for panel 10 to expand directly, or use `[` / `]` to move through every panel including Kanban and Operations
+- **Adaptive layout** — full 13-panel grid on wide terminals, a tall-narrow single-column overview for vertical tmux splits, and a denser all-panel overview on 80x24
+- **Detail views** — press `1`-`9` or `0` for panel 10 to expand directly, or use `[` / `]` to move through every panel including Kanban, Operations, and Curator
 - **Focus toggle** — press `f` to jump between the overview and the last selected full-screen panel
 - **Clipboard export** — press `c` to copy the current rendered view as plain text via OSC 52 in compatible terminals
 - **Inline detail filters** — press `/` in Sessions or Logs detail view to live-filter the current table/log stream with field-aware queries, including message-content and severity-threshold filters
@@ -69,7 +70,7 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 
 ### Overview — The Full Picture
 
-The main dashboard shows all 12 panels at a glance. The header starts with the installed `hermesd` version, then shows the current profile mode and time on the right. Gateway status with PID and Hermes Agent version sits at the top, sessions and token costs side by side, tools and config, cron and skills, logs plus profile metadata, and dedicated memory, kanban, and operations panels at the bottom. The footer shows keyboard shortcuts and a polling indicator.
+The main dashboard shows all 13 panels at a glance. The header starts with the installed `hermesd` version, then shows the current profile mode and time on the right. Gateway status with PID and Hermes Agent version sits at the top, sessions and token costs side by side, tools and config, cron and skills, logs plus profile metadata, and dedicated memory, kanban, operations, and curator panels at the bottom. The footer shows keyboard shortcuts and a polling indicator.
 
 ![Overview](images/SCR-20260409-pzqv.png)
 
@@ -85,7 +86,7 @@ Press `2` to expand. The detail table includes billing metadata plus parent-sess
 
 ### [3] Tokens / Cost — Where Are My Tokens Going?
 
-Press `3` for the full per-session token breakdown plus recent `7d`/`30d` rollups and read-only model/provider cost summaries derived from the current session table. The compact view shows today's totals with `~$` prefix indicating estimated costs when the provider (e.g., OpenAI Codex) doesn't report them.
+Press `3` for the full per-session token breakdown plus recent `7d`/`30d` rollups and read-only model/provider cost summaries derived from the current session table. In both the compact and detail views, costs carry a `~$` prefix when estimated (e.g., when the provider, such as OpenAI Codex, doesn't report them) and a plain `$` prefix when provider-reported.
 
 ![Tokens Detail](images/SCR-20260409-qaah.png)
 
@@ -134,6 +135,10 @@ Use `]` from panel 10 or `--snapshot-panel 11` to expand. The Kanban panel reads
 ### [12] Operations — What Runtime Artifacts Exist?
 
 Use `]` from Kanban or `--snapshot-panel 12` to expand. The Operations panel summarizes dashboard background processes, Desktop build metadata, model-cache provider/model counts, cache ages, and PR monitor files.
+
+### [13] Curator — What Did the Last Memory Curation Do?
+
+Use `]` from Operations or `--snapshot-panel 13` to expand. The Curator panel reads the newest `~/.hermes/logs/curator/<stamp>/run.json` and shows the skill before/after/delta counts, archived/added/pruned/consolidated totals, the model and provider used, run duration, total tool calls, and the LLM summary (or error).
 
 ## Installation
 
@@ -221,8 +226,9 @@ hermesd --snapshot-panel 8 --snapshot-format json
 # Export new higher-numbered panels
 hermesd --snapshot-panel 11
 hermesd --snapshot-panel 12 --snapshot-format json
+hermesd --snapshot-panel 13
 
-# Reduce log-read overhead for large log files
+# Reduce log-read overhead for large log files and cron output excerpts
 hermesd --log-tail-bytes 8192
 ```
 
@@ -238,7 +244,7 @@ hermesd --log-tail-bytes 8192
 | Key | Action |
 |-----|--------|
 | `1`-`9`, `0` | Expand panels 1-10 to full-screen detail view (`0` opens panel 10) |
-| `[` / `]` | Move to the previous/next registered panel, including panels 11 and 12 |
+| `[` / `]` | Move to the previous/next registered panel, including panels 11-13 |
 | `Esc` | Return to overview |
 | `f` | Toggle focus mode for the last selected panel |
 | `c` | Copy the current rendered view as plain text via OSC 52 |
@@ -279,7 +285,7 @@ hermesd is a **read-only companion** — it reads files from `~/.hermes/` and ne
                                  app.py      Rich TUI (Live + Layout + threads)
                                      |
                                      v
-                                 panels/*.py  12 panel renderers (compact + detail)
+                                 panels/*.py  13 panel renderers (compact + detail)
 ```
 
 ### Design Decisions
@@ -323,8 +329,9 @@ uv pip install -e ".[dev]"
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy hermesd
-uv run pytest tests/ -v
+uv run pytest tests/ -v -W error::ResourceWarning
 uv run pip-audit
+uv build
 
 # Run the dashboard
 hermesd
@@ -364,6 +371,7 @@ hermesd/
     memory_panel.py    [10] Memory
     kanban.py          [11] Kanban
     operations.py      [12] Operations
+    curator_panel.py   [13] Curator
 tests/                 Test suite: panels, data, resilience, edge cases
 ```
 

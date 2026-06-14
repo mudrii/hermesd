@@ -1,5 +1,7 @@
 """Tests for session active/ended detection."""
 
+from __future__ import annotations
+
 import sqlite3
 import time
 from pathlib import Path
@@ -93,9 +95,21 @@ def test_session_schema_fields_mapped(hermes_home: Path):
     conn = sqlite3.connect(str(db_path))
     create_state_db_tables(conn, include_schema_version=False)
     conn.execute(
-        "INSERT INTO sessions (id, source, started_at, billing_provider, cost_status, pricing_version) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        ("schema_sess", "cli", time.time(), "openai-codex", "reported", "2026-04"),
+        "INSERT INTO sessions ("
+        "id, source, started_at, billing_provider, cost_status, pricing_version, "
+        "end_reason, billing_base_url, billing_mode"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "schema_sess",
+            "cli",
+            time.time(),
+            "openai-codex",
+            "reported",
+            "2026-04",
+            "cron_complete",
+            "https://api.kimi.test/v1",
+            "subscription_included",
+        ),
     )
     conn.commit()
     conn.close()
@@ -106,6 +120,9 @@ def test_session_schema_fields_mapped(hermes_home: Path):
     assert session.billing_provider == "openai-codex"
     assert session.cost_status == "reported"
     assert session.pricing_version == "2026-04"
+    assert session.end_reason == "cron_complete"
+    assert session.billing_base_url == "https://api.kimi.test/v1"
+    assert session.billing_mode == "subscription_included"
     c.close()
 
 

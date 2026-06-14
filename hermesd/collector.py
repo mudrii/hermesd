@@ -24,6 +24,7 @@ import yaml
 from hermesd.db import HermesDB
 from hermesd.file_cache import LastGoodFileCache
 from hermesd.models import (
+    AUTHORITATIVE_COST_STATUSES,
     BackgroundProcessInfo,
     ChannelDirectoryState,
     ChannelPlatformInfo,
@@ -32,12 +33,14 @@ from hermesd.models import (
     CredentialPoolEntry,
     CronJob,
     CronState,
+    CuratorRun,
     DashboardState,
     GatewayState,
     HealthSummary,
     HookInfo,
     KanbanRunSummary,
     KanbanState,
+    KanbanTaskLink,
     KanbanTaskSummary,
     LogLine,
     LogState,
@@ -127,14 +130,25 @@ class Collector:
         self._available_tools_cache_value: tuple[int, list[str]] = (0, [])
         self._last_state: DashboardState | None = None
         self._last_session_rows: list[dict[str, Any]] = []
+        self._log_stream_cache: dict[str, tuple[float | None, int, LogStream]] = {}
+        self._profile_count_cache: dict[str, tuple[float | None, int]] = {}
+        self._derived_rows: list[dict[str, Any]] | None = None
+        self._derived_date = ""
+        self._derived_cache: dict[str, Any] = {}
+        # _lock serializes collect() passes and guards the collector-internal
+        # caches mutated during a pass (_file_cache, _log_cache,
+        # _log_stream_cache, _available_tools_cache_*, _profile_count_cache,
+        # _derived_*) plus _last_state/_last_session_rows. It is deliberately
+        # NOT taken by search_session_ids_by_message(): HermesDB serializes its
+        # own access, so a slow collect pass (git subprocesses, per-profile DB
+        # snapshots) must not stall message search.
         self._lock = threading.RLock()
 
     def collect(self) -> DashboardState:
         with self._lock:
             health = _CollectionHealth()
             session_rows = self._collect_session_rows(health)
-            sessions = self._collect_sessions(session_rows)
-            state = self._build_dashboard_state(health, session_rows, sessions)
+            state = self._build_dashboard_state(health, session_rows)
             if not health.failed_sources:
                 self._last_state = state
             return state
@@ -143,7 +157,6 @@ class Collector:
         self,
         health: _CollectionHealth,
         session_rows: list[dict[str, Any]],
-        sessions: list[SessionInfo],
     ) -> DashboardState:
         safe_collect = health.collect
         session_rows_stale = "sessions" in health.failed_sources
@@ -157,6 +170,24 @@ class Collector:
         def empty_checkpoints() -> list[CheckpointInfo]:
             return []
 
+        def empty_sessions() -> list[SessionInfo]:
+            return []
+
+        def derived(name: str, compute: Callable[[list[dict[str, Any]]], T]) -> Callable[[], T]:
+            # Shared shape for every session-row-derived source: memoized via
+            # _derived_from_rows on fresh (non-stale) rows.
+            return lambda: self._derived_from_rows(
+                name,
+                self._fresh_session_rows(session_rows, session_rows_stale),
+                compute,
+            )
+
+        sessions = safe_collect(
+            lambda: self._last_state.sessions if self._last_state is not None else empty_sessions(),
+            "session_models",
+            derived("sessions", self._collect_sessions),
+            empty_sessions,
+        )
         available_tools = safe_collect(
             lambda: (
                 (
@@ -182,9 +213,7 @@ class Collector:
                 self._last_state.tokens_today if self._last_state is not None else TokenSummary()
             ),
             "tokens_today",
-            lambda: self._collect_tokens_today(
-                self._fresh_session_rows(session_rows, session_rows_stale)
-            ),
+            derived("tokens_today", self._collect_tokens_today),
             TokenSummary,
         )
         tokens_total = safe_collect(
@@ -192,9 +221,7 @@ class Collector:
                 self._last_state.tokens_total if self._last_state is not None else TokenSummary()
             ),
             "tokens_total",
-            lambda: self._collect_tokens_total(
-                self._fresh_session_rows(session_rows, session_rows_stale)
-            ),
+            derived("tokens_total", self._collect_tokens_total),
             TokenSummary,
         )
         token_analytics = safe_collect(
@@ -204,9 +231,7 @@ class Collector:
                 else TokenAnalytics()
             ),
             "token_analytics",
-            lambda: self._collect_token_analytics(
-                self._fresh_session_rows(session_rows, session_rows_stale)
-            ),
+            derived("token_analytics", self._collect_token_analytics),
             TokenAnalytics,
         )
         tool_stats = safe_collect(
@@ -223,9 +248,7 @@ class Collector:
         total_tool_calls = safe_collect(
             lambda: self._last_state.total_tool_calls if self._last_state is not None else 0,
             "tool_call_total",
-            lambda: self._collect_total_tool_calls(
-                self._fresh_session_rows(session_rows, session_rows_stale)
-            ),
+            derived("tool_call_total", self._collect_total_tool_calls),
             int,
         )
         background_processes = safe_collect(
@@ -322,7 +345,18 @@ class Collector:
             self._collect_skin,
             str,
         )
-        runtime = self._collect_runtime_status(gateway, sessions)
+        curator = safe_collect(
+            lambda: self._last_state.curator if self._last_state is not None else CuratorRun(),
+            "curator",
+            self._collect_curator,
+            CuratorRun,
+        )
+        runtime = safe_collect(
+            lambda: self._last_state.runtime if self._last_state is not None else RuntimeStatus(),
+            "runtime",
+            lambda: self._collect_runtime_status(gateway, sessions),
+            RuntimeStatus,
+        )
         health_summary = HealthSummary(
             total_sources=health.total_sources,
             ok_sources=health.total_sources - len(health.failed_sources),
@@ -358,6 +392,7 @@ class Collector:
             logs=logs,
             version_behind=version_behind,
             active_skin=active_skin,
+            curator=curator,
         )
 
     def _fresh_session_rows(
@@ -368,6 +403,26 @@ class Collector:
         if session_rows_stale:
             raise RuntimeError("session rows are stale")
         return rows
+
+    def _derived_from_rows(
+        self,
+        name: str,
+        rows: list[dict[str, Any]],
+        compute: Callable[[list[dict[str, Any]]], T],
+    ) -> T:
+        # HermesDB returns the same cached list object while data_version is
+        # unchanged, so row identity is a cheap invalidation key. The local
+        # date is part of the key because "today" aggregates shift at midnight.
+        today = _local_date()
+        if rows is not self._derived_rows or today != self._derived_date:
+            self._derived_cache = {}
+            self._derived_rows = rows
+            self._derived_date = today
+        if name not in self._derived_cache:
+            self._derived_cache[name] = compute(rows)
+        # type-ignore[no-any-return]: heterogeneous per-name cache; each call
+        # site pins T via its compute callable.
+        return self._derived_cache[name]  # type: ignore[no-any-return]
 
     def _collect_session_rows(
         self,
@@ -397,11 +452,13 @@ class Collector:
         return self._file_cache.read_yaml_mapping(self._paths.shared_path("config.yaml"))
 
     def search_session_ids_by_message(self, query: str) -> set[str]:
-        with self._lock:
-            session_ids = self._db.search_session_ids_by_message(query)
-            if self._db.last_message_search_stale:
-                raise RuntimeError("message search returned cached rows after sqlite error")
-            return session_ids
+        # Intentionally no self._lock here: HermesDB serializes its own reads,
+        # and taking the collect lock would block searches for the full
+        # duration of a slow collect pass (see _lock comment in __init__).
+        session_ids = self._db.search_session_ids_by_message(query)
+        if self._db.last_message_search_stale:
+            raise RuntimeError("message search returned cached rows after sqlite error")
+        return session_ids
 
     def _session_rows_or_read(self, rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
         return rows if rows is not None else self._db.read_sessions()
@@ -418,8 +475,10 @@ class Collector:
             platforms.append(
                 PlatformStatus(
                     name=str(name),
-                    state=info.get("state", "unknown"),
-                    updated_at=info.get("updated_at", ""),
+                    state=str(info.get("state") or "unknown"),
+                    updated_at=str(info.get("updated_at") or ""),
+                    error_code=str(info.get("error_code") or ""),
+                    error_message=str(info.get("error_message") or ""),
                 )
             )
         pid = _coerce_int(data.get("pid"))
@@ -449,6 +508,8 @@ class Collector:
             platforms=platforms,
             hermes_version=version,
             updates_behind=behind,
+            active_agents=_coerce_int(data.get("active_agents")),
+            restart_requested=bool(data.get("restart_requested")),
         )
 
     def _find_gateway_launchd_pid(self) -> int | None:
@@ -489,8 +550,26 @@ class Collector:
             behind = _coerce_int(update_check.get("behind"))
         return version, behind
 
+    def _read_context_lengths(self) -> dict[str, int]:
+        data = self._file_cache.read_yaml_mapping(
+            self._paths.shared_path("context_length_cache.yaml")
+        )
+        raw = data.get("context_lengths")
+        if not isinstance(raw, dict):
+            return {}
+        # Cache keys are "model@base_url" with case-mixed model names (do not
+        # lowercase); normalize only a trailing slash on the base_url part.
+        normalized: dict[str, int] = {}
+        for key, value in raw.items():
+            model, sep, base_url = str(key).partition("@")
+            if not sep:
+                continue
+            normalized[f"{model}@{base_url.rstrip('/')}"] = _coerce_int(value)
+        return normalized
+
     def _collect_sessions(self, rows: list[dict[str, Any]] | None = None) -> list[SessionInfo]:
         rows = self._session_rows_or_read(rows)
+        context_lengths = self._read_context_lengths()
         return [
             SessionInfo(
                 session_id=r["id"],
@@ -498,6 +577,14 @@ class Collector:
                 model=r.get("model") or "",
                 parent_session_id=r.get("parent_session_id") or "",
                 billing_provider=r.get("billing_provider") or "",
+                billing_base_url=r.get("billing_base_url") or "",
+                billing_mode=r.get("billing_mode") or "",
+                end_reason=r.get("end_reason") or "",
+                context_limit=_context_limit_for(
+                    context_lengths,
+                    str(r.get("model") or ""),
+                    str(r.get("billing_base_url") or ""),
+                ),
                 cost_status=r.get("cost_status") or "",
                 pricing_version=r.get("pricing_version") or "",
                 message_count=r.get("message_count") or 0,
@@ -543,6 +630,8 @@ class Collector:
             ],
             by_model=_summarize_breakdown(rows, key_name="model"),
             by_provider=_summarize_breakdown(rows, key_name="billing_provider"),
+            by_endpoint=_summarize_breakdown(rows, key_name="billing_base_url"),
+            cost_status_counts=_count_cost_statuses(rows),
         )
 
     def _collect_tool_stats(
@@ -564,7 +653,7 @@ class Collector:
         for s in sessions:
             tc = s.get("tool_call_count") or 0
             if tc > 0:
-                sid = s.get("id", "?")
+                sid = str(s.get("id") or "?")
                 src = s.get("source") or "?"
                 label = f"{src}:{sid[-6:]}"
                 stats.append(ToolStats(name=label, call_count=tc))
@@ -756,6 +845,8 @@ class Collector:
                 output_excerpt, silent_run, output_path, output_mtime = _latest_cron_output_excerpt(
                     self._paths.shared_path("cron", "output"),
                     str(j.get("id") or ""),
+                    self._log_tail_bytes,
+                    stop_at=self._paths.root_home,
                 )
                 jobs.append(
                     CronJob(
@@ -832,6 +923,12 @@ class Collector:
         )
         db_path = self._paths.shared_path("kanban.db")
         if not db_path.exists():
+            if self._last_state is not None and self._last_state.kanban.db_present:
+                raise RuntimeError("kanban.db disappeared")
+            return base_state
+        if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
+            if self._last_state is not None and self._last_state.kanban.db_present:
+                raise RuntimeError("kanban.db replaced by unsafe path")
             return base_state
         return _read_kanban_state(db_path, base_state)
 
@@ -840,21 +937,101 @@ class Collector:
         background_processes: list[BackgroundProcessInfo],
     ) -> OperationsState:
         dashboard_process_count = sum(
-            1 for process in background_processes if "hermes dashboard" in process.command
+            1 for process in background_processes if _is_dashboard_process(process.command)
         )
         desktop_stamp = self._read_json_cached(self._paths.shared_path("desktop-build-stamp.json"))
         stamp_label = str(
             desktop_stamp.get("version")
             or desktop_stamp.get("stamp")
+            or desktop_stamp.get("builtAt")
             or desktop_stamp.get("built_at")
             or desktop_stamp.get("created_at")
+            or str(desktop_stamp.get("contentHash") or "")[:12]
             or ""
         )
-        return OperationsState(
+        operations = OperationsState(
             dashboard_process_count=dashboard_process_count,
             desktop_build_stamp=stamp_label,
             model_caches=self._collect_model_caches(),
             pr_monitors=self._collect_pr_monitors(),
+        )
+        return self._with_response_store(operations)
+
+    def _with_response_store(self, operations: OperationsState) -> OperationsState:
+        db_path = self._paths.shared_path("response_store.db")
+        if not db_path.exists():
+            if self._last_state is not None and self._last_state.operations.response_store_present:
+                raise RuntimeError("response_store.db disappeared")
+            return operations
+        if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
+            if self._last_state is not None and self._last_state.operations.response_store_present:
+                raise RuntimeError("response_store.db replaced by unsafe path")
+            return operations
+        with _connect_readonly_sqlite(db_path) as conn:
+            conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+            return operations.model_copy(
+                update={
+                    "response_store_present": True,
+                    "conversation_count": _table_count_or_zero(conn, "conversations"),
+                    "response_count": _table_count_or_zero(conn, "responses"),
+                    "response_store_size_bytes": _file_size(db_path),
+                }
+            )
+
+    def _collect_curator(self) -> CuratorRun:
+        curator_dir = self._paths.shared_path("logs", "curator")
+        if (
+            curator_dir.is_symlink()
+            or not _path_resolves_under(curator_dir, self._paths.root_home)
+            or not curator_dir.is_dir()
+        ):
+            return CuratorRun()
+        # Skip symlinked run dirs and any path that escapes the Hermes home,
+        # matching the symlink hardening on the cron/checkpoint readers.
+        run_dirs = sorted(
+            p
+            for p in curator_dir.iterdir()
+            if p.is_dir() and not p.is_symlink() and _path_resolves_under(p, self._paths.root_home)
+        )
+        if not run_dirs:
+            return CuratorRun()
+        newest = run_dirs[-1]
+        run_json = newest / "run.json"
+        if run_json.is_symlink():
+            return CuratorRun()
+        data = self._read_json_cached(run_json)
+        if not data:
+            return CuratorRun()
+        counts = _as_dict(data.get("counts"))
+        tool_call_counts = _int_mapping(data.get("tool_call_counts"))
+        state_transitions = [
+            _state_transition_label(entry)
+            for entry in data.get("state_transitions") or []
+            if isinstance(entry, dict)
+        ]
+        return CuratorRun(
+            run_present=True,
+            stamp=newest.name,
+            started_at=str(data.get("started_at") or ""),
+            duration_seconds=_coerce_float(data.get("duration_seconds")),
+            model=str(data.get("model") or ""),
+            provider=str(data.get("provider") or ""),
+            count_before=_coerce_int(counts.get("before")),
+            count_after=_coerce_int(counts.get("after")),
+            count_delta=_coerce_int(counts.get("delta")),
+            archived_count=_coerce_int(counts.get("archived_this_run"))
+            or _len_if_sized(data.get("archived")),
+            added_count=_coerce_int(counts.get("added_this_run"))
+            or _len_if_sized(data.get("added")),
+            pruned_count=_coerce_int(counts.get("pruned_this_run"))
+            or _len_if_sized(data.get("pruned")),
+            consolidated_count=_coerce_int(counts.get("consolidated_this_run"))
+            or _len_if_sized(data.get("consolidated")),
+            tool_calls_total=_coerce_int(counts.get("tool_calls_total")),
+            tool_call_counts=tool_call_counts,
+            state_transitions=state_transitions,
+            llm_summary=str(data.get("llm_summary") or ""),
+            llm_error=str(data.get("llm_error") or ""),
         )
 
     def _collect_model_caches(self) -> list[ModelCacheSummary]:
@@ -882,23 +1059,46 @@ class Collector:
         return summaries
 
     def _collect_pr_monitors(self) -> list[PRMonitorSummary]:
-        monitors = []
-        for path in sorted(self._paths.shared_path().glob("pr-monitor-*.json")):
+        base = self._paths.shared_path()
+        # The agent writes PR-monitor state under several naming families: flat
+        # hyphen/underscore files and per-repo files inside pr-monitor/pr_monitor
+        # subdirs. Read them all; sorted+dict-keyed paths keep the scan stable.
+        paths = sorted(
+            {
+                path
+                for pattern in (
+                    "pr-monitor-*.json",
+                    "pr_monitor_*.json",
+                    "pr-monitor/*.json",
+                    "pr_monitor/*.json",
+                )
+                for path in base.glob(pattern)
+                if path.is_file() and not path.is_symlink() and _path_resolves_under(path, base)
+            }
+        )
+        # Collapse the same repo (seen across families) to its newest state;
+        # files without a repo stay distinct, keyed by filename.
+        deduped: dict[str, PRMonitorSummary] = {}
+        for path in paths:
             data = self._read_json_cached(path)
             if not data:
                 continue
-            monitors.append(
-                PRMonitorSummary(
-                    filename=path.name,
-                    repo=str(data.get("repo") or ""),
-                    checked_at=str(data.get("checkedAt") or data.get("checked_at") or ""),
-                    monitored_count=_len_if_sized(data.get("monitored")),
-                    tracked_count=_len_if_sized(data.get("tracked")),
-                    author_pr_count=_len_if_sized(data.get("author_prs"))
-                    or _len_if_sized(data.get("author_pr_numbers")),
-                )
+            summary = PRMonitorSummary(
+                filename=path.name,
+                repo=str(data.get("repo") or ""),
+                checked_at=str(data.get("checked_at") or ""),
+                monitored_count=_len_if_sized(data.get("prs"))
+                or _len_if_sized(data.get("monitored")),
+                tracked_count=_len_if_sized(data.get("tracked_numbers"))
+                or _len_if_sized(data.get("tracked")),
+                author_pr_count=_len_if_sized(data.get("author_prs"))
+                or _len_if_sized(data.get("author_pr_numbers")),
             )
-        return monitors
+            key = summary.repo or f"::{path.name}"
+            existing = deduped.get(key)
+            if existing is None or summary.checked_at > existing.checked_at:
+                deduped[key] = summary
+        return sorted(deduped.values(), key=lambda s: (s.repo, s.filename))
 
     def _collect_skills_memory(self) -> SkillsMemory:
         categories: set[str] = set()
@@ -987,9 +1187,7 @@ class Collector:
             )
         return hooks
 
-    def _collect_plugins(self, cfg: dict[str, Any] | None = None) -> list[PluginInfo]:
-        if cfg is None:
-            cfg = self._read_yaml_cached()
+    def _collect_plugins(self, cfg: dict[str, Any]) -> list[PluginInfo]:
         plugins_dir = self._paths.shared_path("plugins")
         if not plugins_dir.is_dir():
             return []
@@ -1023,9 +1221,7 @@ class Collector:
             )
         return plugins
 
-    def _collect_mcp_servers(self, cfg: dict[str, Any] | None = None) -> list[MCPServerInfo]:
-        if cfg is None:
-            cfg = self._read_yaml_cached()
+    def _collect_mcp_servers(self, cfg: dict[str, Any]) -> list[MCPServerInfo]:
         servers = _as_dict(cfg.get("mcp_servers"))
         result: list[MCPServerInfo] = []
         for name, raw_server in sorted(servers.items()):
@@ -1063,7 +1259,7 @@ class Collector:
 
         checkpoints: list[CheckpointInfo] = []
         for repo_dir in sorted(checkpoints_dir.iterdir()):
-            if not repo_dir.is_dir():
+            if repo_dir.is_symlink() or not repo_dir.is_dir():
                 continue
             checkpoints.append(self._summarize_checkpoint(repo_dir))
         return checkpoints
@@ -1114,9 +1310,7 @@ class Collector:
             pass
         return ""
 
-    def _collect_providers(self, data: dict[str, Any] | None = None) -> list[ProviderInfo]:
-        if data is None:
-            data = self._read_json_cached(self._paths.shared_path("auth.json"))
+    def _collect_providers(self, data: dict[str, Any]) -> list[ProviderInfo]:
         if not data:
             return []
         active = str(data.get("active_provider") or "")
@@ -1125,18 +1319,14 @@ class Collector:
         all_names = set(pool.keys()) | set(providers_section.keys())
         return [ProviderInfo(name=name, is_active=(name == active)) for name in sorted(all_names)]
 
-    def _collect_credential_pools(
-        self, data: dict[str, Any] | None = None
-    ) -> list[CredentialPoolEntry]:
-        if data is None:
-            data = self._read_json_cached(self._paths.shared_path("auth.json"))
+    def _collect_credential_pools(self, data: dict[str, Any]) -> list[CredentialPoolEntry]:
         if not data:
             return []
 
         providers_section = _as_dict(data.get("providers"))
         entries = []
         for name, raw_entry in sorted(_as_dict(data.get("credential_pool")).items()):
-            entry = _as_dict(raw_entry)
+            entry = _select_pool_entry(raw_entry)
             provider_entry = _as_dict(providers_section.get(name))
             entries.append(
                 CredentialPoolEntry(
@@ -1165,6 +1355,10 @@ class Collector:
             ("update", self._paths.shared_path("logs", "update.log"), 20),
             ("gateway.error", self._paths.shared_path("logs", "gateway.error.log"), 20),
             ("tui crash", self._paths.shared_path("logs", "tui_gateway_crash.log"), 20),
+            ("audit", self._paths.shared_path("logs", "audit.log"), 20),
+            ("mcp.stderr", self._paths.shared_path("logs", "mcp-stderr.log"), 20),
+            ("workspace", self._paths.shared_path("logs", "workspace.log"), 20),
+            ("workspace.error", self._paths.shared_path("logs", "workspace.error.log"), 20),
         ]
         streams = [
             self._tail_log_stream(name, path, max_lines)
@@ -1191,12 +1385,18 @@ class Collector:
 
     def _collect_profiles(self) -> ProfilesState:
         profiles_dir = self._paths.shared_path("profiles")
-        if not profiles_dir.is_dir():
+        if (
+            profiles_dir.is_symlink()
+            or not _path_resolves_under(profiles_dir, self._paths.root_home)
+            or not profiles_dir.is_dir()
+        ):
             return ProfilesState()
         profiles = [
             self._summarize_profile(profile_dir.name, profile_dir)
             for profile_dir in sorted(profiles_dir.iterdir())
             if profile_dir.is_dir()
+            and not profile_dir.is_symlink()
+            and _path_resolves_under(profile_dir, profiles_dir)
         ]
         return ProfilesState(profile_count=len(profiles), profiles=profiles)
 
@@ -1216,37 +1416,70 @@ class Collector:
 
     def _summarize_profile(self, name: str, profile_home: Path) -> ProfileSummary:
         db_path = profile_home / "state.db"
-        session_count = 0
-        if db_path.exists():
-            db = self._db_factory(db_path)
-            try:
-                session_count = db.read_session_count()
-            finally:
-                db.close()
+        logs_path = profile_home / "logs"
+        skills_path = profile_home / "skills"
+        soul_path = profile_home / "SOUL.md"
+        db_safe = _safe_child_path(db_path, profile_home)
+        logs_safe = _safe_child_path(logs_path, profile_home)
+        skills_safe = _safe_child_path(skills_path, profile_home)
+        soul_safe = _safe_child_path(soul_path, profile_home)
+        if self._last_profile_exists(name) and not all(
+            (
+                _safe_or_absent_child_path(db_path, profile_home),
+                _safe_or_absent_child_path(logs_path, profile_home),
+                _safe_or_absent_child_path(skills_path, profile_home),
+                _safe_or_absent_child_path(soul_path, profile_home),
+            )
+        ):
+            raise RuntimeError(f"profile {name} contains an unsafe replacement path")
+        session_count = self._profile_session_count(name, db_path) if db_safe else 0
         return ProfileSummary(
             name=name,
             session_count=session_count,
-            latest_log_mtime=_latest_log_mtime(profile_home / "logs"),
-            skill_count=_count_skills(profile_home / "skills"),
-            db_size_bytes=_file_size(db_path),
-            soul_excerpt=_read_soul_excerpt(profile_home / "SOUL.md"),
+            latest_log_mtime=_latest_log_mtime(logs_path) if logs_safe else None,
+            skill_count=_count_skills(skills_path) if skills_safe else 0,
+            db_size_bytes=_file_size(db_path) if db_safe else 0,
+            soul_excerpt=_read_soul_excerpt(soul_path) if soul_safe else "",
         )
 
-    def _tail_log(self, path: Path, max_lines: int) -> list[LogLine]:
-        return self._tail_log_stream(path.name, path, max_lines).lines
+    def _last_profile_exists(self, name: str) -> bool:
+        if self._last_state is None:
+            return False
+        return any(profile.name == name for profile in self._last_state.profiles.profiles)
+
+    def _profile_session_count(self, name: str, db_path: Path) -> int:
+        # Opening a profile DB snapshots WAL files to a temp dir, so only
+        # re-open and re-count when the db (or its -wal) mtime changes.
+        mtime = _profile_db_mtime(db_path)
+        cached = self._profile_count_cache.get(name)
+        if cached is not None and mtime is not None and cached[0] == mtime:
+            return cached[1]
+        db = self._db_factory(db_path)
+        try:
+            session_count = db.read_session_count()
+            if getattr(db, "last_read_session_count_stale", False):
+                raise RuntimeError("profile db returned cached count after sqlite error")
+        finally:
+            db.close()
+        self._profile_count_cache[name] = (mtime, session_count)
+        return session_count
 
     def _tail_log_stream(self, name: str, path: Path, max_lines: int) -> LogStream:
         key = str(path)
-        if not path.exists():
+        if not _path_resolves_under(path, self._paths.root_home) or not path.exists():
             return LogStream(name=name, path=path.name, lines=self._log_cache.get(key, []))
         size_bytes = _file_size(path)
         mtime = _mtime(path)
+        cached_stream = self._log_stream_cache.get(key)
+        if (
+            cached_stream is not None
+            and mtime is not None
+            and cached_stream[0] == mtime
+            and cached_stream[1] == size_bytes
+        ):
+            return cached_stream[2]
         try:
-            with open(path, "rb") as f:
-                f.seek(0, 2)
-                size = f.tell()
-                f.seek(max(0, size - self._log_tail_bytes))
-                text = f.read().decode("utf-8", errors="replace")
+            text = _read_tail_text(path, self._log_tail_bytes)
             lines = text.strip().splitlines()[-max_lines:]
             result = []
             for line in lines:
@@ -1267,26 +1500,26 @@ class Collector:
                     result.append(LogLine(message=line.strip()))
             if result:
                 self._log_cache[key] = result
-                return LogStream(
-                    name=name,
-                    path=path.name,
-                    size_bytes=size_bytes,
-                    mtime=mtime,
-                    lines=result,
-                )
-            return LogStream(
+            stream = LogStream(
                 name=name,
                 path=path.name,
                 size_bytes=size_bytes,
                 mtime=mtime,
-                lines=self._log_cache.get(key, []),
+                lines=result if result else self._log_cache.get(key, []),
             )
+            self._log_stream_cache[key] = (mtime, size_bytes, stream)
+            return stream
         except OSError:
             return LogStream(name=name, path=path.name, lines=self._log_cache.get(key, []))
 
     def _tail_latest_cron_output(self, output_root: Path, max_lines: int) -> list[LogLine]:
         key = f"cron:{output_root}"
-        result = _tail_latest_cron_output(output_root, max_lines, self._log_tail_bytes)
+        result = _tail_latest_cron_output(
+            output_root,
+            max_lines,
+            self._log_tail_bytes,
+            stop_at=self._paths.root_home,
+        )
         if result:
             self._log_cache[key] = result
             return result
@@ -1327,10 +1560,15 @@ def _summarize_tokens(
     cache_write_tokens = 0
     reasoning_tokens = 0
     total_cost_usd = 0.0
+    contributing_rows = 0
+    reported_rows = 0
     for row in rows:
         started_at = row.get("started_at") or 0.0
         if started_at_min is not None and started_at < started_at_min:
             continue
+        contributing_rows += 1
+        if _session_cost_is_reported(row):
+            reported_rows += 1
         input_tokens += row.get("input_tokens") or 0
         output_tokens += row.get("output_tokens") or 0
         cache_read_tokens += row.get("cache_read_tokens") or 0
@@ -1344,6 +1582,7 @@ def _summarize_tokens(
         cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
         total_cost_usd=total_cost_usd,
+        cost_is_estimated=contributing_rows == 0 or reported_rows < contributing_rows,
     )
 
 
@@ -1362,6 +1601,14 @@ def _summarize_window(label: str, rows: list[dict[str, Any]], days: int) -> Toke
         total_cost_usd=totals.total_cost_usd,
         cache_ratio=cache_ratio,
     )
+
+
+def _count_cost_statuses(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        status = str(row.get("cost_status") or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    return counts
 
 
 def _summarize_breakdown(rows: list[dict[str, Any]], key_name: str) -> list[TokenBreakdown]:
@@ -1417,10 +1664,17 @@ def _estimate_cost(
     ) / 1_000_000
 
 
+def _session_cost_is_reported(row: dict[str, Any]) -> bool:
+    return (
+        str(row.get("cost_status") or "") in AUTHORITATIVE_COST_STATUSES
+        and row.get("estimated_cost_usd") is not None
+    )
+
+
 def _resolved_session_cost(row: dict[str, Any]) -> float:
     raw_cost = row.get("estimated_cost_usd")
     cost = _coerce_float(raw_cost)
-    if str(row.get("cost_status") or "") == "reported" and raw_cost is not None:
+    if _session_cost_is_reported(row):
         return cost
     if cost:
         return cost
@@ -1510,6 +1764,15 @@ def _read_soul_excerpt(path: Path) -> str:
     return ""
 
 
+def _read_tail_text(path: Path, max_bytes: int) -> str:
+    """Read at most the last max_bytes of path, decoded with replacement."""
+    with path.open("rb") as handle:
+        handle.seek(0, 2)
+        size = handle.tell()
+        handle.seek(max(0, size - max_bytes))
+        return handle.read().decode("utf-8", errors="replace")
+
+
 def _mtime(path: Path) -> float | None:
     try:
         return path.stat().st_mtime
@@ -1519,6 +1782,19 @@ def _mtime(path: Path) -> float | None:
 
 def _safe_mtime(path: Path) -> float:
     return _mtime(path) or 0.0
+
+
+def _profile_db_mtime(db_path: Path) -> float | None:
+    mtimes = [
+        mtime
+        for candidate in (db_path, db_path.with_name(f"{db_path.name}-wal"))
+        if (mtime := _mtime(candidate)) is not None
+    ]
+    return max(mtimes) if mtimes else None
+
+
+def _local_date() -> str:
+    return time.strftime("%Y-%m-%d")
 
 
 def _provider_model_label(cfg: dict[str, Any]) -> str:
@@ -1587,16 +1863,21 @@ def _delivery_target_label(directory: dict[str, Any], deliver: str) -> str:
 def _latest_cron_output_excerpt(
     output_root: Path,
     job_id: str,
+    max_bytes: int,
+    *,
+    stop_at: Path | None = None,
 ) -> tuple[str, bool, str, float | None]:
     if not job_id:
         return "", False, "", None
     job_output_dir = output_root / job_id
-    if not job_output_dir.is_dir():
+    output_root_escaped = stop_at is not None and not _path_resolves_under(output_root, stop_at)
+    job_output_dir_escaped = not _path_resolves_under(job_output_dir, output_root)
+    if output_root_escaped or job_output_dir_escaped or not job_output_dir.is_dir():
         return "", False, "", None
     files = []
     for path in job_output_dir.iterdir():
         try:
-            if path.is_file():
+            if not path.is_symlink() and path.is_file():
                 files.append(path)
         except OSError:
             continue
@@ -1605,7 +1886,7 @@ def _latest_cron_output_excerpt(
     latest = max(files, key=_safe_mtime)
     latest_mtime = _mtime(latest)
     try:
-        lines = latest.read_text(errors="replace").splitlines()
+        lines = _read_tail_text(latest, max_bytes).splitlines()
     except OSError:
         return "", False, "", None
     silent = any("[SILENT]" in line.upper() for line in lines)
@@ -1616,17 +1897,24 @@ def _latest_cron_output_excerpt(
     return "", silent, latest.name, latest_mtime
 
 
-def _tail_latest_cron_output(output_root: Path, max_lines: int, max_bytes: int) -> list[LogLine]:
-    if not output_root.is_dir():
+def _tail_latest_cron_output(
+    output_root: Path,
+    max_lines: int,
+    max_bytes: int,
+    *,
+    stop_at: Path | None = None,
+) -> list[LogLine]:
+    output_root_escaped = stop_at is not None and not _path_resolves_under(output_root, stop_at)
+    if output_root_escaped or not output_root.is_dir():
         return []
     latest_file: Path | None = None
     latest_mtime = 0.0
     for job_dir in output_root.iterdir():
-        if not job_dir.is_dir():
+        if job_dir.is_symlink() or not job_dir.is_dir():
             continue
         for path in job_dir.iterdir():
             try:
-                if not path.is_file():
+                if path.is_symlink() or not path.is_file():
                     continue
                 mtime = path.stat().st_mtime
             except OSError:
@@ -1637,14 +1925,19 @@ def _tail_latest_cron_output(output_root: Path, max_lines: int, max_bytes: int) 
     if latest_file is None:
         return []
     try:
-        with latest_file.open("rb") as handle:
-            handle.seek(0, 2)
-            size = handle.tell()
-            handle.seek(max(0, size - max_bytes))
-            lines = handle.read().decode("utf-8", errors="replace").splitlines()[-max_lines:]
+        lines = _read_tail_text(latest_file, max_bytes).splitlines()[-max_lines:]
     except OSError:
         return []
     return [LogLine(message=line.strip()) for line in lines if line.strip()]
+
+
+def _path_resolves_under(path: Path, root: Path) -> bool:
+    try:
+        resolved_path = path.resolve(strict=False)
+        resolved_root = root.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return False
+    return resolved_path == resolved_root or resolved_path.is_relative_to(resolved_root)
 
 
 def _read_kanban_state(db_path: Path, base_state: KanbanState) -> KanbanState:
@@ -1674,6 +1967,7 @@ def _read_kanban_state(db_path: Path, base_state: KanbanState) -> KanbanState:
             conn,
             "SELECT * FROM task_runs ORDER BY started_at DESC, id DESC LIMIT 10",
         )
+        recent_task_rows = _read_recent_enriched_tasks(conn)
         return base_state.model_copy(
             update={
                 "db_present": True,
@@ -1681,13 +1975,50 @@ def _read_kanban_state(db_path: Path, base_state: KanbanState) -> KanbanState:
                 "run_count": _table_count(conn, "task_runs"),
                 "event_count": _table_count(conn, "task_events"),
                 "comment_count": _table_count(conn, "task_comments"),
+                "link_count": _table_count_or_zero(conn, "task_links"),
+                "attachment_count": _table_count_or_zero(conn, "task_attachments"),
                 "status_counts": status_counts,
                 "assignee_counts": assignee_counts,
                 "active_tasks": [_kanban_task_from_row(row) for row in active_rows],
                 "problem_tasks": [_kanban_task_from_row(row) for row in problem_rows],
+                "recent_tasks": [_kanban_task_from_row(row) for row in recent_task_rows],
+                "task_links": _read_task_links(conn),
                 "recent_runs": [_kanban_run_from_row(row) for row in run_rows],
             }
         )
+
+
+def _context_limit_for(context_lengths: Mapping[str, int], model: str, base_url: str) -> int:
+    normalized_base = base_url.rstrip("/")
+    exact = context_lengths.get(f"{model}@{normalized_base}")
+    if exact is not None:
+        return exact
+
+    origin = _url_origin(normalized_base)
+    if not origin:
+        return 0
+    for key, value in sorted(context_lengths.items()):
+        cached_model, sep, cached_base = key.partition("@")
+        if sep and cached_model == model and _url_origin(cached_base) == origin:
+            return value
+    return 0
+
+
+def _url_origin(value: str) -> str:
+    parsed = urlsplit(value)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _safe_child_path(path: Path, root: Path) -> bool:
+    return not path.is_symlink() and _path_resolves_under(path, root)
+
+
+def _safe_or_absent_child_path(path: Path, root: Path) -> bool:
+    if path.is_symlink():
+        return False
+    return not path.exists() or _path_resolves_under(path, root)
 
 
 @contextlib.contextmanager
@@ -1702,7 +2033,7 @@ def _connect_readonly_sqlite(db_path: Path) -> Iterator[sqlite3.Connection]:
             shutil.copy2(db_path, snapshot_db)
             for suffix in ("-wal", "-shm"):
                 source = db_path.with_name(f"{db_path.name}{suffix}")
-                if source.exists():
+                if source.exists() and _safe_child_path(source, db_path.parent):
                     shutil.copy2(source, snapshot_root / source.name)
             conn = sqlite3.connect(f"{snapshot_db.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
             yield conn
@@ -1733,6 +2064,43 @@ def _table_count(conn: sqlite3.Connection, table_name: str) -> int:
     return int(row[0]) if row is not None else 0
 
 
+def _table_count_or_zero(conn: sqlite3.Connection, table_name: str) -> int:
+    with contextlib.suppress(sqlite3.Error):
+        return _table_count(conn, table_name)
+    return 0
+
+
+def _read_task_links(conn: sqlite3.Connection) -> list[KanbanTaskLink]:
+    with contextlib.suppress(sqlite3.Error):
+        rows = _query_rows(
+            conn,
+            "SELECT parent_id, child_id FROM task_links "
+            "ORDER BY COALESCE(parent_id, ''), COALESCE(child_id, '') LIMIT 20",
+        )
+        return [
+            KanbanTaskLink(
+                parent_id=str(row.get("parent_id") or ""),
+                child_id=str(row.get("child_id") or ""),
+            )
+            for row in rows
+        ]
+    return []
+
+
+def _read_recent_enriched_tasks(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    with contextlib.suppress(sqlite3.Error):
+        return _query_rows(
+            conn,
+            "SELECT * FROM tasks "
+            "WHERE completed_at IS NOT NULL OR COALESCE(workspace_path, '') != '' "
+            "OR COALESCE(goal_mode, '') != '' OR COALESCE(current_step_key, '') != '' "
+            "OR COALESCE(branch_name, '') != '' "
+            "ORDER BY COALESCE(completed_at, last_heartbeat_at, started_at, created_at, 0) "
+            "DESC LIMIT 10",
+        )
+    return []
+
+
 def _count_by(conn: sqlite3.Connection, sql: str) -> dict[str, int]:
     cur = conn.execute(sql)
     return {str(row[0] or "unknown"): int(row[1] or 0) for row in cur.fetchall()}
@@ -1755,6 +2123,10 @@ def _kanban_task_from_row(row: dict[str, Any]) -> KanbanTaskSummary:
         model_override=str(row.get("model_override") or ""),
         branch_name=str(row.get("branch_name") or ""),
         skills=str(row.get("skills") or ""),
+        completed_at=_coerce_int(row.get("completed_at")),
+        workspace_path=str(row.get("workspace_path") or ""),
+        goal_mode=str(row.get("goal_mode") or ""),
+        current_step_key=str(row.get("current_step_key") or ""),
     )
 
 
@@ -1791,10 +2163,36 @@ def _channel_capabilities(name: str) -> list[str]:
     return []
 
 
+def _is_dashboard_process(command: str) -> bool:
+    if "hermes dashboard" in command:
+        return True
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+    return any(Path(part).name == "hermesd" for part in parts)
+
+
 def _len_if_sized(value: object) -> int:
     if isinstance(value, dict | list | tuple | set):
         return len(value)
     return 0
+
+
+def _int_mapping(value: object) -> dict[str, int]:
+    raw = _as_dict(value)
+    return {str(key): _coerce_int(count) for key, count in raw.items() if str(key)}
+
+
+def _state_transition_label(entry: dict[str, Any]) -> str:
+    from_state = str(entry.get("from") or entry.get("from_state") or "")
+    to_state = str(entry.get("to") or entry.get("to_state") or "")
+    at = str(entry.get("at") or entry.get("timestamp") or entry.get("created_at") or "")
+    if from_state or to_state:
+        label = f"{from_state or 'unknown'} -> {to_state or 'unknown'}"
+    else:
+        label = str(entry.get("state") or "")
+    return f"{label} @ {at}" if at and label else label
 
 
 def _git_checkpoint_summary(repo_dir: Path) -> tuple[int, float | None, str]:
@@ -1917,6 +2315,25 @@ def _as_dict(value: object) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def _select_pool_entry(raw_entry: object) -> dict[str, Any]:
+    """Reduce a credential_pool value to one representative entry.
+
+    Live ``auth.json`` stores each provider's credentials as a list of entries;
+    older configs used a single dict. The lowest-priority entry (the next
+    credential to be used) represents the provider; ties keep list order.
+    """
+    if isinstance(raw_entry, list):
+        candidates = [_as_dict(item) for item in raw_entry]
+        candidates = [item for item in candidates if item]
+        if not candidates:
+            return {}
+        return min(
+            enumerate(candidates),
+            key=lambda pair: (_coerce_int(pair[1].get("priority")), pair[0]),
+        )[1]
+    return _as_dict(raw_entry)
 
 
 def _coerce_int(value: object) -> int:

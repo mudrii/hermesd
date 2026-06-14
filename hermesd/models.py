@@ -5,11 +5,20 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from hermesd.paths import default_hermes_home
+
+# cost_status values the hermes-agent producer treats as authoritative (an actual
+# billed/known cost, not a token-based estimate): "reported" (legacy), "exact",
+# and "included" (subscription-covered, genuinely $0.00).
+AUTHORITATIVE_COST_STATUSES: frozenset[str] = frozenset({"reported", "exact", "included"})
+
 
 class PlatformStatus(BaseModel):
     name: str
     state: str = "unknown"
     updated_at: str = ""
+    error_code: str = ""
+    error_message: str = ""
 
 
 class GatewayState(BaseModel):
@@ -19,6 +28,8 @@ class GatewayState(BaseModel):
     platforms: list[PlatformStatus] = Field(default_factory=list)
     hermes_version: str = ""
     updates_behind: int = 0
+    active_agents: int = 0
+    restart_requested: bool = False
 
 
 class SessionInfo(BaseModel):
@@ -27,6 +38,10 @@ class SessionInfo(BaseModel):
     model: str = ""
     parent_session_id: str = ""
     billing_provider: str = ""
+    billing_base_url: str = ""
+    billing_mode: str = ""
+    end_reason: str = ""
+    context_limit: int = 0
     cost_status: str = ""
     pricing_version: str = ""
     message_count: int = 0
@@ -57,6 +72,9 @@ class TokenSummary(BaseModel):
     cache_write_tokens: int = 0
     reasoning_tokens: int = 0
     total_cost_usd: float = 0.0
+    # True unless every contributing session cost was provider-reported.
+    # Zero-session summaries keep the estimated default ("~$" display).
+    cost_is_estimated: bool = True
 
 
 class TokenWindowSummary(BaseModel):
@@ -82,6 +100,8 @@ class TokenAnalytics(BaseModel):
     windows: list[TokenWindowSummary] = Field(default_factory=list)
     by_model: list[TokenBreakdown] = Field(default_factory=list)
     by_provider: list[TokenBreakdown] = Field(default_factory=list)
+    by_endpoint: list[TokenBreakdown] = Field(default_factory=list)
+    cost_status_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class ToolStats(BaseModel):
@@ -331,6 +351,10 @@ class KanbanTaskSummary(BaseModel):
     model_override: str = ""
     branch_name: str = ""
     skills: str = ""
+    completed_at: int = 0
+    workspace_path: str = ""
+    goal_mode: str = ""
+    current_step_key: str = ""
 
 
 class KanbanRunSummary(BaseModel):
@@ -346,6 +370,11 @@ class KanbanRunSummary(BaseModel):
     summary: str = ""
 
 
+class KanbanTaskLink(BaseModel):
+    parent_id: str = ""
+    child_id: str = ""
+
+
 class KanbanState(BaseModel):
     db_present: bool = False
     task_count: int = 0
@@ -356,10 +385,14 @@ class KanbanState(BaseModel):
     dispatch_interval_seconds: int = 0
     auto_decompose: bool = False
     failure_limit: int = 0
+    link_count: int = 0
+    attachment_count: int = 0
     status_counts: dict[str, int] = Field(default_factory=dict)
     assignee_counts: dict[str, int] = Field(default_factory=dict)
     active_tasks: list[KanbanTaskSummary] = Field(default_factory=list)
     problem_tasks: list[KanbanTaskSummary] = Field(default_factory=list)
+    recent_tasks: list[KanbanTaskSummary] = Field(default_factory=list)
+    task_links: list[KanbanTaskLink] = Field(default_factory=list)
     recent_runs: list[KanbanRunSummary] = Field(default_factory=list)
 
 
@@ -385,6 +418,31 @@ class OperationsState(BaseModel):
     desktop_build_stamp: str = ""
     model_caches: list[ModelCacheSummary] = Field(default_factory=list)
     pr_monitors: list[PRMonitorSummary] = Field(default_factory=list)
+    response_store_present: bool = False
+    conversation_count: int = 0
+    response_count: int = 0
+    response_store_size_bytes: int = 0
+
+
+class CuratorRun(BaseModel):
+    run_present: bool = False
+    stamp: str = ""
+    started_at: str = ""
+    duration_seconds: float = 0.0
+    model: str = ""
+    provider: str = ""
+    count_before: int = 0
+    count_after: int = 0
+    count_delta: int = 0
+    archived_count: int = 0
+    added_count: int = 0
+    pruned_count: int = 0
+    consolidated_count: int = 0
+    tool_calls_total: int = 0
+    tool_call_counts: dict[str, int] = Field(default_factory=dict)
+    state_transitions: list[str] = Field(default_factory=list)
+    llm_summary: str = ""
+    llm_error: str = ""
 
 
 class HealthSummary(BaseModel):
@@ -401,7 +459,7 @@ class RuntimeStatus(BaseModel):
 
 
 class DashboardState(BaseModel):
-    hermes_home: Path = Field(default_factory=lambda: Path.home() / ".hermes")
+    hermes_home: Path = Field(default_factory=default_hermes_home)
     selected_profile: str | None = None
     profile_mode_label: str = "root"
     collected_at: float = Field(default_factory=time.time)
@@ -432,3 +490,4 @@ class DashboardState(BaseModel):
     logs: LogState = Field(default_factory=LogState)
     version_behind: int = 0
     active_skin: str = "default"
+    curator: CuratorRun = Field(default_factory=CuratorRun)

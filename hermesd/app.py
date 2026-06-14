@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import signal
 import sys
@@ -47,17 +48,17 @@ _WIDE_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
     ("row4", None, (6, 7)),
     ("row5", 7, (8, 9)),
     ("row6", 6, (10, 11)),
-    ("row7", 6, (12,)),
+    ("row7", 6, (12, 13)),
 )
 _COMPACT_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
     ("row1", 3, (1,)),
-    ("row2", 4, (2,)),
-    ("row3", 4, (3,)),
-    ("row4", 4, (4, 5)),
-    ("row5", 4, (6, 7)),
-    ("row6", 4, (8, 9)),
-    ("row7", 4, (10, 11)),
-    ("row8", None, (12,)),
+    ("row2", 3, (2,)),
+    ("row3", 3, (3,)),
+    ("row4", 3, (4, 5)),
+    ("row5", 3, (6, 7)),
+    ("row6", 3, (8, 9)),
+    ("row7", 3, (10, 11)),
+    ("row8", 3, (12, 13)),
 )
 _TALL_NARROW_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = tuple(
     (f"row{panel_num}", None, (panel_num,)) for panel_num in _PANEL_NUMBERS
@@ -119,9 +120,6 @@ class ViewState:
 
     def scroll_up(self) -> None:
         self.scroll_offset = max(0, self.scroll_offset - 1)
-
-    def cycle_log_view(self) -> None:
-        self.cycle_log_view_in(_LOG_VIEWS)
 
     def cycle_log_view_in(self, views: tuple[str, ...]) -> None:
         if not views:
@@ -203,7 +201,11 @@ class DashboardApp:
         )
         self._running = threading.Event()
         self._force_refresh = threading.Event()
+        # Guards collector/search -> render shared state: _state, _theme,
+        # _input_error, _message_search_inflight.
         self._lock = threading.Lock()
+        # Guards _view (mode/detail/scroll/filter) mutated by the input thread
+        # and read by the render loop.
         self._view_lock = threading.RLock()
         self._spinner_idx = 0
         self._input_error: str | None = None
@@ -216,10 +218,13 @@ class DashboardApp:
 
     def run(self) -> None:
         self._running.set()
-        self._set_state(self._collector.collect())
 
+        # Install handlers before the first collect so Ctrl+C during a slow
+        # initial collect is handled instead of raising a traceback.
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+
+        self._set_state(self._collector.collect())
 
         self._collector_thread = threading.Thread(target=self._collector_loop, daemon=True)
         self._collector_thread.start()
@@ -252,18 +257,15 @@ class DashboardApp:
             force_terminal=not self._no_color,
             no_color=self._no_color,
         )
-        original_console = self._console
         original_view = self._snapshot_view_state()
-        self._console = snapshot_console
         try:
             if panel_num is not None:
                 self._view.enter_detail(panel_num)
             with snapshot_console.capture() as capture:
-                snapshot_console.print(self._build_layout())
+                snapshot_console.print(self._build_layout(console=snapshot_console))
             return capture.get()
         finally:
             self._restore_view_state(original_view)
-            self._console = original_console
 
     def render_snapshot_text(self, panel_num: int | None = None) -> str:
         return self._capture_layout_text(panel_num=panel_num, refresh=True)
@@ -292,8 +294,15 @@ class DashboardApp:
     def copy_current_view(self) -> str:
         copied_text = self.render_current_view_text()
         sequence = _osc52_sequence(copied_text)
-        self._console.file.write(sequence)
-        self._console.file.flush()
+        console = self._console
+        # Hold the console's render lock so the raw OSC52 write cannot
+        # interleave with a Live frame being flushed by the render loop.
+        # Console._lock is Rich-private; fall back to an unguarded write if a
+        # future Rich version renames it (worst case: one garbled frame).
+        render_lock = getattr(console, "_lock", None) or contextlib.nullcontext()
+        with render_lock:
+            console.file.write(sequence)
+            console.file.flush()
         return copied_text
 
     def _snapshot_view_state(self) -> ViewSnapshot:
@@ -386,8 +395,7 @@ class DashboardApp:
 
     def _handle_input_data(self, data: bytes) -> str | None:
         for key in _decode_input_keys(data):
-            with self._view_lock:
-                action = self._handle_key(key)
+            action = self.handle_key(key)
             if action is not None:
                 return action
         return None
@@ -404,10 +412,20 @@ class DashboardApp:
                     }
                 )
             self._state = state
-            if self._theme.skin_name != state.active_skin:
-                self._theme = load_theme(self._home)
+            needs_theme_reload = self._theme.skin_name != state.active_skin
+        if not needs_theme_reload:
+            return
+        # Load the theme (file open + YAML parse) outside the lock so the
+        # render thread is never blocked on disk I/O during a skin change.
+        theme = load_theme(self._home)
+        with self._lock:
+            self._theme = theme
 
-    def _handle_key(self, key: str) -> str | None:
+    def handle_key(self, key: str) -> str | None:
+        with self._view_lock:
+            return self._handle_key_locked(key)
+
+    def _handle_key_locked(self, key: str) -> str | None:
         if not key:
             return None
         if key[0] == "\x1b":
@@ -466,10 +484,12 @@ class DashboardApp:
             self._view.cycle_profile_view()
             return None
         if key == "g":
-            self._view.jump_top()
+            if self._current_detail_is_scrollable():
+                self._view.jump_top()
             return None
         if key == "G":
-            self._view.jump_bottom()
+            if self._current_detail_is_scrollable():
+                self._view.jump_bottom()
             return None
         if key == "j":
             self._view.scroll_down()
@@ -493,7 +513,24 @@ class DashboardApp:
             return tuple(stream.name for stream in streams)
         return _LOG_VIEWS
 
-    def _build_layout(self) -> Layout:
+    def _current_detail_is_scrollable(self) -> bool:
+        detail_panel = self._view.detail_panel
+        if detail_panel is None:
+            return False
+        with self._lock:
+            state = self._state
+        return (
+            _detail_max_scroll_offset(
+                detail_panel,
+                state,
+                self._view.log_sub_view,
+                self._view.filter_query,
+            )
+            is not None
+        )
+
+    def _build_layout(self, console: Console | None = None) -> Layout:
+        render_console = console or self._console
         with self._lock:
             state = self._state
             theme = self._theme
@@ -508,6 +545,19 @@ class DashboardApp:
             filter_query = self._view.filter_query
             filter_edit_mode = self._view.filter_edit_mode
             session_sort = self._view.session_sort
+        if mode == "detail" and detail_panel is not None:
+            max_offset = _detail_max_scroll_offset(detail_panel, state, log_sub_view, filter_query)
+            if max_offset is not None and scroll_offset > max_offset:
+                # Clamp the stored offset to the effective maximum so that
+                # scroll_up after jump_bottom moves off the bottom (G then k).
+                scroll_offset = max_offset
+                with self._view_lock:
+                    if (
+                        self._view.mode == "detail"
+                        and self._view.detail_panel == detail_panel
+                        and self._view.scroll_offset > max_offset
+                    ):
+                        self._view.scroll_offset = max_offset
         session_message_match_ids: set[str] | None = None
         message_query = ""
         if mode == "detail" and detail_panel == _SESSIONS_PANEL_NUM and filter_query:
@@ -526,7 +576,7 @@ class DashboardApp:
             Layout(name="footer", size=1),
         )
 
-        layout["header"].update(self._build_header(state, theme))
+        layout["header"].update(self._build_header(state, theme, console=render_console))
 
         if show_help:
             layout["body"].update(self._build_help(theme))
@@ -545,7 +595,7 @@ class DashboardApp:
             )
             layout["body"].update(panel)
         else:
-            layout["body"].update(self._build_overview(state, theme))
+            layout["body"].update(self._build_overview(state, theme, console=render_console))
 
         layout["footer"].update(
             self._build_footer(
@@ -608,8 +658,14 @@ class DashboardApp:
                 self._message_search_inflight = ""
                 return
 
-    def _build_header(self, state: DashboardState, theme: Theme | None = None) -> Text:
+    def _build_header(
+        self,
+        state: DashboardState,
+        theme: Theme | None = None,
+        console: Console | None = None,
+    ) -> Text:
         active_theme = theme or self._theme
+        active_console = console or self._console
         bg = active_theme.status_bar_bg
         now = datetime.now().strftime("%H:%M:%S")
         t = Text(style=f"on {bg}")
@@ -624,17 +680,17 @@ class DashboardApp:
             right_labels.insert(0, f"{state.active_skin} skin")
         right_text = "   ".join(right_labels)
         right_segment = f"{right_text}   {now} "
-        padding_width = max(1, self._console.width - cell_len(t.plain) - cell_len(right_segment))
-        if cell_len(t.plain) + cell_len(right_segment) < self._console.width:
+        padding_width = max(1, active_console.width - cell_len(t.plain) - cell_len(right_segment))
+        if cell_len(t.plain) + cell_len(right_segment) < active_console.width:
             t.append(
                 f"{' ' * padding_width}{right_segment}",
                 style=f"{active_theme.banner_dim} on {bg}",
             )
-        if cell_len(t.plain) > self._console.width:
-            t.truncate(self._console.width, overflow="crop")
-        elif cell_len(t.plain) < self._console.width:
+        if cell_len(t.plain) > active_console.width:
+            t.truncate(active_console.width, overflow="crop")
+        elif cell_len(t.plain) < active_console.width:
             t.append(
-                " " * (self._console.width - cell_len(t.plain)),
+                " " * (active_console.width - cell_len(t.plain)),
                 style=f"{active_theme.banner_dim} on {bg}",
             )
         return t
@@ -775,10 +831,16 @@ class DashboardApp:
             text.append("  ", style=f"{theme.session_border} on {bg}")
             text.append(state.runtime.banner.lower(), style=f"{theme.ui_warn} on {bg}")
 
-    def _build_overview(self, state: DashboardState, theme: Theme | None = None) -> Layout:
+    def _build_overview(
+        self,
+        state: DashboardState,
+        theme: Theme | None = None,
+        console: Console | None = None,
+    ) -> Layout:
         active_theme = theme or self._theme
-        width = self._console.width
-        height = self._console.height
+        active_console = console or self._console
+        width = active_console.width
+        height = active_console.height
 
         if width < 100 and height >= 50:
             return self._build_overview_from_spec(state, active_theme, _TALL_NARROW_LAYOUT_SPEC)
@@ -890,6 +952,26 @@ def _decode_input_keys(data: bytes) -> list[str]:
     return keys
 
 
+def _detail_max_scroll_offset(
+    panel_num: int,
+    state: DashboardState,
+    log_sub_view: str,
+    filter_query: str,
+) -> int | None:
+    """Effective max scroll offset for scrollable detail panels, else None.
+
+    Logs delegates to the panel's own clamp; skills mirrors the row clamp in
+    hermesd/panels/overview.py.
+    """
+    if panel_num == _LOG_PANEL_NUM:
+        from hermesd.panels.logs import max_detail_scroll_offset
+
+        return max_detail_scroll_offset(state, log_sub_view, filter_query)
+    if panel_num == _SKILLS_PANEL_NUM:
+        return max(0, len(state.skills_memory.skills) - 1)
+    return None
+
+
 def _health_style(state: DashboardState, theme: Theme | None = None) -> str:
     if state.health.total_sources == 0:
         active_theme = theme or Theme()
@@ -898,9 +980,9 @@ def _health_style(state: DashboardState, theme: Theme | None = None) -> str:
         theme = Theme()
     if state.health.ok_sources == state.health.total_sources:
         return theme.ui_ok
-    if state.health.ok_sources >= (state.health.total_sources // 2):
-        return theme.ui_warn
-    return theme.ui_error
+    if state.health.ok_sources == 0:
+        return theme.ui_error
+    return theme.ui_warn
 
 
 def _normalize_json_payload(value: object) -> object:

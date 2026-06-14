@@ -13,6 +13,7 @@ T = TypeVar("T")
 
 class LastGoodFileCache:
     def __init__(self) -> None:
+        # Guards the mtime/value/bad-mtime cache dicts below shared across threads.
         self._lock = threading.RLock()
         self._json_mtimes: dict[str, float] = {}
         self._json_list_mtimes: dict[str, float] = {}
@@ -93,6 +94,8 @@ class LastGoodFileCache:
                 return values.get(key, default_factory())
             mtimes[key] = mtime
             bad_mtimes.pop(key, None)
+            # cast is unavoidable: load() returns untyped JSON/YAML (object);
+            # is_valid() has already checked the shape T expects at runtime.
             values[key] = cast(T, value)
             return values[key]
 

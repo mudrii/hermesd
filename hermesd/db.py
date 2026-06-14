@@ -17,6 +17,8 @@ _CONNECT_BACKOFF_READS = 2
 class HermesDB:
     def __init__(self, db_path: Path):
         self._path = db_path
+        # Guards the SQLite connection lifecycle and serializes reads against
+        # the cached last-good result/version state below.
         self._lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
         self._current_data_version: int | None = None
@@ -52,6 +54,7 @@ class HermesDB:
         self._close_connection()
         if not self._path.exists():
             self._connected_mtime_ns = None
+            self._mark_cached_reads_stale()
             return
         try:
             db_path, uri_params = self._open_target()
@@ -97,7 +100,7 @@ class HermesDB:
             shutil.copy2(self._path, snapshot_db)
             for suffix in ("-wal", "-shm"):
                 source = self._path.with_name(f"{self._path.name}{suffix}")
-                if source.exists():
+                if source.exists() and _safe_sidecar_path(source, self._path.parent):
                     shutil.copy2(source, snapshot_root / source.name)
         except OSError:
             snapshot_dir.cleanup()
@@ -209,6 +212,9 @@ class HermesDB:
             "cache_write_tokens",
             "reasoning_tokens",
             "billing_provider",
+            "billing_base_url",
+            "billing_mode",
+            "end_reason",
             "estimated_cost_usd",
             "cost_status",
             "pricing_version",
@@ -314,6 +320,8 @@ class HermesDB:
             except sqlite3.Error:
                 self._last_message_search_stale = self._cached_message_search_initialized
                 self._record_read_error()
+                if self._cached_message_search_query != normalized:
+                    return set()
             return self._cached_message_search_results
 
     def _read_cached(
@@ -387,12 +395,12 @@ class HermesDB:
         return {str(row[0]) for row in cur.fetchall() if row[0]}
 
     def _search_session_ids_by_like(self, conn: sqlite3.Connection, query: str) -> set[str]:
-        pattern = f"%{query.lower()}%"
+        pattern = f"%{_escape_like_pattern(query.lower())}%"
         cur = conn.execute(
             "SELECT DISTINCT session_id "
             "FROM messages "
-            "WHERE LOWER(COALESCE(content, '')) LIKE ? "
-            "OR LOWER(COALESCE(tool_name, '')) LIKE ?",
+            "WHERE LOWER(COALESCE(content, '')) LIKE ? ESCAPE '\\' "
+            "OR LOWER(COALESCE(tool_name, '')) LIKE ? ESCAPE '\\'",
             (pattern, pattern),
         )
         return {str(row[0]) for row in cur.fetchall() if row[0]}
@@ -400,6 +408,21 @@ class HermesDB:
     def close(self) -> None:
         with self._lock:
             self._close_connection()
+
+
+def _escape_like_pattern(query: str) -> str:
+    return query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _safe_sidecar_path(path: Path, root: Path) -> bool:
+    if path.is_symlink():
+        return False
+    try:
+        resolved_path = path.resolve(strict=False)
+        resolved_root = root.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return False
+    return resolved_path == resolved_root or resolved_path.is_relative_to(resolved_root)
 
 
 def _quote_fts_query(query: str) -> str:

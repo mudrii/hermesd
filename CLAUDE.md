@@ -36,7 +36,7 @@ hermesd/
   models.py       Pydantic models for DashboardState
   paths.py        Profile-scoped path resolution
   theme.py        Skin/color system (inherits from hermes config.yaml)
-  panels/         12 panel renderers (compact + detail views)
+  panels/         13 panel renderers (compact + detail views)
 ```
 
 ### Data Flow

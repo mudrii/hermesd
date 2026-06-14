@@ -122,6 +122,12 @@ def _render_operations_panel(ctx: PanelRenderContext) -> Panel:
     return render_operations(ctx.state, ctx.theme, detail=ctx.detail)
 
 
+def _render_curator_panel(ctx: PanelRenderContext) -> Panel:
+    from hermesd.panels.curator_panel import render_curator
+
+    return render_curator(ctx.state, ctx.theme, detail=ctx.detail)
+
+
 PANEL_NAMES = {
     1: "Gateway & Platforms",
     2: "Sessions",
@@ -135,6 +141,7 @@ PANEL_NAMES = {
     10: "Memory",
     11: "Kanban",
     12: "Operations",
+    13: "Curator",
 }
 
 # Deferred imports keep panel modules unloaded until they are actually rendered.
@@ -151,6 +158,7 @@ _RENDERERS: dict[int, PanelRenderer] = {
     10: _render_memory_panel,
     11: _render_kanban_panel,
     12: _render_operations_panel,
+    13: _render_curator_panel,
 }
 
 

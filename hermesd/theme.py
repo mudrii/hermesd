@@ -162,21 +162,8 @@ class Theme:
         return f"bold {self.banner_title}"
 
     @property
-    def status_bar_style(self) -> str:
-        return f"bg:{self.status_bar_bg} {self.banner_text}"
-
-    @property
     def status_bar_bg(self) -> str:
         return _STATUS_BAR_BG
-
-    def context_color(self, ratio: float) -> str:
-        if ratio >= 0.95:
-            return self.ui_error
-        if ratio > 0.80:
-            return self.ui_warn
-        if ratio >= 0.50:
-            return self.banner_title
-        return self.ui_ok
 
 
 def load_theme(hermes_home: Path) -> Theme:

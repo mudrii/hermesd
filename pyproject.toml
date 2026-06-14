@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermesd"
-version = "2026.6.5"
+version = "2026.6.14"
 description = "TUI monitoring dashboard for Hermes AI agent"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -38,6 +38,7 @@ dependencies = [
 dev = [
     "pip>=26.1",
     "pytest>=9.0.0",
+    "pytest-cov>=6.0.0",
     "ruff>=0.6.0",
     "mypy>=1.11.0",
     "types-PyYAML>=6.0.0",
@@ -105,3 +106,6 @@ check_untyped_defs = false
 
 [tool.hatch.build.targets.sdist]
 include = ["hermesd/", "tests/", "LICENSE", "README.md", "CHANGELOG.md"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["hermesd"]

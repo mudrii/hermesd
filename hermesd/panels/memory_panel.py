@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import rich.box
 from rich.console import Group, RenderableType
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from hermesd.models import DashboardState
+from hermesd.models import DashboardState, MemoryOverview
 from hermesd.theme import Theme
 
 
@@ -26,7 +27,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append(f"{memory.memory_file_count}", style=theme.ui_accent)
     lines.append("\n")
     lines.append("  SOUL: ", style=theme.ui_label)
-    lines.append("present" if memory.soul_excerpt else "none", style=theme.banner_text)
+    lines.append(_soul_compact_label(memory), style=theme.banner_text)
 
     return Panel(
         lines,
@@ -45,7 +46,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     summary = Table(box=None, show_header=False, padding=(0, 2))
     summary.add_column("Key", style=theme.ui_label, min_width=14)
     summary.add_column("Value", style=theme.banner_text, ratio=1)
-    summary.add_row("Provider", memory.provider or "builtin")
+    summary.add_row("Provider", escape(memory.provider) if memory.provider else "builtin")
     summary.add_row("Memory Files", str(memory.memory_file_count))
     summary.add_row("MEMORY.md", f"{memory.memory_word_count} words")
     summary.add_row("USER.md", f"{memory.user_word_count} words")
@@ -61,7 +62,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         files_table.add_column("Name", style=theme.ui_accent)
         files_table.add_column("Role", style=theme.banner_text)
         for name in memory.memory_files:
-            files_table.add_row(name, _file_role(name))
+            files_table.add_row(escape(name), _file_role(name))
         sections.append(files_table)
 
     if memory.soul_excerpt:
@@ -87,6 +88,14 @@ def _file_role(name: str) -> str:
     if lowered == "user.md":
         return "User profile"
     return "Memory artifact"
+
+
+def _soul_compact_label(memory: MemoryOverview) -> str:
+    if memory.soul_excerpt:
+        return "present"
+    if memory.soul_size_bytes > 0:
+        return "empty"
+    return "none"
 
 
 def _soul_summary(size_bytes: int, excerpt: str) -> str:

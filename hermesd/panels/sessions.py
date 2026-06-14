@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import TypedDict
 
 import rich.box
-from rich.console import Group
+from rich.console import Group, RenderableType
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -105,12 +106,12 @@ def _render_detail(
         sid.append(s.session_id[-8:])
         table.add_row(
             sid,
-            s.source,
-            s.model or "—",
-            s.parent_session_id[-8:] if s.parent_session_id else "—",
-            s.billing_provider or "—",
-            s.cost_status or "—",
-            s.pricing_version or "—",
+            escape(s.source),
+            escape(s.model) if s.model else "—",
+            escape(s.parent_session_id[-8:]) if s.parent_session_id else "—",
+            escape(s.billing_provider) if s.billing_provider else "—",
+            escape(s.cost_status) if s.cost_status else "—",
+            escape(s.pricing_version) if s.pricing_version else "—",
             str(s.message_count),
             str(s.tool_call_count),
             fmt_tokens(s.input_tokens),
@@ -131,14 +132,21 @@ def _render_detail(
     if filter_query or session_sort != "recent":
         header.append("\n\n", style=theme.banner_dim)
 
-    sections = [
-        header,
-        table if sessions else Text("  No matching sessions\n", style=theme.banner_dim),
-    ]
+    sections: list[RenderableType] = [header]
     runtime_table = _runtime_table(sessions, theme)
     if runtime_table is not None:
-        sections.append(Text("\nRuntime\n", style=f"bold {theme.ui_label}"))
+        sections.append(Text("Runtime\n", style=f"bold {theme.ui_label}"))
         sections.append(runtime_table)
+    billing_table = _billing_table(sessions, theme)
+    if billing_table is not None:
+        sections.append(Text("\nBilling & Context\n", style=f"bold {theme.ui_label}"))
+        sections.append(billing_table)
+    sections.extend(
+        [
+            Text("\nSessions\n", style=f"bold {theme.ui_label}"),
+            table if sessions else Text("  No matching sessions\n", style=theme.banner_dim),
+        ]
+    )
 
     return Panel(
         Group(*sections),
@@ -244,7 +252,12 @@ def _parse_session_filter(filter_query: str) -> SessionFilterCriteria:
         key, value = token.split(":", 1)
         key = key.lower().strip()
         value = value.strip().lower()
-        if key in {
+        if key in {"message", "msg"}:
+            # With repeated message:/msg: tokens the last occurrence wins
+            # everywhere, mirroring extract_message_search_query (which feeds
+            # the message-search worker with the same final value).
+            fields["message"] = [value]
+        elif key in {
             "id",
             "source",
             "model",
@@ -258,11 +271,8 @@ def _parse_session_filter(filter_query: str) -> SessionFilterCriteria:
             "handoff",
             "platform",
             "active",
-            "message",
         }:
             fields.setdefault(key, []).append(value)
-        elif key == "msg":
-            fields.setdefault("message", []).append(value)
         elif key == "text":
             if value:
                 terms.append(value)
@@ -300,6 +310,7 @@ def _sort_sessions(sessions: list[SessionInfo], session_sort: str) -> list[Sessi
                 session.input_tokens
                 + session.output_tokens
                 + session.cache_read_tokens
+                + session.cache_write_tokens
                 + session.reasoning_tokens,
                 session.started_at,
                 session.session_id,
@@ -355,10 +366,52 @@ def _runtime_table(sessions: list[SessionInfo], theme: Theme) -> Table | None:
             if part
         )
         table.add_row(
-            session.session_id[-8:],
+            escape(session.session_id[-8:]),
             str(session.api_call_count),
-            _cwd_label(session.cwd),
+            escape(_cwd_label(session.cwd)),
             ", ".join(flags) if flags else "—",
-            handoff or "—",
+            escape(handoff) if handoff else "—",
         )
     return table
+
+
+def _billing_table(sessions: list[SessionInfo], theme: Theme) -> Table | None:
+    billing_sessions = [
+        session
+        for session in sessions[:10]
+        if session.end_reason
+        or session.billing_base_url
+        or session.billing_mode
+        or session.context_limit
+    ]
+    if not billing_sessions:
+        return None
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("ID", style=theme.session_label)
+    table.add_column("End", style=theme.banner_dim)
+    table.add_column("Endpoint", style=theme.banner_text)
+    table.add_column("Mode", style=theme.banner_dim)
+    # Lifetime tokens vs the model's context window, not live occupancy.
+    table.add_column("Lifetime / Limit", justify="right", style=theme.banner_dim)
+    for session in billing_sessions:
+        table.add_row(
+            escape(session.session_id[-8:]),
+            escape(session.end_reason) if session.end_reason else "—",
+            escape(session.billing_base_url) if session.billing_base_url else "—",
+            escape(session.billing_mode) if session.billing_mode else "—",
+            _lifetime_context_label(session),
+        )
+    return table
+
+
+def _lifetime_context_label(session: SessionInfo) -> str:
+    if not session.context_limit:
+        return "—"
+    lifetime_tokens = (
+        session.input_tokens
+        + session.output_tokens
+        + session.cache_read_tokens
+        + session.cache_write_tokens
+        + session.reasoning_tokens
+    )
+    return f"{fmt_tokens(lifetime_tokens)} / {fmt_tokens(session.context_limit)}"

@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2026.6.14] - 2026-06-14
+
+### Added
+
+- The Kanban panel now reads task `completed_at`, `workspace_path`, `goal_mode`, and `current_step_key`, shows each task's `branch_name` in the worker/problem tables, and surfaces decomposition-link and attachment counts (`task_links`/`task_attachments`) when those tables hold rows.
+- The Logs panel now tails `audit.log`, `mcp-stderr.log`, `workspace.log`, and `workspace.error.log` as additional Tab sub-views (shown only when the files exist).
+- The Operations detail panel now shows **Response Store** stats (conversation and response row counts plus file size) read-only from `~/.hermes/response_store.db`.
+- The Tokens / Cost detail panel now includes a **By Endpoint** breakdown aggregating spend and tokens per billing endpoint (`billing_base_url`) — finer than the existing per-provider view (same provider, different base URLs).
+- The Tokens / Cost detail panel now shows a **Cost Status** reconciliation line counting sessions by `cost_status` (e.g. unknown vs subscription-included vs estimated), so it's clear how much spend is authoritative versus unknown.
+- New **Curator** panel (panel 13) showing the newest memory-curation run from `~/.hermes/logs/curator/<stamp>/run.json` — skill before/after/delta counts, archived/added/pruned/consolidated totals, the model and provider used, run duration, total tool calls, and the LLM summary (or error). Reach it with `]` from Operations or `--snapshot-panel 13`.
+- The Sessions detail panel now has a Billing & Context table surfacing each session's end reason, billing endpoint (`billing_base_url`), billing mode, and the model's context-window size — joined from `context_length_cache.yaml` on `model@base_url`. (This is the model's context limit against lifetime cumulative tokens, not live context occupancy.)
+- The Gateway panel now surfaces per-platform connection errors (`error_message`/`error_code`), the active-agent count, and a restart-requested marker from `gateway_state.json` — a `⚠` appears in the compact view and a dedicated Error column in the detail view.
+
+### Changed
+
+- Token/cost figures now use a `~$` prefix only when costs are estimated and a plain `$` prefix when every contributing session cost is provider-authoritative, in both the compact and detail views. Authoritative now covers the live producer's `exact` and `included` (subscription-covered) statuses in addition to the legacy `reported`. Subscription-`included` sessions therefore render an authoritative `$0.00` instead of a token-based estimate.
+- Cron output excerpts now respect `--log-tail-bytes` instead of reading whole output files.
+- Reduced redundant file and database re-reads per refresh cycle.
+
+### Fixed
+
+- The Operations panel's desktop build stamp now reads the live `desktop-build-stamp.json` camelCase keys (`builtAt`, falling back to a truncated `contentHash`); previously it looked only for snake_case keys and always rendered blank.
+- PR-monitor counts now read the live JSON shape (`prs`, `tracked_numbers`, `checked_at`); previously they looked for the retired `monitored`/`tracked`/`checkedAt` keys and stayed stuck at zero.
+- PR-monitor state is now read from all of the agent's naming families — flat `pr-monitor-*.json`/`pr_monitor_*.json` and the `pr-monitor/`/`pr_monitor/` subdirectories — and the same repo seen across families collapses to its most recently checked entry.
+- The credential pool view now reads the live `auth.json` shape where each provider maps to a list of credential entries (previously only the legacy single-dict shape was understood, leaving every credential field blank). The lowest-priority entry represents the provider.
+- Untrusted free-text from `~/.hermes/` (session, config, skill, kanban, cron, gateway, memory, profile, operations, and token labels) is now escaped before it reaches Rich's markup parser, so values containing `[...]` render literally and a stray `[/]` can no longer crash the dashboard.
+- Symlinked log files, log directories, cron output files, and cron output directories are now ignored when tailing logs so hermesd does not read outside the Hermes home.
+- Fixed a deadlock when pressing `G` to jump to the bottom of a scrollable detail view.
+- Fixed the footer health indicator showing yellow when zero collector sources were healthy.
+- An unknown `minlevel:` log filter value now shows all lines instead of none.
+- The memory panel compact view now distinguishes an empty `SOUL.md` from a missing one.
+- Message search no longer blocks the dashboard while a refresh is in progress.
+- SQL `LIKE` wildcard characters are now escaped in message search queries.
+- The stale indicator is now set when the SQLite database file disappears.
+
 ## [2026.6.5] - 2026-06-05
 
 ### Added

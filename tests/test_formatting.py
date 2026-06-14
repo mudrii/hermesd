@@ -1,5 +1,7 @@
 """Tests for shared formatting utilities."""
 
+from __future__ import annotations
+
 from hermesd.panels.formatting import fmt_iso_timestamp, fmt_tokens, fmt_usd
 
 
@@ -32,3 +34,8 @@ def test_fmt_usd_places_negative_sign_before_dollar():
 def test_fmt_iso_timestamp_preserves_non_iso_text():
     assert fmt_iso_timestamp("2026-04-09T18:21:49+08:00") == "2026-04-09 18:21:49"
     assert fmt_iso_timestamp("next Thursday") == "next Thursday"
+
+
+def test_fmt_iso_timestamp_empty_value_renders_dash():
+    assert fmt_iso_timestamp(None) == "—"
+    assert fmt_iso_timestamp("") == "—"
