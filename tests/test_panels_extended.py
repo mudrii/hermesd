@@ -457,6 +457,29 @@ def test_tokens_panel_detail_cost_prefix_estimated_vs_reported():
     assert "~$0.31" in text
 
 
+def test_tokens_panel_detail_included_and_exact_cost_use_plain_prefix():
+    state = DashboardState(
+        sessions=[
+            SessionInfo(
+                session_id="sess_included",
+                estimated_cost_usd=0.0,
+                cost_status="included",
+            ),
+            SessionInfo(
+                session_id="sess_exact",
+                estimated_cost_usd=4.20,
+                cost_status="exact",
+            ),
+        ],
+    )
+    panel = render_panel(3, state, Theme(), detail=True)
+    text = render_to_str(panel)
+    assert "$0.00" in text
+    assert "~$0.00" not in text
+    assert "$4.20" in text
+    assert "~$4.20" not in text
+
+
 def _analytics_state(*, cost_is_estimated: bool) -> DashboardState:
     return DashboardState(
         tokens_total=TokenSummary(cost_is_estimated=cost_is_estimated),

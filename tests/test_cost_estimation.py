@@ -72,6 +72,28 @@ def test_resolved_session_cost_preserves_reported_zero_cost():
     assert _resolved_session_cost(row) == 0.0
 
 
+def test_resolved_session_cost_treats_included_zero_as_authoritative():
+    # subscription_included rows store cost 0.0 and must NOT be re-estimated
+    # from tokens — $0.00 is the genuine, provider-authoritative cost.
+    row = {
+        "estimated_cost_usd": 0.0,
+        "cost_status": "included",
+        "input_tokens": 100_000,
+        "output_tokens": 5_000,
+        "cache_read_tokens": 50_000,
+        "reasoning_tokens": 1_000,
+    }
+    assert _resolved_session_cost(row) == 0.0
+
+
+def test_summarize_tokens_all_included_rows_clears_estimated_flag():
+    rows = [
+        {"input_tokens": 10, "estimated_cost_usd": 0.0, "cost_status": "included"},
+        {"input_tokens": 20, "estimated_cost_usd": 0.0, "cost_status": "exact"},
+    ]
+    assert _summarize_tokens(rows).cost_is_estimated is False
+
+
 @pytest.mark.parametrize(
     ("cost_status", "estimated_cost", "expected"),
     [
@@ -81,6 +103,8 @@ def test_resolved_session_cost_preserves_reported_zero_cost():
         # _estimate_cost can't silently agree with itself.
         ("reported", None, 0.325),
         ("reported", 5.0, 5.0),
+        ("included", 0.0, 0.0),
+        ("exact", 4.2, 4.2),
         ("estimated", 0.0, 0.325),
         ("estimated", 1.5, 1.5),
     ],

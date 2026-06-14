@@ -7,7 +7,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from hermesd.models import DashboardState, TokenBreakdown
+from hermesd.models import AUTHORITATIVE_COST_STATUSES, DashboardState, TokenBreakdown
 from hermesd.panels.formatting import fmt_tokens
 from hermesd.theme import Theme
 
@@ -59,7 +59,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     table.add_column("Cost", justify="right", style=theme.ui_accent)
 
     for s in state.sessions:
-        cost_prefix = "$" if s.cost_status == "reported" else "~$"
+        cost_prefix = "$" if s.cost_status in AUTHORITATIVE_COST_STATUSES else "~$"
         table.add_row(
             escape(s.session_id[-8:]),
             fmt_tokens(s.input_tokens),

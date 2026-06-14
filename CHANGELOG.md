@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Token/cost figures now use a `~$` prefix only when costs are estimated and a plain `$` prefix when every contributing session cost is provider-reported, in both the compact and detail views.
+- Token/cost figures now use a `~$` prefix only when costs are estimated and a plain `$` prefix when every contributing session cost is provider-authoritative, in both the compact and detail views. Authoritative now covers the live producer's `exact` and `included` (subscription-covered) statuses in addition to the legacy `reported`. Subscription-`included` sessions therefore render an authoritative `$0.00` instead of a token-based estimate.
 - Cron output excerpts now respect `--log-tail-bytes` instead of reading whole output files.
 - Reduced redundant file and database re-reads per refresh cycle.
 

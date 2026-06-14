@@ -24,6 +24,7 @@ import yaml
 from hermesd.db import HermesDB
 from hermesd.file_cache import LastGoodFileCache
 from hermesd.models import (
+    AUTHORITATIVE_COST_STATUSES,
     BackgroundProcessInfo,
     ChannelDirectoryState,
     ChannelPlatformInfo,
@@ -1481,7 +1482,7 @@ def _estimate_cost(
 
 def _session_cost_is_reported(row: dict[str, Any]) -> bool:
     return (
-        str(row.get("cost_status") or "") == "reported"
+        str(row.get("cost_status") or "") in AUTHORITATIVE_COST_STATUSES
         and row.get("estimated_cost_usd") is not None
     )
 

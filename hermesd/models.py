@@ -7,6 +7,11 @@ from pydantic import BaseModel, Field
 
 from hermesd.paths import default_hermes_home
 
+# cost_status values the hermes-agent producer treats as authoritative (an actual
+# billed/known cost, not a token-based estimate): "reported" (legacy), "exact",
+# and "included" (subscription-covered, genuinely $0.00).
+AUTHORITATIVE_COST_STATUSES: frozenset[str] = frozenset({"reported", "exact", "included"})
+
 
 class PlatformStatus(BaseModel):
     name: str
