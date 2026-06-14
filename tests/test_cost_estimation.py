@@ -233,12 +233,15 @@ def test_collector_uses_db_cost_when_cost_is_non_zero(hermes_home: Path, sample_
     c.close()
 
 
-def test_collector_estimates_when_cost_is_null(hermes_home: Path):
+def test_collector_estimates_when_cost_is_null(hermes_home: Path, monkeypatch: pytest.MonkeyPatch):
     """When all costs are NULL, collector estimates from tokens."""
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
     create_state_db_tables(conn, include_schema_version=False)
     now = time.time()
+    # Pin the "today" cutoff just before the session so it deterministically
+    # counts toward today's total (no midnight-boundary flake).
+    monkeypatch.setattr("hermesd.collector._today_epoch", lambda: now - 1)
     conn.execute(
         "INSERT INTO sessions (id, source, started_at, input_tokens, output_tokens, "
         "cache_read_tokens, estimated_cost_usd) VALUES (?, ?, ?, ?, ?, ?, NULL)",

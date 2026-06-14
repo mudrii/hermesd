@@ -149,8 +149,14 @@ def test_delivery_target_label_branches():
     assert _delivery_target_label(directory, "telegram:Missing") == "telegram:Missing"
 
 
-def test_collect_tokens_today_filters_by_date(hermes_home: Path, sample_db: Path):
+def test_collect_tokens_today_filters_by_date(
+    hermes_home: Path, sample_db: Path, monkeypatch: pytest.MonkeyPatch
+):
     """Only sessions started today count toward today's tokens."""
+    # Pin the "today" cutoff to two hours ago so the assertion is deterministic
+    # regardless of wall-clock time: sample_db's sessions (≤1h old) count toward
+    # today, sess_old (2 days old) does not — with no midnight-boundary flake.
+    monkeypatch.setattr("hermesd.collector._today_epoch", lambda: time.time() - 7200)
     conn = sqlite3.connect(str(sample_db))
     yesterday = time.time() - 86400 * 2
     conn.execute(
@@ -1590,6 +1596,8 @@ def test_collect_profiles_reads_soul_excerpt_when_present(profiled_hermes_home: 
         ("operations", "operations", "_collect_operations"),
         ("skills", "skills_memory", "_collect_skills_memory"),
         ("memory", "memory", "_collect_memory"),
+        ("config", "config", "_collect_config"),
+        ("logs", "logs", "_collect_logs"),
     ],
 )
 def test_collect_preserves_last_good_state_when_source_raises(
