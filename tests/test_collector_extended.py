@@ -585,6 +585,34 @@ def test_collect_operations_handles_empty_caches_and_corrupt_pr_monitor(hermes_h
     c.close()
 
 
+def test_collect_operations_reads_camelcase_desktop_build_stamp(hermes_home: Path):
+    """Live desktop-build-stamp.json uses camelCase builtAt/contentHash/sourceMode."""
+    (hermes_home / "desktop-build-stamp.json").write_text(
+        json.dumps(
+            {
+                "builtAt": "2026-06-14T08:00:00Z",
+                "contentHash": "abcdef1234567890deadbeef",
+                "sourceMode": "release",
+            }
+        )
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.operations.desktop_build_stamp == "2026-06-14T08:00:00Z"
+    c.close()
+
+
+def test_collect_operations_falls_back_to_content_hash_when_no_built_at(hermes_home: Path):
+    """With only contentHash present, a truncated hash represents the build."""
+    (hermes_home / "desktop-build-stamp.json").write_text(
+        json.dumps({"contentHash": "abcdef1234567890deadbeef"})
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.operations.desktop_build_stamp == "abcdef123456"
+    c.close()
+
+
 def test_collect_ignores_stray_entries_in_scanned_directories(populated_hermes_home: Path):
     """Stray files / incomplete dirs in skills, hooks, plugins, and checkpoints are skipped."""
     home = populated_hermes_home

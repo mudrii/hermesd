@@ -903,8 +903,10 @@ class Collector:
         stamp_label = str(
             desktop_stamp.get("version")
             or desktop_stamp.get("stamp")
+            or desktop_stamp.get("builtAt")
             or desktop_stamp.get("built_at")
             or desktop_stamp.get("created_at")
+            or str(desktop_stamp.get("contentHash") or "")[:12]
             or ""
         )
         return OperationsState(
