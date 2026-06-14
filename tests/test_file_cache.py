@@ -1,12 +1,33 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from pathlib import Path
 
 import yaml
 
 from hermesd.file_cache import LastGoodFileCache
+
+
+def test_cache_hit_skips_reload_and_invalidates_on_mtime_change(tmp_path):
+    """An unchanged mtime returns the cached value; a new mtime reloads it."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "data.json"
+    path.write_text(json.dumps({"v": 1}))
+    assert cache.read_json_mapping(path) == {"v": 1}
+
+    # Cache hit: restore the original mtime after corrupting the file. A hit
+    # must return the cached good value without re-reading the corrupt bytes.
+    stat = path.stat()
+    path.write_text("{ not valid json")
+    os.utime(path, (stat.st_atime, stat.st_mtime))
+    assert cache.read_json_mapping(path) == {"v": 1}
+
+    # Invalidation: a newer mtime with valid new content yields the new value.
+    path.write_text(json.dumps({"v": 2}))
+    os.utime(path, (stat.st_atime, stat.st_mtime + 10))
+    assert cache.read_json_mapping(path) == {"v": 2}
 
 
 def test_json_mapping_invalid_shape_reuses_bad_mtime(tmp_path, monkeypatch):

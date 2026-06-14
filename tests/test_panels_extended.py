@@ -891,6 +891,15 @@ def test_logs_panel_detail_unknown_structured_filter_matches_as_text():
     assert "provider timeout" not in text
 
 
+def test_logs_panel_detail_empty_unfiltered_shows_no_log_lines():
+    # Distinct from the filtered-empty branch ("No matching log lines"): with
+    # no lines and no active filter, the detail view shows "No log lines".
+    panel = render_panel(8, DashboardState(), Theme(), detail=True)
+    text = render_to_str(panel)
+    assert "No log lines" in text
+    assert "No matching log lines" not in text
+
+
 # ── Empty state tests ──────────────────────────────────────────────────
 
 
