@@ -41,6 +41,7 @@ class SessionInfo(BaseModel):
     billing_base_url: str = ""
     billing_mode: str = ""
     end_reason: str = ""
+    context_limit: int = 0
     cost_status: str = ""
     pricing_version: str = ""
     message_count: int = 0

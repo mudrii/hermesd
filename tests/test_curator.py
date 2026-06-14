@@ -37,7 +37,8 @@ def test_collect_curator_reads_newest_run(hermes_home: Path):
     _write_curator_run(hermes_home, "20260601-100000", {"model": "stale", "counts": {"before": 1}})
     _write_curator_run(hermes_home, "20260610-133539", _LIVE_SHAPE)
 
-    state = Collector(hermes_home).collect()
+    c = Collector(hermes_home)
+    state = c.collect()
     cur = state.curator
     assert cur.run_present is True
     assert cur.stamp == "20260610-133539"
@@ -52,16 +53,21 @@ def test_collect_curator_reads_newest_run(hermes_home: Path):
     assert cur.consolidated_count == 0
     assert cur.tool_calls_total == 67
     assert cur.llm_error == ""
+    c.close()
 
 
 def test_collect_curator_absent_is_empty(hermes_home: Path):
-    state = Collector(hermes_home).collect()
+    c = Collector(hermes_home)
+    state = c.collect()
     assert state.curator.run_present is False
     assert state.curator.model == ""
     assert "curator" not in state.health.failed_sources
+    c.close()
 
 
 def test_collect_curator_empty_dir_is_empty(hermes_home: Path):
     (hermes_home / "logs" / "curator").mkdir(parents=True)
-    state = Collector(hermes_home).collect()
+    c = Collector(hermes_home)
+    state = c.collect()
     assert state.curator.run_present is False
+    c.close()

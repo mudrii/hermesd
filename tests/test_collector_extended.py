@@ -608,6 +608,57 @@ def test_collect_pr_monitor_reads_live_key_shape(hermes_home: Path):
     c.close()
 
 
+def _insert_session_with_endpoint(db_path: Path, model: str, base_url: str) -> None:
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, model, billing_base_url) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("ctx_sess", "cli", time.time(), model, base_url),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_collect_session_context_limit_joins_on_model_and_base_url(hermes_home: Path):
+    """SessionInfo.context_limit joins model@billing_base_url against the cache."""
+    _insert_session_with_endpoint(
+        hermes_home / "state.db", "MiniMax-M3", "https://api.minimax.io/v1"
+    )
+    (hermes_home / "context_length_cache.yaml").write_text(
+        "context_lengths:\n  MiniMax-M3@https://api.minimax.io/v1: 1048576\n"
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.sessions[0].context_limit == 1048576
+    c.close()
+
+
+def test_collect_session_context_limit_normalizes_trailing_slash(hermes_home: Path):
+    """A trailing slash on the session base_url still matches the cache key."""
+    _insert_session_with_endpoint(
+        hermes_home / "state.db", "MiniMax-M3", "https://api.minimax.io/v1/"
+    )
+    (hermes_home / "context_length_cache.yaml").write_text(
+        "context_lengths:\n  MiniMax-M3@https://api.minimax.io/v1: 1048576\n"
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.sessions[0].context_limit == 1048576
+    c.close()
+
+
+def test_collect_session_context_limit_missing_cache_is_zero(hermes_home: Path):
+    _insert_session_with_endpoint(
+        hermes_home / "state.db", "MiniMax-M3", "https://api.minimax.io/v1"
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.sessions[0].context_limit == 0
+    assert "sessions" not in state.health.failed_sources
+    c.close()
+
+
 def test_collect_pr_monitor_reads_underscore_and_subdir_families(hermes_home: Path):
     """pr_monitor_*.json (underscore) and pr_monitor/*.json (subdir) are also read."""
     (hermes_home / "pr_monitor_state.json").write_text(

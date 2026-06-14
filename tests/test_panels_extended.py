@@ -77,6 +77,24 @@ def test_sessions_panel_detail():
     assert "https://api.kimi.test/v1" in text
 
 
+def test_sessions_panel_detail_shows_context_limit():
+    state = DashboardState(
+        sessions=[
+            SessionInfo(
+                session_id="sess_ctx",
+                source="cli",
+                model="MiniMax-M3",
+                billing_base_url="https://api.minimax.io/v1",
+                context_limit=1048576,
+                is_active=True,
+            ),
+        ],
+    )
+    text = render_to_str(render_panel(2, state, Theme(), detail=True), width=160)
+    # Lifetime-tokens-vs-limit framing: the model's context window size is shown.
+    assert "1.0M" in text
+
+
 def test_sessions_panel_detail_filter_query():
     state = DashboardState(
         sessions=[

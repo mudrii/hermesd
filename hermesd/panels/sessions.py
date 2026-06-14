@@ -140,6 +140,10 @@ def _render_detail(
     if runtime_table is not None:
         sections.append(Text("\nRuntime\n", style=f"bold {theme.ui_label}"))
         sections.append(runtime_table)
+    billing_table = _billing_table(sessions, theme)
+    if billing_table is not None:
+        sections.append(Text("\nBilling & Context\n", style=f"bold {theme.ui_label}"))
+        sections.append(billing_table)
 
     return Panel(
         Group(*sections),
@@ -334,9 +338,6 @@ def _runtime_table(sessions: list[SessionInfo], theme: Theme) -> Table | None:
         or session.handoff_state
         or session.handoff_platform
         or session.handoff_error
-        or session.end_reason
-        or session.billing_base_url
-        or session.billing_mode
     ]
     if not runtime_sessions:
         return None
@@ -346,9 +347,6 @@ def _runtime_table(sessions: list[SessionInfo], theme: Theme) -> Table | None:
     table.add_column("CWD", style=theme.banner_text)
     table.add_column("Flags", style=theme.banner_dim)
     table.add_column("Handoff", style=theme.banner_text)
-    table.add_column("End", style=theme.banner_dim)
-    table.add_column("Endpoint", style=theme.banner_text)
-    table.add_column("Mode", style=theme.banner_dim)
     for session in runtime_sessions:
         flags = []
         if session.archived:
@@ -370,8 +368,34 @@ def _runtime_table(sessions: list[SessionInfo], theme: Theme) -> Table | None:
             escape(_cwd_label(session.cwd)),
             ", ".join(flags) if flags else "—",
             escape(handoff) if handoff else "—",
+        )
+    return table
+
+
+def _billing_table(sessions: list[SessionInfo], theme: Theme) -> Table | None:
+    billing_sessions = [
+        session
+        for session in sessions[:10]
+        if session.end_reason
+        or session.billing_base_url
+        or session.billing_mode
+        or session.context_limit
+    ]
+    if not billing_sessions:
+        return None
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("ID", style=theme.session_label)
+    table.add_column("End", style=theme.banner_dim)
+    table.add_column("Endpoint", style=theme.banner_text)
+    table.add_column("Mode", style=theme.banner_dim)
+    # Lifetime tokens vs the model's context window, not live occupancy.
+    table.add_column("Ctx Limit", justify="right", style=theme.banner_dim)
+    for session in billing_sessions:
+        table.add_row(
+            escape(session.session_id[-8:]),
             escape(session.end_reason) if session.end_reason else "—",
             escape(session.billing_base_url) if session.billing_base_url else "—",
             escape(session.billing_mode) if session.billing_mode else "—",
+            fmt_tokens(session.context_limit) if session.context_limit else "—",
         )
     return table

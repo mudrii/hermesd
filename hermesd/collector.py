@@ -549,8 +549,26 @@ class Collector:
             behind = _coerce_int(update_check.get("behind"))
         return version, behind
 
+    def _read_context_lengths(self) -> dict[str, int]:
+        data = self._file_cache.read_yaml_mapping(
+            self._paths.shared_path("context_length_cache.yaml")
+        )
+        raw = data.get("context_lengths")
+        if not isinstance(raw, dict):
+            return {}
+        # Cache keys are "model@base_url" with case-mixed model names (do not
+        # lowercase); normalize only a trailing slash on the base_url part.
+        normalized: dict[str, int] = {}
+        for key, value in raw.items():
+            model, sep, base_url = str(key).partition("@")
+            if not sep:
+                continue
+            normalized[f"{model}@{base_url.rstrip('/')}"] = _coerce_int(value)
+        return normalized
+
     def _collect_sessions(self, rows: list[dict[str, Any]] | None = None) -> list[SessionInfo]:
         rows = self._session_rows_or_read(rows)
+        context_lengths = self._read_context_lengths()
         return [
             SessionInfo(
                 session_id=r["id"],
@@ -561,6 +579,10 @@ class Collector:
                 billing_base_url=r.get("billing_base_url") or "",
                 billing_mode=r.get("billing_mode") or "",
                 end_reason=r.get("end_reason") or "",
+                context_limit=context_lengths.get(
+                    f"{r.get('model') or ''}@{str(r.get('billing_base_url') or '').rstrip('/')}",
+                    0,
+                ),
                 cost_status=r.get("cost_status") or "",
                 pricing_version=r.get("pricing_version") or "",
                 message_count=r.get("message_count") or 0,
