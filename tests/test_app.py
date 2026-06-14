@@ -129,13 +129,13 @@ def test_app_handle_bracket_navigation_reaches_new_panels(populated_hermes_home:
 
 def test_app_handle_bracket_navigation_wraps_at_boundaries(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    for _ in range(11):
+    for _ in range(12):
         app.handle_key("]")
-    assert app._view.detail_panel == 12
-    app.handle_key("]")  # forward wrap: 12 -> 1
+    assert app._view.detail_panel == 13
+    app.handle_key("]")  # forward wrap: 13 -> 1
     assert app._view.detail_panel == 1
-    app.handle_key("[")  # backward wrap: 1 -> 12
-    assert app._view.detail_panel == 12
+    app.handle_key("[")  # backward wrap: 1 -> 13
+    assert app._view.detail_panel == 13
     app.close()
 
 

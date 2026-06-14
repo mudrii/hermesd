@@ -1015,7 +1015,7 @@ def test_panels_render_with_ares_skin():
     assert "Running" in text
 
 
-@pytest.mark.parametrize("panel_num", range(1, 13))
+@pytest.mark.parametrize("panel_num", range(1, 14))
 @pytest.mark.parametrize("detail", [False, True])
 def test_panel_renders_fully_empty_state_without_crashing(panel_num: int, detail: bool):
     """First-launch condition: ~/.hermes exists but the agent never ran.

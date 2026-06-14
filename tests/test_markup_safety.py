@@ -11,6 +11,7 @@ from hermesd.models import (
     CredentialPoolEntry,
     CronJob,
     CronState,
+    CuratorRun,
     DashboardState,
     GatewayState,
     HookInfo,
@@ -251,10 +252,21 @@ def _state_for(panel_num: int) -> DashboardState:
                 pr_monitors=[PRMonitorSummary(filename=INJECT, repo=INJECT, checked_at=INJECT)],
             ),
         )
+    if panel_num == 13:  # Curator
+        return DashboardState(
+            curator=CuratorRun(
+                run_present=True,
+                stamp=INJECT,
+                started_at=INJECT,
+                model=INJECT,
+                provider=INJECT,
+                llm_summary=INJECT,
+            ),
+        )
     raise AssertionError(f"no state builder for panel {panel_num}")
 
 
-@pytest.mark.parametrize("panel_num", range(1, 13))
+@pytest.mark.parametrize("panel_num", range(1, 14))
 @pytest.mark.parametrize("detail", [False, True])
 def test_panel_does_not_crash_on_markup_injection(panel_num: int, detail: bool) -> None:
     state = _state_for(panel_num)
@@ -264,7 +276,7 @@ def test_panel_does_not_crash_on_markup_injection(panel_num: int, detail: bool) 
     assert rendered  # rendered to something rather than crashing
 
 
-@pytest.mark.parametrize("panel_num", range(1, 13))
+@pytest.mark.parametrize("panel_num", range(1, 14))
 @pytest.mark.parametrize("detail", [False, True])
 def test_panel_preserves_literal_brackets(panel_num: int, detail: bool) -> None:
     state = _state_for(panel_num)

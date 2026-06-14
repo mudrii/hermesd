@@ -44,7 +44,7 @@ def test_parse_args_snapshot_panel_zero_alias():
     assert args.snapshot_panel == 10
 
 
-@pytest.mark.parametrize("value", ["11", "12"])
+@pytest.mark.parametrize("value", ["11", "12", "13"])
 def test_parse_args_snapshot_panel_above_ten(value: str):
     args = parse_args(["--snapshot-panel", value])
     assert args.snapshot_panel == int(value)
@@ -56,7 +56,7 @@ def test_parse_args_snapshot_format_and_log_tail_bytes():
     assert args.log_tail_bytes == 4096
 
 
-@pytest.mark.parametrize("value", ["13", "-1"])
+@pytest.mark.parametrize("value", ["14", "-1"])
 def test_parse_args_rejects_invalid_snapshot_panel(value: str):
     with pytest.raises(SystemExit):
         parse_args(["--snapshot-panel", value])
@@ -64,13 +64,14 @@ def test_parse_args_rejects_invalid_snapshot_panel(value: str):
 
 def test_parse_args_invalid_snapshot_panel_lists_available_panels(capsys):
     with pytest.raises(SystemExit):
-        parse_args(["--snapshot-panel", "13"])
+        parse_args(["--snapshot-panel", "14"])
 
     err = capsys.readouterr().err
     assert "snapshot panel must be one of:" in err
     assert "10" in err
     assert "11" in err
     assert "12" in err
+    assert "13" in err
 
 
 def test_parse_args_help_describes_registered_snapshot_panels(capsys):

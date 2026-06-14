@@ -40,6 +40,7 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 | 10 | **Memory** | Memory provider, MEMORY.md/USER.md word counts, SOUL.md size/excerpt, and memory file inventory |
 | 11 | **Kanban** | Read-only kanban task/run/event/comment counts, dispatch config, active workers, blocked/failing tasks, and recent runs |
 | 12 | **Operations** | Dashboard process count, Desktop build stamp, model-cache summaries, and PR monitor state |
+| 13 | **Curator** | Newest memory-curation run: skill before/after counts, archived/pruned/added totals, model/provider, duration, tool-call total, and LLM summary or error |
 
 ### Key Features
 
@@ -69,7 +70,7 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 
 ### Overview — The Full Picture
 
-The main dashboard shows all 12 panels at a glance. The header starts with the installed `hermesd` version, then shows the current profile mode and time on the right. Gateway status with PID and Hermes Agent version sits at the top, sessions and token costs side by side, tools and config, cron and skills, logs plus profile metadata, and dedicated memory, kanban, and operations panels at the bottom. The footer shows keyboard shortcuts and a polling indicator.
+The main dashboard shows all 13 panels at a glance. The header starts with the installed `hermesd` version, then shows the current profile mode and time on the right. Gateway status with PID and Hermes Agent version sits at the top, sessions and token costs side by side, tools and config, cron and skills, logs plus profile metadata, and dedicated memory, kanban, and operations panels at the bottom. The footer shows keyboard shortcuts and a polling indicator.
 
 ![Overview](images/SCR-20260409-pzqv.png)
 
@@ -134,6 +135,10 @@ Use `]` from panel 10 or `--snapshot-panel 11` to expand. The Kanban panel reads
 ### [12] Operations — What Runtime Artifacts Exist?
 
 Use `]` from Kanban or `--snapshot-panel 12` to expand. The Operations panel summarizes dashboard background processes, Desktop build metadata, model-cache provider/model counts, cache ages, and PR monitor files.
+
+### [13] Curator — What Did the Last Memory Curation Do?
+
+Use `]` from Operations or `--snapshot-panel 13` to expand. The Curator panel reads the newest `~/.hermes/logs/curator/<stamp>/run.json` and shows the skill before/after/delta counts, archived/added/pruned/consolidated totals, the model and provider used, run duration, total tool calls, and the LLM summary (or error).
 
 ## Installation
 
@@ -279,7 +284,7 @@ hermesd is a **read-only companion** — it reads files from `~/.hermes/` and ne
                                  app.py      Rich TUI (Live + Layout + threads)
                                      |
                                      v
-                                 panels/*.py  12 panel renderers (compact + detail)
+                                 panels/*.py  13 panel renderers (compact + detail)
 ```
 
 ### Design Decisions
@@ -364,6 +369,7 @@ hermesd/
     memory_panel.py    [10] Memory
     kanban.py          [11] Kanban
     operations.py      [12] Operations
+    curator_panel.py   [13] Curator
 tests/                 Test suite: panels, data, resilience, edge cases
 ```
 

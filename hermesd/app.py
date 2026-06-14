@@ -48,7 +48,7 @@ _WIDE_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
     ("row4", None, (6, 7)),
     ("row5", 7, (8, 9)),
     ("row6", 6, (10, 11)),
-    ("row7", 6, (12,)),
+    ("row7", 6, (12, 13)),
 )
 _COMPACT_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
     ("row1", 3, (1,)),
@@ -58,7 +58,7 @@ _COMPACT_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
     ("row5", 4, (6, 7)),
     ("row6", 4, (8, 9)),
     ("row7", 4, (10, 11)),
-    ("row8", None, (12,)),
+    ("row8", None, (12, 13)),
 )
 _TALL_NARROW_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = tuple(
     (f"row{panel_num}", None, (panel_num,)) for panel_num in _PANEL_NUMBERS
