@@ -941,25 +941,46 @@ class Collector:
         return summaries
 
     def _collect_pr_monitors(self) -> list[PRMonitorSummary]:
-        monitors = []
-        for path in sorted(self._paths.shared_path().glob("pr-monitor-*.json")):
+        base = self._paths.shared_path()
+        # The agent writes PR-monitor state under several naming families: flat
+        # hyphen/underscore files and per-repo files inside pr-monitor/pr_monitor
+        # subdirs. Read them all; sorted+dict-keyed paths keep the scan stable.
+        paths = sorted(
+            {
+                path
+                for pattern in (
+                    "pr-monitor-*.json",
+                    "pr_monitor_*.json",
+                    "pr-monitor/*.json",
+                    "pr_monitor/*.json",
+                )
+                for path in base.glob(pattern)
+                if path.is_file()
+            }
+        )
+        # Collapse the same repo (seen across families) to its newest state;
+        # files without a repo stay distinct, keyed by filename.
+        deduped: dict[str, PRMonitorSummary] = {}
+        for path in paths:
             data = self._read_json_cached(path)
             if not data:
                 continue
-            monitors.append(
-                PRMonitorSummary(
-                    filename=path.name,
-                    repo=str(data.get("repo") or ""),
-                    checked_at=str(data.get("checked_at") or ""),
-                    monitored_count=_len_if_sized(data.get("prs"))
-                    or _len_if_sized(data.get("monitored")),
-                    tracked_count=_len_if_sized(data.get("tracked_numbers"))
-                    or _len_if_sized(data.get("tracked")),
-                    author_pr_count=_len_if_sized(data.get("author_prs"))
-                    or _len_if_sized(data.get("author_pr_numbers")),
-                )
+            summary = PRMonitorSummary(
+                filename=path.name,
+                repo=str(data.get("repo") or ""),
+                checked_at=str(data.get("checked_at") or ""),
+                monitored_count=_len_if_sized(data.get("prs"))
+                or _len_if_sized(data.get("monitored")),
+                tracked_count=_len_if_sized(data.get("tracked_numbers"))
+                or _len_if_sized(data.get("tracked")),
+                author_pr_count=_len_if_sized(data.get("author_prs"))
+                or _len_if_sized(data.get("author_pr_numbers")),
             )
-        return monitors
+            key = summary.repo or f"::{path.name}"
+            existing = deduped.get(key)
+            if existing is None or summary.checked_at > existing.checked_at:
+                deduped[key] = summary
+        return sorted(deduped.values(), key=lambda s: (s.repo, s.filename))
 
     def _collect_skills_memory(self) -> SkillsMemory:
         categories: set[str] = set()

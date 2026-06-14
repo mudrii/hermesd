@@ -608,6 +608,60 @@ def test_collect_pr_monitor_reads_live_key_shape(hermes_home: Path):
     c.close()
 
 
+def test_collect_pr_monitor_reads_underscore_and_subdir_families(hermes_home: Path):
+    """pr_monitor_*.json (underscore) and pr_monitor/*.json (subdir) are also read."""
+    (hermes_home / "pr_monitor_state.json").write_text(
+        json.dumps(
+            {
+                "repo": "underscore/flat",
+                "checked_at": "2026-06-14T01:00:00Z",
+                "prs": {"1": {}},
+                "tracked_numbers": [1],
+            }
+        )
+    )
+    subdir = hermes_home / "pr_monitor"
+    subdir.mkdir()
+    (subdir / "state.json").write_text(
+        json.dumps({"repo": "subdir/under", "checked_at": "2026-06-14T02:00:00Z", "prs": {"7": {}}})
+    )
+    hyphen_subdir = hermes_home / "pr-monitor"
+    hyphen_subdir.mkdir()
+    (hyphen_subdir / "widget-prs.json").write_text(
+        json.dumps(
+            {"repo": "subdir/hyphen", "checked_at": "2026-06-14T03:00:00Z", "prs": {"9": {}}}
+        )
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    repos = {m.repo for m in state.operations.pr_monitors}
+    assert {"underscore/flat", "subdir/under", "subdir/hyphen"} <= repos
+    c.close()
+
+
+def test_collect_pr_monitor_dedupes_same_repo_keeping_newest(hermes_home: Path):
+    """The same repo across multiple monitor files collapses to the newest checked_at."""
+    (hermes_home / "pr-monitor-acme-widget.json").write_text(
+        json.dumps({"repo": "acme/widget", "checked_at": "2026-06-10T00:00:00Z", "prs": {"1": {}}})
+    )
+    (hermes_home / "pr_monitor_acme_widget_state.json").write_text(
+        json.dumps(
+            {
+                "repo": "acme/widget",
+                "checked_at": "2026-06-14T00:00:00Z",
+                "prs": {"1": {}, "2": {}, "3": {}},
+            }
+        )
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    acme = [m for m in state.operations.pr_monitors if m.repo == "acme/widget"]
+    assert len(acme) == 1
+    assert acme[0].checked_at == "2026-06-14T00:00:00Z"
+    assert acme[0].monitored_count == 3
+    c.close()
+
+
 def test_collect_operations_reads_camelcase_desktop_build_stamp(hermes_home: Path):
     """Live desktop-build-stamp.json uses camelCase builtAt/contentHash/sourceMode."""
     (hermes_home / "desktop-build-stamp.json").write_text(

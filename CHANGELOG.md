@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The Operations panel's desktop build stamp now reads the live `desktop-build-stamp.json` camelCase keys (`builtAt`, falling back to a truncated `contentHash`); previously it looked only for snake_case keys and always rendered blank.
 - PR-monitor counts now read the live JSON shape (`prs`, `tracked_numbers`, `checked_at`); previously they looked for the retired `monitored`/`tracked`/`checkedAt` keys and stayed stuck at zero.
+- PR-monitor state is now read from all of the agent's naming families — flat `pr-monitor-*.json`/`pr_monitor_*.json` and the `pr-monitor/`/`pr_monitor/` subdirectories — and the same repo seen across families collapses to its most recently checked entry.
 - The credential pool view now reads the live `auth.json` shape where each provider maps to a list of credential entries (previously only the legacy single-dict shape was understood, leaving every credential field blank). The lowest-priority entry represents the provider.
 - Untrusted free-text from `~/.hermes/` (session, config, skill, kanban, cron, gateway, memory, profile, operations, and token labels) is now escaped before it reaches Rich's markup parser, so values containing `[...]` render literally and a stray `[/]` can no longer crash the dashboard.
 - Symlinked log files, log directories, cron output files, and cron output directories are now ignored when tailing logs so hermesd does not read outside the Hermes home.
