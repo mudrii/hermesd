@@ -950,9 +950,11 @@ class Collector:
                 PRMonitorSummary(
                     filename=path.name,
                     repo=str(data.get("repo") or ""),
-                    checked_at=str(data.get("checkedAt") or data.get("checked_at") or ""),
-                    monitored_count=_len_if_sized(data.get("monitored")),
-                    tracked_count=_len_if_sized(data.get("tracked")),
+                    checked_at=str(data.get("checked_at") or ""),
+                    monitored_count=_len_if_sized(data.get("prs"))
+                    or _len_if_sized(data.get("monitored")),
+                    tracked_count=_len_if_sized(data.get("tracked_numbers"))
+                    or _len_if_sized(data.get("tracked")),
                     author_pr_count=_len_if_sized(data.get("author_prs"))
                     or _len_if_sized(data.get("author_pr_numbers")),
                 )

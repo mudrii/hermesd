@@ -631,9 +631,9 @@ def sample_pr_monitor(hermes_home: Path) -> Path:
         json.dumps(
             {
                 "repo": "NousResearch/hermes-agent",
-                "checkedAt": "2026-06-04T17:14:31Z",
-                "monitored": [1, 2],
-                "tracked": {"1": {}, "2": {}},
+                "checked_at": "2026-06-04T17:14:31Z",
+                "tracked_numbers": [1, 2],
+                "prs": {"1": {}, "2": {}},
                 "author_prs": {"3": {}},
             }
         )

@@ -585,6 +585,29 @@ def test_collect_operations_handles_empty_caches_and_corrupt_pr_monitor(hermes_h
     c.close()
 
 
+def test_collect_pr_monitor_reads_live_key_shape(hermes_home: Path):
+    """Live pr-monitor JSON uses tracked_numbers/prs/author_prs/checked_at."""
+    (hermes_home / "pr-monitor-acme-widget.json").write_text(
+        json.dumps(
+            {
+                "repo": "acme/widget",
+                "checked_at": "2026-06-14T09:00:00Z",
+                "tracked_numbers": [10, 11, 12],
+                "prs": {"10": {}, "11": {}},
+                "author_prs": {"99": {}},
+            }
+        )
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    monitor = next(m for m in state.operations.pr_monitors if m.repo == "acme/widget")
+    assert monitor.checked_at == "2026-06-14T09:00:00Z"
+    assert monitor.tracked_count == 3
+    assert monitor.monitored_count == 2
+    assert monitor.author_pr_count == 1
+    c.close()
+
+
 def test_collect_operations_reads_camelcase_desktop_build_stamp(hermes_home: Path):
     """Live desktop-build-stamp.json uses camelCase builtAt/contentHash/sourceMode."""
     (hermes_home / "desktop-build-stamp.json").write_text(
