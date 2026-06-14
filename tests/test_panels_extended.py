@@ -44,6 +44,9 @@ def test_sessions_panel_detail():
                 billing_provider="openai-codex",
                 cost_status="reported",
                 pricing_version="2026-04",
+                end_reason="cron_complete",
+                billing_base_url="https://api.kimi.test/v1",
+                billing_mode="subscription_included",
                 is_active=True,
             ),
             SessionInfo(
@@ -69,6 +72,9 @@ def test_sessions_panel_detail():
     assert "openai-codex" in text
     assert "reported" in text
     assert "2026-04" in text
+    assert "cron_complete" in text
+    assert "subscription_included" in text
+    assert "https://api.kimi.test/v1" in text
 
 
 def test_sessions_panel_detail_filter_query():

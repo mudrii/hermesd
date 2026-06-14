@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The Sessions detail panel's Runtime table now surfaces each session's end reason, billing endpoint (`billing_base_url`), and billing mode read from `~/.hermes/state.db`.
+
 ### Changed
 
 - Token/cost figures now use a `~$` prefix only when costs are estimated and a plain `$` prefix when every contributing session cost is provider-reported, in both the compact and detail views.

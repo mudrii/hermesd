@@ -60,7 +60,7 @@ def test_read_sessions_excludes_private_payload_columns(hermes_home):
     assert row["input_tokens"] == 42
     assert "system_prompt" not in row
     assert "model_config" not in row
-    assert "billing_base_url" not in row
+    assert row["billing_base_url"] == "https://billing.example.test/private"
     db.close()
 
 

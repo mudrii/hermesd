@@ -29,6 +29,9 @@ class SessionInfo(BaseModel):
     model: str = ""
     parent_session_id: str = ""
     billing_provider: str = ""
+    billing_base_url: str = ""
+    billing_mode: str = ""
+    end_reason: str = ""
     cost_status: str = ""
     pricing_version: str = ""
     message_count: int = 0

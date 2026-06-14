@@ -334,6 +334,9 @@ def _runtime_table(sessions: list[SessionInfo], theme: Theme) -> Table | None:
         or session.handoff_state
         or session.handoff_platform
         or session.handoff_error
+        or session.end_reason
+        or session.billing_base_url
+        or session.billing_mode
     ]
     if not runtime_sessions:
         return None
@@ -343,6 +346,9 @@ def _runtime_table(sessions: list[SessionInfo], theme: Theme) -> Table | None:
     table.add_column("CWD", style=theme.banner_text)
     table.add_column("Flags", style=theme.banner_dim)
     table.add_column("Handoff", style=theme.banner_text)
+    table.add_column("End", style=theme.banner_dim)
+    table.add_column("Endpoint", style=theme.banner_text)
+    table.add_column("Mode", style=theme.banner_dim)
     for session in runtime_sessions:
         flags = []
         if session.archived:
@@ -364,5 +370,8 @@ def _runtime_table(sessions: list[SessionInfo], theme: Theme) -> Table | None:
             escape(_cwd_label(session.cwd)),
             ", ".join(flags) if flags else "—",
             escape(handoff) if handoff else "—",
+            escape(session.end_reason) if session.end_reason else "—",
+            escape(session.billing_base_url) if session.billing_base_url else "—",
+            escape(session.billing_mode) if session.billing_mode else "—",
         )
     return table
