@@ -106,3 +106,6 @@ check_untyped_defs = false
 
 [tool.hatch.build.targets.sdist]
 include = ["hermesd/", "tests/", "LICENSE", "README.md", "CHANGELOG.md"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["hermesd"]
