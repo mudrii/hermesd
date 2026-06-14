@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 import time
 
+import pytest
+
 from hermesd.models import (
     ConfigSummary,
     CronState,
@@ -24,13 +26,17 @@ from hermesd.models import (
     TokenSummary,
     ToolStats,
 )
-from hermesd.panels import _RENDERERS, PANEL_NAMES, render_panel
+from hermesd.panels import PANEL_NAMES, render_panel
 from hermesd.theme import Theme
 from tests.conftest import render_to_str
 
 
-def test_panel_registry_matches_names():
-    assert set(_RENDERERS) == set(PANEL_NAMES)
+@pytest.mark.parametrize("detail", [False, True])
+@pytest.mark.parametrize("panel_num", sorted(PANEL_NAMES))
+def test_registered_panels_render_by_public_number(panel_num: int, detail: bool):
+    text = render_to_str(render_panel(panel_num, DashboardState(), Theme(), detail=detail))
+
+    assert f"[{panel_num}] {PANEL_NAMES[panel_num]}" in text
 
 
 def test_gateway_panel_compact():
@@ -591,6 +597,7 @@ def test_operations_panel_detail_shows_response_store():
     assert "Response Store" in text
     assert "2 conversations" in text
     assert "3 responses" in text
+    assert "20.5K" in text
     assert "No operations artifacts found" not in text
 
 

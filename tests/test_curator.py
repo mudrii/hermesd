@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 
 from hermesd.collector import Collector
+from hermesd.panels import render_panel
+from hermesd.theme import Theme
+from tests.conftest import render_to_str
 
 
 def _write_curator_run(home: Path, stamp: str, payload: dict) -> Path:
@@ -62,6 +66,25 @@ def test_collect_curator_reads_newest_run(hermes_home: Path):
     assert cur.state_transitions == ["collecting -> summarizing @ 2026-06-10T13:40:00+00:00"]
     assert cur.llm_error == ""
     c.close()
+
+
+def test_collect_curator_added_and_consolidated_counts_render(hermes_home: Path):
+    run = _LIVE_SHAPE | {
+        "counts": _LIVE_SHAPE["counts"]
+        | {
+            "added_this_run": 17,
+            "consolidated_this_run": 19,
+        }
+    }
+    _write_curator_run(hermes_home, "20260610-133539", run)
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    c.close()
+
+    text = render_to_str(render_panel(13, state, Theme(), detail=True), width=120, no_color=True)
+    assert re.search(r"Added\s+17", text)
+    assert re.search(r"Consolidated\s+19", text)
 
 
 def test_collect_curator_absent_is_empty(hermes_home: Path):

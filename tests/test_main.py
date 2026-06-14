@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -352,6 +353,38 @@ def test_main_snapshot_panel_3_surfaces_endpoint_and_cost_status_summary(
     out = capsys.readouterr().out
     assert "Cost Status" in out
     assert "By Endpoint" in out
+
+
+def test_main_snapshot_panel_5_surfaces_config_detail_from_yaml(
+    populated_hermes_home: Path, capsys
+):
+    (populated_hermes_home / "config.yaml").write_text(
+        "dashboard:\n"
+        "  public_url: https://dashboard.example.com\n"
+        "toolsets:\n"
+        "  - coding\n"
+        "  - research\n"
+        "auxiliary:\n"
+        "  summarizer: gpt-5.4\n"
+        "  reviewer: gpt-5.4\n"
+        "  planner: gpt-5.4\n"
+    )
+
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-panel",
+            "5",
+            "--no-color",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert "Dashboard URL" in out
+    assert "https://dashboard.example.com" in out
+    assert "Toolsets" in out
+    assert "coding, research" in out
+    assert re.search(r"Auxiliary Slots\s+3", out)
 
 
 def test_main_snapshot_json_outputs_state(populated_hermes_home: Path, capsys):

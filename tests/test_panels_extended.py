@@ -196,6 +196,58 @@ def test_sessions_panel_detail_message_filter():
     assert "sess_alpha"[-8:] not in text
 
 
+@pytest.mark.parametrize(
+    ("filter_query", "message_match_ids"),
+    [
+        ("id:sess_child", None),
+        ("parent:sess_parent", None),
+        ("cwd:project-alpha", None),
+        ("handoff:pending", None),
+        ("platform:telegram", None),
+        ("title:deploy", None),
+        ("msg:timeout", {"sess_child"}),
+    ],
+)
+def test_sessions_panel_detail_supported_filter_fields(
+    filter_query: str,
+    message_match_ids: set[str] | None,
+):
+    state = DashboardState(
+        sessions=[
+            SessionInfo(
+                session_id="sess_child",
+                source="cli",
+                parent_session_id="sess_parent",
+                cwd="/work/project-alpha",
+                handoff_state="pending",
+                handoff_platform="telegram",
+                title="Deploy release",
+            ),
+            SessionInfo(
+                session_id="sess_other",
+                source="cli",
+                parent_session_id="sess_root",
+                cwd="/work/project-beta",
+                handoff_state="done",
+                handoff_platform="discord",
+                title="Review notes",
+            ),
+        ],
+    )
+    panel = render_panel(
+        2,
+        state,
+        Theme(),
+        detail=True,
+        filter_query=filter_query,
+        session_message_match_ids=message_match_ids,
+    )
+    text = render_to_str(panel)
+
+    assert "sess_child"[-8:] in text
+    assert "sess_other"[-8:] not in text
+
+
 def test_sessions_panel_detail_multiple_message_tokens_last_wins():
     # Last occurrence wins everywhere: only the final message: value is
     # applied, matching extract_message_search_query.
@@ -786,6 +838,25 @@ def test_config_panel_detail_feature_labels():
     assert "sandbox 120s 50 calls" in text
     assert "gateway 30s fail=3 auto-decompose" in text
     assert "strict trust-recent=90s" in text
+
+
+def test_config_panel_detail_shows_dashboard_toolsets_and_auxiliary_slots():
+    state = DashboardState(
+        config=ConfigSummary(
+            dashboard_public_url="https://dashboard.example.com",
+            toolsets=["coding", "research"],
+            auxiliary_slots=["summarizer", "reviewer"],
+        ),
+    )
+    panel = render_panel(5, state, Theme(), detail=True)
+    text = render_to_str(panel)
+
+    assert "Dashboard URL" in text
+    assert "https://dashboard.example.com" in text
+    assert "Toolsets" in text
+    assert "coding, research" in text
+    assert "Auxiliary Slots" in text
+    assert "2" in text
 
 
 def test_overview_panel_detail():

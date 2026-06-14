@@ -504,6 +504,32 @@ def test_collect_marks_session_derived_sources_failed_when_db_returns_stale_cach
     c.close()
 
 
+def test_collect_preserves_session_derived_state_when_real_db_becomes_unreadable(
+    populated_hermes_home: Path,
+):
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    state1 = c.collect()
+
+    db_path = populated_hermes_home / "state.db"
+    db_path.write_bytes(b"not a sqlite database")
+    state2 = c.collect()
+
+    assert state2.sessions == state1.sessions
+    assert state2.tokens_total == state1.tokens_total
+    assert state2.tokens_today == state1.tokens_today
+    assert state2.token_analytics == state1.token_analytics
+    assert state2.total_tool_calls == state1.total_tool_calls
+    assert set(state2.health.failed_sources) >= {
+        "sessions",
+        "tokens_today",
+        "tokens_total",
+        "token_analytics",
+        "tool_stats",
+        "tool_call_total",
+    }
+    c.close()
+
+
 def test_collect_does_not_raise_on_unvalidatable_session_row(hermes_home: Path):
     """A row pydantic cannot coerce (NULL id) must not raise out of collect()."""
     db_path = hermes_home / "state.db"

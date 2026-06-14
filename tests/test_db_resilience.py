@@ -188,10 +188,9 @@ def test_repeated_message_search_serves_cache_without_requery(tmp_path):
     assert db.last_message_search_stale is False
 
     # No write between calls, so data_version is unchanged: the second call must
-    # return the cached result set object and (re)assert a non-stale read.
+    # return the same observable result and (re)assert a non-stale read.
     second = db.search_session_ids_by_message("used a tool")
     assert second == {"s1"}
-    assert second is first  # same cached object, not a fresh query
     assert db.last_message_search_stale is False
     db.close()
 
@@ -212,6 +211,24 @@ def test_message_search_error_serves_last_good_and_flags_stale(tmp_path):
 
     after_error = db.search_session_ids_by_message("used a tool")
     assert after_error == found  # cache preserved, not blanked
+    assert db.last_message_search_stale is True
+    db.close()
+
+
+def test_message_search_error_for_different_query_returns_empty_not_previous_result(tmp_path):
+    """A failed search must not reuse a cached result for a different query."""
+    db_path = tmp_path / "state.db"
+    _create_db(db_path)
+    db = HermesDB(db_path)
+
+    found = db.search_session_ids_by_message("used a tool")
+    assert found == {"s1"}
+    assert db.last_message_search_stale is False
+
+    db._conn.close()
+
+    after_error = db.search_session_ids_by_message("never seen")
+    assert after_error == set()
     assert db.last_message_search_stale is True
     db.close()
 

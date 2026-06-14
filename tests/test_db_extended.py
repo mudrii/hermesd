@@ -75,7 +75,6 @@ def test_read_only_uri_is_immutable_and_does_not_create_sidecars(tmp_path: Path)
 
     db = HermesDB(db_path)
     assert db.read_sessions()[0]["id"] == "sess_001"
-    assert "mode=ro&immutable=1" in db._uri
     assert not db_path.with_name("state.db-wal").exists()
     assert not db_path.with_name("state.db-shm").exists()
     db.close()
@@ -101,11 +100,51 @@ def test_wal_snapshot_reads_uncheckpointed_data_without_home_sidecars(tmp_path: 
     db = HermesDB(db_path)
     try:
         assert [row["id"] for row in db.read_sessions()] == ["sess_wal"]
-        assert db._uri.endswith("?mode=ro")
         assert not db_path.with_name("state.db-shm").exists()
     finally:
         db.close()
         writer.close()
+
+
+def test_open_db_reader_refreshes_after_later_wal_commit(tmp_path: Path):
+    db_path = tmp_path / "state.db"
+    writer = sqlite3.connect(str(db_path))
+    writer.execute("PRAGMA journal_mode=WAL")
+    create_state_db_tables(writer, include_schema_version=False)
+    writer.execute("INSERT INTO sessions (id, source, started_at) VALUES ('sess_1', 'cli', 1.0)")
+    writer.commit()
+
+    db = HermesDB(db_path)
+    try:
+        assert [row["id"] for row in db.read_sessions()] == ["sess_1"]
+
+        writer.execute(
+            "INSERT INTO sessions (id, source, started_at) VALUES ('sess_2', 'cli', 2.0)"
+        )
+        writer.commit()
+
+        assert {row["id"] for row in db.read_sessions()} == {"sess_1", "sess_2"}
+    finally:
+        db.close()
+        writer.close()
+
+
+def test_wal_snapshot_ignores_symlinked_sidecars_outside_home(tmp_path: Path):
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.execute("INSERT INTO sessions (id, source, started_at) VALUES ('sess_safe', 'cli', 1.0)")
+    conn.commit()
+    conn.close()
+    outside_wal = tmp_path / "outside-wal-dir"
+    outside_wal.mkdir()
+    db_path.with_name("state.db-wal").symlink_to(outside_wal)
+
+    db = HermesDB(db_path)
+    try:
+        assert [row["id"] for row in db.read_sessions()] == ["sess_safe"]
+    finally:
+        db.close()
 
 
 def test_read_only_uri_handles_uri_metacharacters(tmp_path: Path):
@@ -122,8 +161,6 @@ def test_read_only_uri_handles_uri_metacharacters(tmp_path: Path):
     db = HermesDB(db_path)
     sessions = db.read_sessions()
     assert [row["id"] for row in sessions] == ["sess_uri"]
-    assert "mode=ro&immutable=1" in db._uri
-    assert "?" not in db._uri.removeprefix("file://").split("?mode=ro&immutable=1", 1)[0]
     db.close()
 
 

@@ -328,7 +328,63 @@ def test_collector_total_cost_estimates_missing_sessions_when_db_has_mixed_costs
     c = Collector(hermes_home)
     state = c.collect()
     expected_missing = _estimate_cost(100_000, 5_000, 50_000, 0)
-    assert state.tokens_total.total_cost_usd >= 0.42 + expected_missing
+    assert len(state.sessions) == 2
+    assert state.tokens_total.total_cost_usd == pytest.approx(0.42 + expected_missing)
+    c.close()
+
+
+def test_collector_total_cost_flag_is_authoritative_when_all_rows_are_authoritative(
+    hermes_home: Path,
+):
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    now = time.time()
+    rows = [
+        ("included", 0.0),
+        ("exact", 4.2),
+        ("reported", 0.3),
+    ]
+    for idx, (status, cost) in enumerate(rows):
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, input_tokens, cost_status, "
+            "estimated_cost_usd) VALUES (?, ?, ?, ?, ?, ?)",
+            (f"s{idx}", "cli", now, 1000, status, cost),
+        )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.tokens_total.cost_is_estimated is False
+    c.close()
+
+
+def test_collector_total_cost_flag_stays_estimated_for_mixed_authority(
+    hermes_home: Path,
+):
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    now = time.time()
+    rows = [
+        ("reported", 0.3),
+        ("estimated", None),
+    ]
+    for idx, (status, cost) in enumerate(rows):
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, input_tokens, cost_status, "
+            "estimated_cost_usd) VALUES (?, ?, ?, ?, ?, ?)",
+            (f"s{idx}", "cli", now, 1000, status, cost),
+        )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.tokens_total.cost_is_estimated is True
     c.close()
 
 
@@ -446,4 +502,33 @@ def test_collector_builds_token_analytics_windows_and_breakdowns(hermes_home: Pa
     providers = {entry.label: entry for entry in state.token_analytics.by_provider}
     assert providers["openai-codex"].session_count == 2
     assert providers["anthropic"].session_count == 1
+    c.close()
+
+
+def test_collector_token_window_cache_ratio_uses_prompt_and_cache_tokens(
+    hermes_home: Path,
+):
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    now = time.time()
+    rows = [
+        ("cached", 100, 300),
+        ("zero_prompt", 0, 50),
+    ]
+    for sid, input_tokens, cache_read_tokens in rows:
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, input_tokens, cache_read_tokens) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (sid, "cli", now, input_tokens, cache_read_tokens),
+        )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    windows = {window.label: window for window in state.token_analytics.windows}
+    assert windows["7d"].cache_ratio == pytest.approx(350 / 450)
+    assert windows["30d"].cache_ratio == pytest.approx(350 / 450)
     c.close()

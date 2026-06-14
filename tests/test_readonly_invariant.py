@@ -1,9 +1,10 @@
 """Critical-rule guard: the collector must never write to ~/.hermes/.
 
-These tests snapshot a recursive manifest of every file under a populated
-~/.hermes (relative path + size + mtime), exercise the collector's full read
-paths, then re-snapshot and assert the manifest is byte-for-byte identical. Any
-file added, removed, or modified by a read would fail the read-only invariant.
+These tests snapshot a recursive manifest of every entry under a populated
+~/.hermes (relative path, type, link target, size, mtime), exercise the
+collector's full read paths, then re-snapshot and assert the manifest is
+byte-for-byte identical. Any entry added, removed, or modified by a read would
+fail the read-only invariant.
 """
 
 from __future__ import annotations
@@ -15,13 +16,29 @@ from hermesd.app import DashboardApp
 from hermesd.collector import Collector
 
 
-def _manifest(root: Path) -> dict[str, tuple[int, int]]:
-    """Map every file's path (relative to root) to (size_bytes, mtime_ns)."""
-    manifest: dict[str, tuple[int, int]] = {}
+def _manifest(root: Path) -> dict[str, tuple[str, str, int, int]]:
+    """Map every entry's relative path to (kind, link_target, size_bytes, mtime_ns)."""
+    manifest: dict[str, tuple[str, str, int, int]] = {}
     for path in sorted(root.rglob("*")):
-        if path.is_file():
-            stat = path.stat()
-            manifest[str(path.relative_to(root))] = (stat.st_size, stat.st_mtime_ns)
+        stat = path.lstat()
+        if path.is_symlink():
+            kind = "symlink"
+            link_target = str(path.readlink())
+        elif path.is_dir():
+            kind = "dir"
+            link_target = ""
+        elif path.is_file():
+            kind = "file"
+            link_target = ""
+        else:
+            kind = "other"
+            link_target = ""
+        manifest[str(path.relative_to(root))] = (
+            kind,
+            link_target,
+            stat.st_size,
+            stat.st_mtime_ns,
+        )
     return manifest
 
 

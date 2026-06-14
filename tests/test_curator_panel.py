@@ -16,7 +16,9 @@ _RUN = CuratorRun(
     count_after=5,
     count_delta=-3,
     archived_count=3,
+    added_count=2,
     pruned_count=3,
+    consolidated_count=1,
     tool_calls_total=67,
     tool_call_counts={"read_file": 12, "list_dir": 3},
     state_transitions=["collecting -> summarizing @ 2026-06-10T13:40:00+00:00"],
@@ -34,6 +36,10 @@ def test_curator_panel_detail_shows_fields_and_summary():
     text = render_to_str(render_panel(13, DashboardState(curator=_RUN), Theme(), detail=True))
     assert "MiniMax-M3" in text
     assert "minimax" in text
+    assert "Added" in text
+    assert "2" in text
+    assert "Consolidated" in text
+    assert "1" in text
     assert "67" in text
     assert "read_file" in text
     assert "12" in text

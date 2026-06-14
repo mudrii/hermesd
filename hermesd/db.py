@@ -100,7 +100,7 @@ class HermesDB:
             shutil.copy2(self._path, snapshot_db)
             for suffix in ("-wal", "-shm"):
                 source = self._path.with_name(f"{self._path.name}{suffix}")
-                if source.exists():
+                if source.exists() and _safe_sidecar_path(source, self._path.parent):
                     shutil.copy2(source, snapshot_root / source.name)
         except OSError:
             snapshot_dir.cleanup()
@@ -320,6 +320,8 @@ class HermesDB:
             except sqlite3.Error:
                 self._last_message_search_stale = self._cached_message_search_initialized
                 self._record_read_error()
+                if self._cached_message_search_query != normalized:
+                    return set()
             return self._cached_message_search_results
 
     def _read_cached(
@@ -410,6 +412,17 @@ class HermesDB:
 
 def _escape_like_pattern(query: str) -> str:
     return query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _safe_sidecar_path(path: Path, root: Path) -> bool:
+    if path.is_symlink():
+        return False
+    try:
+        resolved_path = path.resolve(strict=False)
+        resolved_root = root.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return False
+    return resolved_path == resolved_root or resolved_path.is_relative_to(resolved_root)
 
 
 def _quote_fts_query(query: str) -> str:

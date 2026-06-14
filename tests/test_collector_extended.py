@@ -2058,6 +2058,22 @@ def test_collect_profiles_preserves_last_good_when_profile_db_read_fails(hermes_
     c.close()
 
 
+def test_collect_profiles_preserves_last_good_when_real_profile_db_becomes_unreadable(
+    profiled_hermes_home: Path,
+):
+    c = Collector(profiled_hermes_home)
+    state1 = c.collect()
+    assert state1.profiles.profiles[0].session_count == 1
+
+    profile_db = profiled_hermes_home / "profiles" / "coding" / "state.db"
+    profile_db.write_bytes(b"not a sqlite database")
+    state2 = c.collect()
+
+    assert state2.profiles == state1.profiles
+    assert "profiles" in state2.health.failed_sources
+    c.close()
+
+
 def test_summarize_profile_ignores_symlinked_children_outside_profile(
     hermes_home: Path, tmp_path: Path
 ):
@@ -2456,6 +2472,56 @@ def test_collect_profiles_lists_profile_directories(profiled_hermes_home: Path):
     assert profile.soul_excerpt == ""
     assert profile.latest_log_mtime is not None
     c.close()
+
+
+def test_collect_profiles_updates_session_count_after_profile_db_changes(
+    profiled_hermes_home: Path,
+):
+    c = Collector(profiled_hermes_home)
+    first = c.collect()
+    assert first.sessions[0].session_id == "root_session"
+    assert first.profiles.profiles[0].session_count == 1
+
+    profile_db = profiled_hermes_home / "profiles" / "coding" / "state.db"
+    conn = sqlite3.connect(str(profile_db))
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+        ("profile_session_2", "profile", time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+    second = c.collect()
+
+    assert second.sessions[0].session_id == "root_session"
+    assert second.profiles.profiles[0].session_count == 2
+    c.close()
+
+
+def test_collect_profiles_updates_session_count_after_profile_wal_commit(
+    profiled_hermes_home: Path,
+):
+    profile_db = profiled_hermes_home / "profiles" / "coding" / "state.db"
+    writer = sqlite3.connect(str(profile_db))
+    writer.execute("PRAGMA journal_mode=WAL")
+
+    c = Collector(profiled_hermes_home)
+    try:
+        first = c.collect()
+        assert first.profiles.profiles[0].session_count == 1
+
+        writer.execute(
+            "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+            ("profile_session_2", "profile", time.time()),
+        )
+        writer.commit()
+
+        second = c.collect()
+        assert second.sessions[0].session_id == "root_session"
+        assert second.profiles.profiles[0].session_count == 2
+    finally:
+        c.close()
+        writer.close()
 
 
 def test_collect_profiles_reads_soul_excerpt_when_present(profiled_hermes_home: Path):

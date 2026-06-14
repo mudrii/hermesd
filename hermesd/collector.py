@@ -1457,6 +1457,8 @@ class Collector:
         db = self._db_factory(db_path)
         try:
             session_count = db.read_session_count()
+            if getattr(db, "last_read_session_count_stale", False):
+                raise RuntimeError("profile db returned cached count after sqlite error")
         finally:
             db.close()
         self._profile_count_cache[name] = (mtime, session_count)

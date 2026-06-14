@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
+import re
 import threading
 from pathlib import Path
 
@@ -88,10 +90,18 @@ def test_handle_key_c_copies_current_view(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
     buffer = io.StringIO()
     app._console = Console(file=buffer, width=120, height=40, force_terminal=True, no_color=True)
+    expected = app.render_current_view_text()
     app.handle_key("c")
     copied = buffer.getvalue()
     assert "]52;c;" in copied
+    assert _decoded_osc52_payload(copied) == expected
     app.close()
+
+
+def _decoded_osc52_payload(output: str) -> str:
+    match = re.search(r"\]52;c;([A-Za-z0-9+/=]+)\a", output)
+    assert match is not None
+    return base64.b64decode(match.group(1)).decode()
 
 
 def test_handle_key_f_toggles_focus_mode(populated_hermes_home: Path):
@@ -170,6 +180,23 @@ def test_handle_key_filter_text_and_enter(populated_hermes_home: Path):
     app.handle_key("\r")
     assert app._view.filter_edit_mode is False
     assert app._view.filter_query == "err"
+    app.close()
+
+
+def test_filter_edit_mode_treats_command_keys_as_text(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app.handle_key("2")
+    app.handle_key("/")
+
+    assert app.handle_key("q") is None
+    assert app.handle_key("r") is None
+    assert app.handle_key("s") is None
+    assert app.handle_key("1") is None
+
+    assert app._view.filter_query == "qrs1"
+    assert app._view.session_sort == "recent"
+    assert app._view.detail_panel == 2
+    assert not app._force_refresh.is_set()
     app.close()
 
 
@@ -252,6 +279,26 @@ def test_handle_key_g_and_big_g_jump_scroll(populated_hermes_home: Path):
     assert app._view.scroll_offset > 2
     app.handle_key("g")
     assert app._view.scroll_offset == 0
+    app.close()
+
+
+def test_footer_advertises_top_bottom_only_for_scrollable_detail_panels(
+    populated_hermes_home: Path,
+):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    state = app._state
+
+    app.handle_key("7")
+    skills_footer = app._build_footer(state).plain
+    assert "Top/bottom" in skills_footer
+
+    app.handle_key("8")
+    logs_footer = app._build_footer(state).plain
+    assert "Top/bottom" in logs_footer
+
+    app.handle_key("2")
+    sessions_footer = app._build_footer(state).plain
+    assert "Top/bottom" not in sessions_footer
     app.close()
 
 
@@ -817,6 +864,18 @@ def test_build_footer_detail_sessions_shows_sort(populated_hermes_home: Path):
     app.close()
 
 
+def test_top_bottom_keys_ignore_non_scrollable_detail_panels(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+
+    app.handle_key("2")
+    app.handle_key("G")
+    assert app._view.scroll_offset == 0
+
+    app.handle_key("g")
+    assert app._view.scroll_offset == 0
+    app.close()
+
+
 def test_build_help_panel_shows_filter_shortcut(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     panel = app._build_help()
@@ -883,9 +942,8 @@ def test_compact_overview_renders_tools_and_skills_panels(populated_hermes_home:
         app._console.print(overview)
     text = cap.get()
 
-    assert "Tools" in text
-    assert "Skills / Integrations" in text
-    assert "Memory" in text
+    for panel_name in PANEL_NAMES.values():
+        assert panel_name in text
     app.close()
 
 
@@ -899,15 +957,8 @@ def test_wide_overview_renders_existing_panels(populated_hermes_home: Path):
         app._console.print(overview)
     text = cap.get()
 
-    assert "Gateway & Platforms" in text
-    assert "Sessions" in text
-    assert "Tokens / Cost" in text
-    assert "Tools" in text
-    assert "Config" in text
-    assert "Cron" in text
-    assert "Skills / Integrations" in text
-    assert "Logs" in text
-    assert "Memory" in text
+    for panel_name in PANEL_NAMES.values():
+        assert panel_name in text
     app.close()
 
 
@@ -923,9 +974,8 @@ def test_tall_narrow_overview_uses_single_column_rows(populated_hermes_home: Pat
         app._console.print(overview)
     text = cap.get()
 
-    assert "Gateway & Platforms" in text
-    assert "Profiles" in text
-    assert "Memory" in text
+    for panel_name in PANEL_NAMES.values():
+        assert panel_name in text
     app.close()
 
 
@@ -1476,4 +1526,24 @@ def test_copy_current_view_preserves_detail_filter_and_sort(populated_hermes_hom
 
     assert "Filter: source:telegram" in copied
     assert "Sort: cost" in copied
+    app.close()
+
+
+def test_sessions_filter_and_sort_render_after_keypress_workflow(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    app._console = Console(width=140, height=40, force_terminal=True, no_color=True)
+    app._set_state(app._collector.collect())
+
+    app.handle_key("2")
+    app.handle_key("/")
+    for char in "source:telegram":
+        app.handle_key(char)
+    app.handle_key("\r")
+    app.handle_key("s")
+    copied = app.copy_current_view()
+
+    assert "Filter: source:telegram" in copied
+    assert "Sort: cost" in copied
+    assert "telegram" in copied
+    assert "cli" not in copied
     app.close()

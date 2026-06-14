@@ -52,13 +52,13 @@ _WIDE_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
 )
 _COMPACT_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
     ("row1", 3, (1,)),
-    ("row2", 4, (2,)),
-    ("row3", 4, (3,)),
-    ("row4", 4, (4, 5)),
-    ("row5", 4, (6, 7)),
-    ("row6", 4, (8, 9)),
-    ("row7", 4, (10, 11)),
-    ("row8", None, (12, 13)),
+    ("row2", 3, (2,)),
+    ("row3", 3, (3,)),
+    ("row4", 3, (4, 5)),
+    ("row5", 3, (6, 7)),
+    ("row6", 3, (8, 9)),
+    ("row7", 3, (10, 11)),
+    ("row8", 3, (12, 13)),
 )
 _TALL_NARROW_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = tuple(
     (f"row{panel_num}", None, (panel_num,)) for panel_num in _PANEL_NUMBERS
@@ -484,10 +484,12 @@ class DashboardApp:
             self._view.cycle_profile_view()
             return None
         if key == "g":
-            self._view.jump_top()
+            if self._current_detail_is_scrollable():
+                self._view.jump_top()
             return None
         if key == "G":
-            self._view.jump_bottom()
+            if self._current_detail_is_scrollable():
+                self._view.jump_bottom()
             return None
         if key == "j":
             self._view.scroll_down()
@@ -510,6 +512,22 @@ class DashboardApp:
         if streams:
             return tuple(stream.name for stream in streams)
         return _LOG_VIEWS
+
+    def _current_detail_is_scrollable(self) -> bool:
+        detail_panel = self._view.detail_panel
+        if detail_panel is None:
+            return False
+        with self._lock:
+            state = self._state
+        return (
+            _detail_max_scroll_offset(
+                detail_panel,
+                state,
+                self._view.log_sub_view,
+                self._view.filter_query,
+            )
+            is not None
+        )
 
     def _build_layout(self, console: Console | None = None) -> Layout:
         render_console = console or self._console

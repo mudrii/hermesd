@@ -55,7 +55,7 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 - **Clipboard export** — press `c` to copy the current rendered view as plain text via OSC 52 in compatible terminals
 - **Inline detail filters** — press `/` in Sessions or Logs detail view to live-filter the current table/log stream with field-aware queries, including message-content and severity-threshold filters
 - **Session sorting** — press `s` in Sessions detail to cycle recent/cost/token ordering
-- **Jump navigation** — press `g` / `G` in any detail view to jump to the top or bottom
+- **Jump navigation** — press `g` / `G` in scrollable detail views to jump to the top or bottom
 - **Footer health indicator** — a green/yellow/red dot shows how many collector sources succeeded on the last refresh, with failed source names surfaced inline when degraded
 - **Header status** — the top-left header shows the installed `hermesd` version, while the header/footer surface an `AGENT OFFLINE` warning when Hermes Agent appears inactive
 - **Scrollable lists** — `j`/`k` scroll both skills and log detail views
@@ -252,7 +252,7 @@ hermesd --log-tail-bytes 8192
 | `Tab` | Cycle log sub-view for the discovered log streams (panel 8) |
 | `/` | Edit the inline filter for Sessions or Logs detail |
 | `s` | Cycle session sort in Sessions detail |
-| `g` / `G` | Jump to top/bottom in detail views |
+| `g` / `G` | Jump to top/bottom in scrollable detail views |
 | `p` | Cycle the viewed profile in Profiles detail |
 | `r` | Force immediate refresh |
 | `q` | Quit |
