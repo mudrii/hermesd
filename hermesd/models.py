@@ -404,6 +404,25 @@ class OperationsState(BaseModel):
     pr_monitors: list[PRMonitorSummary] = Field(default_factory=list)
 
 
+class CuratorRun(BaseModel):
+    run_present: bool = False
+    stamp: str = ""
+    started_at: str = ""
+    duration_seconds: float = 0.0
+    model: str = ""
+    provider: str = ""
+    count_before: int = 0
+    count_after: int = 0
+    count_delta: int = 0
+    archived_count: int = 0
+    added_count: int = 0
+    pruned_count: int = 0
+    consolidated_count: int = 0
+    tool_calls_total: int = 0
+    llm_summary: str = ""
+    llm_error: str = ""
+
+
 class HealthSummary(BaseModel):
     total_sources: int = 0
     ok_sources: int = 0
@@ -449,3 +468,4 @@ class DashboardState(BaseModel):
     logs: LogState = Field(default_factory=LogState)
     version_behind: int = 0
     active_skin: str = "default"
+    curator: CuratorRun = Field(default_factory=CuratorRun)

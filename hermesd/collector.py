@@ -33,6 +33,7 @@ from hermesd.models import (
     CredentialPoolEntry,
     CronJob,
     CronState,
+    CuratorRun,
     DashboardState,
     GatewayState,
     HealthSummary,
@@ -343,6 +344,12 @@ class Collector:
             self._collect_skin,
             str,
         )
+        curator = safe_collect(
+            lambda: self._last_state.curator if self._last_state is not None else CuratorRun(),
+            "curator",
+            self._collect_curator,
+            CuratorRun,
+        )
         runtime = safe_collect(
             lambda: self._last_state.runtime if self._last_state is not None else RuntimeStatus(),
             "runtime",
@@ -384,6 +391,7 @@ class Collector:
             logs=logs,
             version_behind=version_behind,
             active_skin=active_skin,
+            curator=curator,
         )
 
     def _fresh_session_rows(
@@ -914,6 +922,41 @@ class Collector:
             desktop_build_stamp=stamp_label,
             model_caches=self._collect_model_caches(),
             pr_monitors=self._collect_pr_monitors(),
+        )
+
+    def _collect_curator(self) -> CuratorRun:
+        curator_dir = self._paths.shared_path("logs", "curator")
+        if not curator_dir.is_dir():
+            return CuratorRun()
+        run_dirs = sorted(p for p in curator_dir.iterdir() if p.is_dir())
+        if not run_dirs:
+            return CuratorRun()
+        newest = run_dirs[-1]
+        data = self._read_json_cached(newest / "run.json")
+        if not data:
+            return CuratorRun()
+        counts = _as_dict(data.get("counts"))
+        return CuratorRun(
+            run_present=True,
+            stamp=newest.name,
+            started_at=str(data.get("started_at") or ""),
+            duration_seconds=_coerce_float(data.get("duration_seconds")),
+            model=str(data.get("model") or ""),
+            provider=str(data.get("provider") or ""),
+            count_before=_coerce_int(counts.get("before")),
+            count_after=_coerce_int(counts.get("after")),
+            count_delta=_coerce_int(counts.get("delta")),
+            archived_count=_coerce_int(counts.get("archived_this_run"))
+            or _len_if_sized(data.get("archived")),
+            added_count=_coerce_int(counts.get("added_this_run"))
+            or _len_if_sized(data.get("added")),
+            pruned_count=_coerce_int(counts.get("pruned_this_run"))
+            or _len_if_sized(data.get("pruned")),
+            consolidated_count=_coerce_int(counts.get("consolidated_this_run"))
+            or _len_if_sized(data.get("consolidated")),
+            tool_calls_total=_coerce_int(counts.get("tool_calls_total")),
+            llm_summary=str(data.get("llm_summary") or ""),
+            llm_error=str(data.get("llm_error") or ""),
         )
 
     def _collect_model_caches(self) -> list[ModelCacheSummary]:
