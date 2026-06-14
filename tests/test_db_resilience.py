@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from pathlib import Path
 
-from hermesd.db import HermesDB
+import pytest
+
+from hermesd.db import _RECONNECT_ERROR_THRESHOLD, HermesDB
 from tests.conftest import create_state_db_tables
+
+_RUNNING_AS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+_skip_if_root = pytest.mark.skipif(
+    _RUNNING_AS_ROOT, reason="chmod 000 does not block reads when running as root"
+)
 
 
 def _create_db(path: Path) -> None:
@@ -60,6 +68,7 @@ def test_unopenable_db_backs_off_two_reads_before_reconnect(tmp_path, monkeypatc
     db.close()
 
 
+@_skip_if_root
 def test_wal_snapshot_copy_failure_then_recovery(tmp_path):
     """If snapshotting a WAL db fails, reads stay safe and recover once readable again."""
     db_path = tmp_path / "state.db"
@@ -135,8 +144,9 @@ def test_externally_closed_connection_recovers(tmp_path):
 
     db._conn.close()  # simulate the handle dying without our knowledge
 
-    # Errors on the dead handle serve cached data; the third triggers reconnect.
-    for _ in range(3):
+    # Errors on the dead handle serve cached data; reaching the threshold
+    # triggers a reconnect on the next read.
+    for _ in range(_RECONNECT_ERROR_THRESHOLD):
         assert db.read_sessions() == sessions
     assert db.read_sessions() == sessions
     assert db.last_read_sessions_stale is False
