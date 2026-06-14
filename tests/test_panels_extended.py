@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from hermesd.models import (
@@ -851,12 +853,10 @@ def test_config_panel_detail_shows_dashboard_toolsets_and_auxiliary_slots():
     panel = render_panel(5, state, Theme(), detail=True)
     text = render_to_str(panel)
 
-    assert "Dashboard URL" in text
-    assert "https://dashboard.example.com" in text
+    assert re.search(r"Dashboard URL\s+https://dashboard[.]example[.]com", text)
     assert "Toolsets" in text
     assert "coding, research" in text
-    assert "Auxiliary Slots" in text
-    assert "2" in text
+    assert re.search(r"Auxiliary Slots\s+2", text)
 
 
 def test_overview_panel_detail():

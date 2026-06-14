@@ -380,8 +380,7 @@ def test_main_snapshot_panel_5_surfaces_config_detail_from_yaml(
         ]
     )
     out = capsys.readouterr().out
-    assert "Dashboard URL" in out
-    assert "https://dashboard.example.com" in out
+    assert re.search(r"Dashboard URL\s+https://dashboard[.]example[.]com", out)
     assert "Toolsets" in out
     assert "coding, research" in out
     assert re.search(r"Auxiliary Slots\s+3", out)
