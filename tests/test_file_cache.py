@@ -10,24 +10,37 @@ import yaml
 from hermesd.file_cache import LastGoodFileCache
 
 
-def test_cache_hit_skips_reload_and_invalidates_on_mtime_change(tmp_path):
-    """An unchanged mtime returns the cached value; a new mtime reloads it."""
+def test_cache_hit_skips_reload_and_invalidates_on_mtime_change(tmp_path, monkeypatch):
+    """An unchanged mtime returns the cached value without re-reading the file;
+    a newer mtime reloads it."""
     cache = LastGoodFileCache()
     path = tmp_path / "data.json"
     path.write_text(json.dumps({"v": 1}))
     assert cache.read_json_mapping(path) == {"v": 1}
+    original = path.stat()
 
-    # Cache hit: restore the original mtime after corrupting the file. A hit
-    # must return the cached good value without re-reading the corrupt bytes.
-    stat = path.stat()
-    path.write_text("{ not valid json")
-    os.utime(path, (stat.st_atime, stat.st_mtime))
+    open_calls = 0
+    real_open = Path.open
+
+    def counting_open(self: Path, *args, **kwargs):
+        nonlocal open_calls
+        if self == path:
+            open_calls += 1
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+
+    # Cache hit: unchanged mtime returns the cached value and skips the reload
+    # entirely (the file is never reopened).
     assert cache.read_json_mapping(path) == {"v": 1}
+    assert open_calls == 0
 
-    # Invalidation: a newer mtime with valid new content yields the new value.
+    # Invalidation: a newer mtime with valid new content reloads the file once.
     path.write_text(json.dumps({"v": 2}))
-    os.utime(path, (stat.st_atime, stat.st_mtime + 10))
+    os.utime(path, (original.st_atime, original.st_mtime + 10))
+    open_calls = 0  # ignore write_text's own open; count only the reload
     assert cache.read_json_mapping(path) == {"v": 2}
+    assert open_calls == 1
 
 
 def test_json_mapping_invalid_shape_reuses_bad_mtime(tmp_path, monkeypatch):
