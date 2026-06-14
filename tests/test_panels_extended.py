@@ -777,9 +777,7 @@ def test_logs_panel_detail_component_and_session_filters_exclude_mismatches():
             ]
         ),
     )
-    component_panel = render_panel(
-        8, state, Theme(), detail=True, filter_query="component:gateway"
-    )
+    component_panel = render_panel(8, state, Theme(), detail=True, filter_query="component:gateway")
     component_text = render_to_str(component_panel)
     assert "provider timeout" in component_text
     assert "session saved" not in component_text

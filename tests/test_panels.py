@@ -180,12 +180,8 @@ def test_tokens_panel_compact():
 
 def test_tokens_panel_compact_reported_cost_uses_plain_prefix():
     state = DashboardState(
-        tokens_today=TokenSummary(
-            input_tokens=12400, total_cost_usd=0.42, cost_is_estimated=False
-        ),
-        tokens_total=TokenSummary(
-            input_tokens=45100, total_cost_usd=2.18, cost_is_estimated=False
-        ),
+        tokens_today=TokenSummary(input_tokens=12400, total_cost_usd=0.42, cost_is_estimated=False),
+        tokens_total=TokenSummary(input_tokens=45100, total_cost_usd=2.18, cost_is_estimated=False),
     )
     panel = render_panel(3, state, Theme(), detail=False)
     text = render_to_str(panel, width=80)

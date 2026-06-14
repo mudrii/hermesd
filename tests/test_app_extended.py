@@ -1017,9 +1017,7 @@ def test_set_state_loads_theme_without_holding_state_lock(
 )
 def test_health_style_boundaries(ok_sources: int, total_sources: int, style_attr: str):
     theme = Theme()
-    state = DashboardState(
-        health=HealthSummary(total_sources=total_sources, ok_sources=ok_sources)
-    )
+    state = DashboardState(health=HealthSummary(total_sources=total_sources, ok_sources=ok_sources))
     assert _health_style(state, theme) == getattr(theme, style_attr)
 
 
@@ -1198,9 +1196,7 @@ def test_set_state_preserves_message_search_results_across_refresh(
     app._set_state(app._collector.collect())
     app._view.enter_detail(2)
     app._view.filter_query = "message:response"
-    monkeypatch.setattr(
-        app._collector, "search_session_ids_by_message", lambda query: {"sess_001"}
-    )
+    monkeypatch.setattr(app._collector, "search_session_ids_by_message", lambda query: {"sess_001"})
     app._build_layout()
     app._message_search_thread.join(timeout=1)
     assert app._state.session_message_match_query == "response"
