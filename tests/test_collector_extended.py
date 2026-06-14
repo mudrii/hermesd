@@ -25,7 +25,9 @@ from hermesd.collector import (
     _today_epoch,
 )
 from hermesd.models import KanbanState
-from tests.conftest import create_kanban_db_tables, create_state_db_tables
+from hermesd.panels import render_panel
+from hermesd.theme import Theme
+from tests.conftest import create_kanban_db_tables, create_state_db_tables, render_to_str
 
 
 @pytest.mark.parametrize(
@@ -648,6 +650,21 @@ def test_collect_session_context_limit_normalizes_trailing_slash(hermes_home: Pa
     c.close()
 
 
+def test_collect_session_context_limit_falls_back_to_same_origin_endpoint_variant(
+    hermes_home: Path,
+):
+    _insert_session_with_endpoint(
+        hermes_home / "state.db", "MiniMax-M3", "https://api.minimax.io/anthropic"
+    )
+    (hermes_home / "context_length_cache.yaml").write_text(
+        "context_lengths:\n  MiniMax-M3@https://api.minimax.io/v1: 1048576\n"
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.sessions[0].context_limit == 1048576
+    c.close()
+
+
 def test_collect_session_context_limit_missing_cache_is_zero(hermes_home: Path):
     _insert_session_with_endpoint(
         hermes_home / "state.db", "MiniMax-M3", "https://api.minimax.io/v1"
@@ -691,6 +708,132 @@ def test_collect_response_store_absent_is_zero(hermes_home: Path):
     c.close()
 
 
+def test_collect_response_store_preserves_last_good_on_corrupt_db(hermes_home: Path):
+    db_path = hermes_home / "response_store.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        "CREATE TABLE conversations (id TEXT PRIMARY KEY);"
+        "CREATE TABLE responses (id TEXT PRIMARY KEY);"
+        "INSERT INTO conversations VALUES ('c1'), ('c2');"
+        "INSERT INTO responses VALUES ('r1'), ('r2'), ('r3');"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    first = c.collect()
+    db_path.write_bytes(b"not a sqlite database")
+    second = c.collect()
+
+    assert second.operations.response_store_present is True
+    assert second.operations.conversation_count == first.operations.conversation_count
+    assert second.operations.response_count == first.operations.response_count
+    assert "operations" in second.health.failed_sources
+    c.close()
+
+
+def test_collect_response_store_preserves_last_good_when_db_disappears(hermes_home: Path):
+    db_path = hermes_home / "response_store.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        "CREATE TABLE conversations (id TEXT PRIMARY KEY);"
+        "CREATE TABLE responses (id TEXT PRIMARY KEY);"
+        "INSERT INTO conversations VALUES ('c1'), ('c2');"
+        "INSERT INTO responses VALUES ('r1'), ('r2'), ('r3');"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    first = c.collect()
+    db_path.unlink()
+    second = c.collect()
+
+    assert second.operations.response_store_present is True
+    assert second.operations.conversation_count == first.operations.conversation_count
+    assert second.operations.response_count == first.operations.response_count
+    assert "operations" in second.health.failed_sources
+    c.close()
+
+
+def test_collect_response_store_preserves_last_good_when_db_becomes_unsafe_symlink(
+    hermes_home: Path, tmp_path: Path
+):
+    db_path = hermes_home / "response_store.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        "CREATE TABLE conversations (id TEXT PRIMARY KEY);"
+        "CREATE TABLE responses (id TEXT PRIMARY KEY);"
+        "INSERT INTO conversations VALUES ('c1'), ('c2');"
+        "INSERT INTO responses VALUES ('r1'), ('r2'), ('r3');"
+    )
+    conn.commit()
+    conn.close()
+    outside_db = tmp_path / "response_store.db"
+    sqlite3.connect(str(outside_db)).close()
+
+    c = Collector(hermes_home)
+    first = c.collect()
+    db_path.unlink()
+    db_path.symlink_to(outside_db)
+    second = c.collect()
+
+    assert second.operations.response_store_present is True
+    assert second.operations.conversation_count == first.operations.conversation_count
+    assert second.operations.response_count == first.operations.response_count
+    assert "operations" in second.health.failed_sources
+    c.close()
+
+
+def test_collect_response_store_ignores_symlinked_db_outside_home(
+    hermes_home: Path, tmp_path: Path
+):
+    outside_db = tmp_path / "response_store.db"
+    conn = sqlite3.connect(str(outside_db))
+    conn.executescript(
+        "CREATE TABLE conversations (id TEXT PRIMARY KEY);"
+        "CREATE TABLE responses (id TEXT PRIMARY KEY);"
+        "INSERT INTO conversations VALUES ('outside');"
+        "INSERT INTO responses VALUES ('outside-response');"
+    )
+    conn.commit()
+    conn.close()
+    (hermes_home / "response_store.db").symlink_to(outside_db)
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.operations.response_store_present is False
+    assert state.operations.conversation_count == 0
+    assert "operations" not in state.health.failed_sources
+    c.close()
+
+
+def test_collect_response_store_ignores_symlinked_wal_sidecar(hermes_home: Path, tmp_path: Path):
+    db_path = hermes_home / "response_store.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        "CREATE TABLE conversations (id TEXT PRIMARY KEY);"
+        "CREATE TABLE responses (id TEXT PRIMARY KEY);"
+        "INSERT INTO conversations VALUES ('c1');"
+        "INSERT INTO responses VALUES ('r1');"
+    )
+    conn.commit()
+    conn.close()
+    outside_wal = tmp_path / "outside-response-store-wal"
+    outside_wal.write_bytes(b"not a sqlite wal")
+    (hermes_home / "response_store.db-wal").symlink_to(outside_wal)
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.operations.response_store_present is True
+    assert state.operations.conversation_count == 1
+    assert state.operations.response_count == 1
+    assert "operations" not in state.health.failed_sources
+    c.close()
+
+
 def test_collect_pr_monitor_reads_underscore_and_subdir_families(hermes_home: Path):
     """pr_monitor_*.json (underscore) and pr_monitor/*.json (subdir) are also read."""
     (hermes_home / "pr_monitor_state.json").write_text(
@@ -719,6 +862,26 @@ def test_collect_pr_monitor_reads_underscore_and_subdir_families(hermes_home: Pa
     state = c.collect()
     repos = {m.repo for m in state.operations.pr_monitors}
     assert {"underscore/flat", "subdir/under", "subdir/hyphen"} <= repos
+    c.close()
+
+
+def test_collect_pr_monitor_ignores_symlinked_files_outside_home(hermes_home: Path, tmp_path: Path):
+    outside_monitor = tmp_path / "outside-pr.json"
+    outside_monitor.write_text(
+        json.dumps(
+            {
+                "repo": "outside/repo",
+                "checked_at": "2026-06-14T01:00:00Z",
+                "prs": {"1": {}},
+            }
+        )
+    )
+    (hermes_home / "pr-monitor-outside.json").symlink_to(outside_monitor)
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert [monitor.repo for monitor in state.operations.pr_monitors] == []
     c.close()
 
 
@@ -1440,6 +1603,25 @@ def test_gateway_ignores_non_mapping_platform_entries(hermes_home: Path):
     c.close()
 
 
+def test_gateway_null_platform_fields_degrade_to_strings(hermes_home: Path):
+    gw = hermes_home / "gateway_state.json"
+    gw.write_text(
+        json.dumps(
+            {
+                "pid": 0,
+                "gateway_state": "stopped",
+                "platforms": {"telegram": {"state": None, "updated_at": None}},
+            }
+        )
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.gateway.platforms[0].state == "unknown"
+    assert state.gateway.platforms[0].updated_at == ""
+    assert "gateway" not in state.health.failed_sources
+    c.close()
+
+
 def test_gateway_surfaces_platform_errors_and_agent_counts(hermes_home: Path):
     """Live gateway_state.json carries per-platform error_message/error_code and
     top-level active_agents/restart_requested; hermesd surfaces them."""
@@ -1876,12 +2058,90 @@ def test_collect_profiles_preserves_last_good_when_profile_db_read_fails(hermes_
     c.close()
 
 
+def test_summarize_profile_ignores_symlinked_children_outside_profile(
+    hermes_home: Path, tmp_path: Path
+):
+    profile_home = hermes_home / "profiles" / "coding"
+    profile_home.mkdir(parents=True)
+    outside_db = tmp_path / "state.db"
+    outside_db.touch()
+    outside_soul = tmp_path / "SOUL.md"
+    outside_soul.write_text("outside soul\n")
+    (profile_home / "state.db").symlink_to(outside_db)
+    (profile_home / "SOUL.md").symlink_to(outside_soul)
+
+    c = Collector(hermes_home)
+    summary = c._summarize_profile("coding", profile_home)
+
+    assert summary.session_count == 0
+    assert summary.db_size_bytes == 0
+    assert summary.soul_excerpt == ""
+    c.close()
+
+
+def test_collect_profiles_preserves_last_good_when_profile_child_becomes_unsafe_symlink(
+    profiled_hermes_home: Path, tmp_path: Path
+):
+    profile_home = profiled_hermes_home / "profiles" / "coding"
+    outside_soul = tmp_path / "SOUL.md"
+    outside_soul.write_text("outside soul\n")
+
+    c = Collector(profiled_hermes_home)
+    first = c.collect()
+    assert first.profiles.profiles[0].session_count == 1
+
+    soul_path = profile_home / "SOUL.md"
+    soul_path.write_text("safe soul\n")
+    second = c.collect()
+    assert second.profiles.profiles[0].soul_excerpt == "safe soul"
+
+    soul_path.unlink()
+    soul_path.symlink_to(outside_soul)
+    third = c.collect()
+
+    assert third.profiles == second.profiles
+    assert "profiles" in third.health.failed_sources
+    c.close()
+
+
 def test_collect_kanban_corrupt_db_preserves_last_good(populated_hermes_home: Path):
     c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
     state1 = c.collect()
     assert state1.kanban.task_count == 3
 
     (populated_hermes_home / "kanban.db").write_bytes(b"this is not a sqlite database")
+    state2 = c.collect()
+
+    assert state2.kanban == state1.kanban
+    assert "kanban" in state2.health.failed_sources
+    c.close()
+
+
+def test_collect_kanban_disappearing_db_preserves_last_good(populated_hermes_home: Path):
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    state1 = c.collect()
+    assert state1.kanban.task_count == 3
+
+    (populated_hermes_home / "kanban.db").unlink()
+    state2 = c.collect()
+
+    assert state2.kanban == state1.kanban
+    assert "kanban" in state2.health.failed_sources
+    c.close()
+
+
+def test_collect_kanban_unsafe_symlink_replacement_preserves_last_good(
+    populated_hermes_home: Path, tmp_path: Path
+):
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    state1 = c.collect()
+    assert state1.kanban.task_count == 3
+
+    outside_db = tmp_path / "kanban.db"
+    sqlite3.connect(str(outside_db)).close()
+    db_path = populated_hermes_home / "kanban.db"
+    db_path.unlink()
+    db_path.symlink_to(outside_db)
     state2 = c.collect()
 
     assert state2.kanban == state1.kanban
@@ -1996,6 +2256,72 @@ def test_collect_kanban_enrichment_fields_and_link_attachment_counts(hermes_home
     assert task.goal_mode == "autonomous"
     assert task.current_step_key == "step-3"
     assert task.branch_name == "feature/goal"
+    c.close()
+
+
+def test_collect_kanban_ignores_symlinked_db_outside_home(hermes_home: Path, tmp_path: Path):
+    outside_db = tmp_path / "kanban.db"
+    conn = sqlite3.connect(str(outside_db))
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES (?, ?, ?, ?)",
+        ("outside_task", "Outside task", "in_progress", int(time.time())),
+    )
+    conn.commit()
+    conn.close()
+    (hermes_home / "kanban.db").symlink_to(outside_db)
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.kanban.db_present is True
+    assert state.kanban.task_count == 0
+    assert state.kanban.active_tasks == []
+    c.close()
+
+
+def test_collect_kanban_enrichment_renders_from_collected_state(hermes_home: Path):
+    db_path = hermes_home / "kanban.db"
+    conn = sqlite3.connect(str(db_path))
+    create_kanban_db_tables(conn)
+    conn.executescript(
+        "ALTER TABLE tasks ADD COLUMN workspace_path TEXT;"
+        "ALTER TABLE tasks ADD COLUMN goal_mode TEXT;"
+        "ALTER TABLE tasks ADD COLUMN current_step_key TEXT;"
+        "CREATE TABLE task_links (parent_id TEXT, child_id TEXT);"
+        "CREATE TABLE task_attachments (id INTEGER PRIMARY KEY, task_id TEXT);"
+    )
+    now = 1_775_791_440
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, completed_at, "
+        "branch_name, workspace_path, goal_mode, current_step_key) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "t_done",
+            "Completed milestone",
+            "done",
+            now - 100,
+            now,
+            "feature/done",
+            "/work/done",
+            "guided",
+            "final",
+        ),
+    )
+    conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES ('t_done', 't_child')")
+    conn.execute("INSERT INTO task_attachments (task_id) VALUES ('t_done')")
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    text = render_to_str(render_panel(11, state, Theme(), detail=True), width=140)
+
+    assert "t_done" in text
+    assert "/work/done" in text
+    assert "guided" in text
+    assert "final" in text
+    assert "t_child" in text
     c.close()
 
 

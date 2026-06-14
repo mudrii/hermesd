@@ -18,7 +18,11 @@ class HermesPaths:
             return
         if not _is_valid_profile_name(self.profile_name):
             raise ValueError(f"Invalid profile name '{self.profile_name}'")
-        profiles_home = (self.root_home / "profiles").resolve(strict=False)
+        profiles_path = self.root_home / "profiles"
+        profiles_home = profiles_path.resolve(strict=False)
+        root_home = self.root_home.resolve(strict=False)
+        if profiles_path.is_symlink() or not profiles_home.is_relative_to(root_home):
+            raise ValueError("Invalid profiles directory")
         profile_home = (profiles_home / self.profile_name).resolve(strict=False)
         if not profile_home.is_relative_to(profiles_home):
             raise ValueError(f"Invalid profile name '{self.profile_name}'")

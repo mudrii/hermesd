@@ -85,14 +85,43 @@ def test_sessions_panel_detail_shows_context_limit():
                 source="cli",
                 model="MiniMax-M3",
                 billing_base_url="https://api.minimax.io/v1",
+                input_tokens=50_000,
+                output_tokens=4_000,
+                cache_read_tokens=1_000,
+                cache_write_tokens=250,
+                reasoning_tokens=250,
                 context_limit=1048576,
                 is_active=True,
             ),
         ],
     )
     text = render_to_str(render_panel(2, state, Theme(), detail=True), width=160)
-    # Lifetime-tokens-vs-limit framing: the model's context window size is shown.
+    # Lifetime-tokens-vs-limit framing: cumulative session tokens are shown
+    # next to the model context window size, not as live occupancy.
+    assert "Lifetime / Limit" in text
+    assert "55.5K / 1.0M" in text
     assert "1.0M" in text
+
+
+def test_sessions_panel_detail_surfaces_billing_summary_before_long_session_table():
+    sessions = [
+        SessionInfo(
+            session_id=f"sess_{idx:03d}",
+            source="cli",
+            model="MiniMax-M3",
+            billing_base_url="https://api.minimax.io/anthropic",
+            input_tokens=10_000 + idx,
+            context_limit=1048576,
+        )
+        for idx in range(120)
+    ]
+    text = render_to_str(
+        render_panel(2, DashboardState(sessions=sessions), Theme(), detail=True),
+        width=160,
+    )
+    assert "Billing & Context" in text
+    assert "Lifetime / Limit" in text
+    assert text.index("Billing & Context") < text.index("sess_000")
 
 
 def test_sessions_panel_detail_filter_query():
@@ -529,6 +558,7 @@ def test_tokens_panel_detail_negative_cost_uses_minus_sign_prefix():
 
 def test_tokens_panel_detail_shows_by_endpoint_breakdown():
     state = DashboardState(
+        tokens_total=TokenSummary(cost_is_estimated=False),
         token_analytics=TokenAnalytics(
             by_endpoint=[
                 TokenBreakdown(
@@ -546,6 +576,29 @@ def test_tokens_panel_detail_shows_by_endpoint_breakdown():
     # Assert the row's own aggregates render, not just the label that any data echoes.
     assert "150.0K" in text
     assert "$0.50" in text
+    assert "~$0.50" not in text
+
+
+def test_tokens_panel_detail_surfaces_endpoint_summary_before_long_session_table():
+    state = DashboardState(
+        sessions=[
+            SessionInfo(session_id=f"sess_{idx:03d}", cost_status="estimated") for idx in range(120)
+        ],
+        token_analytics=TokenAnalytics(
+            by_endpoint=[
+                TokenBreakdown(
+                    label="https://api.minimax.io/anthropic",
+                    session_count=120,
+                    input_tokens=1_200_000,
+                ),
+            ],
+            cost_status_counts={"estimated": 120},
+        ),
+    )
+    text = render_to_str(render_panel(3, state, Theme(), detail=True), width=160)
+    assert "By Endpoint" in text
+    assert "Cost Status" in text
+    assert text.index("By Endpoint") < text.index("Sessions")
 
 
 def _analytics_state(*, cost_is_estimated: bool) -> DashboardState:

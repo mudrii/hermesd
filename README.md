@@ -47,7 +47,7 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 - **Read-only** — hermesd never writes to `~/.hermes/` or modifies Hermes Agent state
 - **Live-updating** — polls every 5 seconds (configurable with `--refresh-rate`)
 - **Snapshot mode** — `--snapshot` renders one overview frame to stdout and exits; `--snapshot-panel N` selects any registered detail panel for text snapshots and annotates JSON snapshots (`0` aliases panel 10); `--snapshot-file PATH` writes either form to disk; `--snapshot-format json` emits machine-readable full-state snapshots
-- **Bounded log reads** — `--log-tail-bytes` caps how much of each log file is read per refresh
+- **Bounded log reads** — `--log-tail-bytes` caps how much of each log file and cron output excerpt is read per refresh
 - **Opt-in profiles** — root mode stays the default; use `--profile NAME` or `HERMES_PROFILE=NAME` to read profile-scoped runtime data
 - **Adaptive layout** — full 13-panel grid on wide terminals, a tall-narrow single-column overview for vertical tmux splits, and a denser all-panel overview on 80x24
 - **Detail views** — press `1`-`9` or `0` for panel 10 to expand directly, or use `[` / `]` to move through every panel including Kanban, Operations, and Curator
@@ -226,8 +226,9 @@ hermesd --snapshot-panel 8 --snapshot-format json
 # Export new higher-numbered panels
 hermesd --snapshot-panel 11
 hermesd --snapshot-panel 12 --snapshot-format json
+hermesd --snapshot-panel 13
 
-# Reduce log-read overhead for large log files
+# Reduce log-read overhead for large log files and cron output excerpts
 hermesd --log-tail-bytes 8192
 ```
 

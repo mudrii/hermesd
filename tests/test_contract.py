@@ -11,13 +11,18 @@ never couples to a particular machine's data.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 import pytest
 
 from hermesd.collector import Collector
+from hermesd.models import DashboardState
+from hermesd.panels import render_panel
 from hermesd.paths import default_hermes_home
+from hermesd.theme import Theme
+from tests.conftest import render_to_str
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("HERMESD_CONTRACT_TEST") != "1",
@@ -48,9 +53,14 @@ def test_live_hermes_home_has_no_drifted_blank_fields():
     # (label falling back to the provider name) is the drift signature.
     pools = state.skills_memory.credential_pools
     if pools:
-        assert any(p.label and p.label != p.name for p in pools), (
-            "credential pool entries present but all labels blank/echo the name — "
-            "auth.json shape drift (see FIX A1)"
+        assert all(p.label for p in pools), (
+            "credential pool entries present but labels blank (see FIX A1)"
+        )
+    raw_pool_labels = _raw_credential_pool_labels(home / "auth.json")
+    if raw_pool_labels:
+        collected_labels = {p.label for p in pools}
+        assert raw_pool_labels <= collected_labels, (
+            "credential_pool list entry labels are not surfaced (see FIX A1)"
         )
 
     # FIX B — sessions billing/end fields: some session should expose at least
@@ -59,6 +69,22 @@ def test_live_hermes_home_has_no_drifted_blank_fields():
         assert any(s.billing_base_url or s.end_reason or s.billing_mode for s in state.sessions), (
             "no session exposes billing_base_url/end_reason/billing_mode (see FIX B)"
         )
+        authoritative_cost_sessions = [
+            s for s in state.sessions if s.cost_status in {"included", "exact"}
+        ]
+        if authoritative_cost_sessions:
+            text = render_to_str(
+                render_panel(
+                    3,
+                    DashboardState(sessions=authoritative_cost_sessions),
+                    Theme(),
+                    detail=True,
+                ),
+                width=160,
+            )
+            assert "~$" not in text, (
+                "live sessions with included/exact cost_status still render as estimated (see FIX A4)"
+            )
 
     # C1 — gateway platforms populated when gateway_state.json exists.
     if (home / "gateway_state.json").exists():
@@ -84,3 +110,29 @@ def test_live_hermes_home_has_no_drifted_blank_fields():
     curator_dir = home / "logs" / "curator"
     if curator_dir.is_dir() and any(p.is_dir() for p in curator_dir.iterdir()):
         assert state.curator.run_present, "curator run directories exist but none parsed (see C3)"
+
+
+def _raw_credential_pool_labels(path: Path) -> set[str]:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return set()
+    pool = data.get("credential_pool")
+    if not isinstance(pool, dict):
+        return set()
+    labels: set[str] = set()
+    for raw_entry in pool.values():
+        entries = raw_entry if isinstance(raw_entry, list) else [raw_entry]
+        candidates = [entry for entry in entries if isinstance(entry, dict)]
+        if candidates:
+            selected = min(enumerate(candidates), key=lambda pair: (_priority(pair[1]), pair[0]))[1]
+            if selected.get("label"):
+                labels.add(str(selected["label"]))
+    return labels
+
+
+def _priority(entry: dict[str, object]) -> int:
+    try:
+        return int(entry.get("priority") or 0)
+    except (TypeError, ValueError):
+        return 0

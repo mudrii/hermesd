@@ -81,6 +81,22 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
 
     sections: list[RenderableType] = [summary]
 
+    if cur.tool_call_counts:
+        sections.append(Text("\nTool Calls\n", style=f"bold {theme.ui_label}"))
+        tools = Table(box=None, show_header=True, padding=(0, 2))
+        tools.add_column("Tool", style=theme.ui_label)
+        tools.add_column("Calls", justify="right", style=theme.banner_text)
+        for tool, count in sorted(cur.tool_call_counts.items()):
+            tools.add_row(escape(tool), str(count))
+        sections.append(tools)
+
+    if cur.state_transitions:
+        sections.append(Text("\nState Transitions\n", style=f"bold {theme.ui_label}"))
+        transitions = Text()
+        for transition in cur.state_transitions[:10]:
+            transitions.append(f"  {escape(transition)}\n", style=theme.banner_dim)
+        sections.append(transitions)
+
     if cur.llm_error:
         sections.append(Text("\nError\n", style=f"bold {theme.ui_error}"))
         sections.append(Text(f"  {escape(cur.llm_error)}", style=theme.ui_error))

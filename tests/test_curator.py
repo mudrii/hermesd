@@ -30,6 +30,10 @@ _LIVE_SHAPE = {
         "consolidated_this_run": 0,
         "tool_calls_total": 67,
     },
+    "tool_call_counts": {"read_file": 12, "list_dir": 3},
+    "state_transitions": [
+        {"from": "collecting", "to": "summarizing", "at": "2026-06-10T13:40:00+00:00"}
+    ],
     "llm_summary": "## Summary\nprocessed the candidates",
     "llm_error": None,
 }
@@ -54,6 +58,8 @@ def test_collect_curator_reads_newest_run(hermes_home: Path):
     assert cur.pruned_count == 3
     assert cur.consolidated_count == 0
     assert cur.tool_calls_total == 67
+    assert cur.tool_call_counts == {"read_file": 12, "list_dir": 3}
+    assert cur.state_transitions == ["collecting -> summarizing @ 2026-06-10T13:40:00+00:00"]
     assert cur.llm_error == ""
     c.close()
 
@@ -98,6 +104,23 @@ def test_collect_curator_skips_symlinked_run_dir(hermes_home: Path):
         pytest.skip("directory symlinks not supported here")
     c = Collector(hermes_home)
     state = c.collect()
+    assert state.curator.run_present is False
+    assert state.curator.model == ""
+    assert "curator" not in state.health.failed_sources
+    c.close()
+
+
+def test_collect_curator_skips_symlinked_root_dir(hermes_home: Path, tmp_path: Path):
+    outside = tmp_path / "curator"
+    run_dir = outside / "20260610-133539"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({"model": "leaked"}))
+    logs_dir = hermes_home / "logs"
+    (logs_dir / "curator").symlink_to(outside, target_is_directory=True)
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
     assert state.curator.run_present is False
     assert state.curator.model == ""
     assert "curator" not in state.health.failed_sources

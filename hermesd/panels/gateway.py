@@ -42,7 +42,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             dot_color = theme.ui_ok if p.state == "connected" else theme.ui_error
             lines.append(f"{p.name}:", style=theme.ui_label)
             lines.append(" ● ", style=f"bold {dot_color}")
-            if p.error_message:
+            if p.error_message or p.error_code:
                 lines.append("⚠ ", style=theme.ui_warn)
             lines.append(" ")
     if state.channels.platform_count:
@@ -73,7 +73,8 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         status = Text()
         status.append("● ", style=f"bold {dot_color}")
         status.append(p.state)
-        error = escape(p.error_message) if p.error_message else "—"
+        error_parts = [p.error_code, p.error_message]
+        error = " / ".join(escape(part) for part in error_parts if part) or "—"
         table.add_row(escape(p.name), status, fmt_iso_timestamp(p.updated_at), error)
 
     header = Text()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -300,6 +301,59 @@ def test_main_snapshot_panel_file_writes_detail(populated_hermes_home: Path, tmp
     assert "sess_001" in text
 
 
+def test_main_snapshot_panel_2_surfaces_billing_context_summary(
+    populated_hermes_home: Path, capsys
+):
+    conn = sqlite3.connect(str(populated_hermes_home / "state.db"))
+    conn.execute(
+        "UPDATE sessions SET model = ?, billing_base_url = ?, input_tokens = ?, output_tokens = ?",
+        ("MiniMax-M3", "https://api.minimax.io/anthropic", 50_000, 4_000),
+    )
+    conn.commit()
+    conn.close()
+    (populated_hermes_home / "context_length_cache.yaml").write_text(
+        "context_lengths:\n  MiniMax-M3@https://api.minimax.io/v1: 1048576\n"
+    )
+
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-panel",
+            "2",
+            "--no-color",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert "Billing & Context" in out
+    assert "Lifetime / Limit" in out
+
+
+def test_main_snapshot_panel_3_surfaces_endpoint_and_cost_status_summary(
+    populated_hermes_home: Path, capsys
+):
+    conn = sqlite3.connect(str(populated_hermes_home / "state.db"))
+    conn.execute(
+        "UPDATE sessions SET billing_base_url = ?, cost_status = ?",
+        ("https://api.minimax.io/anthropic", "estimated"),
+    )
+    conn.commit()
+    conn.close()
+
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-panel",
+            "3",
+            "--no-color",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert "Cost Status" in out
+    assert "By Endpoint" in out
+
+
 def test_main_snapshot_json_outputs_state(populated_hermes_home: Path, capsys):
     main(
         [
@@ -368,6 +422,34 @@ def test_main_snapshot_panel_12_outputs_operations_detail(populated_hermes_home:
     out = capsys.readouterr().out
     assert "[12] Operations" in out
     assert "Desktop Build" in out
+
+
+def test_main_snapshot_panel_13_outputs_curator_detail(populated_hermes_home: Path, capsys):
+    run_dir = populated_hermes_home / "logs" / "curator" / "20260610-133539"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "started_at": "2026-06-10T13:35:39+00:00",
+                "model": "MiniMax-M3",
+                "provider": "minimax",
+                "counts": {"before": 8, "after": 5, "tool_calls_total": 67},
+            }
+        )
+    )
+
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-panel",
+            "13",
+            "--no-color",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert "[13] Curator" in out
+    assert "MiniMax-M3" in out
 
 
 def test_main_runs_dashboard_when_no_snapshot_flags(populated_hermes_home: Path, monkeypatch):

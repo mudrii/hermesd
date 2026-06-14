@@ -10,6 +10,7 @@ from hermesd.models import (
     GatewayState,
     KanbanRunSummary,
     KanbanState,
+    KanbanTaskLink,
     KanbanTaskSummary,
     LogLine,
     LogState,
@@ -105,6 +106,7 @@ def test_gateway_panel_detail_shows_platform_error():
     panel = render_panel(1, state, Theme(), detail=True)
     text = render_to_str(panel, width=120)
     assert "failed to reconnect" in text
+    assert "reconnect_failed" in text
     assert "restart" in text.lower()
     assert "3" in text
 
@@ -118,7 +120,7 @@ def test_gateway_panel_compact_shows_platform_error_marker():
                 PlatformStatus(
                     name="discord",
                     state="disconnected",
-                    error_message="failed to reconnect",
+                    error_code="reconnect_failed",
                 ),
             ],
         ),
@@ -388,26 +390,62 @@ def test_kanban_panel_detail():
 
 
 def test_kanban_panel_detail_shows_branch_and_guarded_link_attachment_rows():
+    completed_at = 1_775_791_440
     state = DashboardState(
         kanban=KanbanState(
             db_present=True,
             task_count=1,
             link_count=3,
             attachment_count=2,
+            task_links=[KanbanTaskLink(parent_id="t_goal", child_id="t_child")],
             active_tasks=[
                 KanbanTaskSummary(
                     task_id="t_goal",
                     title="Decompose milestone",
                     status="in_progress",
                     branch_name="feature/goal",
+                    completed_at=completed_at,
+                    workspace_path="/work/repo",
+                    goal_mode="autonomous",
+                    current_step_key="step-3",
                 )
             ],
         )
     )
     text = render_to_str(render_panel(11, state, Theme(), detail=True), width=120)
     assert "feature/goal" in text
+    assert "/work/repo" in text
+    assert "autonomous" in text
+    assert "step-3" in text
+    assert str(completed_at) in text
+    assert "Decomposition Tree" in text
+    assert "t_child" in text
     assert "Decomposition Links" in text
     assert "Attachments" in text
+
+
+def test_kanban_panel_detail_shows_completed_task_metadata():
+    state = DashboardState(
+        kanban=KanbanState(
+            db_present=True,
+            recent_tasks=[
+                KanbanTaskSummary(
+                    task_id="t_done",
+                    title="Completed task",
+                    status="done",
+                    completed_at=1_775_791_440,
+                    workspace_path="/work/done",
+                    goal_mode="guided",
+                    current_step_key="final",
+                )
+            ],
+        )
+    )
+    text = render_to_str(render_panel(11, state, Theme(), detail=True), width=120)
+    assert "t_done" in text
+    assert "/work/done" in text
+    assert "guided" in text
+    assert "final" in text
 
 
 def test_kanban_panel_detail_hides_link_attachment_rows_when_zero():

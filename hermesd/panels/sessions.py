@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TypedDict
 
 import rich.box
-from rich.console import Group
+from rich.console import Group, RenderableType
 from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
@@ -132,18 +132,21 @@ def _render_detail(
     if filter_query or session_sort != "recent":
         header.append("\n\n", style=theme.banner_dim)
 
-    sections = [
-        header,
-        table if sessions else Text("  No matching sessions\n", style=theme.banner_dim),
-    ]
+    sections: list[RenderableType] = [header]
     runtime_table = _runtime_table(sessions, theme)
     if runtime_table is not None:
-        sections.append(Text("\nRuntime\n", style=f"bold {theme.ui_label}"))
+        sections.append(Text("Runtime\n", style=f"bold {theme.ui_label}"))
         sections.append(runtime_table)
     billing_table = _billing_table(sessions, theme)
     if billing_table is not None:
         sections.append(Text("\nBilling & Context\n", style=f"bold {theme.ui_label}"))
         sections.append(billing_table)
+    sections.extend(
+        [
+            Text("\nSessions\n", style=f"bold {theme.ui_label}"),
+            table if sessions else Text("  No matching sessions\n", style=theme.banner_dim),
+        ]
+    )
 
     return Panel(
         Group(*sections),
@@ -389,13 +392,26 @@ def _billing_table(sessions: list[SessionInfo], theme: Theme) -> Table | None:
     table.add_column("Endpoint", style=theme.banner_text)
     table.add_column("Mode", style=theme.banner_dim)
     # Lifetime tokens vs the model's context window, not live occupancy.
-    table.add_column("Ctx Limit", justify="right", style=theme.banner_dim)
+    table.add_column("Lifetime / Limit", justify="right", style=theme.banner_dim)
     for session in billing_sessions:
         table.add_row(
             escape(session.session_id[-8:]),
             escape(session.end_reason) if session.end_reason else "—",
             escape(session.billing_base_url) if session.billing_base_url else "—",
             escape(session.billing_mode) if session.billing_mode else "—",
-            fmt_tokens(session.context_limit) if session.context_limit else "—",
+            _lifetime_context_label(session),
         )
     return table
+
+
+def _lifetime_context_label(session: SessionInfo) -> str:
+    if not session.context_limit:
+        return "—"
+    lifetime_tokens = (
+        session.input_tokens
+        + session.output_tokens
+        + session.cache_read_tokens
+        + session.cache_write_tokens
+        + session.reasoning_tokens
+    )
+    return f"{fmt_tokens(lifetime_tokens)} / {fmt_tokens(session.context_limit)}"

@@ -370,6 +370,11 @@ class KanbanRunSummary(BaseModel):
     summary: str = ""
 
 
+class KanbanTaskLink(BaseModel):
+    parent_id: str = ""
+    child_id: str = ""
+
+
 class KanbanState(BaseModel):
     db_present: bool = False
     task_count: int = 0
@@ -386,6 +391,8 @@ class KanbanState(BaseModel):
     assignee_counts: dict[str, int] = Field(default_factory=dict)
     active_tasks: list[KanbanTaskSummary] = Field(default_factory=list)
     problem_tasks: list[KanbanTaskSummary] = Field(default_factory=list)
+    recent_tasks: list[KanbanTaskSummary] = Field(default_factory=list)
+    task_links: list[KanbanTaskLink] = Field(default_factory=list)
     recent_runs: list[KanbanRunSummary] = Field(default_factory=list)
 
 
@@ -432,6 +439,8 @@ class CuratorRun(BaseModel):
     pruned_count: int = 0
     consolidated_count: int = 0
     tool_calls_total: int = 0
+    tool_call_counts: dict[str, int] = Field(default_factory=dict)
+    state_transitions: list[str] = Field(default_factory=list)
     llm_summary: str = ""
     llm_error: str = ""
 

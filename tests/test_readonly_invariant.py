@@ -8,6 +8,7 @@ file added, removed, or modified by a read would fail the read-only invariant.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from hermesd.app import DashboardApp
@@ -45,3 +46,27 @@ def test_snapshot_read_paths_do_not_write_to_hermes_home(populated_hermes_home: 
     app.close()
 
     assert _manifest(populated_hermes_home) == before
+
+
+def test_response_store_read_paths_do_not_write_to_hermes_home(hermes_home: Path):
+    db_path = hermes_home / "response_store.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        "PRAGMA journal_mode=WAL;"
+        "CREATE TABLE conversations (id TEXT PRIMARY KEY);"
+        "CREATE TABLE responses (id TEXT PRIMARY KEY);"
+        "INSERT INTO conversations VALUES ('c1');"
+        "INSERT INTO responses VALUES ('r1');"
+    )
+    conn.commit()
+    conn.close()
+    before = _manifest(hermes_home)
+
+    c = Collector(hermes_home)
+    c.collect()
+    c.close()
+    app = DashboardApp(hermes_home, refresh_rate=5, no_color=True)
+    app.render_snapshot_text(12)
+    app.close()
+
+    assert _manifest(hermes_home) == before

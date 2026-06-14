@@ -81,7 +81,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--log-tail-bytes",
         type=_positive_int,
         default=32768,
-        help="Bytes read from the end of each log file per refresh (default: 32768)",
+        help=(
+            "Bytes read from the end of each log file and cron output excerpt "
+            "per refresh (default: 32768)"
+        ),
     )
     parser.add_argument(
         "--version",

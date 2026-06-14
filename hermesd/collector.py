@@ -40,6 +40,7 @@ from hermesd.models import (
     HookInfo,
     KanbanRunSummary,
     KanbanState,
+    KanbanTaskLink,
     KanbanTaskSummary,
     LogLine,
     LogState,
@@ -474,8 +475,8 @@ class Collector:
             platforms.append(
                 PlatformStatus(
                     name=str(name),
-                    state=info.get("state", "unknown"),
-                    updated_at=info.get("updated_at", ""),
+                    state=str(info.get("state") or "unknown"),
+                    updated_at=str(info.get("updated_at") or ""),
                     error_code=str(info.get("error_code") or ""),
                     error_message=str(info.get("error_message") or ""),
                 )
@@ -579,9 +580,10 @@ class Collector:
                 billing_base_url=r.get("billing_base_url") or "",
                 billing_mode=r.get("billing_mode") or "",
                 end_reason=r.get("end_reason") or "",
-                context_limit=context_lengths.get(
-                    f"{r.get('model') or ''}@{str(r.get('billing_base_url') or '').rstrip('/')}",
-                    0,
+                context_limit=_context_limit_for(
+                    context_lengths,
+                    str(r.get("model") or ""),
+                    str(r.get("billing_base_url") or ""),
                 ),
                 cost_status=r.get("cost_status") or "",
                 pricing_version=r.get("pricing_version") or "",
@@ -921,6 +923,12 @@ class Collector:
         )
         db_path = self._paths.shared_path("kanban.db")
         if not db_path.exists():
+            if self._last_state is not None and self._last_state.kanban.db_present:
+                raise RuntimeError("kanban.db disappeared")
+            return base_state
+        if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
+            if self._last_state is not None and self._last_state.kanban.db_present:
+                raise RuntimeError("kanban.db replaced by unsafe path")
             return base_state
         return _read_kanban_state(db_path, base_state)
 
@@ -952,8 +960,15 @@ class Collector:
     def _with_response_store(self, operations: OperationsState) -> OperationsState:
         db_path = self._paths.shared_path("response_store.db")
         if not db_path.exists():
+            if self._last_state is not None and self._last_state.operations.response_store_present:
+                raise RuntimeError("response_store.db disappeared")
+            return operations
+        if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
+            if self._last_state is not None and self._last_state.operations.response_store_present:
+                raise RuntimeError("response_store.db replaced by unsafe path")
             return operations
         with _connect_readonly_sqlite(db_path) as conn:
+            conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
             return operations.model_copy(
                 update={
                     "response_store_present": True,
@@ -965,7 +980,11 @@ class Collector:
 
     def _collect_curator(self) -> CuratorRun:
         curator_dir = self._paths.shared_path("logs", "curator")
-        if not curator_dir.is_dir():
+        if (
+            curator_dir.is_symlink()
+            or not _path_resolves_under(curator_dir, self._paths.root_home)
+            or not curator_dir.is_dir()
+        ):
             return CuratorRun()
         # Skip symlinked run dirs and any path that escapes the Hermes home,
         # matching the symlink hardening on the cron/checkpoint readers.
@@ -984,6 +1003,12 @@ class Collector:
         if not data:
             return CuratorRun()
         counts = _as_dict(data.get("counts"))
+        tool_call_counts = _int_mapping(data.get("tool_call_counts"))
+        state_transitions = [
+            _state_transition_label(entry)
+            for entry in data.get("state_transitions") or []
+            if isinstance(entry, dict)
+        ]
         return CuratorRun(
             run_present=True,
             stamp=newest.name,
@@ -1003,6 +1028,8 @@ class Collector:
             consolidated_count=_coerce_int(counts.get("consolidated_this_run"))
             or _len_if_sized(data.get("consolidated")),
             tool_calls_total=_coerce_int(counts.get("tool_calls_total")),
+            tool_call_counts=tool_call_counts,
+            state_transitions=state_transitions,
             llm_summary=str(data.get("llm_summary") or ""),
             llm_error=str(data.get("llm_error") or ""),
         )
@@ -1046,7 +1073,7 @@ class Collector:
                     "pr_monitor/*.json",
                 )
                 for path in base.glob(pattern)
-                if path.is_file()
+                if path.is_file() and not path.is_symlink() and _path_resolves_under(path, base)
             }
         )
         # Collapse the same repo (seen across families) to its newest state;
@@ -1358,12 +1385,18 @@ class Collector:
 
     def _collect_profiles(self) -> ProfilesState:
         profiles_dir = self._paths.shared_path("profiles")
-        if not profiles_dir.is_dir():
+        if (
+            profiles_dir.is_symlink()
+            or not _path_resolves_under(profiles_dir, self._paths.root_home)
+            or not profiles_dir.is_dir()
+        ):
             return ProfilesState()
         profiles = [
             self._summarize_profile(profile_dir.name, profile_dir)
             for profile_dir in sorted(profiles_dir.iterdir())
             if profile_dir.is_dir()
+            and not profile_dir.is_symlink()
+            and _path_resolves_under(profile_dir, profiles_dir)
         ]
         return ProfilesState(profile_count=len(profiles), profiles=profiles)
 
@@ -1383,15 +1416,36 @@ class Collector:
 
     def _summarize_profile(self, name: str, profile_home: Path) -> ProfileSummary:
         db_path = profile_home / "state.db"
-        session_count = self._profile_session_count(name, db_path) if db_path.exists() else 0
+        logs_path = profile_home / "logs"
+        skills_path = profile_home / "skills"
+        soul_path = profile_home / "SOUL.md"
+        db_safe = _safe_child_path(db_path, profile_home)
+        logs_safe = _safe_child_path(logs_path, profile_home)
+        skills_safe = _safe_child_path(skills_path, profile_home)
+        soul_safe = _safe_child_path(soul_path, profile_home)
+        if self._last_profile_exists(name) and not all(
+            (
+                _safe_or_absent_child_path(db_path, profile_home),
+                _safe_or_absent_child_path(logs_path, profile_home),
+                _safe_or_absent_child_path(skills_path, profile_home),
+                _safe_or_absent_child_path(soul_path, profile_home),
+            )
+        ):
+            raise RuntimeError(f"profile {name} contains an unsafe replacement path")
+        session_count = self._profile_session_count(name, db_path) if db_safe else 0
         return ProfileSummary(
             name=name,
             session_count=session_count,
-            latest_log_mtime=_latest_log_mtime(profile_home / "logs"),
-            skill_count=_count_skills(profile_home / "skills"),
-            db_size_bytes=_file_size(db_path),
-            soul_excerpt=_read_soul_excerpt(profile_home / "SOUL.md"),
+            latest_log_mtime=_latest_log_mtime(logs_path) if logs_safe else None,
+            skill_count=_count_skills(skills_path) if skills_safe else 0,
+            db_size_bytes=_file_size(db_path) if db_safe else 0,
+            soul_excerpt=_read_soul_excerpt(soul_path) if soul_safe else "",
         )
+
+    def _last_profile_exists(self, name: str) -> bool:
+        if self._last_state is None:
+            return False
+        return any(profile.name == name for profile in self._last_state.profiles.profiles)
 
     def _profile_session_count(self, name: str, db_path: Path) -> int:
         # Opening a profile DB snapshots WAL files to a temp dir, so only
@@ -1911,6 +1965,7 @@ def _read_kanban_state(db_path: Path, base_state: KanbanState) -> KanbanState:
             conn,
             "SELECT * FROM task_runs ORDER BY started_at DESC, id DESC LIMIT 10",
         )
+        recent_task_rows = _read_recent_enriched_tasks(conn)
         return base_state.model_copy(
             update={
                 "db_present": True,
@@ -1924,9 +1979,44 @@ def _read_kanban_state(db_path: Path, base_state: KanbanState) -> KanbanState:
                 "assignee_counts": assignee_counts,
                 "active_tasks": [_kanban_task_from_row(row) for row in active_rows],
                 "problem_tasks": [_kanban_task_from_row(row) for row in problem_rows],
+                "recent_tasks": [_kanban_task_from_row(row) for row in recent_task_rows],
+                "task_links": _read_task_links(conn),
                 "recent_runs": [_kanban_run_from_row(row) for row in run_rows],
             }
         )
+
+
+def _context_limit_for(context_lengths: Mapping[str, int], model: str, base_url: str) -> int:
+    normalized_base = base_url.rstrip("/")
+    exact = context_lengths.get(f"{model}@{normalized_base}")
+    if exact is not None:
+        return exact
+
+    origin = _url_origin(normalized_base)
+    if not origin:
+        return 0
+    for key, value in sorted(context_lengths.items()):
+        cached_model, sep, cached_base = key.partition("@")
+        if sep and cached_model == model and _url_origin(cached_base) == origin:
+            return value
+    return 0
+
+
+def _url_origin(value: str) -> str:
+    parsed = urlsplit(value)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _safe_child_path(path: Path, root: Path) -> bool:
+    return not path.is_symlink() and _path_resolves_under(path, root)
+
+
+def _safe_or_absent_child_path(path: Path, root: Path) -> bool:
+    if path.is_symlink():
+        return False
+    return not path.exists() or _path_resolves_under(path, root)
 
 
 @contextlib.contextmanager
@@ -1941,7 +2031,7 @@ def _connect_readonly_sqlite(db_path: Path) -> Iterator[sqlite3.Connection]:
             shutil.copy2(db_path, snapshot_db)
             for suffix in ("-wal", "-shm"):
                 source = db_path.with_name(f"{db_path.name}{suffix}")
-                if source.exists():
+                if source.exists() and _safe_child_path(source, db_path.parent):
                     shutil.copy2(source, snapshot_root / source.name)
             conn = sqlite3.connect(f"{snapshot_db.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
             yield conn
@@ -1976,6 +2066,37 @@ def _table_count_or_zero(conn: sqlite3.Connection, table_name: str) -> int:
     with contextlib.suppress(sqlite3.Error):
         return _table_count(conn, table_name)
     return 0
+
+
+def _read_task_links(conn: sqlite3.Connection) -> list[KanbanTaskLink]:
+    with contextlib.suppress(sqlite3.Error):
+        rows = _query_rows(
+            conn,
+            "SELECT parent_id, child_id FROM task_links "
+            "ORDER BY COALESCE(parent_id, ''), COALESCE(child_id, '') LIMIT 20",
+        )
+        return [
+            KanbanTaskLink(
+                parent_id=str(row.get("parent_id") or ""),
+                child_id=str(row.get("child_id") or ""),
+            )
+            for row in rows
+        ]
+    return []
+
+
+def _read_recent_enriched_tasks(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    with contextlib.suppress(sqlite3.Error):
+        return _query_rows(
+            conn,
+            "SELECT * FROM tasks "
+            "WHERE completed_at IS NOT NULL OR COALESCE(workspace_path, '') != '' "
+            "OR COALESCE(goal_mode, '') != '' OR COALESCE(current_step_key, '') != '' "
+            "OR COALESCE(branch_name, '') != '' "
+            "ORDER BY COALESCE(completed_at, last_heartbeat_at, started_at, created_at, 0) "
+            "DESC LIMIT 10",
+        )
+    return []
 
 
 def _count_by(conn: sqlite3.Connection, sql: str) -> dict[str, int]:
@@ -2054,6 +2175,22 @@ def _len_if_sized(value: object) -> int:
     if isinstance(value, dict | list | tuple | set):
         return len(value)
     return 0
+
+
+def _int_mapping(value: object) -> dict[str, int]:
+    raw = _as_dict(value)
+    return {str(key): _coerce_int(count) for key, count in raw.items() if str(key)}
+
+
+def _state_transition_label(entry: dict[str, Any]) -> str:
+    from_state = str(entry.get("from") or entry.get("from_state") or "")
+    to_state = str(entry.get("to") or entry.get("to_state") or "")
+    at = str(entry.get("at") or entry.get("timestamp") or entry.get("created_at") or "")
+    if from_state or to_state:
+        label = f"{from_state or 'unknown'} -> {to_state or 'unknown'}"
+    else:
+        label = str(entry.get("state") or "")
+    return f"{label} @ {at}" if at and label else label
 
 
 def _git_checkpoint_summary(repo_dir: Path) -> tuple[int, float | None, str]:

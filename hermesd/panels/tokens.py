@@ -81,11 +81,30 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
             fmt_tokens(s.reasoning_tokens),
             _fmt_cost(s.estimated_cost_usd, estimated=estimated),
         )
-    sections.append(table)
 
     # Aggregate tables mix estimated and reported sessions; reuse the
     # summary-level flag the compact view uses.
     aggregate_estimated = state.tokens_total.cost_is_estimated
+
+    if state.token_analytics.cost_status_counts:
+        sections.append(Text("Cost Status\n", style=f"bold {theme.ui_label}"))
+        ordered = sorted(
+            state.token_analytics.cost_status_counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+        line = Text("  ")
+        for index, (status, count) in enumerate(ordered):
+            if index:
+                line.append("  ·  ", style=theme.banner_dim)
+            line.append(escape(status), style=theme.ui_label)
+            line.append(f" {count}", style=theme.banner_text)
+        sections.append(line)
+
+    if state.token_analytics.by_endpoint:
+        sections.append(Text("\nBy Endpoint\n", style=f"bold {theme.ui_label}"))
+        sections.append(
+            _render_breakdown_table(state.token_analytics.by_endpoint, theme, aggregate_estimated)
+        )
 
     if state.token_analytics.windows:
         sections.append(Text("\nRecent Windows\n", style=f"bold {theme.ui_label}"))
@@ -119,25 +138,8 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
             _render_breakdown_table(state.token_analytics.by_provider, theme, aggregate_estimated)
         )
 
-    if state.token_analytics.by_endpoint:
-        sections.append(Text("\nBy Endpoint\n", style=f"bold {theme.ui_label}"))
-        sections.append(
-            _render_breakdown_table(state.token_analytics.by_endpoint, theme, aggregate_estimated)
-        )
-
-    if state.token_analytics.cost_status_counts:
-        sections.append(Text("\nCost Status\n", style=f"bold {theme.ui_label}"))
-        ordered = sorted(
-            state.token_analytics.cost_status_counts.items(),
-            key=lambda item: (-item[1], item[0]),
-        )
-        line = Text("  ")
-        for index, (status, count) in enumerate(ordered):
-            if index:
-                line.append("  ·  ", style=theme.banner_dim)
-            line.append(escape(status), style=theme.ui_label)
-            line.append(f" {count}", style=theme.banner_text)
-        sections.append(line)
+    sections.append(Text("\nSessions\n", style=f"bold {theme.ui_label}"))
+    sections.append(table)
 
     return Panel(
         Group(*sections),

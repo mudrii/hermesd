@@ -70,6 +70,15 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         summary.add_row("Attachments", str(kanban.attachment_count))
     sections.append(summary)
 
+    if kanban.task_links:
+        sections.append(Text("\nDecomposition Tree\n", style=f"bold {theme.ui_label}"))
+        links = Table(box=None, show_header=True, padding=(0, 2))
+        links.add_column("Parent", style=theme.ui_accent)
+        links.add_column("Child", style=theme.banner_text)
+        for link in kanban.task_links:
+            links.add_row(escape(link.parent_id), escape(link.child_id))
+        sections.append(links)
+
     if kanban.status_counts:
         sections.append(Text("\nStatus Counts\n", style=f"bold {theme.ui_label}"))
         status_table = Table(box=None, show_header=True, padding=(0, 2))
@@ -86,6 +95,14 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     if kanban.problem_tasks:
         sections.append(Text("\nBlocked / Failing Tasks\n", style=f"bold {theme.ui_label}"))
         sections.append(_task_table(kanban.problem_tasks, theme))
+
+    task_metadata = _task_metadata_table(
+        [*kanban.active_tasks, *kanban.problem_tasks, *kanban.recent_tasks],
+        theme,
+    )
+    if task_metadata is not None:
+        sections.append(Text("\nTask Metadata\n", style=f"bold {theme.ui_label}"))
+        sections.append(task_metadata)
 
     if kanban.recent_runs:
         sections.append(Text("\nRecent Runs\n", style=f"bold {theme.ui_label}"))
@@ -142,6 +159,37 @@ def _task_table(tasks: list[KanbanTaskSummary], theme: Theme) -> Table:
             str(task.consecutive_failures),
             escape(task.branch_name) if task.branch_name else "—",
             escape(task.title),
+        )
+    return table
+
+
+def _task_metadata_table(tasks: list[KanbanTaskSummary], theme: Theme) -> Table | None:
+    metadata_tasks = [
+        task
+        for task in tasks
+        if task.completed_at
+        or task.workspace_path
+        or task.goal_mode
+        or task.current_step_key
+        or task.branch_name
+    ]
+    if not metadata_tasks:
+        return None
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("Task", style=theme.ui_accent)
+    table.add_column("Branch", style=theme.banner_dim)
+    table.add_column("Completed", justify="right", style=theme.banner_dim)
+    table.add_column("Workspace", style=theme.banner_text)
+    table.add_column("Goal Mode", style=theme.banner_dim)
+    table.add_column("Step", style=theme.banner_dim)
+    for task in metadata_tasks:
+        table.add_row(
+            escape(task.task_id),
+            escape(task.branch_name) if task.branch_name else "—",
+            str(task.completed_at) if task.completed_at else "—",
+            escape(task.workspace_path) if task.workspace_path else "—",
+            escape(task.goal_mode) if task.goal_mode else "—",
+            escape(task.current_step_key) if task.current_step_key else "—",
         )
     return table
 
