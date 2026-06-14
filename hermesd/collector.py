@@ -941,12 +941,27 @@ class Collector:
             or str(desktop_stamp.get("contentHash") or "")[:12]
             or ""
         )
-        return OperationsState(
+        operations = OperationsState(
             dashboard_process_count=dashboard_process_count,
             desktop_build_stamp=stamp_label,
             model_caches=self._collect_model_caches(),
             pr_monitors=self._collect_pr_monitors(),
         )
+        return self._with_response_store(operations)
+
+    def _with_response_store(self, operations: OperationsState) -> OperationsState:
+        db_path = self._paths.shared_path("response_store.db")
+        if not db_path.exists():
+            return operations
+        with _connect_readonly_sqlite(db_path) as conn:
+            return operations.model_copy(
+                update={
+                    "response_store_present": True,
+                    "conversation_count": _table_count_or_zero(conn, "conversations"),
+                    "response_count": _table_count_or_zero(conn, "responses"),
+                    "response_store_size_bytes": _file_size(db_path),
+                }
+            )
 
     def _collect_curator(self) -> CuratorRun:
         curator_dir = self._paths.shared_path("logs", "curator")
@@ -1940,6 +1955,12 @@ def _table_count(conn: sqlite3.Connection, table_name: str) -> int:
     cur = conn.execute(f"SELECT COUNT(*) FROM {table_name}")
     row = cur.fetchone()
     return int(row[0]) if row is not None else 0
+
+
+def _table_count_or_zero(conn: sqlite3.Connection, table_name: str) -> int:
+    with contextlib.suppress(sqlite3.Error):
+        return _table_count(conn, table_name)
+    return 0
 
 
 def _count_by(conn: sqlite3.Connection, sql: str) -> dict[str, int]:

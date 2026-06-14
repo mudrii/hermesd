@@ -405,6 +405,10 @@ class OperationsState(BaseModel):
     desktop_build_stamp: str = ""
     model_caches: list[ModelCacheSummary] = Field(default_factory=list)
     pr_monitors: list[PRMonitorSummary] = Field(default_factory=list)
+    response_store_present: bool = False
+    conversation_count: int = 0
+    response_count: int = 0
+    response_store_size_bytes: int = 0
 
 
 class CuratorRun(BaseModel):

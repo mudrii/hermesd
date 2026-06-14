@@ -50,6 +50,12 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     summary.add_row(
         "Desktop Build", escape(ops.desktop_build_stamp) if ops.desktop_build_stamp else "—"
     )
+    if ops.response_store_present:
+        summary.add_row(
+            "Response Store",
+            f"{ops.conversation_count} conversations  {ops.response_count} responses  "
+            f"{_size_label(ops.response_store_size_bytes)}",
+        )
     sections.append(summary)
 
     if ops.model_caches:
@@ -90,7 +96,12 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
             )
         sections.append(pr_table)
 
-    if not ops.model_caches and not ops.pr_monitors and ops.dashboard_process_count == 0:
+    if (
+        not ops.model_caches
+        and not ops.pr_monitors
+        and ops.dashboard_process_count == 0
+        and not ops.response_store_present
+    ):
         sections.append(Text("\n  No operations artifacts found\n", style=theme.banner_dim))
 
     return Panel(

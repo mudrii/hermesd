@@ -510,6 +510,22 @@ def test_operations_panel_detail():
     assert "PR Monitors" in text
 
 
+def test_operations_panel_detail_shows_response_store():
+    state = DashboardState(
+        operations=OperationsState(
+            response_store_present=True,
+            conversation_count=2,
+            response_count=3,
+            response_store_size_bytes=20480,
+        )
+    )
+    text = render_to_str(render_panel(12, state, Theme(), detail=True), width=100, no_color=True)
+    assert "Response Store" in text
+    assert "2 conversations" in text
+    assert "3 responses" in text
+    assert "No operations artifacts found" not in text
+
+
 def test_operations_panel_detail_size_and_age_labels():
     now = time.time()
     state = DashboardState(

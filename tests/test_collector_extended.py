@@ -659,6 +659,38 @@ def test_collect_session_context_limit_missing_cache_is_zero(hermes_home: Path):
     c.close()
 
 
+def test_collect_response_store_counts(hermes_home: Path):
+    """response_store.db conversation/response counts surface in Operations."""
+    db_path = hermes_home / "response_store.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        "CREATE TABLE conversations (id TEXT PRIMARY KEY);"
+        "CREATE TABLE responses (id TEXT PRIMARY KEY);"
+        "INSERT INTO conversations VALUES ('c1'), ('c2');"
+        "INSERT INTO responses VALUES ('r1'), ('r2'), ('r3');"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    ops = state.operations
+    assert ops.response_store_present is True
+    assert ops.conversation_count == 2
+    assert ops.response_count == 3
+    assert ops.response_store_size_bytes > 0
+    assert "operations" not in state.health.failed_sources
+    c.close()
+
+
+def test_collect_response_store_absent_is_zero(hermes_home: Path):
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.operations.response_store_present is False
+    assert state.operations.conversation_count == 0
+    c.close()
+
+
 def test_collect_pr_monitor_reads_underscore_and_subdir_families(hermes_home: Path):
     """pr_monitor_*.json (underscore) and pr_monitor/*.json (subdir) are also read."""
     (hermes_home / "pr_monitor_state.json").write_text(
