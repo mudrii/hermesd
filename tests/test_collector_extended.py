@@ -1363,6 +1363,57 @@ def test_collect_credential_pool_infers_oauth_auth_type_from_token_fields(hermes
     c.close()
 
 
+def test_collect_credential_pool_accepts_list_shaped_entries(hermes_home: Path):
+    """Live auth.json stores credential_pool as provider -> [entries]; surface the entry fields.
+
+    hermesd used to feed the list to _as_dict (-> {}), blanking every credential
+    field. The lowest-priority entry (next credential to be used) represents the
+    provider.
+    """
+    (hermes_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "active_provider": "openai-codex",
+                "providers": {"openai-codex": {"id_token": "REDACTED"}},
+                "credential_pool": {
+                    "openai-codex": [
+                        {
+                            "label": "Secondary Codex",
+                            "auth_type": "oauth",
+                            "source": "codex",
+                            "last_status": "rate_limited",
+                            "request_count": 42,
+                            "priority": 2,
+                            "id": "cred-b",
+                        },
+                        {
+                            "label": "Primary Codex",
+                            "auth_type": "oauth",
+                            "source": "codex",
+                            "last_status": "ok",
+                            "request_count": 7,
+                            "priority": 1,
+                            "id": "cred-a",
+                        },
+                    ]
+                },
+            }
+        )
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    pools = {pool.name: pool for pool in state.skills_memory.credential_pools}
+    assert "openai-codex" in pools
+    entry = pools["openai-codex"]
+    assert entry.label == "Primary Codex"
+    assert entry.last_status == "ok"
+    assert entry.request_count == 7
+    assert entry.priority == 1
+    assert entry.auth_type == "oauth"
+    assert entry.source == "codex"
+    c.close()
+
+
 def test_collect_providers_ignores_non_mapping_auth_json(hermes_home: Path):
     auth = hermes_home / "auth.json"
     auth.write_text(json.dumps(["not", "a", "mapping"]))

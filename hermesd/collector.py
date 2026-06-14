@@ -1178,7 +1178,7 @@ class Collector:
         providers_section = _as_dict(data.get("providers"))
         entries = []
         for name, raw_entry in sorted(_as_dict(data.get("credential_pool")).items()):
-            entry = _as_dict(raw_entry)
+            entry = _select_pool_entry(raw_entry)
             provider_entry = _as_dict(providers_section.get(name))
             entries.append(
                 CredentialPoolEntry(
@@ -2031,6 +2031,25 @@ def _as_dict(value: object) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def _select_pool_entry(raw_entry: object) -> dict[str, Any]:
+    """Reduce a credential_pool value to one representative entry.
+
+    Live ``auth.json`` stores each provider's credentials as a list of entries;
+    older configs used a single dict. The lowest-priority entry (the next
+    credential to be used) represents the provider; ties keep list order.
+    """
+    if isinstance(raw_entry, list):
+        candidates = [_as_dict(item) for item in raw_entry]
+        candidates = [item for item in candidates if item]
+        if not candidates:
+            return {}
+        return min(
+            enumerate(candidates),
+            key=lambda pair: (_coerce_int(pair[1].get("priority")), pair[0]),
+        )[1]
+    return _as_dict(raw_entry)
 
 
 def _coerce_int(value: object) -> int:
