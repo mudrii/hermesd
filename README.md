@@ -35,7 +35,7 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 | 5 | **Config** | Model, provider, personality, Tool Search, dashboard auth, kanban, code execution, gateway, routing and memory/session settings |
 | 6 | **Cron** | Scheduler tick, cron config, job table with schedule, delivery target, error count, latest error, and output metadata |
 | 7 | **Skills / Integrations** | Provider auth status, credential pools, hooks/plugins/MCP inventory, BOOT.md presence, skills with descriptions |
-| 8 | **Logs** | Tailed agent, gateway, errors, cron, desktop, dashboard, GUI, update, gateway-error, and crash logs with Tab switching and inline filtering |
+| 8 | **Logs** | Tailed agent, gateway, errors, cron, desktop, dashboard, GUI, update, gateway-error, crash, audit, MCP-stderr, and workspace logs with Tab switching and inline filtering |
 | 9 | **Profiles** | Read-only profile discovery with session counts, log freshness, skill counts, DB size, and SOUL excerpts |
 | 10 | **Memory** | Memory provider, MEMORY.md/USER.md word counts, SOUL.md size/excerpt, and memory file inventory |
 | 11 | **Kanban** | Read-only kanban task/run/event/comment counts, dispatch config, active workers, blocked/failing tasks, and recent runs |

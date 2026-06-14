@@ -901,6 +901,28 @@ def test_collect_logs_discovers_shared_named_streams(hermes_home: Path):
     c.close()
 
 
+def test_collect_logs_discovers_audit_mcp_and_workspace_streams(hermes_home: Path):
+    extra_logs = {
+        "audit.log": ("audit", "audit entry"),
+        "mcp-stderr.log": ("mcp.stderr", "mcp stderr entry"),
+        "workspace.log": ("workspace", "workspace entry"),
+        "workspace.error.log": ("workspace.error", "workspace error entry"),
+    }
+    for filename, (_, message) in extra_logs.items():
+        (hermes_home / "logs" / filename).write_text(
+            f"2026-04-09 15:41:58,123 - hermes - INFO - {message}\n"
+        )
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    streams = {stream.name: stream for stream in state.logs.streams}
+    for _, (stream_name, message) in extra_logs.items():
+        assert stream_name in streams
+        assert streams[stream_name].lines[0].message == message
+    c.close()
+
+
 def test_profiled_collector_uses_shared_aux_log_streams(profiled_hermes_home: Path):
     (profiled_hermes_home / "logs" / "desktop.log").write_text(
         "2026-04-09 15:41:58,123 - hermes - INFO - shared desktop log\n"

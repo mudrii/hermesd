@@ -1319,6 +1319,10 @@ class Collector:
             ("update", self._paths.shared_path("logs", "update.log"), 20),
             ("gateway.error", self._paths.shared_path("logs", "gateway.error.log"), 20),
             ("tui crash", self._paths.shared_path("logs", "tui_gateway_crash.log"), 20),
+            ("audit", self._paths.shared_path("logs", "audit.log"), 20),
+            ("mcp.stderr", self._paths.shared_path("logs", "mcp-stderr.log"), 20),
+            ("workspace", self._paths.shared_path("logs", "workspace.log"), 20),
+            ("workspace.error", self._paths.shared_path("logs", "workspace.error.log"), 20),
         ]
         streams = [
             self._tail_log_stream(name, path, max_lines)

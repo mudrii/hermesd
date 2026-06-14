@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The Logs panel now tails `audit.log`, `mcp-stderr.log`, `workspace.log`, and `workspace.error.log` as additional Tab sub-views (shown only when the files exist).
 - The Operations detail panel now shows **Response Store** stats (conversation and response row counts plus file size) read read-only from `~/.hermes/response_store.db`.
 - The Tokens / Cost detail panel now includes a **By Endpoint** breakdown aggregating spend and tokens per billing endpoint (`billing_base_url`) — finer than the existing per-provider view (same provider, different base URLs).
 - The Tokens / Cost detail panel now shows a **Cost Status** reconciliation line counting sessions by `cost_status` (e.g. unknown vs subscription-included vs estimated), so it's clear how much spend is authoritative versus unknown.
