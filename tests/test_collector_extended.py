@@ -230,6 +230,25 @@ def test_collect_cron_logs_respect_log_tail_bytes(hermes_home: Path):
     c.close()
 
 
+def test_collect_cron_logs_skip_non_dir_and_non_file_entries(hermes_home: Path):
+    output_root = hermes_home / "cron" / "output"
+    # A stray file sitting directly in the output root (not a job directory).
+    (output_root / "stray.txt").write_text("not a job dir")
+    job_dir = output_root / "job-1"
+    job_dir.mkdir()
+    # A nested directory inside a job dir (not an output file).
+    (job_dir / "nested").mkdir()
+    output_file = job_dir / "latest.md"
+    output_file.write_text("real cron output line\n")
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    messages = [line.message for line in state.logs.cron_lines]
+    assert any("real cron output line" in message for message in messages)
+    c.close()
+
+
 def test_collect_total_tool_calls(hermes_home: Path, sample_db: Path):
     c = Collector(hermes_home)
     state = c.collect()

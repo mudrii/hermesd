@@ -176,3 +176,40 @@ def test_gateway_version_up_to_date(hermes_home: Path):
     assert state.gateway.hermes_version == "0.8.0"
     assert state.gateway.updates_behind == 0
     c.close()
+
+
+def test_gateway_cache_preserved_on_collection_error(hermes_home: Path, monkeypatch):
+    """On a gateway collection error, the next refresh keeps the last-good gateway."""
+    my_pid = os.getpid()
+    gw = hermes_home / "gateway_state.json"
+    gw.write_text(
+        json.dumps(
+            {
+                "pid": my_pid,
+                "gateway_state": "running",
+                "platforms": {"telegram": {"state": "connected", "updated_at": ""}},
+            }
+        )
+    )
+    agent_dir = hermes_home / "hermes-agent"
+    agent_dir.mkdir()
+    (agent_dir / "pyproject.toml").write_text('[project]\nversion = "0.8.0"\n')
+
+    c = Collector(hermes_home)
+    good = c.collect().gateway
+    assert good.running is True
+    assert good.pid == my_pid
+    assert good.hermes_version == "0.8.0"
+
+    def boom() -> object:
+        raise OSError("gateway source unavailable")
+
+    monkeypatch.setattr(c, "_collect_gateway", boom)
+
+    after_error = c.collect().gateway
+    # Cache-preservation invariant: last-good data survives, never blanked.
+    assert after_error.running is True
+    assert after_error.pid == my_pid
+    assert after_error.hermes_version == "0.8.0"
+    assert after_error == good
+    c.close()
