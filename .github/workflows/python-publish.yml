@@ -15,6 +15,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.11"
+          enable-cache: true
       - name: Install
         run: uv pip install -e ".[dev]"
       - name: Lint (ruff)
@@ -24,7 +25,7 @@ jobs:
       - name: Type check (mypy)
         run: uv run mypy hermesd
       - name: Test
-        run: uv run pytest tests/ -v
+        run: uv run pytest tests/ -v -W error::ResourceWarning
       - name: Audit dependencies (pip-audit)
         run: uv run pip-audit
 

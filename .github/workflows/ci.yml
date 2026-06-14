@@ -4,15 +4,19 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
@@ -20,6 +24,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
+          enable-cache: true
       - name: Install
         run: uv pip install -e ".[dev]"
       - name: Lint (ruff)
@@ -29,7 +34,7 @@ jobs:
       - name: Type check (mypy)
         run: uv run mypy hermesd
       - name: Test
-        run: uv run pytest tests/ -v
+        run: uv run pytest tests/ -v -W error::ResourceWarning
       - name: Audit dependencies (pip-audit)
         run: uv run pip-audit
       - name: Build package
