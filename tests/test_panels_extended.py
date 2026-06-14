@@ -766,7 +766,7 @@ def test_config_panel_detail():
         ),
     )
     panel = render_panel(5, state, Theme(), detail=True)
-    text = render_to_str(panel)
+    text = render_to_str(panel, no_color=True)
     assert "gpt-5.4" in text
     assert "192" in text
     assert "medium" in text
