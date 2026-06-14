@@ -1230,6 +1230,43 @@ def test_gateway_ignores_non_mapping_platform_entries(hermes_home: Path):
     c.close()
 
 
+def test_gateway_surfaces_platform_errors_and_agent_counts(hermes_home: Path):
+    """Live gateway_state.json carries per-platform error_message/error_code and
+    top-level active_agents/restart_requested; hermesd surfaces them."""
+    gw = hermes_home / "gateway_state.json"
+    gw.write_text(
+        json.dumps(
+            {
+                "pid": 0,
+                "gateway_state": "stopped",
+                "active_agents": 3,
+                "restart_requested": True,
+                "platforms": {
+                    "discord": {
+                        "state": "disconnected",
+                        "updated_at": "2026-04-08T10:00:00+00:00",
+                        "error_code": "reconnect_failed",
+                        "error_message": "failed to reconnect",
+                    },
+                    "telegram": {
+                        "state": "connected",
+                        "updated_at": "2026-04-08T17:42:57+00:00",
+                    },
+                },
+            }
+        )
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    by_name = {p.name: p for p in state.gateway.platforms}
+    assert by_name["discord"].error_message == "failed to reconnect"
+    assert by_name["discord"].error_code == "reconnect_failed"
+    assert by_name["telegram"].error_message == ""
+    assert state.gateway.active_agents == 3
+    assert state.gateway.restart_requested is True
+    c.close()
+
+
 def test_gateway_stale_pid_with_launchd_pid(hermes_home: Path):
     """gateway_state.json has stale PID but gateway.pid has live PID."""
     import os

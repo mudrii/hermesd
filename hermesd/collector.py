@@ -467,6 +467,8 @@ class Collector:
                     name=str(name),
                     state=info.get("state", "unknown"),
                     updated_at=info.get("updated_at", ""),
+                    error_code=str(info.get("error_code") or ""),
+                    error_message=str(info.get("error_message") or ""),
                 )
             )
         pid = _coerce_int(data.get("pid"))
@@ -496,6 +498,8 @@ class Collector:
             platforms=platforms,
             hermes_version=version,
             updates_behind=behind,
+            active_agents=_coerce_int(data.get("active_agents")),
+            restart_requested=bool(data.get("restart_requested")),
         )
 
     def _find_gateway_launchd_pid(self) -> int | None:

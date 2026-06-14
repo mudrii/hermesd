@@ -12,6 +12,8 @@ class PlatformStatus(BaseModel):
     name: str
     state: str = "unknown"
     updated_at: str = ""
+    error_code: str = ""
+    error_message: str = ""
 
 
 class GatewayState(BaseModel):
@@ -21,6 +23,8 @@ class GatewayState(BaseModel):
     platforms: list[PlatformStatus] = Field(default_factory=list)
     hermes_version: str = ""
     updates_behind: int = 0
+    active_agents: int = 0
+    restart_requested: bool = False
 
 
 class SessionInfo(BaseModel):

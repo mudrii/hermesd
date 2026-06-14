@@ -42,6 +42,8 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             dot_color = theme.ui_ok if p.state == "connected" else theme.ui_error
             lines.append(f"{p.name}:", style=theme.ui_label)
             lines.append(" ● ", style=f"bold {dot_color}")
+            if p.error_message:
+                lines.append("⚠ ", style=theme.ui_warn)
             lines.append(" ")
     if state.channels.platform_count:
         lines.append("\n  Directory: ", style=theme.ui_label)
@@ -64,13 +66,15 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     table.add_column("Platform", style=theme.ui_label)
     table.add_column("Status", style=theme.banner_text)
     table.add_column("Updated", style=theme.banner_dim)
+    table.add_column("Error", style=theme.ui_error)
 
     for p in gw.platforms:
         dot_color = theme.ui_ok if p.state == "connected" else theme.ui_error
         status = Text()
         status.append("● ", style=f"bold {dot_color}")
         status.append(p.state)
-        table.add_row(escape(p.name), status, fmt_iso_timestamp(p.updated_at))
+        error = escape(p.error_message) if p.error_message else "—"
+        table.add_row(escape(p.name), status, fmt_iso_timestamp(p.updated_at), error)
 
     header = Text()
     if gw.running:
@@ -87,6 +91,10 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
             )
         else:
             header.append("  (up to date)", style=theme.ui_ok)
+    if gw.active_agents:
+        header.append(f"\n  {gw.active_agents} active agents", style=theme.ui_accent)
+    if gw.restart_requested:
+        header.append("  ⚠ restart requested", style=theme.ui_warn)
     header.append("\n\n")
 
     sections: list[RenderableType] = [header, table]

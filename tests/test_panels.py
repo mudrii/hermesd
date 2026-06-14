@@ -84,6 +84,50 @@ def test_gateway_panel_detail():
     assert "meeting invites" in text
 
 
+def test_gateway_panel_detail_shows_platform_error():
+    state = DashboardState(
+        gateway=GatewayState(
+            pid=0,
+            running=False,
+            state="stopped",
+            active_agents=3,
+            restart_requested=True,
+            platforms=[
+                PlatformStatus(
+                    name="discord",
+                    state="disconnected",
+                    error_code="reconnect_failed",
+                    error_message="failed to reconnect",
+                ),
+            ],
+        ),
+    )
+    panel = render_panel(1, state, Theme(), detail=True)
+    text = render_to_str(panel, width=120)
+    assert "failed to reconnect" in text
+    assert "restart" in text.lower()
+    assert "3" in text
+
+
+def test_gateway_panel_compact_shows_platform_error_marker():
+    state = DashboardState(
+        gateway=GatewayState(
+            running=True,
+            state="running",
+            platforms=[
+                PlatformStatus(
+                    name="discord",
+                    state="disconnected",
+                    error_message="failed to reconnect",
+                ),
+            ],
+        ),
+    )
+    panel = render_panel(1, state, Theme(), detail=False)
+    text = render_to_str(panel, width=80)
+    assert "⚠" in text
+
+
 def test_gateway_panel_stopped():
     state = DashboardState(
         gateway=GatewayState(running=False, state="stopped"),

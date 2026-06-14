@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - The Sessions detail panel's Runtime table now surfaces each session's end reason, billing endpoint (`billing_base_url`), and billing mode read from `~/.hermes/state.db`.
+- The Gateway panel now surfaces per-platform connection errors (`error_message`/`error_code`), the active-agent count, and a restart-requested marker from `gateway_state.json` — a `⚠` appears in the compact view and a dedicated Error column in the detail view.
 
 ### Changed
 
