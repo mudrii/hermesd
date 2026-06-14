@@ -187,6 +187,8 @@ def test_read_after_close_returns_cached(sample_db, hermes_home):
     db.close()
     sessions_after = db.read_sessions()
     assert sessions_after == sessions_before
+    # The post-close read transparently reopens a connection; close it too.
+    db.close()
 
 
 def test_search_session_ids_by_message_like(sample_db, hermes_home):

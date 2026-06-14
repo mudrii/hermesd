@@ -188,6 +188,11 @@ def test_collect_tokens_today_filters_by_date(hermes_home: Path, sample_db: Path
     conn.close()
     c = Collector(hermes_home)
     state = c.collect()
+    # sample_db: sess_001 (12_400 in) + sess_002 (9_100 in) started today.
+    # sess_old (5_000 in) started two days ago, so it counts toward the total
+    # but not toward today.
+    assert state.tokens_today.input_tokens == 21_500
+    assert state.tokens_total.input_tokens == 26_500
     assert state.tokens_today.input_tokens < state.tokens_total.input_tokens
     c.close()
 
@@ -1202,7 +1207,9 @@ def test_session_active_detection(hermes_home: Path, sample_db: Path):
     """Sessions with ended_at=NULL should be marked active."""
     c = Collector(hermes_home)
     state = c.collect()
-    # Both sample sessions have ended_at=NULL
+    # Both sample sessions have ended_at=NULL. Assert the count first so the
+    # all() below can't pass vacuously on an empty session list.
+    assert len(state.sessions) == 2
     assert all(s.is_active for s in state.sessions)
     c.close()
 
@@ -1571,4 +1578,43 @@ def test_collect_profiles_reads_soul_excerpt_when_present(profiled_hermes_home: 
     c = Collector(profiled_hermes_home)
     state = c.collect()
     assert state.profiles.profiles[0].soul_excerpt == "Profile soul line one"
+    c.close()
+
+
+@pytest.mark.parametrize(
+    ("source_name", "state_attr", "method_name"),
+    [
+        ("cron", "cron", "_collect_cron"),
+        ("channels", "channels", "_collect_channels"),
+        ("kanban", "kanban", "_collect_kanban"),
+        ("operations", "operations", "_collect_operations"),
+        ("skills", "skills_memory", "_collect_skills_memory"),
+        ("memory", "memory", "_collect_memory"),
+    ],
+)
+def test_collect_preserves_last_good_state_when_source_raises(
+    populated_hermes_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_name: str,
+    state_attr: str,
+    method_name: str,
+):
+    """A source that starts raising keeps its last-good state and is marked failed.
+
+    Each source produces non-default data under populated_hermes_home (verified:
+    none equal their model default), so the equality assertion is meaningful.
+    """
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    s1 = c.collect()
+    good = getattr(s1, state_attr)
+    assert source_name not in s1.health.failed_sources
+
+    def boom(*args: object, **kwargs: object):
+        raise OSError("forced")
+
+    monkeypatch.setattr(c, method_name, boom)
+    s2 = c.collect()
+
+    assert getattr(s2, state_attr) == good
+    assert source_name in s2.health.failed_sources
     c.close()

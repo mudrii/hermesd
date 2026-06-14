@@ -75,9 +75,13 @@ def test_resolved_session_cost_preserves_reported_zero_cost():
 @pytest.mark.parametrize(
     ("cost_status", "estimated_cost", "expected"),
     [
-        ("reported", None, _estimate_cost(100_000, 5_000, 50_000, 1_000)),
+        # Hand-computed from _COST_PER_M (input 2.50, output 10, cache_read 0.30,
+        # reasoning 10 per 1M): (100_000*2.50 + 5_000*10 + 50_000*0.30 + 1_000*10)
+        # / 1e6 = 325_000 / 1e6 = 0.325. Pinned as a literal so a regression in
+        # _estimate_cost can't silently agree with itself.
+        ("reported", None, 0.325),
         ("reported", 5.0, 5.0),
-        ("estimated", 0.0, _estimate_cost(100_000, 5_000, 50_000, 1_000)),
+        ("estimated", 0.0, 0.325),
         ("estimated", 1.5, 1.5),
     ],
 )
@@ -245,9 +249,11 @@ def test_collector_estimates_when_cost_is_null(hermes_home: Path):
 
     c = Collector(hermes_home)
     state = c.collect()
-    # Should have an estimated cost > 0
-    assert state.tokens_total.total_cost_usd > 0
-    assert state.tokens_today.total_cost_usd > 0
+    # Hand-computed: 100_000*2.50 + 5_000*10 + 50_000*0.30 + 0*10 = 315_000;
+    # /1e6 = 0.315. The single session started "now", so it counts toward both
+    # totals.
+    assert state.tokens_total.total_cost_usd == pytest.approx(0.315)
+    assert state.tokens_today.total_cost_usd == pytest.approx(0.315)
     c.close()
 
 
@@ -268,7 +274,8 @@ def test_collector_estimates_missing_session_cost_in_detail_rows(hermes_home: Pa
     c = Collector(hermes_home)
     state = c.collect()
     assert len(state.sessions) == 1
-    assert state.sessions[0].estimated_cost_usd > 0
+    # Hand-computed: 100_000*2.50 + 5_000*10 + 50_000*0.30 = 315_000; /1e6 = 0.315.
+    assert state.sessions[0].estimated_cost_usd == pytest.approx(0.315)
     c.close()
 
 

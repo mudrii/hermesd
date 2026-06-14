@@ -9,7 +9,7 @@ def test_read_sessions(sample_db, hermes_home):
     db = HermesDB(hermes_home / "state.db")
     sessions = db.read_sessions()
     assert len(sessions) == 2
-    assert sessions[0]["id"] == "sess_001" or sessions[1]["id"] == "sess_001"
+    assert {s["id"] for s in sessions} == {"sess_001", "sess_002"}
     db.close()
 
 

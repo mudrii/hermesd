@@ -89,6 +89,7 @@ def test_token_analytics():
 def test_tool_stats():
     ts = ToolStats(name="shell_exec", call_count=23)
     assert ts.name == "shell_exec"
+    assert ts.call_count == 23
 
 
 def test_config_summary():

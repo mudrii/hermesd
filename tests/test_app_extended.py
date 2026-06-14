@@ -510,6 +510,7 @@ def test_render_snapshot_json_sorts_set_backed_fields(populated_hermes_home: Pat
 
 def test_collector_loop_marks_state_stale_on_collect_error(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    real_collector = app._collector
     app._set_state(app._collector.collect())
 
     class FailingCollector:
@@ -534,6 +535,7 @@ def test_collector_loop_marks_state_stale_on_collect_error(populated_hermes_home
 
     assert app._state.is_stale is True
     assert not thread.is_alive()
+    real_collector.close()
     app.close()
 
 
@@ -1070,6 +1072,7 @@ def test_render_snapshot_prints_to_console(populated_hermes_home: Path):
 
 def test_collector_loop_updates_state_on_successful_collect(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    real_collector = app._collector
     marker_state = app._collector.collect().model_copy(
         update={"health": HealthSummary(total_sources=1, ok_sources=1)}
     )
@@ -1096,6 +1099,7 @@ def test_collector_loop_updates_state_on_successful_collect(populated_hermes_hom
 
     assert app._state.health.total_sources == 1
     assert app._state.health.ok_sources == 1
+    real_collector.close()
     app.close()
 
 
