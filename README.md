@@ -49,8 +49,8 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 - **Snapshot mode** — `--snapshot` renders one overview frame to stdout and exits; `--snapshot-panel N` selects any registered detail panel for text snapshots and annotates JSON snapshots (`0` aliases panel 10); `--snapshot-file PATH` writes either form to disk; `--snapshot-format json` emits machine-readable full-state snapshots
 - **Bounded log reads** — `--log-tail-bytes` caps how much of each log file is read per refresh
 - **Opt-in profiles** — root mode stays the default; use `--profile NAME` or `HERMES_PROFILE=NAME` to read profile-scoped runtime data
-- **Adaptive layout** — full 12-panel grid on wide terminals, a tall-narrow single-column overview for vertical tmux splits, and a denser all-panel overview on 80x24
-- **Detail views** — press `1`-`9` or `0` for panel 10 to expand directly, or use `[` / `]` to move through every panel including Kanban and Operations
+- **Adaptive layout** — full 13-panel grid on wide terminals, a tall-narrow single-column overview for vertical tmux splits, and a denser all-panel overview on 80x24
+- **Detail views** — press `1`-`9` or `0` for panel 10 to expand directly, or use `[` / `]` to move through every panel including Kanban, Operations, and Curator
 - **Focus toggle** — press `f` to jump between the overview and the last selected full-screen panel
 - **Clipboard export** — press `c` to copy the current rendered view as plain text via OSC 52 in compatible terminals
 - **Inline detail filters** — press `/` in Sessions or Logs detail view to live-filter the current table/log stream with field-aware queries, including message-content and severity-threshold filters
@@ -70,7 +70,7 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 
 ### Overview — The Full Picture
 
-The main dashboard shows all 13 panels at a glance. The header starts with the installed `hermesd` version, then shows the current profile mode and time on the right. Gateway status with PID and Hermes Agent version sits at the top, sessions and token costs side by side, tools and config, cron and skills, logs plus profile metadata, and dedicated memory, kanban, and operations panels at the bottom. The footer shows keyboard shortcuts and a polling indicator.
+The main dashboard shows all 13 panels at a glance. The header starts with the installed `hermesd` version, then shows the current profile mode and time on the right. Gateway status with PID and Hermes Agent version sits at the top, sessions and token costs side by side, tools and config, cron and skills, logs plus profile metadata, and dedicated memory, kanban, operations, and curator panels at the bottom. The footer shows keyboard shortcuts and a polling indicator.
 
 ![Overview](images/SCR-20260409-pzqv.png)
 
