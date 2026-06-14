@@ -513,6 +513,24 @@ def test_tokens_panel_detail_shows_cost_status_reconciliation():
     assert "110" in text
 
 
+def test_tokens_panel_detail_shows_by_endpoint_breakdown():
+    state = DashboardState(
+        token_analytics=TokenAnalytics(
+            by_endpoint=[
+                TokenBreakdown(
+                    label="https://api.kimi.test/v1",
+                    session_count=2,
+                    input_tokens=150_000,
+                    total_cost_usd=0.50,
+                ),
+            ],
+        ),
+    )
+    text = render_to_str(render_panel(3, state, Theme(), detail=True))
+    assert "By Endpoint" in text
+    assert "https://api.kimi.test/v1" in text
+
+
 def _analytics_state(*, cost_is_estimated: bool) -> DashboardState:
     return DashboardState(
         tokens_total=TokenSummary(cost_is_estimated=cost_is_estimated),

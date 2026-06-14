@@ -1661,6 +1661,45 @@ def test_collect_credential_pool_accepts_list_shaped_entries(hermes_home: Path):
     c.close()
 
 
+def test_collect_credential_pool_empty_and_non_dict_list_degrade_gracefully(hermes_home: Path):
+    """An empty list or a list of non-dicts yields a name-only entry, no crash."""
+    (hermes_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "active_provider": "p_empty",
+                "credential_pool": {
+                    "p_empty": [],
+                    "p_scalar": ["not-a-dict", 7],
+                },
+            }
+        )
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    pools = {p.name: p for p in state.skills_memory.credential_pools}
+    assert pools["p_empty"].name == "p_empty"
+    assert pools["p_empty"].label == "p_empty"  # falls back to provider name
+    assert pools["p_empty"].source == ""
+    assert pools["p_scalar"].source == ""
+    c.close()
+
+
+def test_collect_pr_monitor_repoless_files_stay_distinct(hermes_home: Path):
+    """Monitor files without a repo key are kept separate, keyed by filename."""
+    (hermes_home / "pr-monitor-one.json").write_text(
+        json.dumps({"checked_at": "2026-06-14T01:00:00Z", "prs": {"1": {}}})
+    )
+    (hermes_home / "pr-monitor-two.json").write_text(
+        json.dumps({"checked_at": "2026-06-14T02:00:00Z", "prs": {"2": {}, "3": {}}})
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    repoless = [m for m in state.operations.pr_monitors if not m.repo]
+    assert len(repoless) == 2
+    assert {m.filename for m in repoless} == {"pr-monitor-one.json", "pr-monitor-two.json"}
+    c.close()
+
+
 def test_collect_providers_ignores_non_mapping_auth_json(hermes_home: Path):
     auth = hermes_home / "auth.json"
     auth.write_text(json.dumps(["not", "a", "mapping"]))
