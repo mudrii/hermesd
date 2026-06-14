@@ -51,3 +51,36 @@ def test_curator_panel_detail_shows_error_over_summary():
     text = render_to_str(render_panel(13, DashboardState(curator=run), Theme(), detail=True))
     assert "model timeout" in text
     assert "processed the candidate skills" not in text
+
+
+def test_curator_panel_compact_shows_error_marker():
+    # A run that finished with an llm_error appends a ⚠ marker in the compact view.
+    run = _RUN.model_copy(update={"llm_error": "model timeout"})
+    text = render_to_str(render_panel(13, DashboardState(curator=run), Theme(), detail=False))
+    assert "⚠" in text
+    # The compact marker is just a flag; the full error text is detail-only.
+    assert "model timeout" not in text
+
+
+def test_curator_panel_compact_no_error_marker_when_clean():
+    # Without an llm_error the compact view must not show the warning marker.
+    text = render_to_str(render_panel(13, DashboardState(curator=_RUN), Theme(), detail=False))
+    assert "⚠" not in text
+
+
+def test_curator_panel_detail_truncates_long_summary():
+    # llm_summary over 600 chars is cut to 600 and gets an ellipsis; the tail is dropped.
+    long_summary = "A" * 600 + "TAIL_SENTINEL"
+    run = _RUN.model_copy(update={"llm_summary": long_summary})
+    text = render_to_str(render_panel(13, DashboardState(curator=run), Theme(), detail=True))
+    assert "…" in text
+    assert "TAIL_SENTINEL" not in text
+    assert "A" * 100 in text
+
+
+def test_curator_panel_detail_short_summary_not_truncated():
+    # A summary at or under the limit renders whole, with no ellipsis appended.
+    run = _RUN.model_copy(update={"llm_summary": "B" * 600})
+    text = render_to_str(render_panel(13, DashboardState(curator=run), Theme(), detail=True))
+    assert "…" not in text
+    assert "B" * 100 in text

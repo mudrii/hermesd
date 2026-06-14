@@ -165,3 +165,86 @@ def test_concurrent_writer_does_not_wipe_cache(tmp_path):
     sessions2 = db.read_sessions()
     assert len(sessions2) == 2
     db.close()
+
+
+def test_repeated_message_search_serves_cache_without_requery(tmp_path):
+    """An unchanged repeat search hits the version cache and clears the stale flag."""
+    db_path = tmp_path / "state.db"
+    _create_db(db_path)
+    db = HermesDB(db_path)
+
+    first = db.search_session_ids_by_message("used a tool")
+    assert first == {"s1"}
+    assert db.last_message_search_stale is False
+
+    # No write between calls, so data_version is unchanged: the second call must
+    # return the cached result set object and (re)assert a non-stale read.
+    second = db.search_session_ids_by_message("used a tool")
+    assert second == {"s1"}
+    assert second is first  # same cached object, not a fresh query
+    assert db.last_message_search_stale is False
+    db.close()
+
+
+def test_message_search_error_serves_last_good_and_flags_stale(tmp_path):
+    """A failed search returns the last-good result set and marks the read stale."""
+    db_path = tmp_path / "state.db"
+    _create_db(db_path)
+    db = HermesDB(db_path)
+
+    found = db.search_session_ids_by_message("used a tool")
+    assert found == {"s1"}
+    assert db.last_message_search_stale is False
+
+    # Kill the live handle so the next query raises mid-search; the data_version
+    # probe also fails, so we fall through to the query and into the error path.
+    db._conn.close()
+
+    after_error = db.search_session_ids_by_message("used a tool")
+    assert after_error == found  # cache preserved, not blanked
+    assert db.last_message_search_stale is True
+    db.close()
+
+
+def test_message_search_fts_check_failure_degrades_without_crashing(tmp_path):
+    """If probing for the FTS table raises, search degrades gracefully (no crash)."""
+    db_path = tmp_path / "state.db"
+    _create_db(db_path)
+    db = HermesDB(db_path)
+
+    # Kill the handle before any search runs, so FTS availability is still
+    # undetermined: the sqlite_master probe inside _messages_fts_enabled raises
+    # and must be swallowed (FTS treated as unavailable) rather than crashing.
+    db._conn.close()
+
+    assert db._messages_fts_available is None
+    result = db.search_session_ids_by_message("used a tool")
+    assert result == set()  # no cache yet, query failed -> empty, not a crash
+    assert db._messages_fts_available is False
+    db.close()
+
+
+def test_message_search_reconnect_failure_resets_error_count(tmp_path):
+    """Three consecutive search errors trigger a reconnect; a failed one resets the count."""
+    db_path = tmp_path / "state.db"
+    _create_db(db_path)
+    db = HermesDB(db_path)
+
+    found = db.search_session_ids_by_message("used a tool")
+    assert found == {"s1"}
+
+    # Kill the handle and remove the file so the reconnect attempt also fails.
+    db._conn.close()
+    db_path.unlink()
+
+    # Each call serves cache while counting errors; the third hits the reconnect
+    # threshold, and because the file is gone the reconnect yields no connection,
+    # resetting the consecutive-error counter back to zero.
+    for _ in range(2):
+        assert db.search_session_ids_by_message("used a tool") == found
+    assert db._consecutive_errors == 2
+    assert db.search_session_ids_by_message("used a tool") == found
+    assert db._conn is None
+    assert db._consecutive_errors == 0
+    assert db.last_message_search_stale is True
+    db.close()

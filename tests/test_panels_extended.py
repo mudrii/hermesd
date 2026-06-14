@@ -543,6 +543,9 @@ def test_tokens_panel_detail_shows_by_endpoint_breakdown():
     text = render_to_str(render_panel(3, state, Theme(), detail=True))
     assert "By Endpoint" in text
     assert "https://api.kimi.test/v1" in text
+    # Assert the row's own aggregates render, not just the label that any data echoes.
+    assert "150.0K" in text
+    assert "$0.50" in text
 
 
 def _analytics_state(*, cost_is_estimated: bool) -> DashboardState:
