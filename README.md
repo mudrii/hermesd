@@ -24,7 +24,7 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 
 ## Features
 
-### 12 Dashboard Panels
+### 13 Dashboard Panels
 
 | # | Panel | What It Shows |
 |---|-------|---------------|
@@ -243,7 +243,7 @@ hermesd --log-tail-bytes 8192
 | Key | Action |
 |-----|--------|
 | `1`-`9`, `0` | Expand panels 1-10 to full-screen detail view (`0` opens panel 10) |
-| `[` / `]` | Move to the previous/next registered panel, including panels 11 and 12 |
+| `[` / `]` | Move to the previous/next registered panel, including panels 11-13 |
 | `Esc` | Return to overview |
 | `f` | Toggle focus mode for the last selected panel |
 | `c` | Copy the current rendered view as plain text via OSC 52 |
