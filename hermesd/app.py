@@ -395,8 +395,7 @@ class DashboardApp:
 
     def _handle_input_data(self, data: bytes) -> str | None:
         for key in _decode_input_keys(data):
-            with self._view_lock:
-                action = self._handle_key(key)
+            action = self.handle_key(key)
             if action is not None:
                 return action
         return None
@@ -422,7 +421,11 @@ class DashboardApp:
         with self._lock:
             self._theme = theme
 
-    def _handle_key(self, key: str) -> str | None:
+    def handle_key(self, key: str) -> str | None:
+        with self._view_lock:
+            return self._handle_key_locked(key)
+
+    def _handle_key_locked(self, key: str) -> str | None:
         if not key:
             return None
         if key[0] == "\x1b":

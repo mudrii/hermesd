@@ -93,14 +93,14 @@ def test_app_build_layout(populated_hermes_home: Path):
 
 def test_app_handle_key_quit(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    result = app._handle_key("q")
+    result = app.handle_key("q")
     assert result == "quit"
     app.close()
 
 
 def test_app_handle_key_detail(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("3")
+    app.handle_key("3")
     assert app._view.mode == "detail"
     assert app._view.detail_panel == 3
     app.close()
@@ -108,7 +108,7 @@ def test_app_handle_key_detail(populated_hermes_home: Path):
 
 def test_app_handle_key_zero_opens_panel_ten(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("0")
+    app.handle_key("0")
     assert app._view.mode == "detail"
     assert app._view.detail_panel == 10
     app.close()
@@ -117,12 +117,12 @@ def test_app_handle_key_zero_opens_panel_ten(populated_hermes_home: Path):
 def test_app_handle_bracket_navigation_reaches_new_panels(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     for _ in range(10):
-        app._handle_key("]")
+        app.handle_key("]")
     assert app._view.mode == "detail"
     assert app._view.detail_panel == 11
-    app._handle_key("]")
+    app.handle_key("]")
     assert app._view.detail_panel == 12
-    app._handle_key("[")
+    app.handle_key("[")
     assert app._view.detail_panel == 11
     app.close()
 
@@ -130,19 +130,19 @@ def test_app_handle_bracket_navigation_reaches_new_panels(populated_hermes_home:
 def test_app_handle_bracket_navigation_wraps_at_boundaries(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     for _ in range(11):
-        app._handle_key("]")
+        app.handle_key("]")
     assert app._view.detail_panel == 12
-    app._handle_key("]")  # forward wrap: 12 -> 1
+    app.handle_key("]")  # forward wrap: 12 -> 1
     assert app._view.detail_panel == 1
-    app._handle_key("[")  # backward wrap: 1 -> 12
+    app.handle_key("[")  # backward wrap: 1 -> 12
     assert app._view.detail_panel == 12
     app.close()
 
 
 def test_app_handle_key_escape(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("3")
-    app._handle_key("\x1b")  # single Esc byte
+    app.handle_key("3")
+    app.handle_key("\x1b")  # single Esc byte
     assert app._view.mode == "overview"
     app.close()
 
@@ -150,8 +150,8 @@ def test_app_handle_key_escape(populated_hermes_home: Path):
 def test_app_handle_key_escape_sequence_ignored(populated_hermes_home: Path):
     """Multi-byte escape sequences (arrow keys, etc.) must not exit detail."""
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("3")
-    app._handle_key("\x1b[A")  # Up arrow
+    app.handle_key("3")
+    app.handle_key("\x1b[A")  # Up arrow
     assert app._view.mode == "detail"
     assert app._view.detail_panel == 3
     app.close()
@@ -194,6 +194,7 @@ def test_run_live_loop_renders_and_exits_when_running_cleared(
 
         def __enter__(self):
             self.console.print(self.renderable)
+            app_ref._running.clear()
             return self
 
         def __exit__(self, exc_type, exc, traceback):
@@ -205,14 +206,13 @@ def test_run_live_loop_renders_and_exits_when_running_cleared(
     app = DashboardApp(populated_hermes_home, refresh_rate=1)
     buffer = io.StringIO()
     app._console = Console(file=buffer, width=80, height=24, force_terminal=True)
+    app_ref = app
 
     monkeypatch.setattr(app_module, "Live", RecordingLive)
-    stopper = threading.Timer(0.2, app._running.clear)
-    stopper.start()
     try:
         app.run()
     finally:
-        stopper.cancel()
+        app.close()
     assert app._running.is_set() is False
     assert app._closed.is_set() is True
     assert "hermesd" in buffer.getvalue()

@@ -438,6 +438,7 @@ def test_operations_panel_detail():
     state = DashboardState(
         operations=OperationsState(
             dashboard_process_count=1,
+            desktop_build_stamp="desktop-2026.6.14",
             model_caches=[
                 ModelCacheSummary(
                     name="models_dev_cache.json",
@@ -460,6 +461,7 @@ def test_operations_panel_detail():
     panel = render_panel(12, state, Theme(), detail=True)
     text = render_to_str(panel, width=80)
     assert "Operations" in text
+    assert "desktop-2026.6.14" in text
     assert "models_dev_cache.json" in text
     assert "PR Monitors" in text
 

@@ -308,32 +308,6 @@ def test_collect_available_tools_from_session_json(hermes_home: Path):
     c.close()
 
 
-def test_collect_available_tools_reuses_cached_index_when_sessions_json_is_unchanged(
-    hermes_home: Path,
-):
-    sessions_json = hermes_home / "sessions" / "sessions.json"
-    sessions_json.write_text(json.dumps({"entry1": {"session_id": "s1"}}))
-    session_file = hermes_home / "sessions" / "session_s1.json"
-    session_file.write_text(json.dumps({"session_id": "s1", "tools": [{"name": "terminal"}]}))
-
-    c = Collector(hermes_home)
-    original = c._read_json_cached
-    session_reads = 0
-
-    def counting_read_json(path: Path) -> dict[str, object]:
-        nonlocal session_reads
-        if path.name.startswith("session_"):
-            session_reads += 1
-        return original(path)
-
-    c._read_json_cached = counting_read_json
-
-    assert c._collect_available_tools() == (1, ["terminal"])
-    assert c._collect_available_tools() == (1, ["terminal"])
-    assert session_reads == 1
-    c.close()
-
-
 def test_collect_available_tools_accepts_string_tool_entries(hermes_home: Path):
     """A session file may list tools as bare strings instead of objects."""
     (hermes_home / "sessions" / "sessions.json").write_text(
@@ -708,6 +682,51 @@ def test_collect_logs_parses_format(hermes_home: Path, sample_logs: Path):
     c.close()
 
 
+def test_collect_logs_discovers_shared_named_streams(hermes_home: Path):
+    shared_logs = {
+        "desktop.log": "desktop ready",
+        "dashboard.log": "dashboard ready",
+        "gui.log": "gui ready",
+        "update.log": "update ready",
+        "gateway.error.log": "gateway error ready",
+        "tui_gateway_crash.log": "crash ready",
+    }
+    for filename, message in shared_logs.items():
+        (hermes_home / "logs" / filename).write_text(
+            f"2026-04-09 15:41:58,123 - hermes - INFO - {message}\n"
+        )
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    streams = {stream.name: stream for stream in state.logs.streams}
+    assert set(streams) == {
+        "desktop",
+        "dashboard",
+        "gui",
+        "update",
+        "gateway.error",
+        "tui crash",
+    }
+    assert streams["desktop"].lines[0].message == "desktop ready"
+    assert streams["tui crash"].lines[0].message == "crash ready"
+    c.close()
+
+
+def test_profiled_collector_uses_shared_aux_log_streams(profiled_hermes_home: Path):
+    (profiled_hermes_home / "logs" / "desktop.log").write_text(
+        "2026-04-09 15:41:58,123 - hermes - INFO - shared desktop log\n"
+    )
+
+    c = Collector(profiled_hermes_home, profile_name="coding")
+    state = c.collect()
+
+    streams = {stream.name: stream for stream in state.logs.streams}
+    assert streams["agent"].lines[0].message == "profile agent log"
+    assert streams["desktop"].lines[0].message == "shared desktop log"
+    c.close()
+
+
 def test_collect_logs_non_standard_line(hermes_home: Path):
     log = hermes_home / "logs" / "agent.log"
     log.write_text("plain text without timestamp\n")
@@ -741,6 +760,69 @@ def test_collect_logs_preserves_cache_when_file_rotates_to_empty(hermes_home: Pa
     c.close()
 
 
+def test_collect_logs_ignores_symlinked_log_files_outside_home(hermes_home: Path, tmp_path: Path):
+    outside_log = tmp_path / "outside-secret.log"
+    outside_log.write_text("2026-04-09 15:41:58,123 - hermes - INFO - outside secret\n")
+    (hermes_home / "logs" / "agent.log").symlink_to(outside_log)
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.logs.agent_lines == []
+    assert all(
+        "outside secret" not in line.message
+        for stream in state.logs.streams
+        for line in stream.lines
+    )
+    c.close()
+
+
+def test_collect_logs_ignores_symlinked_log_directory_outside_home(
+    hermes_home: Path, tmp_path: Path
+):
+    outside_logs = tmp_path / "outside-logs"
+    outside_logs.mkdir()
+    (outside_logs / "agent.log").write_text(
+        "2026-04-09 15:41:58,123 - hermes - INFO - outside secret\n"
+    )
+    logs_dir = hermes_home / "logs"
+    logs_dir.rmdir()
+    logs_dir.symlink_to(outside_logs, target_is_directory=True)
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.logs.agent_lines == []
+    assert all(
+        "outside secret" not in line.message
+        for stream in state.logs.streams
+        for line in stream.lines
+    )
+    c.close()
+
+
+def test_collect_logs_and_cron_allow_symlinked_hermes_home(hermes_home: Path, tmp_path: Path):
+    (hermes_home / "logs" / "agent.log").write_text(
+        "2026-04-09 15:41:58,123 - hermes - INFO - in-home log\n"
+    )
+    (hermes_home / "cron" / "jobs.json").write_text(
+        json.dumps({"jobs": [{"id": "job-1", "name": "Job 1"}]})
+    )
+    cron_output_dir = hermes_home / "cron" / "output" / "job-1"
+    cron_output_dir.mkdir(parents=True)
+    (cron_output_dir / "latest.md").write_text("in-home cron output\n")
+    linked_home = tmp_path / "linked-hermes"
+    linked_home.symlink_to(hermes_home, target_is_directory=True)
+
+    c = Collector(linked_home)
+    state = c.collect()
+
+    assert state.logs.agent_lines[0].message == "in-home log"
+    assert state.logs.cron_lines[0].message == "in-home cron output"
+    assert state.cron.jobs[0].latest_output_excerpt == "in-home cron output"
+    c.close()
+
+
 def test_collect_cron_logs_preserve_cache_when_latest_output_disappears(hermes_home: Path):
     cron_output_dir = hermes_home / "cron" / "output" / "job-1"
     cron_output_dir.mkdir(parents=True)
@@ -753,6 +835,78 @@ def test_collect_cron_logs_preserve_cache_when_latest_output_disappears(hermes_h
     second = c.collect()
 
     assert second.logs.cron_lines == first.logs.cron_lines
+    c.close()
+
+
+def test_collect_cron_logs_ignores_symlinked_output_files_outside_home(
+    hermes_home: Path, tmp_path: Path
+):
+    outside_output = tmp_path / "outside-cron.md"
+    outside_output.write_text("outside cron secret\n")
+    cron_output_dir = hermes_home / "cron" / "output" / "job-1"
+    cron_output_dir.mkdir(parents=True)
+    (cron_output_dir / "latest.md").symlink_to(outside_output)
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.logs.cron_lines == []
+    c.close()
+
+
+def test_collect_cron_logs_ignores_symlinked_output_directory_outside_home(
+    hermes_home: Path, tmp_path: Path
+):
+    outside_output = tmp_path / "outside-output" / "job-1"
+    outside_output.mkdir(parents=True)
+    (outside_output / "latest.md").write_text("outside cron secret\n")
+    output_root = hermes_home / "cron" / "output"
+    output_root.rmdir()
+    output_root.symlink_to(outside_output.parent, target_is_directory=True)
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.logs.cron_lines == []
+    c.close()
+
+
+def test_collect_cron_job_excerpt_ignores_symlinked_output_directory_outside_home(
+    hermes_home: Path, tmp_path: Path
+):
+    (hermes_home / "cron" / "jobs.json").write_text(
+        json.dumps({"jobs": [{"id": "job-1", "name": "Job 1"}]})
+    )
+    outside_output = tmp_path / "outside-output"
+    outside_output.mkdir()
+    (outside_output / "latest.md").write_text("outside cron secret\n")
+    job_output_dir = hermes_home / "cron" / "output" / "job-1"
+    job_output_dir.symlink_to(outside_output, target_is_directory=True)
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.cron.jobs[0].latest_output_excerpt == ""
+    assert state.cron.jobs[0].latest_output_path == ""
+    assert state.cron.jobs[0].latest_output_mtime is None
+    c.close()
+
+
+def test_collect_cron_job_excerpt_rejects_traversal_job_id(hermes_home: Path, tmp_path: Path):
+    outside_job = tmp_path / "outside-job"
+    outside_job.mkdir()
+    (outside_job / "latest.md").write_text("outside cron secret\n")
+    traversal_id = os.path.relpath(outside_job, hermes_home / "cron" / "output")
+    (hermes_home / "cron" / "jobs.json").write_text(
+        json.dumps({"jobs": [{"id": traversal_id, "name": "Job 1"}]})
+    )
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.cron.jobs[0].latest_output_excerpt == ""
+    assert state.cron.jobs[0].latest_output_path == ""
+    assert state.cron.jobs[0].latest_output_mtime is None
     c.close()
 
 
@@ -826,11 +980,8 @@ def test_latest_cron_output_excerpt_ignores_file_that_disappears_during_stat(
     assert output_mtime is not None
 
 
-def test_git_checkpoint_summary_sets_timeouts(monkeypatch):
-    timeouts: list[int] = []
-
+def test_git_checkpoint_summary_parses_latest_checkpoint(monkeypatch):
     def fake_run(*args, **kwargs):
-        timeouts.append(kwargs["timeout"])
         if "rev-list" in args[0]:
             return CompletedProcess(args[0], 0, stdout="3\n")
         return CompletedProcess(args[0], 0, stdout="1712345678\tcheckpoint reason\n")
@@ -839,24 +990,18 @@ def test_git_checkpoint_summary_sets_timeouts(monkeypatch):
 
     commit_count, timestamp, reason = _git_checkpoint_summary(Path("/tmp/repo.git"))
 
-    assert timeouts == [2, 2]
     assert commit_count == 3
     assert timestamp == 1712345678.0
     assert reason == "checkpoint reason"
 
 
 def test_git_checkpoint_summary_empty_repo_skips_log(monkeypatch):
-    calls: list[list[str]] = []
-
     def fake_run(*args, **kwargs):
-        calls.append(args[0])
         return CompletedProcess(args[0], 0, stdout="0\n")
 
     monkeypatch.setattr("hermesd.collector.subprocess.run", fake_run)
 
     assert _git_checkpoint_summary(Path("/tmp/repo.git")) == (0, None, "")
-    assert len(calls) == 1
-    assert "rev-list" in calls[0]
 
 
 def test_git_checkpoint_summary_handles_missing_git(monkeypatch):

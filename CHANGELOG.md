@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Untrusted free-text from `~/.hermes/` (session, config, skill, kanban, cron, gateway, memory, profile, operations, and token labels) is now escaped before it reaches Rich's markup parser, so values containing `[...]` render literally and a stray `[/]` can no longer crash the dashboard.
+- Symlinked log files, log directories, cron output files, and cron output directories are now ignored when tailing logs so hermesd does not read outside the Hermes home.
 - Fixed a deadlock when pressing `G` to jump to the bottom of a scrollable detail view.
 - Fixed the footer health indicator showing yellow when zero collector sources were healthy.
 - An unknown `minlevel:` log filter value now shows all lines instead of none.

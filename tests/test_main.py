@@ -266,6 +266,21 @@ def test_main_snapshot_panel_outputs_detail(populated_hermes_home: Path, capsys)
     assert "SOUL.md" in out
 
 
+def test_main_snapshot_panel_11_outputs_kanban_detail(populated_hermes_home: Path, capsys):
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-panel",
+            "11",
+            "--no-color",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert "[11] Kanban" in out
+    assert "Status Counts" in out
+
+
 def test_main_snapshot_panel_file_writes_detail(populated_hermes_home: Path, tmp_path: Path):
     output_path = tmp_path / "memory-panel.txt"
     main(
@@ -319,6 +334,39 @@ def test_main_snapshot_panel_json_file(populated_hermes_home: Path, tmp_path: Pa
     assert payload["panel_num"] == 8
     assert payload["panel_name"] == "Logs"
     assert "logs" in payload["state"]
+
+
+def test_main_snapshot_panel_12_json_annotates_operations(populated_hermes_home: Path, capsys):
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-panel",
+            "12",
+            "--snapshot-format",
+            "json",
+            "--no-color",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["panel_num"] == 12
+    assert payload["panel_name"] == "Operations"
+    assert "operations" in payload["state"]
+
+
+def test_main_snapshot_panel_12_outputs_operations_detail(populated_hermes_home: Path, capsys):
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-panel",
+            "12",
+            "--no-color",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert "[12] Operations" in out
+    assert "Desktop Build" in out
 
 
 def test_main_runs_dashboard_when_no_snapshot_flags(populated_hermes_home: Path, monkeypatch):

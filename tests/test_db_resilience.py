@@ -112,6 +112,19 @@ def test_db_file_deleted_marks_all_cached_reads_stale(tmp_path):
     db.close()
 
 
+def test_open_connection_serves_cached_sessions_when_source_file_disappears(tmp_path):
+    db_path = tmp_path / "state.db"
+    _create_db(db_path)
+    db = HermesDB(db_path)
+    sessions = db.read_sessions()
+
+    db_path.unlink()
+
+    assert db.read_sessions() == sessions
+    assert db.last_read_sessions_stale is False
+    db.close()
+
+
 def test_externally_closed_connection_recovers(tmp_path):
     """If the handle dies under us, reads serve cache, then reconnect restores live data."""
     db_path = tmp_path / "state.db"

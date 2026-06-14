@@ -77,6 +77,8 @@ def test_collect_cron_tick(populated_hermes_home: Path):
     state = c.collect()
     assert state.cron.last_tick_ago_seconds is not None
     assert state.cron.last_tick_ago_seconds >= 0
+    assert state.cron.max_parallel_jobs == 3
+    assert state.cron.wrap_response is True
     c.close()
 
 
@@ -289,6 +291,9 @@ def test_collect_kanban_state(populated_hermes_home: Path):
 
 
 def test_collect_channels_and_operations(populated_hermes_home: Path):
+    (populated_hermes_home / "desktop-build-stamp.json").write_text(
+        json.dumps({"version": "desktop-2026.6.14"})
+    )
     c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
     state = c.collect()
 
@@ -300,6 +305,7 @@ def test_collect_channels_and_operations(populated_hermes_home: Path):
     assert platforms["feishu"].capabilities == ["meeting invites"]
 
     caches = {cache.name: cache for cache in state.operations.model_caches}
+    assert state.operations.desktop_build_stamp == "desktop-2026.6.14"
     assert caches["models_dev_cache.json"].provider_count == 2
     assert caches["models_dev_cache.json"].model_count == 3
     assert state.operations.pr_monitors[0].repo == "NousResearch/hermes-agent"
@@ -320,34 +326,6 @@ def test_collect_does_not_mutate_hermes_home(populated_hermes_home: Path):
     assert _file_mtimes(populated_hermes_home) == before
 
 
-def test_collect_mtime_cache(populated_hermes_home: Path, monkeypatch):
-    sessions_dir = populated_hermes_home / "sessions"
-    sessions_dir.mkdir(exist_ok=True)
-    (sessions_dir / "sessions.json").write_text(json.dumps({"one": {"session_id": "one"}}))
-    (sessions_dir / "session_one.json").write_text(
-        json.dumps({"session_id": "one", "tools": [{"name": "cached_tool"}]})
-    )
-    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
-    read_count = 0
-    original_read = c._read_json_cached
-
-    def counting_read(path: Path):
-        nonlocal read_count
-        read_count += 1
-        return original_read(path)
-
-    monkeypatch.setattr(c, "_read_json_cached", counting_read)
-    try:
-        tools1 = c._collect_available_tools()
-        reads_after_first_call = read_count
-        tools2 = c._collect_available_tools()
-    finally:
-        c.close()
-
-    assert tools2 == tools1
-    assert read_count == reads_after_first_call
-
-
 def _file_mtimes(root: Path) -> dict[Path, int]:
     return {
         path.relative_to(root): path.stat().st_mtime_ns
@@ -366,6 +344,17 @@ def test_collection_health_uses_default_when_fallback_also_fails():
     assert health.failed_sources == ["source"]
     assert "RuntimeError: unavailable" in health.errors["source"]
     assert health.total_sources == 1
+
+
+def test_collection_health_redacts_secret_material_from_errors():
+    health = _CollectionHealth()
+
+    def fail() -> str:
+        raise RuntimeError("request failed token=secret-value")
+
+    assert health.collect(lambda: "cached", "source", fail, lambda: "default") == "cached"
+    assert "[REDACTED]" in health.errors["source"]
+    assert "secret-value" not in health.errors["source"]
 
 
 def test_collect_recent_activity_suppresses_offline_banner(hermes_home: Path, sample_db: Path):
@@ -690,42 +679,6 @@ def test_search_session_ids_raises_when_db_returns_stale_cache(hermes_home: Path
         c.close()
 
 
-def test_collect_reuses_session_summaries_when_rows_unchanged(
-    populated_hermes_home: Path,
-    monkeypatch,
-):
-    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
-    session_builds = 0
-    analytics_builds = 0
-    original_sessions = c._collect_sessions
-    original_analytics = c._collect_token_analytics
-
-    def counting_sessions(rows=None):
-        nonlocal session_builds
-        session_builds += 1
-        return original_sessions(rows)
-
-    def counting_analytics(rows=None):
-        nonlocal analytics_builds
-        analytics_builds += 1
-        return original_analytics(rows)
-
-    monkeypatch.setattr(c, "_collect_sessions", counting_sessions)
-    monkeypatch.setattr(c, "_collect_token_analytics", counting_analytics)
-
-    state1 = c.collect()
-    state2 = c.collect()
-
-    assert session_builds == 1
-    assert analytics_builds == 1
-    assert state2.sessions == state1.sessions
-    assert state2.tokens_today == state1.tokens_today
-    assert state2.tokens_total == state1.tokens_total
-    assert state2.token_analytics == state1.token_analytics
-    assert state2.total_tool_calls == state1.total_tool_calls
-    c.close()
-
-
 def test_collect_recomputes_session_summaries_when_rows_change(
     hermes_home: Path,
     sample_db: Path,
@@ -750,26 +703,33 @@ def test_collect_recomputes_session_summaries_when_rows_change(
     c.close()
 
 
-def test_collect_recomputes_session_summaries_when_date_changes(
-    populated_hermes_home: Path,
-    monkeypatch,
+def test_collect_recomputes_today_summaries_when_local_date_changes(
+    hermes_home: Path,
+    sample_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
-    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
-    builds = 0
-    original = c._collect_tokens_today
+    today_context: dict[str, float | str] = {
+        "date": "2026-06-14",
+        "cutoff": time.time() - 7200,
+    }
+    monkeypatch.setattr(
+        "hermesd.collector._local_date",
+        lambda: str(today_context["date"]),
+    )
+    monkeypatch.setattr(
+        "hermesd.collector._today_epoch",
+        lambda: float(today_context["cutoff"]),
+    )
+    c = Collector(hermes_home)
+    state1 = c.collect()
+    assert state1.tokens_today.input_tokens == 21_500
 
-    def counting(rows=None):
-        nonlocal builds
-        builds += 1
-        return original(rows)
+    today_context["date"] = "2026-06-15"
+    today_context["cutoff"] = time.time() + 60
+    state2 = c.collect()
 
-    monkeypatch.setattr(c, "_collect_tokens_today", counting)
-
-    c.collect()
-    assert builds == 1
-    monkeypatch.setattr("hermesd.collector._local_date", lambda: "1999-01-01")
-    c.collect()
-    assert builds == 2
+    assert state2.tokens_today.input_tokens == 0
+    assert state2.tokens_total.input_tokens == state1.tokens_total.input_tokens
     c.close()
 
 

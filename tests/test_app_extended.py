@@ -49,18 +49,37 @@ def test_panel_name_lookup_fails_with_context():
 
 def test_handle_key_refresh(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    result = app._handle_key("r")
+    result = app.handle_key("r")
     assert result == "refresh"
     assert app._force_refresh.is_set()
+    app.close()
+
+
+def test_handle_key_acquires_view_lock(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    entered = 0
+
+    class RecordingLock:
+        def __enter__(self):
+            nonlocal entered
+            entered += 1
+
+        def __exit__(self, exc_type, exc, traceback):
+            return None
+
+    app._view_lock = RecordingLock()
+
+    assert app.handle_key("q") == "quit"
+    assert entered == 1
     app.close()
 
 
 def test_handle_key_help_toggle(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     assert app._view.show_help is False
-    app._handle_key("?")
+    app.handle_key("?")
     assert app._view.show_help is True
-    app._handle_key("?")
+    app.handle_key("?")
     assert app._view.show_help is False
     app.close()
 
@@ -69,7 +88,7 @@ def test_handle_key_c_copies_current_view(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
     buffer = io.StringIO()
     app._console = Console(file=buffer, width=120, height=40, force_terminal=True, no_color=True)
-    app._handle_key("c")
+    app.handle_key("c")
     copied = buffer.getvalue()
     assert "]52;c;" in copied
     app.close()
@@ -77,20 +96,20 @@ def test_handle_key_c_copies_current_view(populated_hermes_home: Path):
 
 def test_handle_key_f_toggles_focus_mode(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("f")
+    app.handle_key("f")
     assert app._view.mode == "detail"
     assert app._view.detail_panel == 1
-    app._handle_key("f")
+    app.handle_key("f")
     assert app._view.mode == "overview"
     app.close()
 
 
 def test_handle_key_f_reuses_last_selected_panel(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("5")
-    app._handle_key("f")
+    app.handle_key("5")
+    app.handle_key("f")
     assert app._view.mode == "overview"
-    app._handle_key("f")
+    app.handle_key("f")
     assert app._view.mode == "detail"
     assert app._view.detail_panel == 5
     app.close()
@@ -98,42 +117,42 @@ def test_handle_key_f_reuses_last_selected_panel(populated_hermes_home: Path):
 
 def test_handle_key_scroll_in_detail(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("3")
-    app._handle_key("j")
+    app.handle_key("3")
+    app.handle_key("j")
     assert app._view.scroll_offset == 1
-    app._handle_key("j")
+    app.handle_key("j")
     assert app._view.scroll_offset == 2
-    app._handle_key("k")
+    app.handle_key("k")
     assert app._view.scroll_offset == 1
     app.close()
 
 
 def test_handle_key_tab_cycles_log_view(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("8")
+    app.handle_key("8")
     assert app._view.detail_panel == 8
     assert app._view.log_sub_view == "agent"
-    app._handle_key("\t")
+    app.handle_key("\t")
     assert app._view.log_sub_view == "gateway"
-    app._handle_key("\t")
+    app.handle_key("\t")
     assert app._view.log_sub_view == "errors"
-    app._handle_key("\t")
+    app.handle_key("\t")
     assert app._view.log_sub_view == "cron"
     app.close()
 
 
 def test_handle_key_tab_ignored_outside_logs(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("3")
-    app._handle_key("\t")
+    app.handle_key("3")
+    app.handle_key("\t")
     assert app._view.log_sub_view == "agent"
     app.close()
 
 
 def test_handle_key_slash_enters_filter_mode_in_sessions(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("2")
-    app._handle_key("/")
+    app.handle_key("2")
+    app.handle_key("/")
     assert app._view.filter_edit_mode is True
     assert app._view.filter_query == ""
     app.close()
@@ -141,14 +160,14 @@ def test_handle_key_slash_enters_filter_mode_in_sessions(populated_hermes_home: 
 
 def test_handle_key_filter_text_and_enter(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("8")
-    app._handle_key("/")
-    app._handle_key("e")
-    app._handle_key("r")
-    app._handle_key("r")
+    app.handle_key("8")
+    app.handle_key("/")
+    app.handle_key("e")
+    app.handle_key("r")
+    app.handle_key("r")
     assert app._view.filter_query == "err"
     assert app._view.filter_edit_mode is True
-    app._handle_key("\r")
+    app.handle_key("\r")
     assert app._view.filter_edit_mode is False
     assert app._view.filter_query == "err"
     app.close()
@@ -156,21 +175,21 @@ def test_handle_key_filter_text_and_enter(populated_hermes_home: Path):
 
 def test_handle_key_filter_backspace(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("2")
-    app._handle_key("/")
-    app._handle_key("a")
-    app._handle_key("b")
-    app._handle_key("\x7f")
+    app.handle_key("2")
+    app.handle_key("/")
+    app.handle_key("a")
+    app.handle_key("b")
+    app.handle_key("\x7f")
     assert app._view.filter_query == "a"
     app.close()
 
 
 def test_handle_key_escape_exits_filter_mode_before_detail(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("2")
-    app._handle_key("/")
-    app._handle_key("x")
-    app._handle_key("\x1b")
+    app.handle_key("2")
+    app.handle_key("/")
+    app.handle_key("x")
+    app.handle_key("\x1b")
     assert app._view.mode == "detail"
     assert app._view.detail_panel == 2
     assert app._view.filter_edit_mode is False
@@ -180,8 +199,8 @@ def test_handle_key_escape_exits_filter_mode_before_detail(populated_hermes_home
 
 def test_handle_key_slash_ignored_outside_filter_panels(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("5")
-    app._handle_key("/")
+    app.handle_key("5")
+    app.handle_key("/")
     assert app._view.filter_edit_mode is False
     assert app._view.filter_query == ""
     app.close()
@@ -189,25 +208,25 @@ def test_handle_key_slash_ignored_outside_filter_panels(populated_hermes_home: P
 
 def test_handle_key_s_cycles_session_sort(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("2")
+    app.handle_key("2")
     assert app._view.session_sort == "recent"
-    app._handle_key("s")
+    app.handle_key("s")
     assert app._view.session_sort == "cost"
-    app._handle_key("s")
+    app.handle_key("s")
     assert app._view.session_sort == "tokens"
-    app._handle_key("s")
+    app.handle_key("s")
     assert app._view.session_sort == "recent"
     app.close()
 
 
 def test_digit_key_for_current_detail_panel_preserves_filter_state(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("2")
+    app.handle_key("2")
     app._view.filter_query = "source:cli"
     app._view.scroll_offset = 3
     app._view.session_sort = "cost"
 
-    app._handle_key("2")
+    app.handle_key("2")
 
     assert app._view.filter_query == "source:cli"
     assert app._view.scroll_offset == 3
@@ -217,21 +236,21 @@ def test_digit_key_for_current_detail_panel_preserves_filter_state(populated_her
 
 def test_handle_key_s_ignored_outside_sessions(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("8")
-    app._handle_key("s")
+    app.handle_key("8")
+    app.handle_key("s")
     assert app._view.session_sort == "recent"
     app.close()
 
 
 def test_handle_key_g_and_big_g_jump_scroll(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("8")
-    app._handle_key("j")
-    app._handle_key("j")
+    app.handle_key("8")
+    app.handle_key("j")
+    app.handle_key("j")
     assert app._view.scroll_offset == 2
-    app._handle_key("G")
+    app.handle_key("G")
     assert app._view.scroll_offset > 2
-    app._handle_key("g")
+    app.handle_key("g")
     assert app._view.scroll_offset == 0
     app.close()
 
@@ -241,11 +260,11 @@ def test_jump_bottom_then_scroll_up_changes_logs_offset(populated_hermes_home: P
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     lines = [LogLine(message=f"line {i}") for i in range(15)]
     app._set_state(app._state.model_copy(update={"logs": LogState(agent_lines=lines)}))
-    app._handle_key("8")
-    app._handle_key("G")
+    app.handle_key("8")
+    app.handle_key("G")
     app._build_layout()
     assert app._view.scroll_offset == 5  # 15 lines - 10 visible
-    app._handle_key("k")
+    app.handle_key("k")
     assert app._view.scroll_offset == 4
     app.close()
 
@@ -255,25 +274,25 @@ def test_jump_bottom_then_scroll_up_changes_skills_offset(populated_hermes_home:
     skills = [SkillInfo(name=f"skill-{i}") for i in range(5)]
     skills_memory = app._state.skills_memory.model_copy(update={"skills": skills})
     app._set_state(app._state.model_copy(update={"skills_memory": skills_memory}))
-    app._handle_key("7")
-    app._handle_key("G")
+    app.handle_key("7")
+    app.handle_key("G")
     app._build_layout()
     assert app._view.scroll_offset == 4  # 5 rows - 1
-    app._handle_key("k")
+    app.handle_key("k")
     assert app._view.scroll_offset == 3
     app.close()
 
 
 def test_handle_key_invalid_returns_none(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    result = app._handle_key("x")
+    result = app.handle_key("x")
     assert result is None
     app.close()
 
 
 def test_handle_key_digit_9_enters_profiles_detail(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("9")
+    app.handle_key("9")
     assert app._view.mode == "detail"
     assert app._view.detail_panel == 9
     app.close()
@@ -281,7 +300,7 @@ def test_handle_key_digit_9_enters_profiles_detail(populated_hermes_home: Path):
 
 def test_handle_key_escape_in_overview_noop(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("\x1b")
+    app.handle_key("\x1b")
     assert app._view.mode == "overview"
     app.close()
 
@@ -289,7 +308,7 @@ def test_handle_key_escape_in_overview_noop(populated_hermes_home: Path):
 def test_handle_key_escape_sequence_not_digit(populated_hermes_home: Path):
     """Arrow keys like \\x1b[2~ must not be treated as digit '2'."""
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("\x1b[2~")
+    app.handle_key("\x1b[2~")
     assert app._view.mode == "overview"
     assert app._view.detail_panel is None
     app.close()
@@ -298,7 +317,7 @@ def test_handle_key_escape_sequence_not_digit(populated_hermes_home: Path):
 def test_handle_key_multi_char_ignored(populated_hermes_home: Path):
     """Multi-char input that isn't an escape sequence is ignored."""
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    result = app._handle_key("ab")
+    result = app.handle_key("ab")
     assert result is None
     assert app._view.mode == "overview"
     app.close()
@@ -306,17 +325,17 @@ def test_handle_key_multi_char_ignored(populated_hermes_home: Path):
 
 def test_handle_key_p_cycles_profile_view_in_profiles_panel(profiled_hermes_home: Path):
     app = DashboardApp(profiled_hermes_home, refresh_rate=5)
-    app._handle_key("9")
+    app.handle_key("9")
     assert app._view.profile_cycle_index == 0
-    app._handle_key("p")
+    app.handle_key("p")
     assert app._view.profile_cycle_index == 1
     app.close()
 
 
 def test_handle_key_p_ignored_outside_profiles_panel(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("3")
-    app._handle_key("p")
+    app.handle_key("3")
+    app.handle_key("p")
     assert app._view.profile_cycle_index == 0
     app.close()
 
@@ -558,7 +577,12 @@ def test_input_loop_handles_quit_and_restores_terminal(populated_hermes_home: Pa
     monkeypatch.setattr(termios, "tcgetattr", lambda fd: ["old-settings"])
     monkeypatch.setattr(tty, "setcbreak", lambda fd: None)
     monkeypatch.setattr(select, "select", lambda read, write, err, timeout: ([123], [], []))
-    monkeypatch.setattr(os, "read", lambda fd, size: b"q")
+
+    def fake_read(fd: int, size: int) -> bytes:
+        assert size == 64
+        return b"q"
+
+    monkeypatch.setattr(os, "read", fake_read)
 
     def fake_tcsetattr(fd: int, when: int, settings: object) -> None:
         restored["fd"] = fd
@@ -950,7 +974,7 @@ def test_copy_current_view_returns_detail_text(populated_hermes_home: Path):
     buffer = io.StringIO()
     app._console = Console(file=buffer, width=120, height=40, force_terminal=True, no_color=True)
     app._set_state(app._collector.collect())
-    app._handle_key("2")
+    app.handle_key("2")
     copied = app.copy_current_view()
     assert "[2] Sessions" in copied
     assert "sess_001" in copied
@@ -1026,7 +1050,7 @@ def test_health_style_boundaries(ok_sources: int, total_sources: int, style_attr
 
 def test_handle_key_empty_string_is_noop(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    assert app._handle_key("") is None
+    assert app.handle_key("") is None
     assert app._view.mode == "overview"
     app.close()
 
@@ -1036,13 +1060,13 @@ def test_handle_key_tab_cycles_named_log_streams(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     streams = [LogStream(name="alpha"), LogStream(name="beta")]
     app._set_state(app._state.model_copy(update={"logs": LogState(streams=streams)}))
-    app._handle_key("8")
+    app.handle_key("8")
     assert app._view.log_sub_view == "agent"
-    app._handle_key("\t")
+    app.handle_key("\t")
     assert app._view.log_sub_view == "alpha"
-    app._handle_key("\t")
+    app.handle_key("\t")
     assert app._view.log_sub_view == "beta"
-    app._handle_key("\t")
+    app.handle_key("\t")
     assert app._view.log_sub_view == "alpha"
     app.close()
 
@@ -1053,8 +1077,8 @@ def test_jump_bottom_clamps_to_first_stream_when_sub_view_missing(populated_herm
     lines = [LogLine(message=f"line {i}") for i in range(15)]
     streams = [LogStream(name="custom", lines=lines)]
     app._set_state(app._state.model_copy(update={"logs": LogState(streams=streams)}))
-    app._handle_key("8")
-    app._handle_key("G")
+    app.handle_key("8")
+    app.handle_key("G")
     app._build_layout()
     assert app._view.scroll_offset == 5  # 15 lines - 10 visible
     app.close()
@@ -1359,8 +1383,8 @@ def test_build_footer_detail_profiles_shows_cycle_action(populated_hermes_home: 
 
 def test_build_footer_shows_enter_apply_while_editing_filter(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app._handle_key("2")
-    app._handle_key("/")
+    app.handle_key("2")
+    app.handle_key("/")
     footer = app._build_footer(app._state)
     assert "[Enter]" in footer.plain
     assert "Apply" in footer.plain
@@ -1424,7 +1448,7 @@ def test_copy_current_view_preserves_detail_filter_and_sort(populated_hermes_hom
     buffer = io.StringIO()
     app._console = Console(file=buffer, width=120, height=40, force_terminal=True, no_color=True)
     app._set_state(app._collector.collect())
-    app._handle_key("2")
+    app.handle_key("2")
     app._view.filter_query = "source:telegram"
     app._view.session_sort = "cost"
 

@@ -54,6 +54,8 @@ def test_cron_detail_shows_job_table():
         cron=CronState(
             last_tick_ago_seconds=5.0,
             job_count=2,
+            max_parallel_jobs=3,
+            wrap_response=True,
             jobs=[
                 CronJob(
                     job_id="abc123",
@@ -80,6 +82,8 @@ def test_cron_detail_shows_job_table():
     assert "once in 2m" in text
     assert "daily-backup" in text
     assert "2026-04-09 18:21:49" in text
+    assert "max_parallel=3" in text
+    assert "wrap_response=yes" in text
 
 
 def test_cron_detail_empty():

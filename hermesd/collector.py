@@ -804,6 +804,7 @@ class Collector:
                     self._paths.shared_path("cron", "output"),
                     str(j.get("id") or ""),
                     self._log_tail_bytes,
+                    stop_at=self._paths.root_home,
                 )
                 jobs.append(
                     CronJob(
@@ -1281,7 +1282,7 @@ class Collector:
 
     def _tail_log_stream(self, name: str, path: Path, max_lines: int) -> LogStream:
         key = str(path)
-        if not path.exists():
+        if not _path_resolves_under(path, self._paths.root_home) or not path.exists():
             return LogStream(name=name, path=path.name, lines=self._log_cache.get(key, []))
         size_bytes = _file_size(path)
         mtime = _mtime(path)
@@ -1329,7 +1330,12 @@ class Collector:
 
     def _tail_latest_cron_output(self, output_root: Path, max_lines: int) -> list[LogLine]:
         key = f"cron:{output_root}"
-        result = _tail_latest_cron_output(output_root, max_lines, self._log_tail_bytes)
+        result = _tail_latest_cron_output(
+            output_root,
+            max_lines,
+            self._log_tail_bytes,
+            stop_at=self._paths.root_home,
+        )
         if result:
             self._log_cache[key] = result
             return result
@@ -1666,16 +1672,20 @@ def _latest_cron_output_excerpt(
     output_root: Path,
     job_id: str,
     max_bytes: int,
+    *,
+    stop_at: Path | None = None,
 ) -> tuple[str, bool, str, float | None]:
     if not job_id:
         return "", False, "", None
     job_output_dir = output_root / job_id
-    if not job_output_dir.is_dir():
+    output_root_escaped = stop_at is not None and not _path_resolves_under(output_root, stop_at)
+    job_output_dir_escaped = not _path_resolves_under(job_output_dir, output_root)
+    if output_root_escaped or job_output_dir_escaped or not job_output_dir.is_dir():
         return "", False, "", None
     files = []
     for path in job_output_dir.iterdir():
         try:
-            if path.is_file():
+            if not path.is_symlink() and path.is_file():
                 files.append(path)
         except OSError:
             continue
@@ -1695,17 +1705,24 @@ def _latest_cron_output_excerpt(
     return "", silent, latest.name, latest_mtime
 
 
-def _tail_latest_cron_output(output_root: Path, max_lines: int, max_bytes: int) -> list[LogLine]:
-    if not output_root.is_dir():
+def _tail_latest_cron_output(
+    output_root: Path,
+    max_lines: int,
+    max_bytes: int,
+    *,
+    stop_at: Path | None = None,
+) -> list[LogLine]:
+    output_root_escaped = stop_at is not None and not _path_resolves_under(output_root, stop_at)
+    if output_root_escaped or not output_root.is_dir():
         return []
     latest_file: Path | None = None
     latest_mtime = 0.0
     for job_dir in output_root.iterdir():
-        if not job_dir.is_dir():
+        if job_dir.is_symlink() or not job_dir.is_dir():
             continue
         for path in job_dir.iterdir():
             try:
-                if not path.is_file():
+                if path.is_symlink() or not path.is_file():
                     continue
                 mtime = path.stat().st_mtime
             except OSError:
@@ -1720,6 +1737,15 @@ def _tail_latest_cron_output(output_root: Path, max_lines: int, max_bytes: int) 
     except OSError:
         return []
     return [LogLine(message=line.strip()) for line in lines if line.strip()]
+
+
+def _path_resolves_under(path: Path, root: Path) -> bool:
+    try:
+        resolved_path = path.resolve(strict=False)
+        resolved_root = root.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return False
+    return resolved_path == resolved_root or resolved_path.is_relative_to(resolved_root)
 
 
 def _read_kanban_state(db_path: Path, base_state: KanbanState) -> KanbanState:
