@@ -1071,6 +1071,26 @@ def test_handle_key_tab_cycles_named_log_streams(populated_hermes_home: Path):
     app.close()
 
 
+def test_tab_reaches_real_aux_log_streams(populated_hermes_home: Path):
+    """End-to-end: real audit/mcp-stderr logs collected and reachable via Tab."""
+    logs = populated_hermes_home / "logs"
+    logs.mkdir(exist_ok=True)
+    (logs / "audit.log").write_text("2026-04-09 15:41:58,123 - hermes - INFO - audit entry\n")
+    (logs / "mcp-stderr.log").write_text("2026-04-09 15:41:58,123 - hermes - INFO - mcp entry\n")
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._set_state(app._collector.collect())
+    app.handle_key("8")
+    names = [stream.name for stream in app._state.logs.streams]
+    assert "audit" in names
+    assert "mcp.stderr" in names
+    visited = {app._view.log_sub_view}
+    for _ in range(len(names) + 1):
+        app.handle_key("\t")
+        visited.add(app._view.log_sub_view)
+    assert {"audit", "mcp.stderr"} <= visited
+    app.close()
+
+
 def test_jump_bottom_clamps_to_first_stream_when_sub_view_missing(populated_hermes_home: Path):
     """Scroll clamping follows the first named stream when the sub-view is absent."""
     app = DashboardApp(populated_hermes_home, refresh_rate=5)

@@ -1934,6 +1934,10 @@ def test_collect_kanban_null_columns_coerced(populated_hermes_home: Path):
     assert null_task.model_override == ""
     assert null_task.branch_name == ""
     assert state.kanban.assignee_counts.get("unassigned") == 1
+    # The fixture kanban.db has no task_links/task_attachments tables, so
+    # _table_count_or_zero must tolerate the absent tables and report zero.
+    assert state.kanban.link_count == 0
+    assert state.kanban.attachment_count == 0
 
     runs = {run.run_id: run for run in state.kanban.recent_runs}
     null_run = runs[2]
