@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from hermesd.collector import Collector
 
 
@@ -70,4 +72,33 @@ def test_collect_curator_empty_dir_is_empty(hermes_home: Path):
     c = Collector(hermes_home)
     state = c.collect()
     assert state.curator.run_present is False
+    c.close()
+
+
+def test_collect_curator_run_dir_without_run_json_is_empty(hermes_home: Path):
+    # A run directory exists but run.json is missing (e.g. interrupted run) —
+    # degrade to empty, not a failed source.
+    (hermes_home / "logs" / "curator" / "20260610-133539").mkdir(parents=True)
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.curator.run_present is False
+    assert "curator" not in state.health.failed_sources
+    c.close()
+
+
+def test_collect_curator_skips_symlinked_run_dir(hermes_home: Path):
+    curator_dir = hermes_home / "logs" / "curator"
+    curator_dir.mkdir(parents=True)
+    outside = hermes_home / "outside_run"
+    outside.mkdir()
+    (outside / "run.json").write_text(json.dumps({"model": "leaked", "run_present": True}))
+    try:
+        (curator_dir / "20260610-133539").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks not supported here")
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.curator.run_present is False
+    assert state.curator.model == ""
+    assert "curator" not in state.health.failed_sources
     c.close()

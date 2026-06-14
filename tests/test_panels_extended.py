@@ -513,6 +513,20 @@ def test_tokens_panel_detail_shows_cost_status_reconciliation():
     assert "110" in text
 
 
+def test_tokens_panel_detail_negative_cost_uses_minus_sign_prefix():
+    # A credit/refund (negative cost) must render -$ / ~-$, not $- / ~$-.
+    state = DashboardState(
+        sessions=[
+            SessionInfo(session_id="sess_credit", estimated_cost_usd=-0.50, cost_status="exact"),
+            SessionInfo(session_id="sess_est", estimated_cost_usd=-0.30, cost_status="estimated"),
+        ],
+    )
+    text = render_to_str(render_panel(3, state, Theme(), detail=True))
+    assert "-$0.50" in text
+    assert "$-0.50" not in text
+    assert "~-$0.30" in text
+
+
 def test_tokens_panel_detail_shows_by_endpoint_breakdown():
     state = DashboardState(
         token_analytics=TokenAnalytics(

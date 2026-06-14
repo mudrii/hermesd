@@ -8,8 +8,16 @@ from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import AUTHORITATIVE_COST_STATUSES, DashboardState, TokenBreakdown
-from hermesd.panels.formatting import fmt_tokens
+from hermesd.panels.formatting import fmt_tokens, fmt_usd
 from hermesd.theme import Theme
+
+
+def _fmt_cost(value: float, *, estimated: bool) -> str:
+    """Format a USD cost, prefixing '~' when the figure is an estimate.
+
+    Routes through fmt_usd so negatives render as -$x.xx (not $-x.xx).
+    """
+    return f"~{fmt_usd(value)}" if estimated else fmt_usd(value)
 
 
 def render_tokens(state: DashboardState, theme: Theme, detail: bool = False) -> Panel:
@@ -29,12 +37,16 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     )
     lines.append("       ", style=theme.ui_label)
     lines.append(f"  Cache-R:{fmt_tokens(t.cache_read_tokens):>6}\n", style=theme.banner_text)
-    today_prefix = "~$" if t.cost_is_estimated else "$"
-    total_prefix = "~$" if total.cost_is_estimated else "$"
     lines.append("  Cost", style=theme.ui_label)
-    lines.append(f"   Today:{today_prefix}{t.total_cost_usd:.2f}\n", style=theme.ui_accent)
+    lines.append(
+        f"   Today:{_fmt_cost(t.total_cost_usd, estimated=t.cost_is_estimated)}\n",
+        style=theme.ui_accent,
+    )
     lines.append("       ", style=theme.ui_label)
-    lines.append(f"   Total:{total_prefix}{total.total_cost_usd:.2f}", style=theme.banner_dim)
+    lines.append(
+        f"   Total:{_fmt_cost(total.total_cost_usd, estimated=total.cost_is_estimated)}",
+        style=theme.banner_dim,
+    )
 
     return Panel(
         lines,
@@ -59,7 +71,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     table.add_column("Cost", justify="right", style=theme.ui_accent)
 
     for s in state.sessions:
-        cost_prefix = "$" if s.cost_status in AUTHORITATIVE_COST_STATUSES else "~$"
+        estimated = s.cost_status not in AUTHORITATIVE_COST_STATUSES
         table.add_row(
             escape(s.session_id[-8:]),
             fmt_tokens(s.input_tokens),
@@ -67,13 +79,13 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
             fmt_tokens(s.cache_read_tokens),
             fmt_tokens(s.cache_write_tokens),
             fmt_tokens(s.reasoning_tokens),
-            f"{cost_prefix}{s.estimated_cost_usd:.2f}",
+            _fmt_cost(s.estimated_cost_usd, estimated=estimated),
         )
     sections.append(table)
 
     # Aggregate tables mix estimated and reported sessions; reuse the
     # summary-level flag the compact view uses.
-    aggregate_prefix = "~$" if state.tokens_total.cost_is_estimated else "$"
+    aggregate_estimated = state.tokens_total.cost_is_estimated
 
     if state.token_analytics.windows:
         sections.append(Text("\nRecent Windows\n", style=f"bold {theme.ui_label}"))
@@ -91,26 +103,26 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
                 fmt_tokens(window.input_tokens),
                 fmt_tokens(window.output_tokens),
                 f"{window.cache_ratio * 100:.0f}%",
-                f"{aggregate_prefix}{window.total_cost_usd:.2f}",
+                _fmt_cost(window.total_cost_usd, estimated=aggregate_estimated),
             )
         sections.append(windows)
 
     if state.token_analytics.by_model:
         sections.append(Text("\nBy Model\n", style=f"bold {theme.ui_label}"))
         sections.append(
-            _render_breakdown_table(state.token_analytics.by_model, theme, aggregate_prefix)
+            _render_breakdown_table(state.token_analytics.by_model, theme, aggregate_estimated)
         )
 
     if state.token_analytics.by_provider:
         sections.append(Text("\nBy Provider\n", style=f"bold {theme.ui_label}"))
         sections.append(
-            _render_breakdown_table(state.token_analytics.by_provider, theme, aggregate_prefix)
+            _render_breakdown_table(state.token_analytics.by_provider, theme, aggregate_estimated)
         )
 
     if state.token_analytics.by_endpoint:
         sections.append(Text("\nBy Endpoint\n", style=f"bold {theme.ui_label}"))
         sections.append(
-            _render_breakdown_table(state.token_analytics.by_endpoint, theme, aggregate_prefix)
+            _render_breakdown_table(state.token_analytics.by_endpoint, theme, aggregate_estimated)
         )
 
     if state.token_analytics.cost_status_counts:
@@ -137,7 +149,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     )
 
 
-def _render_breakdown_table(entries: list[TokenBreakdown], theme: Theme, cost_prefix: str) -> Table:
+def _render_breakdown_table(entries: list[TokenBreakdown], theme: Theme, estimated: bool) -> Table:
     table = Table(box=None, show_header=True, padding=(0, 2))
     table.add_column("Label", style=theme.ui_label)
     table.add_column("Sessions", justify="right", style=theme.banner_text)
@@ -152,6 +164,6 @@ def _render_breakdown_table(entries: list[TokenBreakdown], theme: Theme, cost_pr
             fmt_tokens(entry.input_tokens),
             fmt_tokens(entry.output_tokens),
             fmt_tokens(entry.cache_read_tokens),
-            f"{cost_prefix}{entry.total_cost_usd:.2f}",
+            _fmt_cost(entry.total_cost_usd, estimated=estimated),
         )
     return table

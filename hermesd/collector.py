@@ -967,11 +967,20 @@ class Collector:
         curator_dir = self._paths.shared_path("logs", "curator")
         if not curator_dir.is_dir():
             return CuratorRun()
-        run_dirs = sorted(p for p in curator_dir.iterdir() if p.is_dir())
+        # Skip symlinked run dirs and any path that escapes the Hermes home,
+        # matching the symlink hardening on the cron/checkpoint readers.
+        run_dirs = sorted(
+            p
+            for p in curator_dir.iterdir()
+            if p.is_dir() and not p.is_symlink() and _path_resolves_under(p, self._paths.root_home)
+        )
         if not run_dirs:
             return CuratorRun()
         newest = run_dirs[-1]
-        data = self._read_json_cached(newest / "run.json")
+        run_json = newest / "run.json"
+        if run_json.is_symlink():
+            return CuratorRun()
+        data = self._read_json_cached(run_json)
         if not data:
             return CuratorRun()
         counts = _as_dict(data.get("counts"))
