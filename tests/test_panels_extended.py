@@ -256,6 +256,35 @@ def test_sessions_panel_detail_text_filter_and_token_sort_order():
     assert text.find("ss_high") < text.find("sess_low")
 
 
+def test_sessions_panel_token_sort_includes_cache_write_tokens():
+    state = DashboardState(
+        sessions=[
+            SessionInfo(
+                session_id="sess_cache_write",
+                title="deploy task",
+                input_tokens=1,
+                output_tokens=1,
+                cache_write_tokens=500,
+                started_at=10,
+            ),
+            SessionInfo(
+                session_id="sess_plain",
+                title="deploy task",
+                input_tokens=100,
+                output_tokens=100,
+                started_at=20,
+            ),
+        ],
+    )
+
+    panel = render_panel(
+        2, state, Theme(), detail=True, filter_query="text:deploy", session_sort="tokens"
+    )
+    text = render_to_str(panel)
+
+    assert text.find("e_write") < text.find("ss_plain")
+
+
 def test_extract_message_search_query_uses_last_message_term():
     assert extract_message_search_query("message:timeout message:retry") == "retry"
 

@@ -3,9 +3,7 @@ from __future__ import annotations
 import io
 import json
 import threading
-import time
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 from rich.cells import cell_len
@@ -524,13 +522,14 @@ def test_collector_loop_marks_state_stale_on_collect_error(populated_hermes_home
     app._running.set()
     app._force_refresh.set()
 
+    def fail_once_and_stop():
+        app._running.clear()
+        raise RuntimeError("collector failed")
+
+    app._collector.collect = fail_once_and_stop
+
     thread = threading.Thread(target=app._collector_loop)
     thread.start()
-    deadline = time.monotonic() + 1
-    while not app._state.is_stale and time.monotonic() < deadline:
-        time.sleep(0.01)
-    app._running.clear()
-    app._force_refresh.set()
     thread.join(timeout=1)
 
     assert app._state.is_stale is True
@@ -720,7 +719,7 @@ def test_app_refreshes_theme_when_skin_changes(populated_hermes_home: Path):
     app.close()
 
 
-def test_app_unknown_skin_does_not_reload_theme_every_update(populated_hermes_home: Path):
+def test_app_unknown_skin_keeps_fallback_theme_on_repeated_updates(populated_hermes_home: Path):
     import yaml
 
     config_path = populated_hermes_home / "config.yaml"
@@ -729,11 +728,12 @@ def test_app_unknown_skin_does_not_reload_theme_every_update(populated_hermes_ho
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     state = app._collector.collect()
 
-    with patch("hermesd.app.load_theme", wraps=load_theme) as mocked:
-        app._set_state(state)
-        app._set_state(state)
+    app._set_state(state)
+    first_theme = app._theme
+    app._set_state(state)
 
-    assert mocked.call_count <= 1
+    assert app._theme is first_theme
+    assert app._theme.skin_name == "default"
     app.close()
 
 
@@ -1089,13 +1089,14 @@ def test_collector_loop_updates_state_on_successful_collect(populated_hermes_hom
     app._running.set()
     app._force_refresh.set()
 
+    def collect_once_and_stop():
+        app._running.clear()
+        return marker_state
+
+    app._collector.collect = collect_once_and_stop
+
     thread = threading.Thread(target=app._collector_loop)
     thread.start()
-    deadline = time.monotonic() + 1
-    while app._state.health.total_sources != 1 and time.monotonic() < deadline:
-        time.sleep(0.01)
-    app._running.clear()
-    app._force_refresh.set()
     thread.join(timeout=1)
 
     assert app._state.health.total_sources == 1

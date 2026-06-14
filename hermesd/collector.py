@@ -888,7 +888,7 @@ class Collector:
         background_processes: list[BackgroundProcessInfo],
     ) -> OperationsState:
         dashboard_process_count = sum(
-            1 for process in background_processes if "hermes dashboard" in process.command
+            1 for process in background_processes if _is_dashboard_process(process.command)
         )
         desktop_stamp = self._read_json_cached(self._paths.shared_path("desktop-build-stamp.json"))
         stamp_label = str(
@@ -1107,7 +1107,7 @@ class Collector:
 
         checkpoints: list[CheckpointInfo] = []
         for repo_dir in sorted(checkpoints_dir.iterdir()):
-            if not repo_dir.is_dir():
+            if repo_dir.is_symlink() or not repo_dir.is_dir():
                 continue
             checkpoints.append(self._summarize_checkpoint(repo_dir))
         return checkpoints
@@ -1864,6 +1864,16 @@ def _channel_capabilities(name: str) -> list[str]:
     if name == "feishu":
         return ["meeting invites"]
     return []
+
+
+def _is_dashboard_process(command: str) -> bool:
+    if "hermes dashboard" in command:
+        return True
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+    return any(Path(part).name == "hermesd" for part in parts)
 
 
 def _len_if_sized(value: object) -> int:

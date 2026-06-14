@@ -13,7 +13,7 @@ from rich.console import Console
 
 def render_to_str(panel, width: int = 120, no_color: bool = False) -> str:
     """Render a Rich renderable to a string for assertion."""
-    console = Console(width=width, force_terminal=True, no_color=no_color)
+    console = Console(width=width, height=80, force_terminal=True, no_color=no_color)
     with console.capture() as cap:
         console.print(panel)
     return cap.get()

@@ -178,16 +178,35 @@ def test_run_installs_signal_handlers_before_initial_collect(
 
 
 def test_run_live_loop_renders_and_exits_when_running_cleared(
-    populated_hermes_home: Path, restore_signal_handlers
+    populated_hermes_home: Path, monkeypatch, restore_signal_handlers
 ):
     """run() drives the Live loop and exits cleanly once the running event clears."""
     import io
 
     from rich.console import Console
 
+    import hermesd.app as app_module
+
+    class RecordingLive:
+        def __init__(self, renderable, *, console, refresh_per_second, screen):
+            self.renderable = renderable
+            self.console = console
+
+        def __enter__(self):
+            self.console.print(self.renderable)
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def update(self, renderable):
+            self.console.print(renderable)
+
     app = DashboardApp(populated_hermes_home, refresh_rate=1)
     buffer = io.StringIO()
     app._console = Console(file=buffer, width=80, height=24, force_terminal=True)
+
+    monkeypatch.setattr(app_module, "Live", RecordingLive)
     stopper = threading.Timer(0.2, app._running.clear)
     stopper.start()
     try:

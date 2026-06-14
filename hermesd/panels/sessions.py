@@ -303,6 +303,7 @@ def _sort_sessions(sessions: list[SessionInfo], session_sort: str) -> list[Sessi
                 session.input_tokens
                 + session.output_tokens
                 + session.cache_read_tokens
+                + session.cache_write_tokens
                 + session.reasoning_tokens,
                 session.started_at,
                 session.session_id,

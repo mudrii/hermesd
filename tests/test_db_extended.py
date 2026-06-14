@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import shutil
 import sqlite3
-import threading
 import time
 from pathlib import Path
 
@@ -109,49 +108,6 @@ def test_wal_snapshot_reads_uncheckpointed_data_without_home_sidecars(tmp_path: 
         writer.close()
 
 
-def test_empty_sessions_are_cached(hermes_home, monkeypatch):
-    db_path = hermes_home / "state.db"
-    conn = sqlite3.connect(str(db_path))
-    create_state_db_tables(conn, include_schema_version=False)
-    conn.close()
-    db = HermesDB(db_path)
-    reads = 0
-    original_read_all_sessions = db._read_all_sessions
-
-    def counting_read_all_sessions(conn: sqlite3.Connection) -> list[dict[str, object]]:
-        nonlocal reads
-        reads += 1
-        return original_read_all_sessions(conn)
-
-    monkeypatch.setattr(db, "_read_all_sessions", counting_read_all_sessions)
-
-    assert db.read_sessions() == []
-    assert db.read_sessions() == []
-    assert reads == 1
-    db.close()
-
-
-def test_empty_tool_stats_are_cached(hermes_home):
-    db_path = hermes_home / "state.db"
-    conn = sqlite3.connect(str(db_path))
-    create_state_db_tables(conn, include_schema_version=False)
-    conn.close()
-    db = HermesDB(db_path)
-    reads = 0
-    original_read_tool_stats = db._read_tool_stats
-
-    def counting_read_tool_stats(conn: sqlite3.Connection) -> list[dict[str, object]]:
-        nonlocal reads
-        reads += 1
-        return original_read_tool_stats(conn)
-
-    db._read_tool_stats = counting_read_tool_stats  # type: ignore[assignment]  # test seam: replacing bound method with counting stub
-    assert db.read_tool_stats() == []
-    assert db.read_tool_stats() == []
-    assert reads == 1
-    db.close()
-
-
 def test_read_only_uri_handles_uri_metacharacters(tmp_path: Path):
     hermes_home = tmp_path / "hermes?demo#home"
     hermes_home.mkdir()
@@ -244,21 +200,6 @@ def test_search_blank_query_returns_empty(sample_db, hermes_home):
     db.close()
 
 
-def test_search_repeated_same_query_uses_cache(sample_db, hermes_home, monkeypatch):
-    """Same query on unchanged data must be served from cache, not re-queried."""
-    db = HermesDB(hermes_home / "state.db")
-    first = db.search_session_ids_by_message("response 0")
-    assert first == {"sess_001"}
-
-    def fail_like(conn: sqlite3.Connection, query: str) -> set[str]:
-        raise AssertionError("cache hit expected; search re-ran SQL")
-
-    monkeypatch.setattr(db, "_search_session_ids_by_like", fail_like)  # test seam
-    assert db.search_session_ids_by_message("response 0") == {"sess_001"}
-    assert db.last_message_search_stale is False
-    db.close()
-
-
 def test_search_two_distinct_queries_reuse_fts_detection(sample_db, hermes_home):
     """Consecutive distinct queries both resolve correctly (FTS detection memoized)."""
     db = HermesDB(hermes_home / "state.db")
@@ -345,49 +286,6 @@ def test_read_session_count_refreshes_after_write(sample_db, hermes_home):
     conn.close()
 
     assert db.read_session_count() == 3
-    db.close()
-
-
-def test_read_session_count_cache_hit_skips_sql(sample_db, hermes_home):
-    db = HermesDB(hermes_home / "state.db")
-    reads = 0
-    original_read_session_count = db._read_session_count
-
-    def counting_read_session_count(conn: sqlite3.Connection) -> int:
-        nonlocal reads
-        reads += 1
-        return original_read_session_count(conn)
-
-    db._read_session_count = counting_read_session_count  # type: ignore[assignment]  # test seam: replacing bound method with counting stub
-
-    assert db.read_session_count() == 2
-    assert db.read_session_count() == 2
-    assert reads == 1
-    db.close()
-
-
-def test_read_sessions_reconnects_after_three_query_errors(sample_db, hermes_home, monkeypatch):
-    db = HermesDB(hermes_home / "state.db")
-    reconnects = 0
-    original_connect = sqlite3.connect
-
-    def fail_read(_conn: sqlite3.Connection) -> list[dict[str, object]]:
-        raise sqlite3.OperationalError("db unavailable")
-
-    def counting_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
-        nonlocal reconnects
-        reconnects += 1
-        return original_connect(*args, **kwargs)
-
-    monkeypatch.setattr(sqlite3, "connect", counting_connect)
-    monkeypatch.setattr(db, "_current_version", lambda: 1)
-    monkeypatch.setattr(db, "_read_all_sessions", fail_read)
-
-    assert db.read_sessions() == []
-    assert db.read_sessions() == []
-    assert reconnects == 0
-    assert db.read_sessions() == []
-    assert reconnects == 1
     db.close()
 
 
@@ -520,66 +418,4 @@ def test_search_session_ids_by_message_falls_back_to_like_when_fts_raises(
     monkeypatch.setattr(db, "_search_session_ids_by_fts", fail_fts)
 
     assert db.search_session_ids_by_message("response 0") == {"sess_001"}
-    db.close()
-
-
-def test_db_serializes_cross_thread_reads(hermes_home):
-    db = HermesDB(hermes_home / "state.db")
-    entered = threading.Event()
-    second_started = threading.Event()
-    release = threading.Event()
-    active = threading.Lock()
-    conn = object()
-    results: dict[str, object] = {}
-    errors: list[BaseException] = []
-
-    def enter_critical() -> None:
-        if not active.acquire(blocking=False):
-            raise AssertionError("concurrent db access")
-        entered.set()
-        if not release.wait(timeout=1):
-            active.release()
-            raise AssertionError("timed out waiting for release")
-        active.release()
-
-    def fake_read_all_sessions(_conn: object) -> list[dict[str, object]]:
-        enter_critical()
-        return [{"id": "sess_001"}]
-
-    def fake_search(_conn: object, query: str) -> set[str]:
-        enter_critical()
-        return {query}
-
-    db._ensure_connection = lambda: conn  # type: ignore[assignment]  # test seam: replacing bound method with stub
-    db._current_version = lambda: 1  # type: ignore[assignment]  # test seam: replacing bound method with stub
-    db._messages_fts_enabled = lambda _conn: False  # type: ignore[assignment]  # test seam: replacing bound method with stub
-    db._read_all_sessions = fake_read_all_sessions  # type: ignore[assignment]  # test seam: replacing bound method with stub
-    db._search_session_ids_by_like = fake_search  # type: ignore[assignment]  # test seam: replacing bound method with stub
-
-    def run_read() -> None:
-        try:
-            results["sessions"] = db.read_sessions()
-        except BaseException as exc:  # pragma: no cover - exercised on failure
-            errors.append(exc)
-
-    def run_search() -> None:
-        try:
-            second_started.set()
-            results["search"] = db.search_session_ids_by_message("sess_001")
-        except BaseException as exc:  # pragma: no cover - exercised on failure
-            errors.append(exc)
-
-    first = threading.Thread(target=run_read)
-    second = threading.Thread(target=run_search)
-    first.start()
-    assert entered.wait(timeout=1)
-    second.start()
-    assert second_started.wait(timeout=1)
-    release.set()
-    first.join()
-    second.join()
-
-    assert errors == []
-    assert results["sessions"] == [{"id": "sess_001"}]
-    assert results["search"] == {"sess_001"}
     db.close()

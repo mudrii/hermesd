@@ -119,6 +119,21 @@ def test_collect_background_processes(populated_hermes_home: Path):
     c.close()
 
 
+def test_collect_operations_counts_current_hermesd_background_process(
+    populated_hermes_home: Path,
+):
+    processes = populated_hermes_home / "processes.json"
+    rows = json.loads(processes.read_text())
+    rows[1]["command"] = "uv run hermesd --snapshot"
+    processes.write_text(json.dumps(rows))
+
+    c = Collector(populated_hermes_home)
+    state = c.collect()
+
+    assert state.operations.dashboard_process_count == 1
+    c.close()
+
+
 def test_collect_integrations(populated_hermes_home: Path):
     c = Collector(populated_hermes_home)
     state = c.collect()

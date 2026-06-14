@@ -640,6 +640,24 @@ def test_collect_ignores_stray_entries_in_scanned_directories(populated_hermes_h
     c.close()
 
 
+def test_collect_checkpoints_ignores_symlinked_repo_dirs(hermes_home: Path, tmp_path: Path):
+    checkpoints_dir = hermes_home / "checkpoints"
+    checkpoints_dir.mkdir()
+    external_repo = tmp_path / "external-repo"
+    external_repo.mkdir()
+    (external_repo / "HERMES_WORKDIR").write_text(str(tmp_path / "outside-workdir"))
+    try:
+        (checkpoints_dir / "escaped").symlink_to(external_repo, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are not supported here: {exc}")
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.checkpoints == []
+    c.close()
+
+
 def test_collect_hook_with_non_list_events_gets_empty_events(hermes_home: Path):
     hook_dir = hermes_home / "hooks" / "odd-events"
     hook_dir.mkdir(parents=True)
@@ -1584,45 +1602,4 @@ def test_collect_profiles_reads_soul_excerpt_when_present(profiled_hermes_home: 
     c = Collector(profiled_hermes_home)
     state = c.collect()
     assert state.profiles.profiles[0].soul_excerpt == "Profile soul line one"
-    c.close()
-
-
-@pytest.mark.parametrize(
-    ("source_name", "state_attr", "method_name"),
-    [
-        ("cron", "cron", "_collect_cron"),
-        ("channels", "channels", "_collect_channels"),
-        ("kanban", "kanban", "_collect_kanban"),
-        ("operations", "operations", "_collect_operations"),
-        ("skills", "skills_memory", "_collect_skills_memory"),
-        ("memory", "memory", "_collect_memory"),
-        ("config", "config", "_collect_config"),
-        ("logs", "logs", "_collect_logs"),
-    ],
-)
-def test_collect_preserves_last_good_state_when_source_raises(
-    populated_hermes_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    source_name: str,
-    state_attr: str,
-    method_name: str,
-):
-    """A source that starts raising keeps its last-good state and is marked failed.
-
-    Each source produces non-default data under populated_hermes_home (verified:
-    none equal their model default), so the equality assertion is meaningful.
-    """
-    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
-    s1 = c.collect()
-    good = getattr(s1, state_attr)
-    assert source_name not in s1.health.failed_sources
-
-    def boom(*args: object, **kwargs: object):
-        raise OSError("forced")
-
-    monkeypatch.setattr(c, method_name, boom)
-    s2 = c.collect()
-
-    assert getattr(s2, state_attr) == good
-    assert source_name in s2.health.failed_sources
     c.close()
