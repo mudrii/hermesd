@@ -670,6 +670,7 @@ def test_build_header_with_custom_skin(populated_hermes_home: Path):
     config_path = populated_hermes_home / "config.yaml"
     config_path.write_text(yaml.dump({"display": {"skin": "ares"}}))
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    assert app._theme.skin_name == "ares"
     state = app._collector.collect()
     header = app._build_header(state)
     assert header is not None

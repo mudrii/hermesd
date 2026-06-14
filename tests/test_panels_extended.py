@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from hermesd.models import (
     CheckpointInfo,
     ConfigSummary,
@@ -944,3 +946,17 @@ def test_panels_render_with_ares_skin():
     panel = render_panel(1, state, Theme("ares"), detail=False)
     text = render_to_str(panel)
     assert "Running" in text
+
+
+@pytest.mark.parametrize("panel_num", range(1, 13))
+@pytest.mark.parametrize("detail", [False, True])
+def test_panel_renders_fully_empty_state_without_crashing(panel_num: int, detail: bool):
+    """First-launch condition: ~/.hermes exists but the agent never ran.
+
+    A default DashboardState has every collection empty, every count zero, and
+    every optional None simultaneously. Each panel's compact and detail view
+    must render without raising (no None-formatting or zero-division).
+    """
+    panel = render_panel(panel_num, DashboardState(), Theme(), detail=detail)
+    text = render_to_str(panel)
+    assert text.strip()

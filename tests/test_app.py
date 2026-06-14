@@ -127,6 +127,18 @@ def test_app_handle_bracket_navigation_reaches_new_panels(populated_hermes_home:
     app.close()
 
 
+def test_app_handle_bracket_navigation_wraps_at_boundaries(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    for _ in range(11):
+        app._handle_key("]")
+    assert app._view.detail_panel == 12
+    app._handle_key("]")  # forward wrap: 12 -> 1
+    assert app._view.detail_panel == 1
+    app._handle_key("[")  # backward wrap: 1 -> 12
+    assert app._view.detail_panel == 12
+    app.close()
+
+
 def test_app_handle_key_escape(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app._handle_key("3")
