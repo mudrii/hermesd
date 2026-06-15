@@ -700,10 +700,9 @@ def test_tools_panel_detail():
         ],
     )
     panel = render_panel(4, state, Theme(), detail=True)
-    text = render_to_str(panel)
-    assert "shell_exec" in text
-    assert "23" in text
-    assert "read_file" in text
+    text = render_to_str(panel, no_color=True)
+    assert re.search(r"shell_exec\s+23\b", text)
+    assert re.search(r"read_file\s+7\b", text)
 
 
 def test_tools_panel_detail_shows_background_processes():
@@ -1185,8 +1184,12 @@ def test_cron_panel_no_tick():
 def test_overview_panel_no_providers():
     state = DashboardState(skills_memory=SkillsMemory())
     panel = render_panel(7, state, Theme(), detail=False)
-    text = render_to_str(panel)
-    assert "0" in text
+    text = render_to_str(panel, no_color=True)
+    # Bind the zero counts to their labels so an empty panel of stray zeros
+    # cannot pass this vacuously.
+    assert "Skills: 0 (0 cat)" in text
+    assert "0 pools" in text
+    assert "0 plug" in text
 
 
 # ── Skin tests ─────────────────────────────────────────────────────────

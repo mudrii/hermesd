@@ -114,7 +114,7 @@ def test_gateway_panel_detail_shows_platform_error():
     assert "failed to reconnect" in text
     assert "reconnect_failed" in text
     assert "restart" in text.lower()
-    assert "3" in text
+    assert "3 active agents" in text
 
 
 def test_gateway_panel_compact_shows_platform_error_marker():
@@ -301,8 +301,8 @@ def test_overview_panel_compact():
         ),
     )
     panel = render_panel(7, state, Theme(), detail=False)
-    text = render_to_str(panel, width=80)
-    assert "70" in text
+    text = render_to_str(panel, width=80, no_color=True)
+    assert "Skills: 70 (28 cat)" in text
     assert "Skills / Integrations" in text
 
 

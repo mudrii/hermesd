@@ -47,40 +47,39 @@ def _unreadable(path: Path) -> bool:
 # --- available-tools mtime cache HIT (collector.py:694) ----------------------
 
 
-def test_available_tools_cache_hit_skips_reread(hermes_home: Path):
+def test_available_tools_cache_hit_skips_reread(hermes_home: Path, monkeypatch):
     sessions_dir = hermes_home / "sessions"
     (sessions_dir / "sessions.json").write_text(json.dumps({"a": {"session_id": "s1"}}))
-    (sessions_dir / "session_s1.json").write_text(
-        json.dumps({"session_id": "s1", "tools": [{"name": "web_search"}]})
-    )
+    session_file = sessions_dir / "session_s1.json"
+    session_file.write_text(json.dumps({"session_id": "s1", "tools": [{"name": "web_search"}]}))
+
+    # Count real file opens of the per-session file (observable behavior) rather
+    # than wrapping a private collector method.
+    opens: list[Path] = []
+    real_open = Path.open
+
+    def counting_open(self: Path, *args, **kwargs):
+        if self == session_file:
+            opens.append(self)
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting_open)
 
     c = Collector(hermes_home)
     try:
-        calls: list[Path] = []
-        original = c._read_json_cached
-
-        def counting(path: Path):
-            calls.append(path)
-            return original(path)
-
-        c._read_json_cached = counting  # type: ignore[method-assign]
-
         first = c.collect()
-        first_reads = len(calls)
         assert first.available_tools == 1
         assert "web_search" in first.available_tool_names
+        assert len(opens) >= 1  # cold collect opened the per-session file
 
         # Second collect with unchanged sessions.json mtime: the available-tools
-        # branch must return the cached (count, names) without re-reading any
-        # session JSON files.
-        calls.clear()
+        # branch returns the cached (count, names) without re-opening the
+        # per-session file.
+        opens.clear()
         second = c.collect()
         assert second.available_tools == 1
         assert second.available_tool_names == first.available_tool_names
-        # The cache hit means the second collect issues strictly fewer JSON
-        # reads than the cold first collect (it skips sessions.json + per-session
-        # files entirely for the tools branch).
-        assert len(calls) < first_reads
+        assert opens == []
     finally:
         c.close()
 
