@@ -40,7 +40,7 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 | 10 | **Memory** | Memory provider, MEMORY.md/USER.md word counts, SOUL.md size/excerpt, and memory file inventory |
 | 11 | **Kanban** | Read-only kanban task/run/event/comment counts, dispatch config, active workers, blocked/failing tasks, and recent runs |
 | 12 | **Operations** | Dashboard process count, Desktop build stamp, model-cache summaries, and PR monitor state |
-| 13 | **Curator** | Newest memory-curation run: skill before/after counts, archived/pruned/added totals, model/provider, duration, tool-call total, and LLM summary or error |
+| 13 | **Curator** | Newest memory-curation run: skill before/after counts, archived/pruned/added totals, model/provider, duration, tool-call total + per-tool breakdown, state-transition trail, and LLM summary or error |
 
 ### Key Features
 
@@ -138,7 +138,7 @@ Use `]` from Kanban or `--snapshot-panel 12` to expand. The Operations panel sum
 
 ### [13] Curator — What Did the Last Memory Curation Do?
 
-Use `]` from Operations or `--snapshot-panel 13` to expand. The Curator panel reads the newest `~/.hermes/logs/curator/<stamp>/run.json` and shows the skill before/after/delta counts, archived/added/pruned/consolidated totals, the model and provider used, run duration, total tool calls, and the LLM summary (or error).
+Use `]` from Operations or `--snapshot-panel 13` to expand. The Curator panel reads the newest `~/.hermes/logs/curator/<stamp>/run.json` and shows the skill before/after/delta counts, archived/added/pruned/consolidated totals, the model and provider used, run duration, total tool calls plus a per-tool call breakdown, the state-transition trail, and the LLM summary (or error).
 
 ## Installation
 

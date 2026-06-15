@@ -164,15 +164,22 @@ def _task_table(tasks: list[KanbanTaskSummary], theme: Theme) -> Table:
 
 
 def _task_metadata_table(tasks: list[KanbanTaskSummary], theme: Theme) -> Table | None:
-    metadata_tasks = [
-        task
-        for task in tasks
-        if task.completed_at
-        or task.workspace_path
-        or task.goal_mode
-        or task.current_step_key
-        or task.branch_name
-    ]
+    # The same task can appear in more than one input list (e.g. an active task
+    # that also matches the recent-tasks query); dedup by task_id, first wins.
+    seen: set[str] = set()
+    metadata_tasks: list[KanbanTaskSummary] = []
+    for task in tasks:
+        if task.task_id in seen:
+            continue
+        if (
+            task.completed_at
+            or task.workspace_path
+            or task.goal_mode
+            or task.current_step_key
+            or task.branch_name
+        ):
+            seen.add(task.task_id)
+            metadata_tasks.append(task)
     if not metadata_tasks:
         return None
     table = Table(box=None, show_header=True, padding=(0, 1))

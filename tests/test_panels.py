@@ -454,6 +454,27 @@ def test_kanban_panel_detail_shows_completed_task_metadata():
     assert "final" in text
 
 
+def test_kanban_panel_detail_metadata_table_dedups_task_across_lists():
+    # A task present in both active_tasks and recent_tasks must render once in
+    # the Task Metadata table, not duplicated.
+    task = KanbanTaskSummary(
+        task_id="t_dup",
+        title="Dual-listed",
+        status="in_progress",
+        workspace_path="/work/dup",
+        branch_name="feature/dup",
+    )
+    state = DashboardState(
+        kanban=KanbanState(
+            db_present=True,
+            active_tasks=[task],
+            recent_tasks=[task],
+        )
+    )
+    text = render_to_str(render_panel(11, state, Theme(), detail=True), width=120)
+    assert text.count("/work/dup") == 1
+
+
 def test_kanban_panel_detail_hides_link_attachment_rows_when_zero():
     state = DashboardState(kanban=KanbanState(db_present=True, task_count=0))
     text = render_to_str(render_panel(11, state, Theme(), detail=True), width=120)
