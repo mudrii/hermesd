@@ -75,7 +75,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         status.append(p.state)
         error_parts = [p.error_code, p.error_message]
         error = " / ".join(escape(part) for part in error_parts if part) or "—"
-        table.add_row(escape(p.name), status, fmt_iso_timestamp(p.updated_at), error)
+        table.add_row(escape(p.name), status, escape(fmt_iso_timestamp(p.updated_at)), error)
 
     header = Text()
     if gw.running:

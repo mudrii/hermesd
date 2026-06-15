@@ -60,7 +60,15 @@ def _state_for(panel_num: int) -> DashboardState:
                 pid=1,
                 running=True,
                 hermes_version=INJECT,
-                platforms=[PlatformStatus(name=INJECT, state="connected")],
+                platforms=[
+                    PlatformStatus(
+                        name=INJECT,
+                        state="connected",
+                        updated_at=INJECT,
+                        error_code=INJECT,
+                        error_message=INJECT,
+                    )
+                ],
             ),
             channels=ChannelDirectoryState(
                 platform_count=1,
