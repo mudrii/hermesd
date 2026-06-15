@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from hermesd.models import CuratorRun, DashboardState
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
@@ -33,16 +35,18 @@ def test_curator_panel_compact_shows_last_run():
 
 
 def test_curator_panel_detail_shows_fields_and_summary():
-    text = render_to_str(render_panel(13, DashboardState(curator=_RUN), Theme(), detail=True))
+    text = render_to_str(
+        render_panel(13, DashboardState(curator=_RUN), Theme(), detail=True),
+        width=120,
+        no_color=True,
+    )
     assert "MiniMax-M3" in text
     assert "minimax" in text
-    assert "Added" in text
-    assert "2" in text
-    assert "Consolidated" in text
-    assert "1" in text
-    assert "67" in text
-    assert "read_file" in text
-    assert "12" in text
+    # Bind each label to its value so a wrong count can't pass on a stray digit.
+    assert re.search(r"Added\s+2\b", text)
+    assert re.search(r"Consolidated\s+1\b", text)
+    assert re.search(r"Tool Calls\s+67\b", text)
+    assert re.search(r"read_file\s+12\b", text)
     assert "collecting -> summarizing" in text
     assert "processed the candidate skills" in text
 

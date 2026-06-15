@@ -68,6 +68,26 @@ def test_collect_curator_reads_newest_run(hermes_home: Path):
     c.close()
 
 
+def test_collect_curator_state_transition_state_only_shape(hermes_home: Path):
+    # Alternate producer shape: a transition entry with only a `state` key (no
+    # from/to) is labelled by that state, with the timestamp appended.
+    run = _LIVE_SHAPE | {
+        "state_transitions": [
+            {"state": "idle", "at": "2026-06-10T13:41:00+00:00"},
+            {"state": "done"},
+        ]
+    }
+    _write_curator_run(hermes_home, "20260610-133539", run)
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    c.close()
+    assert state.curator.state_transitions == [
+        "idle @ 2026-06-10T13:41:00+00:00",
+        "done",
+    ]
+
+
 def test_collect_curator_added_and_consolidated_counts_render(hermes_home: Path):
     run = _LIVE_SHAPE | {
         "counts": _LIVE_SHAPE["counts"]
