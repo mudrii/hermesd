@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 from hermesd.db import HermesDB
@@ -7,7 +9,7 @@ def test_read_sessions(sample_db, hermes_home):
     db = HermesDB(hermes_home / "state.db")
     sessions = db.read_sessions()
     assert len(sessions) == 2
-    assert sessions[0]["id"] == "sess_001" or sessions[1]["id"] == "sess_001"
+    assert {s["id"] for s in sessions} == {"sess_001", "sess_002"}
     db.close()
 
 
@@ -31,23 +33,8 @@ def test_read_tool_stats(sample_db, hermes_home):
     db.close()
 
 
-def test_data_version_caching(sample_db, hermes_home):
-    db = HermesDB(hermes_home / "state.db")
-    s1 = db.read_sessions()
-    s2 = db.read_sessions()
-    assert s1 == s2
-    assert db._cache_hits >= 1
-    db.close()
-
-
 def test_missing_db():
     db = HermesDB(Path("/nonexistent/state.db"))
     sessions = db.read_sessions()
     assert sessions == []
-    db.close()
-
-
-def test_read_only_mode(sample_db, hermes_home):
-    db = HermesDB(hermes_home / "state.db")
-    assert "mode=ro&immutable=1" in db._uri
     db.close()

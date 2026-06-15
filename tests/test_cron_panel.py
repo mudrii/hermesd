@@ -1,21 +1,11 @@
 """Tests for [6] Cron panel — job listing, compact and detail views."""
 
-import json
-from pathlib import Path
+from __future__ import annotations
 
-from rich.console import Console
-
-from hermesd.collector import Collector
 from hermesd.models import CronJob, CronState, DashboardState
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
-
-
-def _render_to_str(panel) -> str:
-    console = Console(width=100, force_terminal=True, no_color=True)
-    with console.capture() as cap:
-        console.print(panel)
-    return cap.get()
+from tests.conftest import render_to_str
 
 
 def test_cron_compact_shows_job_count():
@@ -38,7 +28,7 @@ def test_cron_compact_shows_job_count():
         ),
     )
     panel = render_panel(6, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=100, no_color=True)
     assert "Jobs: 2" in text
     assert "daily-report" in text
     assert "every day at 9am" in text
@@ -55,7 +45,7 @@ def test_cron_compact_shows_errors():
         ),
     )
     panel = render_panel(6, state, Theme(), detail=False)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=100, no_color=True)
     assert "Errors: 1" in text
 
 
@@ -64,6 +54,8 @@ def test_cron_detail_shows_job_table():
         cron=CronState(
             last_tick_ago_seconds=5.0,
             job_count=2,
+            max_parallel_jobs=3,
+            wrap_response=True,
             jobs=[
                 CronJob(
                     job_id="abc123",
@@ -85,105 +77,20 @@ def test_cron_detail_shows_job_table():
         ),
     )
     panel = render_panel(6, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=100, no_color=True)
     assert "meeting-reminder" in text
     assert "once in 2m" in text
     assert "daily-backup" in text
     assert "2026-04-09 18:21:49" in text
+    assert "max_parallel=3" in text
+    assert "wrap_response=yes" in text
 
 
 def test_cron_detail_empty():
     state = DashboardState(cron=CronState())
     panel = render_panel(6, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=100, no_color=True)
     assert "No cron jobs configured" in text
-
-
-def test_collector_reads_jobs_json(hermes_home: Path):
-    (hermes_home / "cron" / "jobs.json").write_text(
-        json.dumps(
-            {
-                "jobs": [
-                    {
-                        "id": "j1",
-                        "name": "test-cron",
-                        "schedule_display": "every 10m",
-                        "state": "scheduled",
-                        "enabled": True,
-                        "next_run_at": "2026-04-09T19:00:00",
-                        "last_status": None,
-                        "last_error": None,
-                    },
-                    {
-                        "id": "j2",
-                        "name": "failed-job",
-                        "schedule_display": "every 1h",
-                        "state": "error",
-                        "enabled": True,
-                        "last_status": "error",
-                        "last_error": "timeout",
-                    },
-                ],
-            }
-        )
-    )
-    c = Collector(hermes_home)
-    state = c.collect()
-    assert state.cron.job_count == 2
-    assert state.cron.error_count == 1
-    assert state.cron.jobs[0].name == "test-cron"
-    assert state.cron.jobs[1].name == "failed-job"
-    c.close()
-
-
-def test_collector_no_jobs_json(hermes_home: Path):
-    c = Collector(hermes_home)
-    state = c.collect()
-    assert state.cron.job_count == 0
-    assert state.cron.jobs == []
-    c.close()
-
-
-def test_collector_enriches_cron_jobs_with_delivery_and_output(hermes_home: Path):
-    (hermes_home / "channel_directory.json").write_text(
-        json.dumps(
-            {
-                "updated_at": "2026-04-09T19:00:00",
-                "platforms": {
-                    "telegram": [
-                        {"id": "-1001", "name": "My Group", "type": "group"},
-                    ]
-                },
-            }
-        )
-    )
-    (hermes_home / "cron" / "jobs.json").write_text(
-        json.dumps(
-            {
-                "jobs": [
-                    {
-                        "id": "j1",
-                        "name": "test-cron",
-                        "schedule_display": "every 10m",
-                        "state": "scheduled",
-                        "enabled": True,
-                        "deliver": "telegram:My Group",
-                    }
-                ],
-            }
-        )
-    )
-    output_dir = hermes_home / "cron" / "output" / "j1"
-    output_dir.mkdir(parents=True)
-    (output_dir / "2026-04-09T19-00-00.md").write_text("[SILENT]\nNo changes to report.\n")
-
-    c = Collector(hermes_home)
-    state = c.collect()
-    job = state.cron.jobs[0]
-    assert job.delivery_target_label == "telegram:My Group"
-    assert job.silent_run is True
-    assert "No changes to report" in job.latest_output_excerpt
-    c.close()
 
 
 def test_cron_detail_shows_delivery_and_output_metadata():
@@ -199,6 +106,7 @@ def test_cron_detail_shows_delivery_and_output_metadata():
                     enabled=True,
                     deliver="telegram:My Group",
                     delivery_target_label="telegram:My Group",
+                    latest_output_path="cron/output/j1/2026-04-09.md",
                     latest_output_excerpt="No changes to report.",
                     silent_run=True,
                 )
@@ -206,7 +114,8 @@ def test_cron_detail_shows_delivery_and_output_metadata():
         ),
     )
     panel = render_panel(6, state, Theme(), detail=True)
-    text = _render_to_str(panel)
+    text = render_to_str(panel, width=100, no_color=True)
     assert "telegram:My Group" in text
     assert "[SILENT]" in text
+    assert "cron/output/j1/2026-04-09.md" in text
     assert "No changes to report." in text

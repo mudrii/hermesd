@@ -1,10 +1,32 @@
+from __future__ import annotations
+
 import json
+import signal
 import sqlite3
 import subprocess
 import time
 from pathlib import Path
 
 import pytest
+from rich.console import Console
+
+
+def render_to_str(panel, width: int = 120, no_color: bool = False) -> str:
+    """Render a Rich renderable to a string for assertion."""
+    console = Console(width=width, height=80, force_terminal=True, no_color=no_color)
+    with console.capture() as cap:
+        console.print(panel)
+    return cap.get()
+
+
+@pytest.fixture
+def restore_signal_handlers():
+    """Save SIGINT/SIGTERM handlers and restore them after the test."""
+    old_int = signal.getsignal(signal.SIGINT)
+    old_term = signal.getsignal(signal.SIGTERM)
+    yield
+    signal.signal(signal.SIGINT, old_int)
+    signal.signal(signal.SIGTERM, old_term)
 
 
 @pytest.fixture
@@ -609,9 +631,9 @@ def sample_pr_monitor(hermes_home: Path) -> Path:
         json.dumps(
             {
                 "repo": "NousResearch/hermes-agent",
-                "checkedAt": "2026-06-04T17:14:31Z",
-                "monitored": [1, 2],
-                "tracked": {"1": {}, "2": {}},
+                "checked_at": "2026-06-04T17:14:31Z",
+                "tracked_numbers": [1, 2],
+                "prs": {"1": {}, "2": {}},
                 "author_prs": {"3": {}},
             }
         )
@@ -619,10 +641,8 @@ def sample_pr_monitor(hermes_home: Path) -> Path:
     return path
 
 
-@pytest.fixture
-def sample_kanban_db(hermes_home: Path) -> Path:
-    db_path = hermes_home / "kanban.db"
-    conn = sqlite3.connect(str(db_path))
+def create_kanban_db_tables(conn: sqlite3.Connection) -> None:
+    """Create the kanban tables used by collector and panel tests."""
     conn.executescript(
         """
         CREATE TABLE tasks (
@@ -674,6 +694,13 @@ def sample_kanban_db(hermes_home: Path) -> Path:
         );
         """
     )
+
+
+@pytest.fixture
+def sample_kanban_db(hermes_home: Path) -> Path:
+    db_path = hermes_home / "kanban.db"
+    conn = sqlite3.connect(str(db_path))
+    create_kanban_db_tables(conn)
     now = int(time.time())
     conn.execute(
         "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -722,6 +749,29 @@ def sample_kanban_db(hermes_home: Path) -> Path:
         ),
     )
     conn.execute(
+        "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "t_null",
+            "Task with NULL nullable columns",
+            None,
+            "in_progress",
+            None,
+            now - 5000,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+    conn.execute(
         "INSERT INTO task_runs VALUES (?,?,?,?,?,?,?,?,?,?)",
         (
             1,
@@ -734,6 +784,21 @@ def sample_kanban_db(hermes_home: Path) -> Path:
             None,
             "",
             "",
+        ),
+    )
+    conn.execute(
+        "INSERT INTO task_runs VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (
+            2,
+            "t_null",
+            None,
+            "done",
+            None,
+            now - 400,
+            None,
+            None,
+            None,
+            None,
         ),
     )
     conn.execute(

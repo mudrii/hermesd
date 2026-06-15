@@ -5,6 +5,7 @@ from datetime import datetime
 
 import rich.box
 from rich.console import Group
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -76,7 +77,7 @@ def _render_detail(state: DashboardState, theme: Theme, profile_view_index: int)
         marker = "▶" if index == viewed_index else ""
         table.add_row(
             Text(marker, style=f"bold {theme.ui_accent}"),
-            profile.name,
+            escape(profile.name),
             str(profile.session_count),
             str(profile.skill_count),
             _format_size(profile.db_size_bytes),

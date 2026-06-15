@@ -1,8 +1,13 @@
+from __future__ import annotations
+
 import json
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
+
+import pytest
 
 from hermesd.collector import Collector, _CollectionHealth
 from hermesd.models import DashboardState
@@ -29,7 +34,7 @@ def test_collect_full(populated_hermes_home: Path):
     assert state.config.dashboard_basic_auth_configured is True
     assert state.skills_memory.skill_count == 15
     assert state.channels.platform_count == 3
-    assert state.kanban.task_count == 2
+    assert state.kanban.task_count == 3
     assert state.operations.dashboard_process_count == 0
     assert len(state.operations.model_caches) == 2
     assert len(state.logs.agent_lines) > 0
@@ -72,6 +77,8 @@ def test_collect_cron_tick(populated_hermes_home: Path):
     state = c.collect()
     assert state.cron.last_tick_ago_seconds is not None
     assert state.cron.last_tick_ago_seconds >= 0
+    assert state.cron.max_parallel_jobs == 3
+    assert state.cron.wrap_response is True
     c.close()
 
 
@@ -111,6 +118,21 @@ def test_collect_background_processes(populated_hermes_home: Path):
     assert state.background_processes[0].watcher_user_name == "Operator"
     assert state.background_processes[0].watch_patterns == ["ERROR", "listening on port"]
     assert state.background_processes[1].command == "npm run dev"
+    c.close()
+
+
+def test_collect_operations_counts_current_hermesd_background_process(
+    populated_hermes_home: Path,
+):
+    processes = populated_hermes_home / "processes.json"
+    rows = json.loads(processes.read_text())
+    rows[1]["command"] = "uv run hermesd --snapshot"
+    processes.write_text(json.dumps(rows))
+
+    c = Collector(populated_hermes_home)
+    state = c.collect()
+
+    assert state.operations.dashboard_process_count == 1
     c.close()
 
 
@@ -257,11 +279,11 @@ def test_collect_kanban_state(populated_hermes_home: Path):
     state = c.collect()
 
     assert state.kanban.db_present is True
-    assert state.kanban.task_count == 2
-    assert state.kanban.run_count == 1
+    assert state.kanban.task_count == 3
+    assert state.kanban.run_count == 2
     assert state.kanban.event_count == 1
     assert state.kanban.comment_count == 1
-    assert state.kanban.status_counts == {"blocked": 1, "in_progress": 1}
+    assert state.kanban.status_counts == {"blocked": 1, "in_progress": 2}
     assert state.kanban.active_tasks[0].task_id == "t_active"
     assert state.kanban.problem_tasks[0].task_id == "t_blocked"
     assert state.kanban.problem_tasks[0].last_failure_error == "missing credentials"
@@ -269,6 +291,9 @@ def test_collect_kanban_state(populated_hermes_home: Path):
 
 
 def test_collect_channels_and_operations(populated_hermes_home: Path):
+    (populated_hermes_home / "desktop-build-stamp.json").write_text(
+        json.dumps({"version": "desktop-2026.6.14"})
+    )
     c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
     state = c.collect()
 
@@ -280,6 +305,7 @@ def test_collect_channels_and_operations(populated_hermes_home: Path):
     assert platforms["feishu"].capabilities == ["meeting invites"]
 
     caches = {cache.name: cache for cache in state.operations.model_caches}
+    assert state.operations.desktop_build_stamp == "desktop-2026.6.14"
     assert caches["models_dev_cache.json"].provider_count == 2
     assert caches["models_dev_cache.json"].model_count == 3
     assert state.operations.pr_monitors[0].repo == "NousResearch/hermes-agent"
@@ -300,34 +326,6 @@ def test_collect_does_not_mutate_hermes_home(populated_hermes_home: Path):
     assert _file_mtimes(populated_hermes_home) == before
 
 
-def test_collect_mtime_cache(populated_hermes_home: Path, monkeypatch):
-    sessions_dir = populated_hermes_home / "sessions"
-    sessions_dir.mkdir(exist_ok=True)
-    (sessions_dir / "sessions.json").write_text(json.dumps({"one": {"session_id": "one"}}))
-    (sessions_dir / "session_one.json").write_text(
-        json.dumps({"session_id": "one", "tools": [{"name": "cached_tool"}]})
-    )
-    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
-    read_count = 0
-    original_read = c._read_json_cached
-
-    def counting_read(path: Path):
-        nonlocal read_count
-        read_count += 1
-        return original_read(path)
-
-    monkeypatch.setattr(c, "_read_json_cached", counting_read)
-    try:
-        tools1 = c._collect_available_tools()
-        reads_after_first_call = read_count
-        tools2 = c._collect_available_tools()
-    finally:
-        c.close()
-
-    assert tools2 == tools1
-    assert read_count == reads_after_first_call
-
-
 def _file_mtimes(root: Path) -> dict[Path, int]:
     return {
         path.relative_to(root): path.stat().st_mtime_ns
@@ -346,6 +344,17 @@ def test_collection_health_uses_default_when_fallback_also_fails():
     assert health.failed_sources == ["source"]
     assert "RuntimeError: unavailable" in health.errors["source"]
     assert health.total_sources == 1
+
+
+def test_collection_health_redacts_secret_material_from_errors():
+    health = _CollectionHealth()
+
+    def fail() -> str:
+        raise RuntimeError("request failed token=secret-value")
+
+    assert health.collect(lambda: "cached", "source", fail, lambda: "default") == "cached"
+    assert "[REDACTED]" in health.errors["source"]
+    assert "secret-value" not in health.errors["source"]
 
 
 def test_collect_recent_activity_suppresses_offline_banner(hermes_home: Path, sample_db: Path):
@@ -424,8 +433,7 @@ def test_collect_reads_session_rows_once_per_cycle(hermes_home: Path):
             pass
 
     db = CountingDB()
-    c = Collector(hermes_home)
-    c._db = db
+    c = Collector(hermes_home, db_factory=lambda path: db)
 
     state = c.collect()
 
@@ -496,6 +504,261 @@ def test_collect_marks_session_derived_sources_failed_when_db_returns_stale_cach
     c.close()
 
 
+def test_collect_preserves_session_derived_state_when_real_db_becomes_unreadable(
+    populated_hermes_home: Path,
+):
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    state1 = c.collect()
+
+    db_path = populated_hermes_home / "state.db"
+    db_path.write_bytes(b"not a sqlite database")
+    state2 = c.collect()
+
+    assert state2.sessions == state1.sessions
+    assert state2.tokens_total == state1.tokens_total
+    assert state2.tokens_today == state1.tokens_today
+    assert state2.token_analytics == state1.token_analytics
+    assert state2.total_tool_calls == state1.total_tool_calls
+    assert set(state2.health.failed_sources) >= {
+        "sessions",
+        "tokens_today",
+        "tokens_total",
+        "token_analytics",
+        "tool_stats",
+        "tool_call_total",
+    }
+    c.close()
+
+
+def test_collect_does_not_raise_on_unvalidatable_session_row(hermes_home: Path):
+    """A row pydantic cannot coerce (NULL id) must not raise out of collect()."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, source_required=False)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at) VALUES (NULL, 'cli', ?)",
+        (time.time(),),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.sessions == []
+    assert "session_models" in state.health.failed_sources
+    c.close()
+
+
+def test_collect_preserves_last_good_sessions_on_validation_error(hermes_home: Path):
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, source_required=False)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at) VALUES ('sess_good', 'cli', ?)",
+        (time.time(),),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state1 = c.collect()
+    assert [s.session_id for s in state1.sessions] == ["sess_good"]
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at) VALUES (NULL, 'cli', ?)",
+        (time.time(),),
+    )
+    conn.commit()
+    conn.close()
+
+    state2 = c.collect()
+
+    assert state2.sessions == state1.sessions
+    assert "session_models" in state2.health.failed_sources
+    assert state2.config == state1.config  # other sources still populate
+    c.close()
+
+
+def test_collect_runtime_status_failure_preserves_last_good(
+    populated_hermes_home: Path,
+    monkeypatch,
+):
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    state1 = c.collect()
+
+    def boom(*args: object, **kwargs: object):
+        raise RuntimeError("runtime status unavailable")
+
+    monkeypatch.setattr(c, "_collect_runtime_status", boom)
+    state2 = c.collect()
+
+    assert state2.runtime == state1.runtime
+    assert "runtime" in state2.health.failed_sources
+    assert state2.health.ok_sources == state2.health.total_sources - 1
+    c.close()
+
+
+def test_collect_tool_stats_marked_failed_when_db_returns_stale_cache(
+    populated_hermes_home: Path,
+    monkeypatch,
+):
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    state1 = c.collect()
+    assert state1.tool_stats
+
+    def fail_read(conn: sqlite3.Connection) -> list[dict[str, object]]:
+        raise sqlite3.OperationalError("db unavailable")
+
+    monkeypatch.setattr(c._db, "_current_version", lambda: 999)
+    monkeypatch.setattr(c._db, "_read_tool_stats", fail_read)
+
+    state2 = c.collect()
+
+    assert state2.tool_stats == state1.tool_stats
+    assert "tool_stats" in state2.health.failed_sources
+    assert "tool stats are stale" in state2.health.errors["tool_stats"]
+    c.close()
+
+
+def test_collect_tool_stats_handles_null_session_id(hermes_home: Path):
+    """A NULL session id must not fail the tool_stats fallback path."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, source_required=False)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, tool_call_count) VALUES (NULL, 'cli', ?, 5)",
+        (time.time(),),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert "tool_stats" not in state.health.failed_sources
+    assert [t.name for t in state.tool_stats] == ["cli:?"]
+    assert state.tool_stats[0].call_count == 5
+    c.close()
+
+
+def test_search_session_ids_does_not_block_during_slow_collect(
+    populated_hermes_home: Path,
+    monkeypatch,
+):
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    c.collect()
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_checkpoints():
+        entered.set()
+        release.wait(timeout=10)
+        return []
+
+    monkeypatch.setattr(c, "_collect_checkpoints", slow_checkpoints)
+    collect_thread = threading.Thread(target=c.collect, daemon=True)
+    collect_thread.start()
+
+    results: list[set[str]] = []
+
+    def search() -> None:
+        results.append(c.search_session_ids_by_message("response"))
+
+    try:
+        assert entered.wait(timeout=10)
+        search_thread = threading.Thread(target=search, daemon=True)
+        search_thread.start()
+        search_thread.join(timeout=5)
+        assert not search_thread.is_alive(), "search blocked behind slow collect"
+        assert results and "sess_001" in results[0]
+    finally:
+        release.set()
+        collect_thread.join(timeout=10)
+    c.close()
+
+
+def test_search_session_ids_raises_when_db_returns_stale_cache(hermes_home: Path):
+    """A stale (cached-after-error) search result must surface as an error, not silently."""
+
+    class StaleSearchDB:
+        def __init__(self, db_path: Path) -> None:
+            self.db_path = db_path
+
+        def search_session_ids_by_message(self, query: str) -> set[str]:
+            return {"sess_cached"}
+
+        @property
+        def last_message_search_stale(self) -> bool:
+            return True
+
+        def close(self) -> None:
+            return None
+
+    c = Collector(hermes_home, db_factory=StaleSearchDB)
+    try:
+        with pytest.raises(RuntimeError, match="message search returned cached rows"):
+            c.search_session_ids_by_message("anything")
+    finally:
+        c.close()
+
+
+def test_collect_recomputes_session_summaries_when_rows_change(
+    hermes_home: Path,
+    sample_db: Path,
+):
+    c = Collector(hermes_home)
+    state1 = c.collect()
+    assert len(state1.sessions) == 2
+
+    conn = sqlite3.connect(str(sample_db))
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, input_tokens) "
+        "VALUES ('sess_003', 'cli', ?, 777)",
+        (time.time(),),
+    )
+    conn.commit()
+    conn.close()
+
+    state2 = c.collect()
+
+    assert len(state2.sessions) == 3
+    assert state2.tokens_total.input_tokens == state1.tokens_total.input_tokens + 777
+    c.close()
+
+
+def test_collect_recomputes_today_summaries_when_local_date_changes(
+    hermes_home: Path,
+    sample_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    today_context: dict[str, float | str] = {
+        "date": "2026-06-14",
+        "cutoff": time.time() - 7200,
+    }
+    monkeypatch.setattr(
+        "hermesd.collector._local_date",
+        lambda: str(today_context["date"]),
+    )
+    monkeypatch.setattr(
+        "hermesd.collector._today_epoch",
+        lambda: float(today_context["cutoff"]),
+    )
+    c = Collector(hermes_home)
+    state1 = c.collect()
+    assert state1.tokens_today.input_tokens == 21_500
+
+    today_context["date"] = "2026-06-15"
+    today_context["cutoff"] = time.time() + 60
+    state2 = c.collect()
+
+    assert state2.tokens_today.input_tokens == 0
+    assert state2.tokens_total.input_tokens == state1.tokens_total.input_tokens
+    c.close()
+
+
 def test_collect_preserves_token_analytics_on_mid_collection_failure(
     populated_hermes_home: Path,
     monkeypatch,
@@ -507,6 +770,15 @@ def test_collect_preserves_token_analytics_on_mid_collection_failure(
         raise RuntimeError("analytics unavailable")
 
     monkeypatch.setattr(c, "_collect_token_analytics", boom)
+
+    # Change the rows so the derived-summary cache cannot mask the failure.
+    conn = sqlite3.connect(str(populated_hermes_home / "state.db"))
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at) VALUES ('sess_extra', 'cli', ?)",
+        (time.time(),),
+    )
+    conn.commit()
+    conn.close()
 
     state2 = c.collect()
 

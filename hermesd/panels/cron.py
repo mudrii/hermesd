@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import rich.box
 from rich.console import Group, RenderableType
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -93,12 +94,12 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
             last_style = theme.ui_error if last == "error" else theme.banner_text
             table.add_row(
                 sym,
-                j.name or j.job_id[:8],
-                j.schedule_display,
-                j.delivery_target_label or j.deliver or "—",
+                escape(j.name or j.job_id[:8]),
+                escape(j.schedule_display),
+                escape(j.delivery_target_label or j.deliver or "—"),
                 Text(j.state, style=state_color),
                 Text(last, style=last_style),
-                j.last_error[:80] if j.last_error else "—",
+                escape(j.last_error[:80]) if j.last_error else "—",
             )
         sections.append(table)
 

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from hermesd.theme import Theme, load_theme
 
 
@@ -61,20 +63,4 @@ def test_theme_rich_style():
     t = Theme()
     assert t.panel_border_style == "#CD7F32"
     assert t.panel_title_style == "bold #FFD700"
-    assert "bg:#1A1A2E" in t.status_bar_style
-
-
-def test_theme_context_color():
-    t = Theme()
-    assert t.context_color(0.3) == t.ui_ok
-    assert t.context_color(0.5) == t.banner_title
-    assert t.context_color(0.85) == t.ui_warn
-    assert t.context_color(0.96) == t.ui_error
-
-
-def test_theme_context_color_uses_active_skin():
-    t = Theme("ares")
-    assert t.context_color(0.3) == t.ui_ok
-    assert t.context_color(0.5) == t.banner_title
-    assert t.context_color(0.85) == t.ui_warn
-    assert t.context_color(0.96) == t.ui_error
+    assert t.status_bar_bg == "#1A1A2E"

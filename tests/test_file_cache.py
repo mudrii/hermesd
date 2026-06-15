@@ -1,10 +1,30 @@
+from __future__ import annotations
+
 import json
+import os
 import threading
 from pathlib import Path
 
 import yaml
 
 from hermesd.file_cache import LastGoodFileCache
+
+
+def test_cache_hit_reuses_value_until_mtime_changes(tmp_path):
+    """An unchanged mtime returns cached data; a newer mtime reloads it."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "data.json"
+    path.write_text(json.dumps({"v": 1}))
+    assert cache.read_json_mapping(path) == {"v": 1}
+    original = path.stat()
+
+    path.write_text(json.dumps({"v": 99}))
+    os.utime(path, (original.st_atime, original.st_mtime))
+    assert cache.read_json_mapping(path) == {"v": 1}
+
+    path.write_text(json.dumps({"v": 2}))
+    os.utime(path, (original.st_atime, original.st_mtime + 10))
+    assert cache.read_json_mapping(path) == {"v": 2}
 
 
 def test_json_mapping_invalid_shape_reuses_bad_mtime(tmp_path, monkeypatch):

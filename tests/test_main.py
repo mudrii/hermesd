@@ -1,5 +1,9 @@
+from __future__ import annotations
+
 import argparse
 import json
+import re
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -42,7 +46,7 @@ def test_parse_args_snapshot_panel_zero_alias():
     assert args.snapshot_panel == 10
 
 
-@pytest.mark.parametrize("value", ["11", "12"])
+@pytest.mark.parametrize("value", ["11", "12", "13"])
 def test_parse_args_snapshot_panel_above_ten(value: str):
     args = parse_args(["--snapshot-panel", value])
     assert args.snapshot_panel == int(value)
@@ -54,7 +58,7 @@ def test_parse_args_snapshot_format_and_log_tail_bytes():
     assert args.log_tail_bytes == 4096
 
 
-@pytest.mark.parametrize("value", ["13", "-1"])
+@pytest.mark.parametrize("value", ["14", "-1"])
 def test_parse_args_rejects_invalid_snapshot_panel(value: str):
     with pytest.raises(SystemExit):
         parse_args(["--snapshot-panel", value])
@@ -62,13 +66,14 @@ def test_parse_args_rejects_invalid_snapshot_panel(value: str):
 
 def test_parse_args_invalid_snapshot_panel_lists_available_panels(capsys):
     with pytest.raises(SystemExit):
-        parse_args(["--snapshot-panel", "13"])
+        parse_args(["--snapshot-panel", "14"])
 
     err = capsys.readouterr().err
     assert "snapshot panel must be one of:" in err
     assert "10" in err
     assert "11" in err
     assert "12" in err
+    assert "13" in err
 
 
 def test_parse_args_help_describes_registered_snapshot_panels(capsys):
@@ -264,6 +269,21 @@ def test_main_snapshot_panel_outputs_detail(populated_hermes_home: Path, capsys)
     assert "SOUL.md" in out
 
 
+def test_main_snapshot_panel_11_outputs_kanban_detail(populated_hermes_home: Path, capsys):
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-panel",
+            "11",
+            "--no-color",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert "[11] Kanban" in out
+    assert "Status Counts" in out
+
+
 def test_main_snapshot_panel_file_writes_detail(populated_hermes_home: Path, tmp_path: Path):
     output_path = tmp_path / "memory-panel.txt"
     main(
@@ -280,6 +300,90 @@ def test_main_snapshot_panel_file_writes_detail(populated_hermes_home: Path, tmp
     text = output_path.read_text()
     assert "[2] Sessions" in text
     assert "sess_001" in text
+
+
+def test_main_snapshot_panel_2_surfaces_billing_context_summary(
+    populated_hermes_home: Path, capsys
+):
+    conn = sqlite3.connect(str(populated_hermes_home / "state.db"))
+    conn.execute(
+        "UPDATE sessions SET model = ?, billing_base_url = ?, input_tokens = ?, output_tokens = ?",
+        ("MiniMax-M3", "https://api.minimax.io/anthropic", 50_000, 4_000),
+    )
+    conn.commit()
+    conn.close()
+    (populated_hermes_home / "context_length_cache.yaml").write_text(
+        "context_lengths:\n  MiniMax-M3@https://api.minimax.io/v1: 1048576\n"
+    )
+
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-panel",
+            "2",
+            "--no-color",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert "Billing & Context" in out
+    assert "Lifetime / Limit" in out
+
+
+def test_main_snapshot_panel_3_surfaces_endpoint_and_cost_status_summary(
+    populated_hermes_home: Path, capsys
+):
+    conn = sqlite3.connect(str(populated_hermes_home / "state.db"))
+    conn.execute(
+        "UPDATE sessions SET billing_base_url = ?, cost_status = ?",
+        ("https://api.minimax.io/anthropic", "estimated"),
+    )
+    conn.commit()
+    conn.close()
+
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-panel",
+            "3",
+            "--no-color",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert "Cost Status" in out
+    assert "By Endpoint" in out
+
+
+def test_main_snapshot_panel_5_surfaces_config_detail_from_yaml(
+    populated_hermes_home: Path, capsys
+):
+    (populated_hermes_home / "config.yaml").write_text(
+        "dashboard:\n"
+        "  public_url: https://dashboard.example.com\n"
+        "toolsets:\n"
+        "  - coding\n"
+        "  - research\n"
+        "auxiliary:\n"
+        "  summarizer: gpt-5.4\n"
+        "  reviewer: gpt-5.4\n"
+        "  planner: gpt-5.4\n"
+    )
+
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-panel",
+            "5",
+            "--no-color",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert re.search(r"Dashboard URL\s+https://dashboard[.]example[.]com", out)
+    assert "Toolsets" in out
+    assert "coding, research" in out
+    assert re.search(r"Auxiliary Slots\s+3", out)
 
 
 def test_main_snapshot_json_outputs_state(populated_hermes_home: Path, capsys):
@@ -317,6 +421,120 @@ def test_main_snapshot_panel_json_file(populated_hermes_home: Path, tmp_path: Pa
     assert payload["panel_num"] == 8
     assert payload["panel_name"] == "Logs"
     assert "logs" in payload["state"]
+
+
+def test_main_snapshot_panel_12_json_annotates_operations(populated_hermes_home: Path, capsys):
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-panel",
+            "12",
+            "--snapshot-format",
+            "json",
+            "--no-color",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["panel_num"] == 12
+    assert payload["panel_name"] == "Operations"
+    assert "operations" in payload["state"]
+
+
+def test_main_snapshot_panel_12_outputs_operations_detail(populated_hermes_home: Path, capsys):
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-panel",
+            "12",
+            "--no-color",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert "[12] Operations" in out
+    assert "Desktop Build" in out
+
+
+def test_main_snapshot_panel_13_outputs_curator_detail(populated_hermes_home: Path, capsys):
+    run_dir = populated_hermes_home / "logs" / "curator" / "20260610-133539"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "started_at": "2026-06-10T13:35:39+00:00",
+                "model": "MiniMax-M3",
+                "provider": "minimax",
+                "counts": {"before": 8, "after": 5, "tool_calls_total": 67},
+            }
+        )
+    )
+
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-panel",
+            "13",
+            "--no-color",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert "[13] Curator" in out
+    assert "MiniMax-M3" in out
+
+
+def test_main_runs_dashboard_when_no_snapshot_flags(populated_hermes_home: Path, monkeypatch):
+    from hermesd import __main__ as main_module
+
+    ran = False
+
+    class FakeApp:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self):
+            nonlocal ran
+            ran = True
+
+    monkeypatch.setattr("hermesd.app.DashboardApp", FakeApp)
+
+    main_module.main(["--hermes-home", str(populated_hermes_home), "--no-color"])
+
+    assert ran is True
+
+
+def test_python_dash_m_entry_point(populated_hermes_home: Path):
+    """`python -m hermesd` must reach main() (the __main__ guard)."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-m", "hermesd", "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert "hermesd" in result.stdout
+
+
+def test_version_falls_back_when_package_metadata_missing(monkeypatch):
+    import importlib
+    from importlib.metadata import PackageNotFoundError
+
+    import hermesd
+
+    def missing_package(name: str) -> str:
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr("importlib.metadata.version", missing_package)
+    try:
+        reloaded = importlib.reload(hermesd)
+        assert reloaded.__version__ == "0.0.0"
+    finally:
+        monkeypatch.undo()
+        importlib.reload(hermesd)
 
 
 def test_parse_args_version(capsys):

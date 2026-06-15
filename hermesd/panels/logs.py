@@ -26,6 +26,27 @@ _LOG_LEVEL_RANK = {
 _DETAIL_VISIBLE_LOG_LINES = 10
 
 
+def _resolve_log_view(
+    state: DashboardState, sub_view: str, filter_query: str
+) -> tuple[dict[str, list[LogLine]], str, list[LogLine], list[LogLine]]:
+    """Resolve the active sub-view plus its unfiltered and filtered lines."""
+    log_map = _log_stream_map(state)
+    if sub_view not in log_map:
+        sub_view = next(iter(log_map), "agent")
+    unfiltered = log_map.get(sub_view, state.logs.agent_lines)
+    return log_map, sub_view, unfiltered, _filter_log_lines(unfiltered, filter_query)
+
+
+def _max_offset(line_count: int) -> int:
+    return max(0, line_count - _DETAIL_VISIBLE_LOG_LINES)
+
+
+def max_detail_scroll_offset(state: DashboardState, sub_view: str, filter_query: str) -> int:
+    """Effective max scroll offset for the logs detail view."""
+    _, _, _, lines = _resolve_log_view(state, sub_view, filter_query)
+    return _max_offset(len(lines))
+
+
 def render_logs(
     state: DashboardState,
     theme: Theme,
@@ -85,13 +106,11 @@ def _render_detail(
     scroll_offset: int,
     filter_query: str,
 ) -> Panel:
-    log_map = _log_stream_map(state)
-    if sub_view not in log_map:
-        sub_view = next(iter(log_map), "agent")
-    unfiltered_lines = log_map.get(sub_view, state.logs.agent_lines)
-    log_lines = _filter_log_lines(unfiltered_lines, filter_query)
+    log_map, sub_view, unfiltered_lines, log_lines = _resolve_log_view(
+        state, sub_view, filter_query
+    )
     total = len(log_lines)
-    max_offset = max(0, total - _DETAIL_VISIBLE_LOG_LINES)
+    max_offset = _max_offset(total)
     offset = min(scroll_offset, max_offset)
     visible_lines = log_lines[offset : offset + _DETAIL_VISIBLE_LOG_LINES]
 
@@ -157,8 +176,10 @@ def _log_line_matches(line: LogLine, criteria: LogFilterCriteria) -> bool:
                 return False
             if field_name == "minlevel":
                 threshold = _log_level_rank(value)
-                if threshold == 0 and value != "debug":
-                    return False
+                if threshold == 0:
+                    # Unknown minlevel value: treat the filter as inactive
+                    # instead of hiding every line.
+                    continue
                 if _log_level_rank(line.level) < threshold:
                     return False
             if field_name == "component" and value not in line.component.lower():

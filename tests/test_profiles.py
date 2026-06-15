@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import re
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -7,6 +10,7 @@ from hermesd.__main__ import parse_args, resolve_profile_name
 from hermesd.app import DashboardApp
 from hermesd.collector import Collector
 from hermesd.paths import HermesPaths
+from tests.conftest import create_state_db_tables
 
 
 def test_parse_args_profile_default_none():
@@ -87,6 +91,74 @@ def test_hermes_paths_rejects_missing_profile_dir(profiled_hermes_home: Path):
 def test_collector_rejects_invalid_profile_names(profiled_hermes_home: Path, profile_name: str):
     with pytest.raises(ValueError, match="Invalid profile name"):
         Collector(profiled_hermes_home, profile_name=profile_name)
+
+
+def test_hermes_paths_rejects_symlinked_profile_escaping_profiles_dir(hermes_home: Path):
+    """A profile dir that is a symlink out of profiles/ must be rejected."""
+    outside = hermes_home.parent / "outside-profile"
+    outside.mkdir()
+    profiles_dir = hermes_home / "profiles"
+    profiles_dir.mkdir()
+    (profiles_dir / "sneaky").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="Invalid profile name 'sneaky'"):
+        HermesPaths(hermes_home, profile_name="sneaky")
+
+
+def test_default_collector_ignores_discovered_symlinked_profile_outside_home(
+    hermes_home: Path,
+):
+    outside = hermes_home.parent / "outside-profile"
+    outside.mkdir()
+    conn = sqlite3.connect(str(outside / "state.db"))
+    create_state_db_tables(conn)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at) VALUES ('outside_session', 'cli', 1)"
+    )
+    conn.commit()
+    conn.close()
+    (outside / "SOUL.md").write_text("outside profile soul")
+    profiles_dir = hermes_home / "profiles"
+    profiles_dir.mkdir()
+    (profiles_dir / "escaped").symlink_to(outside, target_is_directory=True)
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.profiles.profiles == []
+    c.close()
+
+
+def test_default_collector_ignores_symlinked_profiles_root_outside_home(
+    hermes_home: Path,
+):
+    outside_profiles = hermes_home.parent / "outside-profiles"
+    outside = outside_profiles / "escaped"
+    outside.mkdir(parents=True)
+    conn = sqlite3.connect(str(outside / "state.db"))
+    create_state_db_tables(conn)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at) VALUES ('outside_session', 'cli', 1)"
+    )
+    conn.commit()
+    conn.close()
+    (outside / "SOUL.md").write_text("outside profile soul")
+    (hermes_home / "profiles").symlink_to(outside_profiles, target_is_directory=True)
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.profiles.profiles == []
+    c.close()
+
+
+def test_hermes_paths_rejects_symlinked_profiles_root_escaping_home(hermes_home: Path):
+    outside_profiles = hermes_home.parent / "outside-profiles"
+    (outside_profiles / "coding").mkdir(parents=True)
+    (hermes_home / "profiles").symlink_to(outside_profiles, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="Invalid profiles directory"):
+        HermesPaths(hermes_home, profile_name="coding")
 
 
 def test_collector_rejects_profile_traversal_outside_profiles_dir(hermes_home: Path):

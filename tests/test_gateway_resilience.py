@@ -1,5 +1,7 @@
 """Tests for gateway PID detection including launchd fallback."""
 
+from __future__ import annotations
+
 import json
 import os
 from pathlib import Path

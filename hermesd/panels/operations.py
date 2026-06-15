@@ -4,6 +4,7 @@ import time
 
 import rich.box
 from rich.console import Group, RenderableType
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -46,7 +47,15 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     summary.add_column("Key", style=theme.ui_label)
     summary.add_column("Value", style=theme.banner_text)
     summary.add_row("Dashboard Processes", str(ops.dashboard_process_count))
-    summary.add_row("Desktop Build", ops.desktop_build_stamp or "—")
+    summary.add_row(
+        "Desktop Build", escape(ops.desktop_build_stamp) if ops.desktop_build_stamp else "—"
+    )
+    if ops.response_store_present:
+        summary.add_row(
+            "Response Store",
+            f"{ops.conversation_count} conversations  {ops.response_count} responses  "
+            f"{_size_label(ops.response_store_size_bytes)}",
+        )
     sections.append(summary)
 
     if ops.model_caches:
@@ -59,7 +68,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         cache_table.add_column("Age", style=theme.banner_dim)
         for cache in ops.model_caches:
             cache_table.add_row(
-                cache.name,
+                escape(cache.name),
                 str(cache.provider_count),
                 str(cache.model_count),
                 _size_label(cache.size_bytes),
@@ -78,16 +87,21 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         pr_table.add_column("Author", justify="right", style=theme.banner_text)
         for monitor in ops.pr_monitors:
             pr_table.add_row(
-                monitor.filename,
-                monitor.repo or "—",
-                monitor.checked_at or "—",
+                escape(monitor.filename),
+                escape(monitor.repo) if monitor.repo else "—",
+                escape(monitor.checked_at) if monitor.checked_at else "—",
                 str(monitor.monitored_count),
                 str(monitor.tracked_count),
                 str(monitor.author_pr_count),
             )
         sections.append(pr_table)
 
-    if not ops.model_caches and not ops.pr_monitors and ops.dashboard_process_count == 0:
+    if (
+        not ops.model_caches
+        and not ops.pr_monitors
+        and ops.dashboard_process_count == 0
+        and not ops.response_store_present
+    ):
         sections.append(Text("\n  No operations artifacts found\n", style=theme.banner_dim))
 
     return Panel(

@@ -4,6 +4,7 @@ import time
 
 import rich.box
 from rich.console import Group, RenderableType
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -55,7 +56,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         calls_table.add_column("Name", style=theme.ui_label)
         calls_table.add_column("Calls", justify="right", style=theme.ui_accent)
         for ts in state.tool_stats:
-            calls_table.add_row(ts.name, str(ts.call_count))
+            calls_table.add_row(escape(ts.name), str(ts.call_count))
         sections.append(calls_table)
     else:
         sections.append(Text("  No tool call data\n", style=theme.banner_dim))
@@ -75,9 +76,9 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         tools_table.add_column("Tool", style=theme.banner_text)
         names = state.available_tool_names
         for i in range(0, len(names), 3):
-            row = [names[i] if i < len(names) else ""]
-            row.append(names[i + 1] if i + 1 < len(names) else "")
-            row.append(names[i + 2] if i + 2 < len(names) else "")
+            row = [escape(names[i]) if i < len(names) else ""]
+            row.append(escape(names[i + 1]) if i + 1 < len(names) else "")
+            row.append(escape(names[i + 2]) if i + 2 < len(names) else "")
             tools_table.add_row(*row)
         sections.append(tools_table)
     else:
@@ -101,12 +102,12 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         process_table.add_column("Command", style=theme.banner_text, ratio=1)
         for process in state.background_processes:
             process_table.add_row(
-                process.session_id,
+                escape(process.session_id),
                 str(process.pid) if process.pid else "—",
                 "Yes" if process.notify_on_complete else "No",
                 _watch_summary(process.watch_patterns, process.watcher_interval),
                 _started_label(process.started_at),
-                process.command,
+                escape(process.command),
             )
         sections.append(process_table)
     else:
@@ -128,9 +129,9 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         checkpoint_table.add_column("When", style=theme.banner_dim, min_width=8)
         for checkpoint in state.checkpoints:
             checkpoint_table.add_row(
-                checkpoint.workdir_name or checkpoint.repo_id,
+                escape(checkpoint.workdir_name or checkpoint.repo_id),
                 str(checkpoint.commit_count),
-                checkpoint.last_reason or "—",
+                escape(checkpoint.last_reason) if checkpoint.last_reason else "—",
                 _started_label(checkpoint.last_checkpoint_at or 0.0),
             )
         sections.append(checkpoint_table)

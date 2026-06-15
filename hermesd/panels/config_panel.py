@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import rich.box
 from rich.console import Group, RenderableType
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -51,25 +52,35 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     table.add_column("Key", style=theme.ui_label)
     table.add_column("Value", style=theme.ui_accent)
 
-    table.add_row("Model", c.model or "—")
-    table.add_row("Provider", c.provider or "—")
-    table.add_row("Personality", c.personality or "—")
+    table.add_row("Model", escape(c.model) if c.model else "—")
+    table.add_row("Provider", escape(c.provider) if c.provider else "—")
+    table.add_row("Personality", escape(c.personality) if c.personality else "—")
     table.add_row("Max Turns", str(c.max_turns))
-    table.add_row("Reasoning", c.reasoning_effort or "—")
+    table.add_row("Reasoning", escape(c.reasoning_effort) if c.reasoning_effort else "—")
     table.add_row("Compression", str(c.compression_threshold))
     table.add_row("Redact Secrets", "✓" if c.security_redact else "✗")
-    table.add_row("Approvals", c.approvals_mode or "—")
-    table.add_row("Provider Routing", c.provider_routing_summary or "—")
+    table.add_row("Approvals", escape(c.approvals_mode) if c.approvals_mode else "—")
+    table.add_row(
+        "Provider Routing",
+        escape(c.provider_routing_summary) if c.provider_routing_summary else "—",
+    )
     table.add_row("Smart Routing", "✓" if c.smart_model_routing_enabled else "✗")
-    table.add_row("Cheap Model", c.smart_model_routing_cheap_model or "—")
-    table.add_row("Fallback Model", c.fallback_model_label or "—")
-    table.add_row("Dashboard Theme", c.dashboard_theme or "—")
-    table.add_row("Dashboard Auth", _dashboard_auth_label(c))
-    table.add_row("Dashboard URL", c.dashboard_public_url or "—")
-    table.add_row("Session Reset", c.session_reset_mode or "—")
-    table.add_row("Memory Provider", c.memory_provider or "—")
-    table.add_row("Tool Search", _tool_search_label(c))
-    table.add_row("Toolsets", ", ".join(c.toolsets) if c.toolsets else "—")
+    table.add_row(
+        "Cheap Model",
+        escape(c.smart_model_routing_cheap_model) if c.smart_model_routing_cheap_model else "—",
+    )
+    table.add_row(
+        "Fallback Model", escape(c.fallback_model_label) if c.fallback_model_label else "—"
+    )
+    table.add_row("Dashboard Theme", escape(c.dashboard_theme) if c.dashboard_theme else "—")
+    table.add_row("Dashboard Auth", escape(_dashboard_auth_label(c)))
+    table.add_row(
+        "Dashboard URL", escape(c.dashboard_public_url) if c.dashboard_public_url else "—"
+    )
+    table.add_row("Session Reset", escape(c.session_reset_mode) if c.session_reset_mode else "—")
+    table.add_row("Memory Provider", escape(c.memory_provider) if c.memory_provider else "—")
+    table.add_row("Tool Search", escape(_tool_search_label(c)))
+    table.add_row("Toolsets", escape(", ".join(c.toolsets)) if c.toolsets else "—")
     table.add_row("Code Execution", _code_execution_label(c))
     table.add_row("Kanban Dispatch", _kanban_config_label(c))
     table.add_row("Gateway Media", _gateway_media_label(c))
@@ -84,9 +95,15 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         gateway_table = Table(box=None, show_header=False, padding=(0, 2))
         gateway_table.add_column("Key", style=theme.ui_label)
         gateway_table.add_column("Value", style=theme.ui_accent)
-        gateway_table.add_row("Domain", c.tool_gateway_domain or "—")
-        gateway_table.add_row("Scheme", c.tool_gateway_scheme or "—")
-        gateway_table.add_row("Firecrawl", c.firecrawl_gateway_url or "—")
+        gateway_table.add_row(
+            "Domain", escape(c.tool_gateway_domain) if c.tool_gateway_domain else "—"
+        )
+        gateway_table.add_row(
+            "Scheme", escape(c.tool_gateway_scheme) if c.tool_gateway_scheme else "—"
+        )
+        gateway_table.add_row(
+            "Firecrawl", escape(c.firecrawl_gateway_url) if c.firecrawl_gateway_url else "—"
+        )
         sections.append(gateway_table)
 
         routes_table = Table(box=None, show_header=True, padding=(0, 2))
@@ -95,8 +112,8 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         routes_table.add_column("Token", style=theme.ui_accent)
         for route in c.tool_gateway_routes:
             routes_table.add_row(
-                route.tool,
-                route.mode,
+                escape(route.tool),
+                escape(route.mode),
                 "Yes" if route.token_present else "No",
             )
         sections.append(routes_table)
