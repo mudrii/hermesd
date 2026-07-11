@@ -33,3 +33,27 @@ def test_curator_preserves_last_good_on_corruption(hermes_home: Path):
     assert second.curator.model == "MiniMax-M3"
     assert second.curator.count_before == 8
     c.close()
+
+
+def test_curator_preserves_last_good_when_newest_run_is_corrupt(hermes_home: Path):
+    _write_curator_run(
+        hermes_home,
+        "20260610-133539",
+        {"model": "MiniMax-M3", "provider": "minimax", "counts": {"before": 8, "after": 5}},
+    )
+    c = Collector(hermes_home)
+    first = c.collect()
+    assert first.curator.model == "MiniMax-M3"
+
+    newer_run_json = _write_curator_run(
+        hermes_home,
+        "20260611-090000",
+        {"model": "newer", "provider": "broken"},
+    )
+    newer_run_json.write_text("{not valid json")
+    os.utime(newer_run_json, None)
+    second = c.collect()
+
+    assert second.curator.model == "MiniMax-M3"
+    assert second.curator.count_before == 8
+    c.close()

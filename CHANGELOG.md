@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Logs and cron output excerpts now redact common secret material before rendering in the TUI or snapshots.
 - URL fields shown in config/integration views now redact embedded username/password credentials as well as secret query parameters.
 - Profile session counts and cron job output excerpts now preserve last-good values across transient file/database disappearance.
+- Curator state now falls back to the newest usable run instead of blanking when a newer run directory is incomplete or corrupt.
 - Nix package metadata now matches the Python package version, and README screenshots use package-metadata-safe image URLs.
 
 ## [2026.6.15] - 2026-06-15

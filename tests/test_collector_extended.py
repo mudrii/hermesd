@@ -63,6 +63,14 @@ def test_collect_preserves_last_good_json_sources_on_corruption(
     c.close()
 
 
+def test_collect_after_close_raises(populated_hermes_home: Path):
+    c = Collector(populated_hermes_home)
+    c.close()
+
+    with pytest.raises(RuntimeError, match="collector is closed"):
+        c.collect()
+
+
 def test_today_epoch_is_midnight():
     import datetime
 

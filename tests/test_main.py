@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from hermesd.__main__ import _positive_int, main, parse_args, resolve_hermes_home
+from hermesd.__main__ import (
+    _positive_int,
+    main,
+    parse_args,
+    resolve_hermes_home,
+    resolve_profile_name,
+)
 
 
 def test_parse_args_defaults():
@@ -125,6 +131,21 @@ def test_resolve_hermes_home_default(monkeypatch):
     assert path == Path.home() / ".hermes"
 
 
+def test_resolve_profile_name_default_none(monkeypatch):
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    assert resolve_profile_name(parse_args([])) is None
+
+
+def test_resolve_profile_name_uses_env(monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "research")
+    assert resolve_profile_name(parse_args([])) == "research"
+
+
+def test_resolve_profile_name_cli_overrides_env(monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "research")
+    assert resolve_profile_name(parse_args(["--profile", "coding"])) == "coding"
+
+
 def test_main_exits_on_missing_dir(tmp_path):
     missing = tmp_path / "nonexistent"
     with pytest.raises(SystemExit) as exc:
@@ -132,10 +153,13 @@ def test_main_exits_on_missing_dir(tmp_path):
     assert exc.value.code == 1
 
 
-def test_main_exits_on_missing_profile(populated_hermes_home: Path):
+def test_main_exits_on_missing_profile(populated_hermes_home: Path, capsys):
     with pytest.raises(SystemExit) as exc:
         main(["--hermes-home", str(populated_hermes_home), "--profile", "missing"])
+
+    err = capsys.readouterr().err
     assert exc.value.code == 1
+    assert "Profile 'missing' does not exist" in err
 
 
 def test_main_snapshot_outputs_overview(populated_hermes_home: Path, capsys):

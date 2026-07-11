@@ -1008,12 +1008,17 @@ class Collector:
         )
         if not run_dirs:
             return CuratorRun()
-        newest = run_dirs[-1]
-        run_json = newest / "run.json"
-        if run_json.is_symlink():
-            return CuratorRun()
-        data = self._read_json_cached(run_json)
-        if not data:
+        data: JsonMapping = {}
+        newest: Path | None = None
+        for candidate in reversed(run_dirs):
+            run_json = candidate / "run.json"
+            if run_json.is_symlink():
+                continue
+            data = self._read_json_cached(run_json)
+            if data:
+                newest = candidate
+                break
+        if newest is None:
             return CuratorRun()
         counts = _as_dict(data.get("counts"))
         tool_call_counts = _int_mapping(data.get("tool_call_counts"))

@@ -3,8 +3,9 @@
 Every test drives a real ``Collector().collect()`` (or a real module-level
 helper) against a tmp ``~/.hermes`` and asserts observable behavior:
 cache-preservation, the read-only path-escape guard, and mtime cache hits.
-File IO errors are triggered realistically (chmod 000, symlink loops, symlinked
-run dirs) rather than by monkeypatching collector internals.
+File IO errors are triggered realistically where possible (chmod 000, symlink
+loops, symlinked run dirs) or at the filesystem boundary for root-safe
+determinism, rather than by monkeypatching collector internals.
 """
 
 from __future__ import annotations
@@ -114,7 +115,36 @@ def test_log_stream_oserror_preserves_last_good_lines(hermes_home: Path):
         c.close()
 
 
-# --- curator run.json symlink -> empty, not a failed source (collector.py:982) -
+def test_log_stream_open_error_preserves_last_good_lines(
+    hermes_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    agent_log = hermes_home / "logs" / "agent.log"
+    agent_log.write_text("2026-04-09 15:41:58,123 - hermes - INFO - Tool call: web_search\n")
+
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        good = [line.message for line in first.logs.agent_lines]
+        assert good == ["Tool call: web_search"]
+
+        real_open = Path.open
+
+        def fail_target_open(self: Path, *args, **kwargs):
+            if self == agent_log:
+                raise OSError("simulated log read failure")
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", fail_target_open)
+        os.utime(agent_log, None)
+
+        second = c.collect()
+        assert [line.message for line in second.logs.agent_lines] == good
+    finally:
+        c.close()
+
+
+# --- curator run.json symlink -> empty, not a failed source --------------------
 
 
 def test_curator_run_json_symlink_returns_empty_without_failing_source(hermes_home: Path):
@@ -136,7 +166,7 @@ def test_curator_run_json_symlink_returns_empty_without_failing_source(hermes_ho
         c.close()
 
 
-# --- _path_resolves_under guard returns False on error (collector.py:1882-1883) -
+# --- _path_resolves_under guard returns False on error -------------------------
 
 
 def test_path_resolves_under_false_when_resolve_raises(tmp_path: Path, monkeypatch):
@@ -200,7 +230,7 @@ def test_checkpoint_unreadable_workdir_file_blanks_workdir(hermes_home: Path):
         os.chmod(workdir_file, 0o644)
 
 
-# --- cron tail read OSError -> [] without failing logs (1873-1874) -------------
+# --- cron tail read OSError -> [] without failing logs -------------------------
 
 
 @_skip_if_root
@@ -225,6 +255,32 @@ def test_cron_tail_unreadable_file_yields_no_cron_lines(hermes_home: Path):
             c.close()
     finally:
         os.chmod(out, 0o644)
+
+
+def test_cron_tail_open_error_yields_no_cron_lines(
+    hermes_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    job_dir = hermes_home / "cron" / "output" / "job-1"
+    job_dir.mkdir(parents=True)
+    out = job_dir / "run.log"
+    out.write_text("2026-04-09 15:41:58,123 - hermes - INFO - cron ran\n")
+
+    real_open = Path.open
+
+    def fail_target_open(self: Path, *args, **kwargs):
+        if self == out:
+            raise OSError("simulated cron read failure")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_target_open)
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+        assert "logs" not in state.health.failed_sources
+        assert state.logs.cron_lines == []
+    finally:
+        c.close()
 
 
 # --- module-level helper OSError fallbacks --------------------------------------
@@ -274,19 +330,19 @@ def test_read_soul_excerpt_whitespace_only_returns_empty(tmp_path: Path):
 def test_latest_log_mtime_skips_nonfiles_and_empty(tmp_path: Path):
     logs = tmp_path / "logs"
     logs.mkdir()
-    (logs / "subdir").mkdir()  # non-file: skipped (line 1644-1645)
+    (logs / "subdir").mkdir()  # non-file: skipped
     good = logs / "a.log"
     good.write_text("hi")
     assert _latest_log_mtime(logs) == good.stat().st_mtime
 
-    # Empty dir (only a subdir) -> no file mtimes -> None (line 1650-1651).
+    # Empty dir (only a subdir) -> no file mtimes -> None.
     empty = tmp_path / "emptylogs"
     empty.mkdir()
     (empty / "nested").mkdir()
     assert _latest_log_mtime(empty) is None
 
 
-# --- context_lengths key without "@" separator -> skipped (collector.py:565) --
+# --- context_lengths key without "@" separator -> skipped ----------------------
 
 
 def test_context_lengths_key_without_separator_is_skipped(hermes_home: Path):
@@ -300,7 +356,7 @@ def test_context_lengths_key_without_separator_is_skipped(hermes_home: Path):
         yaml.dump(
             {
                 "context_lengths": {
-                    "no_separator_key": 12345,  # skipped (line 565)
+                    "no_separator_key": 12345,
                     "gpt-5.4@https://api.example.com/": 200000,  # normalized
                 }
             }
@@ -317,7 +373,7 @@ def test_context_lengths_key_without_separator_is_skipped(hermes_home: Path):
         c.close()
 
 
-# --- cron output excerpt read OSError -> empty tuple (collector.py:1834-1835) --
+# --- cron output excerpt read OSError -> empty tuple ---------------------------
 
 
 @_skip_if_root
@@ -340,6 +396,33 @@ def test_cron_output_excerpt_unreadable_file_returns_empty(hermes_home: Path):
         os.chmod(out, 0o644)
 
 
+def test_cron_output_excerpt_open_error_returns_empty(
+    hermes_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = hermes_home / "cron" / "output"
+    job_dir = output_root / "job-x"
+    job_dir.mkdir(parents=True)
+    out = job_dir / "latest.md"
+    out.write_text("some cron output\n")
+
+    real_open = Path.open
+
+    def fail_target_open(self: Path, *args, **kwargs):
+        if self == out:
+            raise OSError("simulated cron excerpt read failure")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_target_open)
+
+    assert _latest_cron_output_excerpt(output_root, "job-x", max_bytes=4096) == (
+        "",
+        False,
+        "",
+        None,
+    )
+
+
 # --- pure helpers: branches with no IO ------------------------------------------
 
 
@@ -350,22 +433,22 @@ def test_count_skills_ignores_dotdirs_and_files(tmp_path: Path):
     (real / "skill-a").mkdir()
     (real / "skill-b").mkdir()
     (real / "README.md").write_text("not a skill dir")  # non-dir child: not counted
-    (skills / ".cache").mkdir()  # dotdir category: skipped (collector.py:1675)
+    (skills / ".cache").mkdir()  # dotdir category: skipped
     (skills / "loose.txt").write_text("x")  # non-dir category: skipped
     assert _count_skills(skills) == 2
     assert _count_skills(tmp_path / "missing") == 0
 
 
 def test_mcp_tool_filter_summary_empty_returns_blank():
-    # Empty cfg (1772-1773) and present-but-empty include/exclude (1780).
+    # Empty cfg and present-but-empty include/exclude both render as blank.
     assert _mcp_tool_filter_summary({}) == ""
     assert _mcp_tool_filter_summary({"include": [], "exclude": []}) == ""
 
 
 def test_is_dashboard_process_matches_phrase_and_bad_quoting():
-    # "hermes dashboard" phrase short-circuits to True (line 2044-2045).
+    # "hermes dashboard" phrase short-circuits to True.
     assert _is_dashboard_process("python -m hermes dashboard") is True
     # Unbalanced quote makes shlex.split raise ValueError -> str.split fallback
-    # still finds the hermesd entrypoint (lines 2046-2050).
+    # still finds the hermesd entrypoint.
     assert _is_dashboard_process('/usr/bin/hermesd --flag "unterminated') is True
     assert _is_dashboard_process('/usr/bin/other "unterminated') is False

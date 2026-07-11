@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import re
 import time
+from pathlib import Path
 
 import pytest
 
+from hermesd.collector import Collector
 from hermesd.models import (
     ConfigSummary,
     CronState,
@@ -37,6 +39,41 @@ def test_registered_panels_render_by_public_number(panel_num: int, detail: bool)
     text = render_to_str(render_panel(panel_num, DashboardState(), Theme(), detail=detail))
 
     assert f"[{panel_num}] {PANEL_NAMES[panel_num]}" in text
+
+
+@pytest.mark.parametrize(
+    ("panel_num", "expected_snippets"),
+    [
+        (1, ("Channel Directory", "telegram", "meeting invites")),
+        (2, ("sess_001", "gpt-5.4", "openai-codex")),
+        (4, ("shell_exec", "proc_alpha", "project-alpha")),
+        (5, ("openai-codex", "Tool Gateway", "Dashboard")),
+        (7, ("Primary Codex", "startup-check", "weather", "skill-0")),
+        (8, ("Tool call: web_search", "Response generated")),
+        (10, ("MEMORY.md", "SOUL.md", "Remember the operator")),
+        (11, ("Implement dashboard auth visibility", "Status Counts", "Recent Runs")),
+        (12, ("Model Caches", "models_dev_cache.json", "NousResearch/hermes-agent")),
+    ],
+)
+def test_collected_fixture_detail_panels_render_fixture_values(
+    populated_hermes_home: Path,
+    panel_num: int,
+    expected_snippets: tuple[str, ...],
+):
+    collector = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    try:
+        state = collector.collect()
+    finally:
+        collector.close()
+
+    text = render_to_str(
+        render_panel(panel_num, state, Theme(), detail=True),
+        width=160,
+        no_color=True,
+    )
+
+    for snippet in expected_snippets:
+        assert snippet in text
 
 
 def test_gateway_panel_compact():
