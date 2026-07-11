@@ -76,7 +76,8 @@ def test_curator_panel_detail_shows_scheduler_state_without_run():
     )
     assert "Scheduler" in text
     assert "paused" in text
-    assert "7" in text
+    assert re.search(r"Run Count\s+7\b", text)
+    assert re.search(r"Last Run\s+2026-07-10T10:00:00Z", text)
     assert "consolidate on" in text
     assert "logs/curator/2026/run.md" in text
 

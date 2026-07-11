@@ -1392,7 +1392,10 @@ class Collector:
             if memories_dir.is_dir()
             else []
         )
-        learning_summary = _learning_summary(self._paths.profile_path("skills"))
+        learning_summary = _learning_summary(
+            self._paths.profile_path("skills"),
+            self._read_json_cached(self._paths.profile_path("skills", ".usage.json")),
+        )
 
         return MemoryOverview(
             provider=str(memory_cfg.get("provider") or ""),
@@ -2051,13 +2054,13 @@ def _read_soul_excerpt(path: Path) -> str:
     return ""
 
 
-def _learning_summary(skills_dir: Path) -> dict[str, int]:
-    usage = _skill_usage_metadata(skills_dir / ".usage.json")
+def _learning_summary(skills_dir: Path, usage: dict[str, Any]) -> dict[str, int]:
+    usage_metadata = {str(name): _as_dict(raw) for name, raw in usage.items()}
     learned = set(_learned_skill_names(skills_dir))
     pinned = set()
     agent_created = set()
 
-    for name, metadata in usage.items():
+    for name, metadata in usage_metadata.items():
         if _usage_indicates_learned(metadata):
             learned.add(name)
         if bool(metadata.get("pinned")):
@@ -2079,21 +2082,11 @@ def _learning_summary(skills_dir: Path) -> dict[str, int]:
                 agent_created.add(name)
 
     return {
-        "used": len(usage),
+        "used": len(usage_metadata),
         "learned": len(learned),
         "pinned": len(pinned),
         "agent": len(agent_created),
     }
-
-
-def _skill_usage_metadata(path: Path) -> dict[str, dict[str, Any]]:
-    if path.is_symlink() or not path.is_file():
-        return {}
-    with contextlib.suppress(OSError, json.JSONDecodeError):
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return {str(name): _as_dict(raw) for name, raw in data.items()}
-    return {}
 
 
 def _usage_indicates_learned(metadata: dict[str, Any]) -> bool:

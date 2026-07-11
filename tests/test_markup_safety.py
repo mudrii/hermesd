@@ -13,10 +13,14 @@ from hermesd.models import (
     CronState,
     CuratorRun,
     DashboardState,
+    DiscoveredRepoSummary,
     GatewayState,
+    GoalSummary,
     HookInfo,
+    KanbanBoardSummary,
     KanbanRunSummary,
     KanbanState,
+    KanbanTaskLink,
     KanbanTaskSummary,
     LogLine,
     LogState,
@@ -29,6 +33,7 @@ from hermesd.models import (
     PRMonitorSummary,
     ProfilesState,
     ProfileSummary,
+    ProjectSummary,
     ProviderInfo,
     SessionInfo,
     SkillInfo,
@@ -37,6 +42,8 @@ from hermesd.models import (
     TokenBreakdown,
     ToolGatewayRoute,
     ToolStats,
+    VerificationEventSummary,
+    VerificationRootSummary,
 )
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
@@ -60,6 +67,10 @@ def _state_for(panel_num: int) -> DashboardState:
                 pid=1,
                 running=True,
                 hermes_version=INJECT,
+                drain_active=True,
+                drain_principal=INJECT,
+                drain_requested_at=INJECT,
+                served_profiles=[INJECT],
                 platforms=[
                     PlatformStatus(
                         name=INJECT,
@@ -79,8 +90,12 @@ def _state_for(panel_num: int) -> DashboardState:
                         states=[INJECT],
                         connected=True,
                         capabilities=[INJECT],
+                        family_label=INJECT,
+                        missing_from_directory=True,
                     )
                 ],
+                alias_count=1,
+                stale_alias_count=1,
             ),
         )
     if panel_num == 2:  # Sessions
@@ -183,6 +198,8 @@ def _state_for(panel_num: int) -> DashboardState:
                         source=INJECT,
                         last_status=INJECT,
                         cooldown_remaining=INJECT,
+                        expires_at=INJECT,
+                        last_refresh=INJECT,
                     )
                 ],
                 hooks=[HookInfo(name=INJECT, description=INJECT, events=[INJECT])],
@@ -230,15 +247,28 @@ def _state_for(panel_num: int) -> DashboardState:
             consecutive_failures=2,
             last_failure_error=INJECT,
             branch_name=INJECT,
+            workspace_path=INJECT,
+            goal_mode=INJECT,
+            current_step_key=INJECT,
         )
         return DashboardState(
             kanban=KanbanState(
                 db_present=True,
                 task_count=1,
                 run_count=1,
+                current_board=INJECT,
+                boards=[
+                    KanbanBoardSummary(
+                        slug=INJECT,
+                        current=True,
+                        task_count=1,
+                        block_kind_counts={INJECT: 1},
+                    )
+                ],
                 status_counts={INJECT: 1},
                 active_tasks=[task],
                 problem_tasks=[task],
+                task_links=[KanbanTaskLink(parent_id=INJECT, child_id=INJECT)],
                 recent_runs=[
                     KanbanRunSummary(
                         run_id=1,
@@ -258,6 +288,49 @@ def _state_for(panel_num: int) -> DashboardState:
                 desktop_build_stamp=INJECT,
                 model_caches=[ModelCacheSummary(name=INJECT, provider_count=1, model_count=1)],
                 pr_monitors=[PRMonitorSummary(filename=INJECT, repo=INJECT, checked_at=INJECT)],
+                verification_db_present=True,
+                verification_latest_events=[
+                    VerificationEventSummary(
+                        command=INJECT,
+                        canonical_command=INJECT,
+                        kind=INJECT,
+                        scope=INJECT,
+                        status=INJECT,
+                        output_summary=INJECT,
+                    )
+                ],
+                verification_roots=[
+                    VerificationRootSummary(
+                        session_id=INJECT,
+                        root=INJECT,
+                        last_edit_at=INJECT,
+                    )
+                ],
+                moa_trace_count=1,
+                moa_trace_newest_session_id=INJECT,
+                moa_trace_latest_record_summary=INJECT,
+                moa_trace_latest_record_keys=[INJECT],
+                projects_db_present=True,
+                projects=[
+                    ProjectSummary(
+                        slug=INJECT,
+                        name=INJECT,
+                        board_slug=INJECT,
+                        primary_path=INJECT,
+                    )
+                ],
+                discovered_repos=[
+                    DiscoveredRepoSummary(root=INJECT, label=INJECT, last_seen=INJECT)
+                ],
+                goal_count=1,
+                goals=[
+                    GoalSummary(
+                        session_id=INJECT,
+                        goal=INJECT,
+                        status=INJECT,
+                        waiting_reason=INJECT,
+                    )
+                ],
             ),
         )
     if panel_num == 13:  # Curator
@@ -268,7 +341,12 @@ def _state_for(panel_num: int) -> DashboardState:
                 started_at=INJECT,
                 model=INJECT,
                 provider=INJECT,
+                state_transitions=[INJECT],
                 llm_summary=INJECT,
+                llm_error=INJECT,
+                scheduler_state_present=True,
+                scheduler_last_run_at=INJECT,
+                scheduler_last_report_path=INJECT,
             ),
         )
     raise AssertionError(f"no state builder for panel {panel_num}")

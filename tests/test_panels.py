@@ -871,7 +871,7 @@ def test_operations_panel_detail_shows_verification_evidence():
             ],
         )
     )
-    text = render_to_str(render_panel(12, state, Theme(), detail=True), width=140, no_color=True)
+    text = render_to_str(render_panel(12, state, Theme(), detail=True), width=120, no_color=True)
     assert "Verification Evidence" in text
     assert "2 events" in text
     assert "1 failed" in text
@@ -881,7 +881,7 @@ def test_operations_panel_detail_shows_verification_evidence():
     assert "No operations artifacts found" not in text
 
 
-def test_operations_panel_detail_shows_moa_traces_and_projects():
+def test_operations_panel_detail_shows_moa_trace_metadata():
     state = DashboardState(
         operations=OperationsState(
             moa_trace_count=2,
@@ -890,6 +890,20 @@ def test_operations_panel_detail_shows_moa_traces_and_projects():
             moa_trace_newest_mtime=time.time() - 60,
             moa_trace_latest_record_summary="ok council",
             moa_trace_latest_record_keys=["preset", "status"],
+        )
+    )
+    text = render_to_str(render_panel(12, state, Theme(), detail=True), width=120, no_color=True)
+    assert "MoA Traces" in text
+    assert "sess-moa" in text
+    assert "Latest Record" in text
+    assert "ok council" in text
+    assert "Latest Keys" in text
+    assert "preset, status" in text
+
+
+def test_operations_panel_detail_shows_projects_and_discovered_repos():
+    state = DashboardState(
+        operations=OperationsState(
             projects_db_present=True,
             project_count=2,
             project_archived_count=1,
@@ -913,16 +927,12 @@ def test_operations_panel_detail_shows_moa_traces_and_projects():
             ],
         )
     )
-    text = render_to_str(render_panel(12, state, Theme(), detail=True), width=140, no_color=True)
-    assert "MoA Traces" in text
-    assert "sess-moa" in text
+    text = render_to_str(render_panel(12, state, Theme(), detail=True), width=120, no_color=True)
     assert "Projects" in text
-    assert "hermesd" in text
-    assert "main" in text
-    assert "4 discovered" in text
-    assert "1 missing paths" in text
-    assert "Latest Record" in text
-    assert "ok council" in text
+    assert re.search(r"Projects\s+2 projects\s+1 archived\s+3 folders\s+4 discovered", text)
+    assert re.search(r"Projects\s+.*1 missing paths", text)
+    assert "/repo/hermesd" in text
+    assert "board present" not in text
     assert "Newest Discovered Repos" in text
     assert "2026-07-12T00:00:00Z" in text
 
@@ -960,7 +970,7 @@ def test_operations_panel_detail_shows_goals_and_project_correlations():
             ],
         )
     )
-    text = render_to_str(render_panel(12, state, Theme(), detail=True), width=150, no_color=True)
+    text = render_to_str(render_panel(12, state, Theme(), detail=True), width=120, no_color=True)
     assert "Goals" in text
     assert "Ship visibility" in text
     assert "3/8" in text

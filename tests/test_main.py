@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+import yaml
 
 from hermesd.__main__ import (
     _positive_int,
@@ -15,6 +16,7 @@ from hermesd.__main__ import (
     resolve_hermes_home,
     resolve_profile_name,
 )
+from tests.conftest import create_kanban_db_tables
 
 
 def test_parse_args_defaults():
@@ -463,6 +465,254 @@ def test_main_snapshot_panel_12_json_annotates_operations(populated_hermes_home:
     assert payload["panel_num"] == 12
     assert payload["panel_name"] == "Operations"
     assert "operations" in payload["state"]
+
+
+def test_main_snapshot_panel_12_json_includes_visibility_fields(
+    populated_hermes_home: Path,
+    capsys,
+):
+    verification_db = populated_hermes_home / "verification_evidence.db"
+    conn = sqlite3.connect(str(verification_db))
+    conn.executescript(
+        """
+        CREATE TABLE verification_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            root TEXT NOT NULL,
+            command TEXT NOT NULL,
+            canonical_command TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            status TEXT NOT NULL,
+            exit_code INTEGER NOT NULL,
+            output_summary TEXT NOT NULL
+        );
+        INSERT INTO verification_events VALUES (
+            1, '2026-07-10T10:00:00Z', 'sess-a', '/repo', '/repo',
+            'uv run pytest', 'pytest', 'test', 'full', 'passed', 0, '12 passed'
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    trace_dir = populated_hermes_home / "moa-traces"
+    trace_dir.mkdir()
+    (trace_dir / "sess-moa.jsonl").write_text(
+        json.dumps({"status": "ok", "preset": "council"}) + "\n"
+    )
+    conn = sqlite3.connect(str(populated_hermes_home / "state.db"))
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS state_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO state_meta VALUES (?, ?)",
+        (
+            "goal:sess-goal",
+            json.dumps({"goal": "Ship visibility", "status": "active"}),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    projects_db = populated_hermes_home / "projects.db"
+    conn = sqlite3.connect(str(projects_db))
+    conn.executescript(
+        """
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            slug TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            icon TEXT,
+            color TEXT,
+            board_slug TEXT,
+            primary_path TEXT,
+            created_at TEXT NOT NULL,
+            archived INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE discovered_repos (
+            root TEXT PRIMARY KEY,
+            label TEXT,
+            last_seen TEXT NOT NULL
+        );
+        INSERT INTO projects VALUES (
+            'p1', 'hermesd', 'hermesd', '', '', '', '', '',
+            '2026-07-10T00:00:00Z', 0
+        );
+        INSERT INTO discovered_repos VALUES ('/repo/hermesd', 'hermesd', '2026-07-12T00:00:00Z');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-panel",
+            "12",
+            "--snapshot-format",
+            "json",
+            "--no-color",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    operations = payload["state"]["operations"]
+
+    assert operations["verification_event_count"] == 1
+    assert operations["verification_latest_events"][0]["canonical_command"] == "pytest"
+    assert operations["moa_trace_count"] == 1
+    assert operations["moa_trace_latest_record_summary"] == "ok council"
+    assert operations["goal_count"] == 1
+    assert operations["goals"][0]["goal"] == "Ship visibility"
+    assert operations["project_missing_primary_path_count"] == 1
+    assert operations["discovered_repos"][0]["root"] == "/repo/hermesd"
+
+
+def test_main_snapshot_panel_12_text_outputs_visibility_detail(
+    populated_hermes_home: Path,
+    capsys,
+):
+    verification_db = populated_hermes_home / "verification_evidence.db"
+    conn = sqlite3.connect(str(verification_db))
+    conn.executescript(
+        """
+        CREATE TABLE verification_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            root TEXT NOT NULL,
+            command TEXT NOT NULL,
+            canonical_command TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            status TEXT NOT NULL,
+            exit_code INTEGER NOT NULL,
+            output_summary TEXT NOT NULL
+        );
+        INSERT INTO verification_events VALUES (
+            1, '2026-07-10T10:00:00Z', 'sess-a', '/repo', '/repo',
+            'uv run ruff check .', 'ruff check', 'lint', 'full', 'failed', 1,
+            'F401 unused import'
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    conn = sqlite3.connect(str(populated_hermes_home / "state.db"))
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS state_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO state_meta VALUES (?, ?)",
+        ("goal:sess-goal", json.dumps({"goal": "Ship visibility", "status": "active"})),
+    )
+    conn.commit()
+    conn.close()
+
+    trace_dir = populated_hermes_home / "moa-traces"
+    trace_dir.mkdir()
+    (trace_dir / "sess-moa.jsonl").write_text(json.dumps({"status": "ok"}) + "\n")
+
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-panel",
+            "12",
+            "--no-color",
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert "Verification Evidence" in out
+    assert "ruff check" in out
+    assert "Ship visibility" in out
+    assert "MoA Traces" in out
+
+
+def test_main_snapshot_json_includes_visibility_state(populated_hermes_home: Path, capsys):
+    (populated_hermes_home / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "scale_to_zero": {"idle_timeout_minutes": 10},
+                "cron": {"provider": "chronos"},
+            }
+        )
+    )
+    (populated_hermes_home / "gateway_state.json").write_text(
+        json.dumps(
+            {
+                "pid": 12345,
+                "gateway_state": "running",
+                "active_agents": 0,
+                "platforms": {"raft": {"state": "connected"}},
+            }
+        )
+    )
+    (populated_hermes_home / "channel_aliases.json").write_text(
+        json.dumps({"raft": {"room-1": {"label": "Ops", "stale": True}}})
+    )
+    (populated_hermes_home / "cron" / "suggestions.json").write_text(
+        json.dumps({"suggestions": [{"name": "standup"}]})
+    )
+    (populated_hermes_home / "skills" / ".curator_state").write_text(
+        json.dumps({"run_count": 2, "last_report_path": "logs/curator/run.md"})
+    )
+    (populated_hermes_home / "skills" / ".usage.json").write_text(
+        json.dumps({"dev-lint": {"use_count": 4, "pinned": True}})
+    )
+    (populated_hermes_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "credential_pool": {
+                    "vertex": [
+                        {
+                            "access_expires_at": "2026-07-11T12:00:00Z",
+                            "last_refresh": "2026-07-11T11:00:00Z",
+                        }
+                    ]
+                }
+            }
+        )
+    )
+    kanban_db = populated_hermes_home / "kanban" / "boards" / "alpha" / "kanban.db"
+    kanban_db.parent.mkdir(parents=True)
+    conn = sqlite3.connect(str(kanban_db))
+    create_kanban_db_tables(conn)
+    conn.execute("ALTER TABLE tasks ADD COLUMN block_kind TEXT")
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, block_kind) VALUES (?, ?, ?, ?, ?)",
+        ("alpha-task", "Alpha task", "blocked", 1, "needs_input"),
+    )
+    conn.commit()
+    conn.close()
+
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-format",
+            "json",
+            "--no-color",
+        ]
+    )
+    state = json.loads(capsys.readouterr().out)["state"]
+
+    assert state["gateway"]["scale_to_zero_relay_only"] is True
+    assert state["channels"]["stale_alias_count"] == 1
+    assert state["cron"]["provider"] == "chronos"
+    assert state["cron"]["suggestion_count"] == 1
+    boards = {board["slug"]: board for board in state["kanban"]["boards"]}
+    assert boards["alpha"]["block_kind_counts"] == {"needs_input": 1}
+    assert state["skills_memory"]["credential_pools"][0]["expires_at"] == "2026-07-11T12:00:00Z"
+    assert state["memory"]["skill_usage_count"] == 1
+    assert state["curator"]["scheduler_run_count"] == 2
 
 
 def test_main_snapshot_panel_12_outputs_operations_detail(populated_hermes_home: Path, capsys):
