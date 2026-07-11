@@ -13,7 +13,7 @@
         python = pkgs.python311;
         hermesd = python.pkgs.buildPythonApplication {
           pname = "hermesd";
-          version = "2026.6.15";
+          version = "2026.7.11";
           pyproject = true;
 
           src = ./.;

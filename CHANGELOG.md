@@ -7,6 +7,8 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ## [Unreleased]
 
+## [2026.7.11] - 2026-07-11
+
 ### Added
 
 - The Operations panel now reads `~/.hermes/verification_evidence.db` read-only and surfaces verification event totals, failed-check counts, latest evidence rows, and pending changed-path counts so Hermes Agent's coding verification ledger is visible in hermesd.

@@ -90,7 +90,11 @@ jobs:
               Path(f"dist/hermesd-{version}.tar.gz"),
               Path(f"dist/hermesd-{version}-py3-none-any.whl"),
           }
-          actual = {path for path in Path("dist").iterdir() if path.is_file()}
+          actual = {
+              path
+              for path in Path("dist").iterdir()
+              if path.is_file() and not path.name.startswith(".")
+          }
           if actual != expected:
               expected_list = ", ".join(sorted(str(path) for path in expected))
               actual_list = ", ".join(sorted(str(path) for path in actual))
@@ -142,6 +146,6 @@ jobs:
           expected_wheel="dist/hermesd-${version}-py3-none-any.whl"
           test -f "${expected_sdist}"
           test -f "${expected_wheel}"
-          test "$(find dist -type f | wc -l | tr -d ' ')" = "2"
+          test "$(find dist -type f ! -name '.*' | wc -l | tr -d ' ')" = "2"
       - name: Publish release distributions to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
