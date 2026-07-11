@@ -8,7 +8,10 @@ Brief description of the change.
 
 ## Testing
 
-- [ ] All existing tests pass (`uv run pytest tests/ -v`)
+- [ ] Full local gate passes:
+      `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy hermesd`,
+      `uv run pytest tests/ -v -W error::ResourceWarning`, `uv run pip-audit`,
+      `uv lock --check`, `uv build`, wheel smoke install, `uvx twine check dist/*`
 - [ ] New tests added for new functionality
 - [ ] Tested manually with `hermesd` against a live `~/.hermes/`
 - [ ] Works in SSH/tmux at 80x24

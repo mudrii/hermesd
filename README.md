@@ -2,7 +2,7 @@
 
 A real-time TUI monitoring dashboard for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
-![hermesd overview](https://raw.githubusercontent.com/mudrii/hermesd/main/images/overview.png)
+![hermesd overview](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/overview.png)
 
 ## Why This Exists
 
@@ -46,7 +46,7 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 
 - **Read-only** — hermesd never writes to `~/.hermes/` or modifies Hermes Agent state
 - **Live-updating** — polls every 5 seconds (configurable with `--refresh-rate`)
-- **Snapshot mode** — `--snapshot` renders one overview frame to stdout and exits; `--snapshot-panel N` selects any registered detail panel for text snapshots and annotates JSON snapshots (`0` aliases panel 10); `--snapshot-file PATH` writes either form to disk; `--snapshot-format json` emits machine-readable full-state snapshots
+- **Snapshot mode** — `--snapshot` renders one overview frame to stdout and exits; `--snapshot-panel N` selects any registered detail panel for text snapshots and annotates JSON snapshots (`0` aliases panel 10); `--snapshot-file PATH` writes either form to disk outside the Hermes home; `--snapshot-format json` emits machine-readable full-state snapshots
 - **Bounded log reads** — `--log-tail-bytes` caps how much of each log file and cron output excerpt is read per refresh
 - **Opt-in profiles** — root mode stays the default; use `--profile NAME` or `HERMES_PROFILE=NAME` to read profile-scoped runtime data
 - **Adaptive layout** — full 13-panel grid on wide terminals, a tall-narrow single-column overview for vertical tmux splits, and a denser all-panel overview on 80x24
@@ -72,85 +72,85 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 
 The main dashboard shows all 13 panels at a glance. The header starts with the installed `hermesd` version, then shows the current profile mode and time on the right. Gateway status with PID and Hermes Agent version sits at the top (note the `discord ⚠` connection-error marker), sessions and token costs side by side, tools and config, cron and skills, logs plus profile metadata, and dedicated memory, kanban, operations, and curator panels at the bottom. The footer shows keyboard shortcuts and a polling indicator.
 
-![Overview](https://raw.githubusercontent.com/mudrii/hermesd/main/images/overview.png)
+![Overview](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/overview.png)
 
 ### [1] Gateway & Platforms — Is Everything Connected?
 
 Press `1` to expand. Shows whether the gateway process is alive (with correct PID even after launchd restarts), Hermes version with update status, and a per-platform table with connection state, last-seen timestamps, and an **Error** column surfacing per-platform connection failures (e.g. discord "failed to reconnect"), plus the active-agent count and a restart-requested marker. Catches the "gateway says running but the PID is dead" case.
 
-![Gateway Detail](https://raw.githubusercontent.com/mudrii/hermesd/main/images/panel-01-gateway.png)
+![Gateway Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-01-gateway.png)
 
 ### [2] Sessions — What’s Active and Where Did It Fork?
 
 Press `2` to expand. The detail table includes billing metadata plus parent-session lineage; a **Runtime** section surfaces API call counts, cwd, archived state, rewind count, and handoff metadata; and a **Billing & Context** section shows each session's end reason, billing endpoint, billing mode, and the model's context-window limit (joined from `context_length_cache.yaml`). Press `/` to filter the currently loaded sessions by ID, source, model, lineage, provider, title, cwd, archived state, handoff state, platform, or message content via `message:term`, and press `s` to cycle recent/cost/token sorting.
 
-![Sessions Detail](https://raw.githubusercontent.com/mudrii/hermesd/main/images/panel-02-sessions.png)
+![Sessions Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-02-sessions.png)
 
 ### [3] Tokens / Cost — Where Are My Tokens Going?
 
 Press `3` for the full per-session token breakdown plus recent `7d`/`30d` rollups and read-only model/provider/**endpoint** cost summaries derived from the current session table, and a **Cost Status** reconciliation line (unknown vs subscription-included vs estimated). In both the compact and detail views, costs carry a `~$` prefix when estimated and a plain `$` prefix when the provider cost is authoritative (`reported`/`exact`/`included`); subscription-`included` sessions render an authoritative `$0.00`.
 
-![Tokens Detail](https://raw.githubusercontent.com/mudrii/hermesd/main/images/panel-03-tokens.png)
+![Tokens Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-03-tokens.png)
 
 ### [4] Tools — What's Available and What's Being Used?
 
 Press `4` for four sections: **Tool Calls** showing the current call leaders by name (tool names when the `messages` table provides them, otherwise fallback session labels), **Available Tools** listing the union of tools discovered across session files in a 3-column grid, **Background Processes** showing the running `processes.json` checkpoint with PID, notify-on-complete, watch-pattern summary, start time, and command, and **Checkpoints** showing filesystem shadow repos with workdir name, commit depth, and latest checkpoint reason. The compact view shows the top callers plus the current background-process and checkpoint counts.
 
-![Tools Detail](https://raw.githubusercontent.com/mudrii/hermesd/main/images/panel-04-tools.png)
+![Tools Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-04-tools.png)
 
 ### [5] Config — Current Agent Configuration
 
 Press `5` for the full config key-value table: model, provider, personality, max turns, reasoning effort, compression threshold, secret redaction, approval mode, provider routing summary, smart routing, fallback model, dashboard theme/auth/public URL, session reset mode, memory provider, Tool Search, toolsets, code execution, kanban dispatch settings, gateway media trust, and auxiliary slot count. Tool Gateway domain, scheme, Firecrawl endpoint, and route token presence are shown from config plus environment with secret-bearing values redacted.
 
-![Config Detail](https://raw.githubusercontent.com/mudrii/hermesd/main/images/panel-05-config.png)
+![Config Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-05-config.png)
 
 ### [6] Cron — Scheduled Jobs
 
 Press `6` to see cron scheduler state, max parallelism, response wrapping mode, all configured jobs, delivery targets, current state, last execution status, latest error, and latest saved output metadata from `~/.hermes/cron/output/`. `[SILENT]` runs are surfaced explicitly so “nothing to report” is distinguishable from missing output.
 
-![Cron Detail](https://raw.githubusercontent.com/mudrii/hermesd/main/images/panel-06-cron.png)
+![Cron Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-06-cron.png)
 
 ### [7] Skills & Integrations — What's Installed?
 
 Press `7` for provider and integration visibility in one place: **Providers** with active auth state, **Credential Pools** with redacted metadata, **Hooks** discovered from `~/.hermes/hooks/`, **Plugins** from `~/.hermes/plugins/`, **MCP Servers** from `config.yaml` with secret-bearing args and URL query params redacted, `BOOT.md` presence, and **Skills** grouped by category with descriptions loaded from each skill's `SKILL.md` frontmatter. Use `j`/`k` to scroll through the full skill list.
 
-![Skills Detail](https://raw.githubusercontent.com/mudrii/hermesd/main/images/panel-07-skills.png)
+![Skills Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-07-skills.png)
 
 ### [8] Logs — What Just Happened?
 
 Press `8` for the full log viewer with discovered streams such as **agent**, **gateway**, **errors**, **cron**, **desktop**, **dashboard**, **gui**, **update**, **gateway.error**, **tui crash**, **workspace**, **workspace.error**, **audit**, and **mcp.stderr** (each shown only when its file exists). Press `Tab` to switch between them, `/` to filter the current log stream by `level:`, `minlevel:`, `component:`, `session:`, or free text, `j`/`k` to move the viewport, and `g`/`G` to jump to the top or bottom.
 
-![Logs Detail](https://raw.githubusercontent.com/mudrii/hermesd/main/images/panel-08-logs.png)
+![Logs Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-08-logs.png)
 
 ### [9] Profiles — Which Runtime State Am I Looking At?
 
 Press `9` for a read-only profile table discovered from `~/.hermes/profiles/*/`. It shows per-profile session count, latest log mtime, skill count, DB size, and a short `SOUL.md` excerpt when present. Press `p` in this panel to cycle the viewed profile highlight without changing the dashboard's selected data source.
 
-![Profiles Detail](https://raw.githubusercontent.com/mudrii/hermesd/main/images/panel-09-profiles.png)
+![Profiles Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-09-profiles.png)
 
 ### [10] Memory — What Context Is Persisted?
 
 Press `0` to expand. The Memory panel shows the configured memory provider, memory-file count, `MEMORY.md` and `USER.md` word counts, `SOUL.md` size, and a short `SOUL.md` excerpt with the discovered memory files listed below.
 
-![Memory Detail](https://raw.githubusercontent.com/mudrii/hermesd/main/images/panel-10-memory.png)
+![Memory Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-10-memory.png)
 
 ### [11] Kanban — What Are Workers Doing?
 
 Use `]` from panel 10 or `--snapshot-panel 11` to expand. The Kanban panel reads `~/.hermes/kanban.db` in read-only mode and shows board counts, configured dispatch mode, status breakdowns, active worker claims, blocked/failing tasks, recent run outcomes, a parent→child **Decomposition Tree** (`task_links`), and a **Task Metadata** table (branch, workspace, goal mode, current step) when those columns are populated.
 
-![Kanban Detail](https://raw.githubusercontent.com/mudrii/hermesd/main/images/panel-11-kanban.png)
+![Kanban Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-11-kanban.png)
 
 ### [12] Operations — What Runtime Artifacts Exist?
 
 Use `]` from Kanban or `--snapshot-panel 12` to expand. The Operations panel summarizes dashboard background processes, Desktop build metadata, **Response Store** stats (conversation/response row counts + size from `response_store.db`), model-cache provider/model counts, cache ages, and PR monitor files across all of the agent's naming families (flat + subdirectory) with per-repo dedup.
 
-![Operations Detail](https://raw.githubusercontent.com/mudrii/hermesd/main/images/panel-12-operations.png)
+![Operations Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-12-operations.png)
 
 ### [13] Curator — What Did the Last Memory Curation Do?
 
-Use `]` from Operations or `--snapshot-panel 13` to expand. The Curator panel reads the newest `~/.hermes/logs/curator/<stamp>/run.json` and shows the skill before/after/delta counts, archived/added/pruned/consolidated totals, the model and provider used, run duration, total tool calls plus a per-tool call breakdown, the state-transition trail, and the LLM summary (or error).
+Use `]` from Operations or `--snapshot-panel 13` to expand. The Curator panel reads the newest usable non-symlinked `~/.hermes/logs/curator/<stamp>/run.json` and shows the skill before/after/delta counts, archived/added/pruned/consolidated totals, the model and provider used, run duration, total tool calls plus a per-tool call breakdown, the state-transition trail, and the LLM summary (or error).
 
-![Curator Detail](https://raw.githubusercontent.com/mudrii/hermesd/main/images/panel-13-curator.png)
+![Curator Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-13-curator.png)
 
 ## Installation
 
@@ -272,7 +272,7 @@ hermesd --log-tail-bytes 8192
 
 ## Architecture
 
-hermesd is a **read-only companion** — it reads files from `~/.hermes/` and never writes anything.
+hermesd is a **read-only companion** — it reads files from `~/.hermes/` and never writes to Hermes Agent state. The only write path is the explicit `--snapshot-file PATH` export, which is rejected when the target is under the Hermes home.
 
 ```
 ~/.hermes/                        hermesd
@@ -337,7 +337,8 @@ uv venv .venv --python 3.11
 source .venv/bin/activate
 uv pip install -e ".[dev]"
 
-# Run the full local gate set — matches CI across Python 3.11/3.12/3.13
+# Run the full local gate set for the active interpreter.
+# CI runs the same checks across Python 3.11, 3.12, and 3.13.
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy hermesd
@@ -359,7 +360,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full TDD-first contributor work
 
 ### Releases
 
-User-facing release notes live in [`CHANGELOG.md`](CHANGELOG.md). PyPI publishing is driven from GitHub Releases: tag the release as `vYYYY.M.D`, publish the release on GitHub, and the `python-publish` workflow will build and upload the package after the full CI gate passes.
+User-facing release notes live in [`CHANGELOG.md`](CHANGELOG.md). Before tagging, bump the package version in `pyproject.toml`, keep `flake.nix` aligned, move user-facing `[Unreleased]` notes into a dated release section, and update screenshot URLs if the release refreshes images. PyPI publishing is driven from GitHub Releases: tag the release as `vYYYY.M.D`, publish the release on GitHub, and the `python-publish` workflow reruns the test matrix, builds and smoke-tests the distributions, checks package metadata, then uploads to PyPI via OIDC.
 
 ### Project Structure
 

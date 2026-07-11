@@ -20,6 +20,9 @@ What should happen instead.
 **Screenshot**
 If applicable, add a screenshot of the TUI.
 
+**Traceback / log excerpt**
+If applicable, paste the traceback, relevant log lines, or `hermesd --snapshot` / `hermesd --snapshot-format json` output.
+
 **Environment**
 - OS: [e.g. macOS 15.4, Ubuntu 24.04]
 - Terminal: [e.g. Ghostty, iTerm2, Alacritty]

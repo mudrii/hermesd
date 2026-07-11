@@ -12,7 +12,18 @@
 uv venv .venv --python 3.11
 source .venv/bin/activate
 uv pip install -e ".[dev]"
-uv run pytest tests/ -v             # full suite
+uv run pytest tests/ -v -W error::ResourceWarning  # full suite
+uv run ruff check .                 # lint
+uv run ruff format --check .        # format check
+uv run mypy hermesd                 # type check
+uv run pip-audit                    # dependency audit
+uv lock --check                     # lockfile freshness
+uv build                            # package build
+python -m venv /tmp/hermesd-wheel-smoke
+/tmp/hermesd-wheel-smoke/bin/python -m pip install dist/hermesd-*.whl
+/tmp/hermesd-wheel-smoke/bin/hermesd --version
+/tmp/hermesd-wheel-smoke/bin/python -m hermesd --version
+uvx twine check dist/*              # package metadata
 hermesd                              # run the dashboard
 hermesd --hermes-home /path          # custom hermes home
 hermesd --profile coding             # opt-in profile-scoped runtime data
@@ -43,6 +54,8 @@ hermesd/
 
 `Collector` polls `~/.hermes/` every N seconds → builds `DashboardState` (Pydantic) → `DashboardApp` renders via `panels/*.py` into Rich `Layout`.
 
+By default hermesd stays root-only. Profile-scoped reads are opt-in via `--profile` or `HERMES_PROFILE`; hermesd does not auto-follow `active_profile`.
+
 ### Threading Model
 
 - **Main thread**: Rich `Live` render loop (0.5s update cycle)
@@ -63,17 +76,17 @@ State is shared via `threading.Lock` on `_state`. SQLite uses `check_same_thread
 
 Canonical contributor workflow lives in [`CONTRIBUTING.md`](CONTRIBUTING.md). The short version:
 
-1. **Write the failing test first** — this project mandates TDD/ATDD (see `.claude/skills/py-rig/SKILL.md`).
+1. **Write the failing test first** — this project mandates TDD/ATDD (see `.codex/skills/py-rig/SKILL.md`).
 2. Add data model fields to `models.py`.
 3. Populate them in `collector.py`.
 4. Render in `panels/*.py` (both `_render_compact` and `_render_detail`).
 5. Make tests pass with the minimum change; refactor while green.
-6. Update `app.py` layout if adding new panels; register the panel in both `PANEL_NAMES` and `_RENDERERS` in `panels/__init__.py`, then add its panel number to `_WIDE_LAYOUT_SPEC`, `_COMPACT_LAYOUT_SPEC`, and `_TALL_NARROW_LAYOUT_SPEC` in `app.py` as needed.
+6. Update `app.py` layout if adding new panels; add a `_render_*_panel(ctx: PanelRenderContext)` wrapper in `panels/__init__.py`, register it in `_RENDERERS` and `PANEL_NAMES`, then add its panel number to `_WIDE_LAYOUT_SPEC`, `_COMPACT_LAYOUT_SPEC`, and `_TALL_NARROW_LAYOUT_SPEC` in `app.py` as needed.
 7. Update `CHANGELOG.md` for user-visible changes.
 
 See also:
 
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — branch/PR workflow and per-panel instructions.
-- [`.claude/rules/python-idioms.md`](.claude/rules/python-idioms.md) — version-tagged modern Python syntax.
-- [`.claude/rules/python-patterns.md`](.claude/rules/python-patterns.md) — style, types, errors, tests.
-- [`.claude/skills/py-rig/SKILL.md`](.claude/skills/py-rig/SKILL.md) — design/TDD/ATDD/DI/review discipline.
+- [`.codex/rules/python-idioms.md`](.codex/rules/python-idioms.md) — version-tagged modern Python syntax.
+- [`.codex/rules/python-patterns.md`](.codex/rules/python-patterns.md) — style, types, errors, tests.
+- [`.codex/skills/py-rig/SKILL.md`](.codex/skills/py-rig/SKILL.md) — design/TDD/ATDD/DI/review discipline.

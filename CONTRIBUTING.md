@@ -21,8 +21,23 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 2. **Write the failing test first** — acceptance-level if user-visible, unit-level otherwise
 3. **Implement the minimum change** that makes the test pass
 4. **Refactor while green** — improve naming/cohesion without changing behavior
-5. **Run the full suite** — `uv run pytest tests/ -v`
-6. **Run lint + type + audit + lock + build** — `uv run ruff check . && uv run ruff format --check . && uv run mypy hermesd && uv run pip-audit && uv lock --check && uv build`
+5. **Run the full suite** — `uv run pytest tests/ -v -W error::ResourceWarning`
+6. **Run lint + type + audit + lock + build + package smoke**:
+
+   ```bash
+   uv run ruff check .
+   uv run ruff format --check .
+   uv run mypy hermesd
+   uv run pip-audit
+   uv lock --check
+   uv build
+   python -m venv /tmp/hermesd-wheel-smoke
+   /tmp/hermesd-wheel-smoke/bin/python -m pip install dist/hermesd-*.whl
+   /tmp/hermesd-wheel-smoke/bin/hermesd --version
+   /tmp/hermesd-wheel-smoke/bin/python -m hermesd --version
+   uvx twine check dist/*
+   ```
+
 7. **Test the TUI manually** — run `hermesd` and verify your changes look correct
    Consider both text and JSON snapshot paths when you change CLI/render surfaces (`--snapshot-format json`).
 8. **Update `CHANGELOG.md`** for user-visible changes
@@ -32,10 +47,12 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 
 1. Merge the release PR only after the full local and CI gate set passes.
 2. Make sure `README.md`, `CHANGELOG.md`, and any affected contributor docs match the shipped behavior.
-3. Move the current user-facing notes from `[Unreleased]` into a dated release section in `CHANGELOG.md`.
-4. Bump the package version in `pyproject.toml` and the editable-package entry in `uv.lock`.
-5. Keep `flake.nix` version metadata aligned with `pyproject.toml` when Nix support remains advertised.
-6. Create and publish a GitHub Release tagged `vYYYY.M.D`; PyPI publishing runs from `.github/workflows/python-publish.yml` after the release is published.
+3. Keep latest-release behavior and current-main behavior distinct: public release copy should describe the tag being released, while current-branch-only behavior stays under `[Unreleased]` or is clearly labeled unreleased.
+4. Move the current user-facing notes from `[Unreleased]` into a dated release section in `CHANGELOG.md`.
+5. Bump the package version in `pyproject.toml` and the editable-package entry in `uv.lock`.
+6. Keep `flake.nix` version metadata aligned with `pyproject.toml` when Nix support remains advertised.
+7. Update README screenshot URLs when release screenshots change, and keep package metadata safe for PyPI rendering.
+8. Create and publish a GitHub Release tagged `vYYYY.M.D`; PyPI publishing runs from `.github/workflows/python-publish.yml` after the release is published.
 
 ## Code Guidelines
 
@@ -52,10 +69,10 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 
 ## Adding a New Panel
 
-1. Create `hermesd/panels/your_panel.py` with `render_your_panel(state, theme, detail=False)` function
+1. Create `hermesd/panels/your_panel.py` with a `render_your_panel(state, theme, detail=False)` function
 2. Add your data to `hermesd/models.py` (Pydantic model)
 3. Collect the data in `hermesd/collector.py`
-4. Register in `hermesd/panels/__init__.py` (add to both `_RENDERERS` and `PANEL_NAMES`)
+4. Register in `hermesd/panels/__init__.py`: add a `_render_your_panel(ctx: PanelRenderContext)` wrapper, add it to `_RENDERERS`, and add the label to `PANEL_NAMES`
 5. Add tests in `tests/test_your_panel.py`
 6. Update the overview layout specs in `hermesd/app.py` (`_WIDE_LAYOUT_SPEC`, `_COMPACT_LAYOUT_SPEC`, `_TALL_NARROW_LAYOUT_SPEC`) if the new panel needs overview placement
 
@@ -70,13 +87,13 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 
 ```bash
 # Full suite
-python -m pytest tests/ -v
+uv run pytest tests/ -v -W error::ResourceWarning
 
 # Single file
-python -m pytest tests/test_collector.py -v
+uv run pytest tests/test_collector.py -v
 
 # Watch for failures
-python -m pytest tests/ -x --tb=short
+uv run pytest tests/ -x --tb=short
 ```
 
 Test categories:
@@ -86,6 +103,10 @@ Test categories:
 - `test_*_panel.py` — panel rendering (compact + detail)
 - `test_app*.py` — TUI key handling, layout, lifecycle
 - `test_*_resilience.py` — error handling, cache preservation
+- `test_package_metadata.py` — packaging, workflow, long-description, and wheel-smoke contracts
+- `test_import_hygiene.py` / `test_readonly_invariant.py` — standalone-package and read-only safety contracts
+- `test_markup_safety.py` — Rich markup and secret-redaction safety
+- `test_cost_estimation.py` — token/cost reconciliation edge cases
 
 ## Reporting Issues
 
@@ -95,6 +116,7 @@ Please include:
 - Hermes Agent version (`hermes version`)
 - hermesd version (`hermesd --version`)
 - The error traceback if applicable
+- A short log excerpt or `--snapshot` / `--snapshot-format json` output when it helps reproduce the display state
 
 ## License
 
