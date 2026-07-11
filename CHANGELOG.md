@@ -24,7 +24,7 @@ and this project uses date-based versions in `YYYY.M.D` form.
 ### Changed
 
 - Detail footers and help text now advertise `j`/`k` scrolling only for scrollable detail views.
-- Release validation now checks lockfile freshness, package metadata, and wheel smoke installs; the publish workflow repeats the test gate on Python 3.11, 3.12, and 3.13.
+- Release validation now installs from `uv.lock`, pins GitHub Actions and `uv` versions, checks lockfile freshness, compiles the package, audits dependencies, smoke-installs both wheel and sdist artifacts, verifies release tag/changelog/distribution filename consistency before PyPI publish, and tracks action updates with Dependabot.
 
 ### Fixed
 

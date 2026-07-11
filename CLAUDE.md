@@ -11,11 +11,12 @@
 ```bash
 uv venv .venv --python 3.11
 source .venv/bin/activate
-uv pip install -e ".[dev]"
+uv sync --locked --all-extras --dev
 uv run pytest tests/ -v -W error::ResourceWarning  # full suite
 uv run ruff check .                 # lint
 uv run ruff format --check .        # format check
 uv run mypy hermesd                 # type check
+uv run python -m compileall hermesd # compile check
 uv run pip-audit                    # dependency audit
 uv lock --check                     # lockfile freshness
 uv build                            # package build
@@ -23,7 +24,11 @@ python -m venv /tmp/hermesd-wheel-smoke
 /tmp/hermesd-wheel-smoke/bin/python -m pip install dist/hermesd-*.whl
 /tmp/hermesd-wheel-smoke/bin/hermesd --version
 /tmp/hermesd-wheel-smoke/bin/python -m hermesd --version
-uvx twine check dist/*              # package metadata
+python -m venv /tmp/hermesd-sdist-smoke
+/tmp/hermesd-sdist-smoke/bin/python -m pip install dist/hermesd-*.tar.gz
+/tmp/hermesd-sdist-smoke/bin/hermesd --version
+/tmp/hermesd-sdist-smoke/bin/python -m hermesd --version
+uv run twine check dist/*           # package metadata
 hermesd                              # run the dashboard
 hermesd --hermes-home /path          # custom hermes home
 hermesd --profile coding             # opt-in profile-scoped runtime data

@@ -16,7 +16,7 @@ Brief description of the change.
 - [ ] New tests added for new functionality
 - [ ] Tested manually with `hermesd` against a live `~/.hermes/`
 - [ ] Works in SSH/tmux at 80x24
-- [ ] Updated `CHANGELOG.md` and user-facing docs for any visible behavior change
+- [ ] Updated `CHANGELOG.md` and docs for visible behavior, packaging, release, CI, or developer-tooling changes
 
 ## Screenshots
 

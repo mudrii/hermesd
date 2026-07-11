@@ -6,6 +6,22 @@ Date: 2026-07-11
 
 This report compares current Hermes Agent release behavior against hermesd's monitoring surface and identifies read-only additions that would improve operator visibility.
 
+## Implementation status
+
+This report started as an implementation roadmap. On branch `feature/hermes-agent-visibility`, the roadmap items below have now been implemented, tested, and documented in hermesd:
+
+- Verification evidence and `/goal` state are visible in Operations.
+- MoA config and bounded trace inventory are visible in Config and Operations.
+- Projects are summarized in Operations, including repo/board correlation data.
+- Gateway lifecycle now shows served profiles, drain state, busy/drainable state, scale-to-zero config, and relay-only intent.
+- Kanban discovers multi-board state, current board, stale claims, and typed blocker counts.
+- Memory shows a lightweight learning summary from persisted skills and memory files.
+- Cron shows scheduler provider, Chronos config presence, and persisted suggestion counts.
+- Gateway shows channel aliases, stale aliases, platform families, and missing channel-directory entries.
+- Curator shows scheduler state and consolidation config.
+
+The remaining roadmap is correlation depth, not basic visibility: richer cross-panel links between Projects, Kanban, verification evidence, MoA traces, cost summaries, and post-update change summaries.
+
 Inputs verified:
 
 - Official GitHub releases for `NousResearch/hermes-agent`.
@@ -46,27 +62,27 @@ The official update docs also matter because `hermes update` tracks the latest c
 
 hermesd already has broad coverage across 13 panels:
 
-- Gateway: PID, version, platform state, platform errors, active-agent count, restart marker.
+- Gateway: PID, version, platform state, platform errors, active-agent count, restart marker, served profiles, drain/busy/drainable state, scale-to-zero config, relay-only intent, channel aliases, stale aliases, platform families, and missing channel-directory entries.
 - Sessions: session summaries, parent lineage, handoff metadata.
 - Tokens/Cost: provider/model cost summaries and endpoint status.
 - Tools: background process and checkpoint visibility.
-- Config: gateway, routing, memory, dashboard auth, kanban, tool search, code execution, hooks, and related settings.
-- Cron: jobs, config, tick/output metadata.
-- Skills/Integrations: skills, provider auth, credential pools, hooks, plugins, MCP, BOOT files.
+- Config: gateway, routing, memory, dashboard auth, kanban, tool search, code execution, hooks, MoA preset/reference/aggregator/trace settings, and related settings.
+- Cron: jobs, config, tick/output metadata, scheduler provider, Chronos config presence, and persisted suggestion counts.
+- Skills/Integrations: skills, provider auth, credential pools, credential freshness, hooks, plugins, MCP, BOOT files.
 - Logs: agent, gateway, errors, cron, desktop, dashboard, GUI, update, gateway error, TUI crash, workspace, audit, MCP stderr.
 - Profiles: discovered profile/runtime view.
-- Memory: memory files and summaries.
-- Kanban: default `kanban.db` task/run/event/comment counts, active/problem tasks, recent runs, task links, attachments, metadata.
-- Operations: dashboard processes, Desktop build stamp, response store, model cache, PR monitor files.
-- Curator: latest memory-curation run, counts, model/provider, tool calls, transitions, summary/error.
+- Memory: memory files, summaries, and lightweight learning summary.
+- Kanban: default and multi-board `kanban.db` task/run/event/comment counts, current board, stale claims, typed blockers, active/problem tasks, recent runs, task links, attachments, metadata.
+- Operations: dashboard processes, Desktop build stamp, response store, verification evidence, `/goal` state, MoA trace metadata, Projects summaries/correlations, model cache, PR monitor files.
+- Curator: scheduler state, consolidation config, latest memory-curation run, counts, model/provider, tool calls, transitions, summary/error.
 
-This means the right roadmap is not "add every release-note item." The best roadmap is to add the new persisted surfaces that are currently invisible or only partially visible.
+This means the original roadmap is now mostly complete. Future work should focus on deeper correlations and post-update summaries, not on adding every release-note item as a new panel.
 
 ## Highest-value implementation candidates
 
 ### 1. Verification and goal evidence
 
-Status: missing or only indirectly visible.
+Status: implemented in Operations.
 
 Hermes Agent v0.18.0 added stronger `/goal` completion contracts and a coding verification evidence ledger. The local source shows a dedicated `verification_evidence.db` with `verification_events` and `verification_state` tables.
 
@@ -75,15 +91,12 @@ Relevant local source:
 - `/Users/mudrii/src/hermes/hermes-agent/agent/verification_evidence.py`
 - `/Users/mudrii/src/hermes/hermes-agent/hermes_cli/goals.py`
 
-Candidate hermesd implementation:
+Implemented hermesd behavior:
 
-- Add a Verification section or panel.
-- Read `~/.hermes/verification_evidence.db` read-only.
-- Show latest checks by session/root, command kind, scope, status, exit code, and age.
-- Show `verification_state` rows with changed paths and last edit time.
-- Read `/goal` state from `state.db.state_meta` keys if present, using schema-tolerant queries.
-- In detail view, group by project root and session.
-- In snapshot JSON, expose structured fields so release automation can inspect verification health.
+- Reads `~/.hermes/verification_evidence.db` read-only.
+- Shows verification totals, failed-check counts, latest evidence rows, pending changed-path counts, and `/goal` state from `state.db`.
+- Preserves last-good data across transient SQLite/read failures.
+- Exposes the new fields through the structured dashboard state and snapshot JSON.
 
 Value:
 
@@ -94,13 +107,13 @@ Risk:
 
 - Medium. Goal metadata may evolve, so readers must tolerate missing tables, missing keys, and JSON decode failures.
 
-Suggested phase:
+Original roadmap phase:
 
 - Phase 1 / P0.
 
 ### 2. Mixture-of-Agents visibility
 
-Status: partially visible through normal session/token provider fields, but MoA-specific configuration and traces are invisible.
+Status: implemented across Config and Operations.
 
 Hermes Agent v0.18.0 made MoA a selectable virtual provider and added optional JSONL trace persistence through `moa.save_traces`.
 
@@ -110,22 +123,11 @@ Relevant local source:
 - `/Users/mudrii/src/hermes/hermes-agent/agent/moa_trace.py`
 - Default trace path: `~/.hermes/moa-traces/<session_id>.jsonl`
 
-Candidate hermesd implementation:
+Implemented hermesd behavior:
 
-- Add MoA summary rows to Config:
-  - enabled/available by config shape,
-  - default preset,
-  - preset count,
-  - reference model count,
-  - aggregator model/provider,
-  - `moa.save_traces` state.
-- Add MoA trace inventory to Operations:
-  - trace file count,
-  - total bytes,
-  - newest trace mtime,
-  - newest session id,
-  - bounded latest-record summary.
-- Avoid rendering full prompts, reference outputs, or aggregator outputs by default.
+- Config shows MoA preset/reference/aggregator/trace settings.
+- Operations inventories `moa-traces/*.jsonl` with bounded latest-record metadata.
+- Full prompts, reference outputs, and aggregator outputs remain out of the default view.
 
 Value:
 
@@ -136,14 +138,14 @@ Risk:
 
 - Medium. Trace files can contain sensitive prompts and model outputs. Initial implementation should be counts and metadata only.
 
-Suggested phase:
+Original roadmap phase:
 
 - Phase 1 / P1 for config and inventory.
 - Phase 2 for optional privacy-safe detail summaries.
 
 ### 3. First-class Projects visibility
 
-Status: missing.
+Status: implemented in Operations.
 
 Hermes Agent Desktop added per-profile Projects backed by `projects.db`. The source shows explicit project, folder, metadata, and discovered repo tables.
 
@@ -151,11 +153,9 @@ Relevant local source:
 
 - `/Users/mudrii/src/hermes/hermes-agent/hermes_cli/projects_db.py`
 
-Candidate hermesd implementation:
+Implemented hermesd behavior:
 
-- Add Projects summary to Operations or a new Projects panel.
-- Read `~/.hermes/projects.db` read-only.
-- Show:
+- Reads `~/.hermes/projects.db` read-only and shows:
   - project count,
   - archived count,
   - folder count,
@@ -173,13 +173,13 @@ Risk:
 
 - Low to medium. The database schema is straightforward, but profile-scoped homes must be handled consistently.
 
-Suggested phase:
+Original roadmap phase:
 
 - Phase 1 / P1.
 
 ### 4. Gateway lifecycle, drain, and scale-to-zero state
 
-Status: partially visible.
+Status: implemented in Gateway.
 
 hermesd currently shows `gateway_state`, `active_agents`, platform errors, and restart markers. Hermes Agent now has explicit drain coordination and scale-to-zero behavior. The local source shows `.drain_request.json`, busy/drainable derivation, and scale-to-zero helpers.
 
@@ -189,13 +189,10 @@ Relevant local source:
 - `/Users/mudrii/src/hermes/hermes-agent/gateway/status.py`
 - `/Users/mudrii/src/hermes/hermes-agent/gateway/scale_to_zero.py`
 
-Candidate hermesd implementation:
+Implemented hermesd behavior:
 
-- Read `~/.hermes/.drain_request.json` safely.
-- Show whether external drain is active, requested age, principal, and suppress-notification flag if present.
-- Derive and render gateway busy/drainable states from `gateway_state` and `active_agents`.
-- Show `served_profiles` from `gateway_state.json` when present.
-- Surface scale-to-zero config from `config.yaml`, especially idle timeout and relay-only intent.
+- Reads `~/.hermes/.drain_request.json` safely.
+- Shows served profiles, external drain marker, busy/drainable state, scale-to-zero idle timeout, and relay-only intent.
 
 Value:
 
@@ -206,13 +203,13 @@ Risk:
 
 - Medium. Avoid overclaiming why a gateway is draining unless the marker/config makes it clear.
 
-Suggested phase:
+Original roadmap phase:
 
 - Phase 1 / P1.
 
 ### 5. Multi-board Kanban and typed blockers
 
-Status: partially visible.
+Status: implemented in Kanban.
 
 hermesd reads the root `~/.hermes/kanban.db` and already surfaces tasks, runs, links, attachments, workers, and metadata. Hermes Agent has expanded multi-board behavior under `kanban/boards/<slug>/kanban.db`, current-board resolution, and typed block reasons.
 
@@ -222,15 +219,11 @@ Relevant local source:
 - Current hermesd reader: `/Users/mudrii/src/hermes/hermesd/hermesd/collector.py`
 - Current hermesd models: `/Users/mudrii/src/hermes/hermesd/hermesd/models.py`
 
-Candidate hermesd implementation:
+Implemented hermesd behavior:
 
-- Discover `~/.hermes/kanban/boards/*/kanban.db` without following symlinks.
-- Read `~/.hermes/kanban/current` when present.
-- Show board count and current board.
-- Aggregate task counts per board.
-- Surface `block_kind` counts when the column exists.
-- Show stale claims using `last_heartbeat_at`, `claim_expires`, and configured TTLs when available.
-- Keep default board behavior exactly as-is for homes without multi-board state.
+- Discovers `~/.hermes/kanban/boards/*/kanban.db` without following symlinks.
+- Reads current board state when present.
+- Shows per-board task/run/problem counts, stale claims, and typed blocker counts while preserving default-board behavior.
 
 Value:
 
@@ -241,13 +234,13 @@ Risk:
 
 - Medium. Multiple databases increase read cost and need bounded iteration.
 
-Suggested phase:
+Original roadmap phase:
 
 - Phase 1 / P1.
 
 ### 6. Journey and learning graph summary
 
-Status: partially visible through Memory and Skills panels, but not as a learning graph/timeline.
+Status: implemented as a lightweight Memory learning summary.
 
 Hermes Agent v0.18.0 added `/journey` and a memory graph. The source builds this from skill metadata, usage, and memory files.
 
@@ -256,21 +249,19 @@ Relevant local source:
 - `/Users/mudrii/src/hermes/hermes-agent/hermes_cli/journey.py`
 - `/Users/mudrii/src/hermes/hermes-agent/agent/learning_graph.py`
 
-Candidate hermesd implementation:
+Implemented hermesd behavior:
 
-- Add a Learning subsection to Memory or Skills.
-- Read only persisted files:
+- Reads only persisted files:
   - `skills/.usage.json`,
   - learned/profile skill metadata,
   - `memories/MEMORY.md`,
   - `memories/USER.md`.
-- Show:
+- Shows:
   - learned skill count,
   - pinned skill count,
   - agent-created skill count,
   - usage-bearing skill count,
-  - memory card count,
-  - isolated vs linked node counts if derivable cheaply.
+  - memory card count.
 
 Value:
 
@@ -281,13 +272,13 @@ Risk:
 
 - Medium. Do not import `agent.learning_graph`; mirror only the minimum stable parsing hermesd needs.
 
-Suggested phase:
+Original roadmap phase:
 
 - Phase 2 / P2.
 
 ### 7. Cron provider, Chronos, and automation blueprint visibility
 
-Status: partially visible.
+Status: implemented in Cron and Config.
 
 hermesd already has a Cron panel for jobs and recent runtime metadata. Hermes Agent added provider-based cron scheduling, Chronos managed cron for scale-to-zero deployments, and Automation Blueprints.
 
@@ -298,18 +289,10 @@ Relevant local source:
 - `/Users/mudrii/src/hermes/hermes-agent/cron/blueprint_catalog.py`
 - `/Users/mudrii/src/hermes/hermes-agent/cron/suggestions.py`
 
-Candidate hermesd implementation:
+Implemented hermesd behavior:
 
-- Extend Config/Cron detail with:
-  - `cron.provider`,
-  - Chronos portal URL presence,
-  - callback URL presence,
-  - expected audience presence,
-  - JWKS URL presence,
-  - builtin fallback suspicion from logs if provider load fails.
-- Show cron suggestion counts if persisted suggestion files exist.
-- Do not import the blueprint catalog from Hermes Agent.
-- Do not duplicate the blueprint UI; hermesd should monitor configured jobs and provider health, not become a blueprint authoring surface.
+- Shows active scheduler provider, Chronos managed-cron config presence, and persisted cron suggestion counts.
+- Keeps blueprint authoring out of hermesd.
 
 Value:
 
@@ -321,13 +304,13 @@ Risk:
 - Low for config presence.
 - Medium if trying to infer provider health from logs.
 
-Suggested phase:
+Original roadmap phase:
 
 - Phase 2 / P2.
 
 ### 8. Channel directory and new messaging adapter detail
 
-Status: partially visible.
+Status: implemented in Gateway.
 
 Hermes Agent v0.17/v0.18 expanded platform coverage and media support, including WhatsApp Cloud/Baileys changes, Teams media, iMessage Photon, Raft, and platform aliasing. hermesd already shows platform states from `gateway_state.json` and directory entries.
 
@@ -336,18 +319,18 @@ Relevant local source:
 - `/Users/mudrii/src/hermes/hermes-agent/gateway/channel_directory.py`
 - `/Users/mudrii/src/hermes/hermes-agent/gateway/platforms/whatsapp_cloud.py`
 
-Candidate hermesd implementation:
+Implemented hermesd behavior:
 
-- Read `channel_aliases.json` if present.
-- Show alias count and stale alias warnings.
-- Add labels for known platform families:
+- Reads `channel_aliases.json` if present.
+- Shows alias count and stale alias warnings.
+- Adds labels for known platform families:
   - WhatsApp Cloud,
   - WhatsApp Baileys,
   - Teams,
   - Photon/iMessage,
   - Raft,
   - Slack, Discord, Telegram, Matrix, etc.
-- Flag platforms present in gateway state but absent from channel directory.
+- Flags platforms present in gateway state but absent from channel directory.
 
 Value:
 
@@ -357,13 +340,13 @@ Risk:
 
 - Low if limited to persisted state.
 
-Suggested phase:
+Original roadmap phase:
 
 - Phase 2 / P2.
 
 ### 9. Curator scheduler state
 
-Status: mostly visible, with one useful gap.
+Status: implemented in Curator.
 
 hermesd already has a strong Curator panel for the newest run report. Hermes Agent also has curator scheduler state and consolidation config.
 
@@ -372,12 +355,11 @@ Relevant local source:
 - `/Users/mudrii/src/hermes/hermes-agent/agent/curator.py`
 - Current hermesd reader: `/Users/mudrii/src/hermes/hermesd/hermesd/collector.py`
 
-Candidate hermesd implementation:
+Implemented hermesd behavior:
 
-- Read `skills/.curator_state` safely if present.
-- Show:
+- Reads `skills/.curator_state` safely if present and shows:
   - paused state,
-  - last run id/path,
+  - last run timestamp,
   - run count,
   - last report path,
   - consolidation enabled/disabled from config.
@@ -390,7 +372,7 @@ Risk:
 
 - Low.
 
-Suggested phase:
+Original roadmap phase:
 
 - Phase 2 / P2.
 
@@ -412,52 +394,26 @@ Projects, profile builder, Skills Hub, memory graph, and cron blueprints are ric
 
 Hermes Agent's update path follows `main` and includes config migration. hermesd readers should key off persisted files and tolerate missing/extra columns rather than assuming a single tag schema.
 
-## Proposed roadmap
+## Implementation completion and future roadmap
 
-### Phase 1: high-value operational gaps
+### Completed in this branch
 
-1. Verification and goals
-   - Add fixture DBs for `verification_evidence.db` and `state.db.state_meta`.
-   - Add models and collector readers.
-   - Add panel/detail rendering or Operations subsection.
-   - Verify snapshot JSON output and read-only DB behavior.
+- Phase 1 visibility: verification/goals, MoA summary, Projects summary, gateway lifecycle, and multi-board Kanban.
+- Phase 2 visibility: learning summary, Cron/Chronos config health, channel aliases/adapter labels, and Curator scheduler state.
+- Resilience and safety: schema-tolerant SQLite reads, symlink/path safety for new file readers, malformed JSON tolerance, cache preservation, markup escaping, and snapshot coverage.
+- Release hardening: locked CI installs, pinned Actions/uv versions, wheel and sdist smoke installs, release tag/changelog/artifact guards, and Dependabot tracking.
 
-2. MoA summary
-   - Add config summary for `moa`.
-   - Add trace inventory under Operations.
-   - Keep trace reads bounded and content-safe.
+### Remaining future work
 
-3. Projects summary
-   - Add read-only `projects.db` collector.
-   - Show project/folder/repo/board mapping counts.
-
-4. Gateway lifecycle
-   - Add drain marker, busy/drainable, scale-to-zero config, and served profiles.
-
-5. Kanban multi-board
-   - Discover boards safely.
-   - Add current board and per-board count summaries.
-   - Add typed block reason counts when available.
-
-### Phase 2: richer context once Phase 1 is stable
-
-1. Learning graph summary from memory and skill persisted files.
-2. Cron provider and Chronos config health.
-3. Channel aliases and new adapter labels.
-4. Curator scheduler state and consolidation config.
-
-### Phase 3: deeper correlation
-
-1. Connect Projects to Kanban board summaries.
-2. Connect verification evidence to project roots and recent sessions.
-3. Correlate MoA trace inventory with provider/model cost summaries.
-4. Add dashboard/snapshot views that answer "what changed after the latest Hermes update?"
+1. Deepen Projects/Kanban/verification links into a dedicated correlation view.
+2. Correlate MoA trace inventory with provider/model cost summaries without exposing trace contents.
+3. Add dashboard/snapshot views that answer "what changed after the latest Hermes update?"
 
 ## Test plan
 
-Use TDD for each implementation slice.
+The completed implementation used TDD for each slice. Keep the same test style for future correlation work.
 
-Recommended tests:
+Implemented or still-relevant test fixtures:
 
 - Fixture `verification_evidence.db` with pass/fail/stale events and missing optional tables.
 - Fixture `state.db` with and without goal metadata.
@@ -472,20 +428,20 @@ Recommended tests:
 
 ## Final priority ranking
 
-| Rank | Candidate | Priority | Why |
+| Rank | Candidate | Priority | Status |
 |---:|---|---|---|
-| 1 | Verification and goals | P0 | Directly monitors the v0.18 reliability headline: completed work backed by evidence. |
-| 2 | MoA config and trace inventory | P1 | Directly monitors the v0.18 model headline without exposing sensitive trace content. |
-| 3 | Projects summary | P1 | Aligns hermesd with Desktop's project-based coding workflow. |
-| 4 | Gateway drain / scale-to-zero | P1 | High operator value for hosted or long-running gateways. |
-| 5 | Multi-board Kanban | P1 | Completes the project/board/worker visibility story. |
-| 6 | Learning graph summary | P2 | Useful self-improvement visibility, but less urgent than verification. |
-| 7 | Cron provider / Chronos | P2 | Important for hosted cron reliability; config-first implementation is safe. |
-| 8 | Channel aliases and adapter detail | P2 | Useful gateway diagnostics, especially with WhatsApp/Teams/Raft expansion. |
-| 9 | Curator scheduler state | P2 | Small enhancement to an already strong panel. |
+| 1 | Verification and goals | P0 | Implemented |
+| 2 | MoA config and trace inventory | P1 | Implemented |
+| 3 | Projects summary | P1 | Implemented |
+| 4 | Gateway drain / scale-to-zero | P1 | Implemented |
+| 5 | Multi-board Kanban | P1 | Implemented |
+| 6 | Learning graph summary | P2 | Implemented as lightweight persisted-file summary |
+| 7 | Cron provider / Chronos | P2 | Implemented as config/suggestion visibility |
+| 8 | Channel aliases and adapter detail | P2 | Implemented |
+| 9 | Curator scheduler state | P2 | Implemented |
 
 ## Bottom line
 
-hermesd is already aligned with many Hermes Agent runtime surfaces, especially gateway state, logs, cron, profiles, memory, kanban, operations, and curator runs. The strongest next step is to make Hermes Agent's new evidence-based coding workflow visible: verification events, goal contracts, project roots, and board state.
+hermesd is now aligned with the high-signal Hermes Agent v0.17/v0.18 runtime surfaces: verification events, goal contracts, MoA configuration/traces, Projects, gateway lifecycle, multi-board Kanban, learning summary, Cron/Chronos config, channel aliases, and Curator scheduler state.
 
-The next most valuable additions are MoA-safe observability, Projects, gateway lifecycle/drain state, and multi-board Kanban. Those changes fit hermesd's read-only architecture and give users better monitoring without duplicating Hermes Desktop or importing Hermes Agent internals.
+The next most valuable additions are deeper cross-panel correlations and "what changed after update" summaries. Those should stay read-only, avoid Hermes Agent imports, and continue to monitor persisted runtime artifacts rather than duplicating Hermes Desktop authoring surfaces.

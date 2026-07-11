@@ -10,7 +10,7 @@ cd hermesd
 uv venv .venv --python 3.11
 source .venv/bin/activate
 uv sync --locked --all-extras --dev
-uv run pytest tests/ -v
+uv run pytest tests/ -v -W error::ResourceWarning
 ```
 
 ## Development Workflow
@@ -45,7 +45,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 
 7. **Test the TUI manually** — run `hermesd` and verify your changes look correct
    Consider both text and JSON snapshot paths when you change CLI/render surfaces (`--snapshot-format json`).
-8. **Update `CHANGELOG.md`** for user-visible changes
+8. **Update `CHANGELOG.md`** for user-visible, packaging, release, CI, and developer-tooling changes
 9. **Open a PR** with a clear description
 
 ## Release Checklist
@@ -57,7 +57,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 5. Bump the package version in `pyproject.toml` and the editable-package entry in `uv.lock`.
 6. Keep `flake.nix` version metadata aligned with `pyproject.toml` when Nix support remains advertised.
 7. Update README screenshot URLs when release screenshots change, and keep package metadata safe for PyPI rendering.
-8. Create and publish a GitHub Release tagged `vYYYY.M.D`; PyPI publishing runs from `.github/workflows/python-publish.yml` after the release is published. The workflow rejects mismatched package/changelog versions, skips prereleases, pins GitHub Actions to immutable SHAs with version comments, and tracks action updates with Dependabot.
+8. Create and publish a GitHub Release tagged `vYYYY.M.D`; PyPI publishing runs from `.github/workflows/python-publish.yml` after the release is published. The workflow rejects mismatched package/changelog versions, skips prerelease build/publish after the test gate, pins GitHub Actions to immutable SHAs with version comments, and tracks action updates with Dependabot.
 
 ## Code Guidelines
 
@@ -69,7 +69,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 - **Read-only** — hermesd must never write to `~/.hermes/`
 - **No hermes-agent imports** — hermesd reads files directly, zero dependency on hermes-agent code
 - **Error resilience** — never crash on missing/corrupt data; show last known good state (cache-preservation pattern)
-- **User-facing text stays documented** — update `README.md`, `CHANGELOG.md`, and affected tests when CLI help, snapshot output, panel labels, or header/footer text changes
+- **User-facing and release text stays documented** — update `README.md`, `CHANGELOG.md`, and affected tests when CLI help, snapshot output, panel labels, header/footer text, packaging, release, CI, or developer-tooling behavior changes
 - **Package version source** — `hermesd.__version__` is derived from installed package metadata; bump `pyproject.toml` for releases rather than hardcoding version text in the UI
 
 ## Adding a New Panel

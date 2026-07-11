@@ -4,6 +4,8 @@ A real-time TUI monitoring dashboard for [Hermes Agent](https://github.com/NousR
 
 ![hermesd overview](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/overview.png)
 
+Screenshots are from `v2026.6.15`; the text below also documents unreleased visibility additions on the current branch.
+
 ## Why This Exists
 
 When you run Hermes Agent seriously — gateway handling Telegram, Discord, Slack, and WhatsApp simultaneously, cron jobs firing reminders, multiple CLI sessions with sub-agents spawning sub-agents, dozens of skills loaded, 7+ LLM providers configured — the information gets scattered fast.
@@ -30,7 +32,7 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 |---|-------|---------------|
 | 1 | **Gateway & Platforms** | Live gateway PID, Hermes version, update status, drain/scale-to-zero state, channel aliases/staleness, platform families, per-platform connection dots, and channel-directory inventory |
 | 2 | **Sessions** | Active/total count, message/tool/API call totals, cwd, archived state, handoff metadata, and parent-session lineage |
-| 3 | **Tokens / Cost** | Today's and all-time token usage, estimated cost (~USD) from token counts, recent-window and model/provider breakdowns |
+| 3 | **Tokens / Cost** | Today's and all-time token usage, authoritative vs estimated cost, cost-status reconciliation, recent-window rollups, and model/provider/endpoint breakdowns |
 | 4 | **Tools** | Available tools count, per-session call stats, background processes, filesystem checkpoints, full tool name grid |
 | 5 | **Config** | Model, provider, personality, MoA, Tool Search, dashboard auth, kanban, code execution, gateway, routing and memory/session settings |
 | 6 | **Cron** | Scheduler tick/provider, Chronos config presence, suggestion count, job table with schedule, delivery target, error count, latest error, and output metadata |
@@ -106,13 +108,13 @@ Press `5` for the full config key-value table: model, provider, personality, max
 
 ### [6] Cron — Scheduled Jobs
 
-Press `6` to see cron scheduler state, max parallelism, response wrapping mode, all configured jobs, delivery targets, current state, last execution status, latest error, and latest saved output metadata from `~/.hermes/cron/output/`. `[SILENT]` runs are surfaced explicitly so “nothing to report” is distinguishable from missing output.
+Press `6` to see cron scheduler state, provider, Chronos managed-cron config presence, persisted suggestion counts, max parallelism, response wrapping mode, all configured jobs, delivery targets, current state, last execution status, latest error, and latest saved output metadata from `~/.hermes/cron/output/`. `[SILENT]` runs are surfaced explicitly so “nothing to report” is distinguishable from missing output.
 
 ![Cron Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-06-cron.png)
 
 ### [7] Skills & Integrations — What's Installed?
 
-Press `7` for provider and integration visibility in one place: **Providers** with active auth state, **Credential Pools** with redacted metadata, **Hooks** discovered from `~/.hermes/hooks/`, **Plugins** from `~/.hermes/plugins/`, **MCP Servers** from `config.yaml` with secret-bearing args and URL query params redacted, `BOOT.md` presence, and **Skills** grouped by category with descriptions loaded from each skill's `SKILL.md` frontmatter. Use `j`/`k` to scroll through the full skill list.
+Press `7` for provider and integration visibility in one place: **Providers** with active auth state and safely persisted credential freshness/expiry metadata, **Credential Pools** with redacted metadata, **Hooks** discovered from `~/.hermes/hooks/`, **Plugins** from `~/.hermes/plugins/`, **MCP Servers** from `config.yaml` with secret-bearing args and URL query params redacted, `BOOT.md` presence, and **Skills** grouped by category with descriptions loaded from each skill's `SKILL.md` frontmatter. Use `j`/`k` to scroll through the full skill list.
 
 ![Skills Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-07-skills.png)
 
@@ -130,7 +132,7 @@ Press `9` for a read-only profile table discovered from `~/.hermes/profiles/*/`.
 
 ### [10] Memory — What Context Is Persisted?
 
-Press `0` to expand. The Memory panel shows the configured memory provider, memory-file count, `MEMORY.md` and `USER.md` word counts, `SOUL.md` size, and a short `SOUL.md` excerpt with the discovered memory files listed below.
+Press `0` to expand. The Memory panel shows the configured memory provider, memory-file count, `MEMORY.md` and `USER.md` word counts, a lightweight learning summary from skill usage and learned skill metadata, `SOUL.md` size, and a short `SOUL.md` excerpt with the discovered memory files listed below.
 
 ![Memory Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-10-memory.png)
 
