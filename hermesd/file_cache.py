@@ -4,11 +4,13 @@ import json
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import TypeVar, cast
 
 import yaml
 
 T = TypeVar("T")
+JsonMapping = dict[str, object]
+JsonObjectList = list[JsonMapping]
 
 
 class LastGoodFileCache:
@@ -18,14 +20,14 @@ class LastGoodFileCache:
         self._json_mtimes: dict[str, float] = {}
         self._json_list_mtimes: dict[str, float] = {}
         self._yaml_mtimes: dict[str, float] = {}
-        self._json_values: dict[str, dict[str, Any]] = {}
-        self._json_lists: dict[str, list[dict[str, Any]]] = {}
-        self._yaml_values: dict[str, dict[str, Any]] = {}
+        self._json_values: dict[str, JsonMapping] = {}
+        self._json_lists: dict[str, JsonObjectList] = {}
+        self._yaml_values: dict[str, JsonMapping] = {}
         self._json_bad_mtimes: dict[str, float] = {}
         self._json_list_bad_mtimes: dict[str, float] = {}
         self._yaml_bad_mtimes: dict[str, float] = {}
 
-    def read_json_mapping(self, path: Path) -> dict[str, Any]:
+    def read_json_mapping(self, path: Path) -> JsonMapping:
         return self._cached_read(
             path,
             mtimes=self._json_mtimes,
@@ -37,7 +39,7 @@ class LastGoodFileCache:
             default_factory=dict,
         )
 
-    def read_json_list(self, path: Path) -> list[dict[str, Any]]:
+    def read_json_list(self, path: Path) -> JsonObjectList:
         return self._cached_read(
             path,
             mtimes=self._json_list_mtimes,
@@ -51,7 +53,7 @@ class LastGoodFileCache:
             default_factory=list,
         )
 
-    def read_yaml_mapping(self, path: Path) -> dict[str, Any]:
+    def read_yaml_mapping(self, path: Path) -> JsonMapping:
         return self._cached_read(
             path,
             mtimes=self._yaml_mtimes,

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -24,22 +25,43 @@ from hermesd.paths import default_hermes_home
 from hermesd.theme import Theme
 from tests.conftest import render_to_str
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("HERMESD_CONTRACT_TEST") != "1",
-    reason="set HERMESD_CONTRACT_TEST=1 to run the live ~/.hermes contract test",
-)
-
 
 def _home() -> Path:
     env = os.environ.get("HERMES_HOME")
     return Path(env) if env else default_hermes_home()
 
 
+@pytest.mark.skipif(
+    os.environ.get("HERMESD_CONTRACT_TEST") != "1",
+    reason="set HERMESD_CONTRACT_TEST=1 to run the live ~/.hermes contract test",
+)
 def test_live_hermes_home_has_no_drifted_blank_fields():
     home = _home()
     if not home.exists():
         pytest.skip(f"no Hermes home at {home}")
 
+    _assert_hermes_home_has_no_drifted_blank_fields(home)
+
+
+def test_fixture_hermes_home_has_no_drifted_blank_fields(populated_hermes_home: Path):
+    with sqlite3.connect(populated_hermes_home / "state.db") as conn:
+        conn.execute(
+            """
+            UPDATE sessions
+            SET end_reason = ?, billing_base_url = ?, billing_mode = ?
+            WHERE id = ?
+            """,
+            (
+                "cron_complete",
+                "https://api.kimi.test/v1",
+                "subscription_included",
+                "sess_001",
+            ),
+        )
+    _assert_hermes_home_has_no_drifted_blank_fields(populated_hermes_home)
+
+
+def _assert_hermes_home_has_no_drifted_blank_fields(home: Path) -> None:
     collector = Collector(home)
     try:
         state = collector.collect()

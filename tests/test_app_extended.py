@@ -127,7 +127,7 @@ def test_handle_key_f_reuses_last_selected_panel(populated_hermes_home: Path):
 
 def test_handle_key_scroll_in_detail(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app.handle_key("3")
+    app.handle_key("8")
     app.handle_key("j")
     assert app._view.scroll_offset == 1
     app.handle_key("j")
@@ -290,14 +290,17 @@ def test_footer_advertises_top_bottom_only_for_scrollable_detail_panels(
 
     app.handle_key("7")
     skills_footer = app._build_footer(state).plain
+    assert "Scroll" in skills_footer
     assert "Top/bottom" in skills_footer
 
     app.handle_key("8")
     logs_footer = app._build_footer(state).plain
+    assert "Scroll" in logs_footer
     assert "Top/bottom" in logs_footer
 
     app.handle_key("2")
     sessions_footer = app._build_footer(state).plain
+    assert "Scroll" not in sessions_footer
     assert "Top/bottom" not in sessions_footer
     app.close()
 
@@ -860,6 +863,7 @@ def test_build_footer_detail_sessions_shows_sort(populated_hermes_home: Path):
     app._view.enter_detail(2)
     footer = app._build_footer(app._state)
     assert "[s]" in footer.plain
+    assert "[j/k]" not in footer.plain
     assert "sort=recent" in footer.plain
     app.close()
 

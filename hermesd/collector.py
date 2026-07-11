@@ -22,7 +22,7 @@ from urllib.parse import parse_qsl, urlsplit, urlunsplit
 import yaml
 
 from hermesd.db import HermesDB
-from hermesd.file_cache import LastGoodFileCache
+from hermesd.file_cache import JsonMapping, JsonObjectList, LastGoodFileCache
 from hermesd.models import (
     AUTHORITATIVE_COST_STATUSES,
     BackgroundProcessInfo,
@@ -115,10 +115,12 @@ class Collector:
         profile_name: str | None = None,
         log_tail_bytes: int = 32768,
         db_factory: Callable[[Path], HermesDB] = HermesDB,
+        file_cache: LastGoodFileCache | None = None,
+        clock: Callable[[], float] = time.time,
         env: Mapping[str, str] | None = None,
     ):
         self._root_home = hermes_home
-        self._file_cache = LastGoodFileCache()
+        self._file_cache = file_cache if file_cache is not None else LastGoodFileCache()
         self._log_cache: dict[str, list[LogLine]] = {}
         self._pid_exists = pid_exists or _pid_exists
         self._log_tail_bytes = max(1024, log_tail_bytes)
@@ -126,15 +128,20 @@ class Collector:
         self._db_factory = db_factory
         self._db = db_factory(self._paths.profile_path("state.db"))
         self._env = env if env is not None else os.environ
+        self._clock = clock
         self._available_tools_cache_mtime: float | None = None
         self._available_tools_cache_value: tuple[int, list[str]] = (0, [])
         self._last_state: DashboardState | None = None
         self._last_session_rows: list[dict[str, Any]] = []
         self._log_stream_cache: dict[str, tuple[float | None, int, LogStream]] = {}
+        self._cron_excerpt_cache: dict[
+            str, tuple[float | None, tuple[str, bool, str, float | None]]
+        ] = {}
         self._profile_count_cache: dict[str, tuple[float | None, int]] = {}
         self._derived_rows: list[dict[str, Any]] | None = None
         self._derived_date = ""
         self._derived_cache: dict[str, Any] = {}
+        self._closed = False
         # _lock serializes collect() passes and guards the collector-internal
         # caches mutated during a pass (_file_cache, _log_cache,
         # _log_stream_cache, _available_tools_cache_*, _profile_count_cache,
@@ -146,6 +153,8 @@ class Collector:
 
     def collect(self) -> DashboardState:
         with self._lock:
+            if self._closed:
+                raise RuntimeError("collector is closed")
             health = _CollectionHealth()
             session_rows = self._collect_session_rows(health)
             state = self._build_dashboard_state(health, session_rows)
@@ -367,7 +376,7 @@ class Collector:
             hermes_home=self._paths.root_home,
             selected_profile=self._paths.profile_name,
             profile_mode_label=self._paths.profile_mode_label,
-            collected_at=time.time(),
+            collected_at=self._clock(),
             health=health_summary,
             runtime=runtime,
             gateway=gateway,
@@ -442,13 +451,13 @@ class Collector:
         self._last_session_rows = session_rows
         return session_rows
 
-    def _read_json_cached(self, path: Path) -> dict[str, Any]:
+    def _read_json_cached(self, path: Path) -> JsonMapping:
         return self._file_cache.read_json_mapping(path)
 
-    def _read_json_list_cached(self, path: Path) -> list[dict[str, Any]]:
+    def _read_json_list_cached(self, path: Path) -> JsonObjectList:
         return self._file_cache.read_json_list(path)
 
-    def _read_yaml_cached(self) -> dict[str, Any]:
+    def _read_yaml_cached(self) -> JsonMapping:
         return self._file_cache.read_yaml_mapping(self._paths.shared_path("config.yaml"))
 
     def search_session_ids_by_message(self, query: str) -> set[str]:
@@ -504,7 +513,7 @@ class Collector:
         return GatewayState(
             pid=pid,
             running=running,
-            state=data.get("gateway_state", "unknown"),
+            state=str(data.get("gateway_state") or "unknown"),
             platforms=platforms,
             hermes_version=version,
             updates_behind=behind,
@@ -683,7 +692,7 @@ class Collector:
                 watcher_thread_id=str(entry.get("watcher_thread_id") or ""),
                 watcher_message_id=str(entry.get("watcher_message_id") or ""),
                 watcher_interval=_coerce_int(entry.get("watcher_interval")),
-                watch_patterns=[str(item) for item in entry.get("watch_patterns") or []],
+                watch_patterns=[str(item) for item in _as_list(entry.get("watch_patterns"))],
             )
             for entry in entries
             if str(entry.get("session_id") or "")
@@ -706,7 +715,7 @@ class Collector:
                 session_file = self._paths.profile_path("sessions", f"session_{sid}.json")
                 data = self._read_json_cached(session_file)
                 if isinstance(data, dict) and "tools" in data:
-                    for t in data["tools"]:
+                    for t in _as_list(data["tools"]):
                         if isinstance(t, dict):
                             name = t.get("function", {}).get("name") or t.get("name", "")
                         else:
@@ -778,7 +787,7 @@ class Collector:
             tool_search_threshold_pct=_coerce_int(tool_search.get("threshold_pct")),
             tool_search_default_limit=_coerce_int(tool_search.get("search_default_limit")),
             tool_search_max_limit=_coerce_int(tool_search.get("max_search_limit")),
-            toolsets=[str(item) for item in cfg.get("toolsets") or [] if item],
+            toolsets=[str(item) for item in _as_list(cfg.get("toolsets")) if item],
             code_execution_mode=str(code_execution_cfg.get("mode") or ""),
             code_execution_timeout=_coerce_int(code_execution_cfg.get("timeout")),
             code_execution_max_tool_calls=_coerce_int(code_execution_cfg.get("max_tool_calls")),
@@ -827,7 +836,7 @@ class Collector:
         if tick_path.exists():
             try:
                 mtime = tick_path.stat().st_mtime
-                last_tick = time.time() - mtime
+                last_tick = self._clock() - mtime
             except OSError:
                 pass
 
@@ -836,17 +845,21 @@ class Collector:
         data = self._read_json_cached(self._paths.shared_path("cron", "jobs.json"))
         if data:
             directory = self._read_json_cached(self._paths.shared_path("channel_directory.json"))
-            for j in data.get("jobs", []):
+            for j in _as_list(data.get("jobs")):
                 if not isinstance(j, dict):
                     continue
                 state = j.get("state", "")
                 if j.get("last_status") == "error" or j.get("last_error"):
                     error_count += 1
-                output_excerpt, silent_run, output_path, output_mtime = _latest_cron_output_excerpt(
+                (
+                    output_excerpt,
+                    silent_run,
+                    output_path,
+                    output_mtime,
+                ) = self._latest_cron_output_excerpt(
                     self._paths.shared_path("cron", "output"),
                     str(j.get("id") or ""),
                     self._log_tail_bytes,
-                    stop_at=self._paths.root_home,
                 )
                 jobs.append(
                     CronJob(
@@ -1006,7 +1019,7 @@ class Collector:
         tool_call_counts = _int_mapping(data.get("tool_call_counts"))
         state_transitions = [
             _state_transition_label(entry)
-            for entry in data.get("state_transitions") or []
+            for entry in _as_list(data.get("state_transitions"))
             if isinstance(entry, dict)
         ]
         return CuratorRun(
@@ -1454,6 +1467,8 @@ class Collector:
         cached = self._profile_count_cache.get(name)
         if cached is not None and mtime is not None and cached[0] == mtime:
             return cached[1]
+        if cached is not None and mtime is None:
+            return cached[1]
         db = self._db_factory(db_path)
         try:
             session_count = db.read_session_count()
@@ -1486,7 +1501,7 @@ class Collector:
                 match = _LOG_LINE_PATTERN.match(line)
                 if match:
                     ts = match.group(1).split()[-1]
-                    message = match.group(4).strip()
+                    message = _redact_secret_text(match.group(4).strip())
                     result.append(
                         LogLine(
                             timestamp=ts,
@@ -1497,7 +1512,7 @@ class Collector:
                         )
                     )
                 elif line.strip():
-                    result.append(LogLine(message=line.strip()))
+                    result.append(LogLine(message=_redact_secret_text(line.strip())))
             if result:
                 self._log_cache[key] = result
             stream = LogStream(
@@ -1525,6 +1540,35 @@ class Collector:
             return result
         return self._log_cache.get(key, [])
 
+    def _latest_cron_output_excerpt(
+        self,
+        output_root: Path,
+        job_id: str,
+        max_bytes: int,
+    ) -> tuple[str, bool, str, float | None]:
+        cache_key = f"{output_root}:{job_id}"
+        cached = self._cron_excerpt_cache.get(cache_key)
+        excerpt = _latest_cron_output_excerpt(
+            output_root,
+            job_id,
+            max_bytes,
+            stop_at=self._paths.root_home,
+        )
+        _output_excerpt, _silent_run, output_path, output_mtime = excerpt
+        if output_path and cached is not None and cached[0] == output_mtime:
+            return cached[1]
+        if not output_path and cached is not None:
+            return cached[1]
+        redacted = (
+            _redact_secret_text(excerpt[0]),
+            excerpt[1],
+            excerpt[2],
+            excerpt[3],
+        )
+        if output_path:
+            self._cron_excerpt_cache[cache_key] = (output_mtime, redacted)
+        return redacted
+
     def _collect_version_behind(self) -> int:
         data = self._read_json_cached(self._paths.shared_path(".update_check"))
         if data:
@@ -1539,7 +1583,9 @@ class Collector:
         return normalize_skin_name(str(skin))
 
     def close(self) -> None:
-        self._db.close()
+        with self._lock:
+            self._closed = True
+            self._db.close()
 
 
 def _today_epoch() -> float:
@@ -1928,7 +1974,7 @@ def _tail_latest_cron_output(
         lines = _read_tail_text(latest_file, max_bytes).splitlines()[-max_lines:]
     except OSError:
         return []
-    return [LogLine(message=line.strip()) for line in lines if line.strip()]
+    return [LogLine(message=_redact_secret_text(line.strip())) for line in lines if line.strip()]
 
 
 def _path_resolves_under(path: Path, root: Path) -> bool:
@@ -2317,6 +2363,12 @@ def _as_dict(value: object) -> dict[str, Any]:
     return {}
 
 
+def _as_list(value: object) -> list[object]:
+    if isinstance(value, list):
+        return value
+    return []
+
+
 def _select_pool_entry(raw_entry: object) -> dict[str, Any]:
     """Reduce a credential_pool value to one representative entry.
 
@@ -2385,14 +2437,26 @@ def _redact_secret_url(value: str) -> str:
     parts = urlsplit(value)
     if not parts.scheme or not parts.netloc:
         return value
+    netloc = parts.netloc
+    if parts.username or parts.password:
+        host = parts.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        try:
+            port = parts.port
+        except ValueError:
+            port = None
+        if port is not None:
+            host = f"{host}:{port}"
+        netloc = f"[REDACTED]@{host}"
     query_pairs = parse_qsl(parts.query, keep_blank_values=True)
     if not query_pairs:
-        return value
+        return urlunsplit(parts._replace(netloc=netloc))
     redacted_query = "&".join(
         f"{key}={'[REDACTED]' if key.lower() in _SECRET_URL_QUERY_KEYS else item_value}"
         for key, item_value in query_pairs
     )
-    return urlunsplit(parts._replace(query=redacted_query))
+    return urlunsplit(parts._replace(netloc=netloc, query=redacted_query))
 
 
 def _redact_secret_args(args: object) -> list[str]:
@@ -2460,7 +2524,8 @@ def _looks_like_secret_value(value: str) -> bool:
 
 
 def _redact_secret_text(value: str) -> str:
-    redacted = re.sub(r"(?i)(bearer)\s+[^,\s]+", r"\1 [REDACTED]", value)
+    redacted = re.sub(r"https?://[^,\s]+", lambda match: _redact_secret_url(match.group(0)), value)
+    redacted = re.sub(r"(?i)(bearer)\s+[^,\s]+", r"\1 [REDACTED]", redacted)
     return re.sub(
         r"(?i)(access[-_]?token|api[-_]?key|authorization|client[-_]?secret|credential|"
         r"pass(?:word|wd)?|pwd|pin|refresh[-_]?token|secret|token|x[-_]?api[-_]?key)"

@@ -44,7 +44,7 @@ def _unreadable(path: Path) -> bool:
     return False
 
 
-# --- available-tools mtime cache HIT (collector.py:694) ----------------------
+# --- available-tools mtime cache hit -----------------------------------------
 
 
 def test_available_tools_cache_hit_skips_reread(hermes_home: Path, monkeypatch):
@@ -84,7 +84,7 @@ def test_available_tools_cache_hit_skips_reread(hermes_home: Path, monkeypatch):
         c.close()
 
 
-# --- log stream OSError -> last-good cached lines (collector.py:1456-1457) ----
+# --- log stream OSError -> last-good cached lines -----------------------------
 
 
 @_skip_if_root
@@ -167,16 +167,13 @@ def test_path_resolves_under_true_for_real_child(tmp_path: Path):
     assert _path_resolves_under(tmp_path / "elsewhere", root) is False
 
 
-# NOTE (collector.py:829-830, accepted-defensive): the cron-tick reader guards
-# ``stat()`` with ``except OSError: pass`` *after* ``tick_path.exists()`` has
-# already succeeded. The only way to reach the except is a TOCTOU race where the
-# file vanishes/loses permissions between exists() and stat() in the same call.
-# Stripping the parent dir's perms makes exists() itself raise (before the
-# guarded line), so this branch is not realistically reachable without
-# monkeypatching stat(). Left uncovered rather than forced with a brittle mock.
+# NOTE: the cron-tick reader guards a TOCTOU race where a file vanishes or loses
+# permissions between an existence check and stat(). That branch is not
+# realistically reachable without monkeypatching stat(), so it is left uncovered
+# rather than forced with a brittle mock.
 
 
-# --- checkpoint HERMES_WORKDIR read OSError -> blank workdir (1246-1247) -------
+# --- checkpoint HERMES_WORKDIR read OSError -> blank workdir ------------------
 
 
 @_skip_if_root
@@ -261,17 +258,17 @@ def test_read_soul_excerpt_oserror_returns_empty(tmp_path: Path):
 
 def test_read_soul_excerpt_whitespace_only_returns_empty(tmp_path: Path):
     # File is present and readable but every line is blank: the loop finds no
-    # non-empty line and falls through to the trailing "" (collector.py:1708).
+    # non-empty line and falls through to the empty-string result.
     f = tmp_path / "SOUL.md"
     f.write_text("\n   \n\t\n")
     assert _read_soul_excerpt(f) == ""
 
 
-# NOTE (collector.py:1648-1649, accepted-defensive): the ``except OSError:
-# continue`` around ``path.stat()`` in _latest_log_mtime only fires when a path
-# that just passed ``is_file()`` then fails ``stat()`` in the same loop — a
-# TOCTOU race not reproducible deterministically without monkeypatching stat().
-# The reachable branches (non-file skip, empty dir -> None) are covered below.
+# NOTE: the ``except OSError: continue`` around ``path.stat()`` in
+# _latest_log_mtime only fires when a path that just passed ``is_file()`` then
+# fails ``stat()`` in the same loop. That TOCTOU race is not reproducible
+# deterministically without monkeypatching stat(); reachable branches are
+# covered below.
 
 
 def test_latest_log_mtime_skips_nonfiles_and_empty(tmp_path: Path):

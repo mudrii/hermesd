@@ -22,6 +22,7 @@ from hermesd.collector import (
     _read_kanban_state,
     _redact_command_string,
     _redact_secret_args,
+    _redact_secret_url,
     _today_epoch,
 )
 from hermesd.models import KanbanState
@@ -99,6 +100,24 @@ def test_redact_secret_args_handles_mixed_and_nested_values():
     assert "--api-key [REDACTED]" in text
     assert "[REDACTED]" in text
     assert "ok=yes" in text
+
+
+def test_redact_secret_url_hides_userinfo_and_secret_query_values():
+    redacted = _redact_secret_url(
+        "https://user:password@example.com:8443/mcp?token=abc123&safe=value"
+    )
+
+    assert redacted == "https://[REDACTED]@example.com:8443/mcp?token=[REDACTED]&safe=value"
+    assert "password" not in redacted
+    assert "abc123" not in redacted
+
+
+def test_redact_secret_url_tolerates_invalid_port():
+    redacted = _redact_secret_url("https://user:password@example.com:bad/mcp?token=abc123")
+
+    assert redacted == "https://[REDACTED]@example.com/mcp?token=[REDACTED]"
+    assert "password" not in redacted
+    assert "abc123" not in redacted
 
 
 def test_redact_secret_args_handles_aliases_headers_and_dicts():
@@ -1133,6 +1152,26 @@ def test_collect_logs_preserves_cache_when_file_rotates_to_empty(hermes_home: Pa
     c.close()
 
 
+def test_collect_logs_redacts_secret_material(hermes_home: Path):
+    log = hermes_home / "logs" / "agent.log"
+    log.write_text(
+        "2026-04-09 15:41:58,123 - hermes - INFO - "
+        "bearer sk-secret token=abc123 https://user:pass@example.com/mcp\n"
+    )
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    message = state.logs.agent_lines[0].message
+    assert "sk-secret" not in message
+    assert "abc123" not in message
+    assert "user:pass" not in message
+    assert "bearer [REDACTED]" in message
+    assert "token=[REDACTED]" in message
+    assert "https://[REDACTED]@example.com/mcp" in message
+    c.close()
+
+
 def test_collect_logs_ignores_symlinked_log_files_outside_home(hermes_home: Path, tmp_path: Path):
     outside_log = tmp_path / "outside-secret.log"
     outside_log.write_text("2026-04-09 15:41:58,123 - hermes - INFO - outside secret\n")
@@ -1196,6 +1235,22 @@ def test_collect_logs_and_cron_allow_symlinked_hermes_home(hermes_home: Path, tm
     c.close()
 
 
+def test_collect_cron_output_redacts_secret_material(hermes_home: Path):
+    (hermes_home / "cron" / "jobs.json").write_text(
+        json.dumps({"jobs": [{"id": "job-1", "name": "Job 1"}]})
+    )
+    cron_output_dir = hermes_home / "cron" / "output" / "job-1"
+    cron_output_dir.mkdir(parents=True)
+    (cron_output_dir / "latest.md").write_text("api_key=cron-secret\n")
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.logs.cron_lines[0].message == "api_key=[REDACTED]"
+    assert state.cron.jobs[0].latest_output_excerpt == "api_key=[REDACTED]"
+    c.close()
+
+
 def test_collect_cron_logs_preserve_cache_when_latest_output_disappears(hermes_home: Path):
     cron_output_dir = hermes_home / "cron" / "output" / "job-1"
     cron_output_dir.mkdir(parents=True)
@@ -1208,6 +1263,28 @@ def test_collect_cron_logs_preserve_cache_when_latest_output_disappears(hermes_h
     second = c.collect()
 
     assert second.logs.cron_lines == first.logs.cron_lines
+    c.close()
+
+
+def test_collect_cron_job_excerpt_preserves_cache_when_latest_output_disappears(
+    hermes_home: Path,
+):
+    (hermes_home / "cron" / "jobs.json").write_text(
+        json.dumps({"jobs": [{"id": "job-1", "name": "Job 1"}]})
+    )
+    cron_output_dir = hermes_home / "cron" / "output" / "job-1"
+    cron_output_dir.mkdir(parents=True)
+    output_file = cron_output_dir / "latest.md"
+    output_file.write_text("cron line 1\n")
+
+    c = Collector(hermes_home)
+    first = c.collect()
+    output_file.unlink()
+    second = c.collect()
+
+    assert second.cron.jobs[0].latest_output_excerpt == first.cron.jobs[0].latest_output_excerpt
+    assert second.cron.jobs[0].latest_output_path == first.cron.jobs[0].latest_output_path
+    assert second.cron.jobs[0].latest_output_mtime == first.cron.jobs[0].latest_output_mtime
     c.close()
 
 
@@ -2071,6 +2148,21 @@ def test_collect_profiles_preserves_last_good_when_real_profile_db_becomes_unrea
 
     assert state2.profiles == state1.profiles
     assert "profiles" in state2.health.failed_sources
+    c.close()
+
+
+def test_collect_profiles_preserves_cached_count_when_profile_db_disappears(
+    profiled_hermes_home: Path,
+):
+    c = Collector(profiled_hermes_home)
+    state1 = c.collect()
+    assert state1.profiles.profiles[0].session_count == 1
+
+    profile_db = profiled_hermes_home / "profiles" / "coding" / "state.db"
+    profile_db.unlink()
+    state2 = c.collect()
+
+    assert state2.profiles.profiles[0].session_count == 1
     c.close()
 
 

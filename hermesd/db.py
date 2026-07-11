@@ -48,9 +48,12 @@ class HermesDB:
         self._messages_fts_available: bool | None = None
         self._session_column_names: set[str] | None = None
         self._snapshot_dir: tempfile.TemporaryDirectory[str] | None = None
+        self._closed = False
         self._connect()
 
     def _connect(self) -> None:
+        if self._closed:
+            return
         self._close_connection()
         if not self._path.exists():
             self._connected_mtime_ns = None
@@ -132,6 +135,8 @@ class HermesDB:
             self._last_message_search_stale = True
 
     def _ensure_connection(self) -> sqlite3.Connection | None:
+        if self._closed:
+            return None
         if self._conn and self._source_changed():
             self._connect()
         if self._conn:
@@ -407,6 +412,7 @@ class HermesDB:
 
     def close(self) -> None:
         with self._lock:
+            self._closed = True
             self._close_connection()
 
 

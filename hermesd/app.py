@@ -737,10 +737,16 @@ class DashboardApp:
         if mode == "overview":
             self._append_overview_footer_actions(t, active_theme)
         else:
+            scrollable = (
+                panel is not None
+                and _detail_max_scroll_offset(panel, state, self._view.log_sub_view, query)
+                is not None
+            )
             self._append_detail_footer_actions(
                 t,
                 active_theme,
                 panel=panel,
+                scrollable=scrollable,
                 editing=editing,
                 query=query,
                 sort_mode=sort_mode,
@@ -773,6 +779,7 @@ class DashboardApp:
         text: Text,
         theme: Theme,
         panel: int | None,
+        scrollable: bool,
         editing: bool,
         query: str,
         sort_mode: str,
@@ -781,7 +788,8 @@ class DashboardApp:
         self._append_footer_action(text, theme, "[f]", " Toggle focus  ")
         self._append_footer_action(text, theme, "[c]", " Copy  ")
         self._append_footer_action(text, theme, "[]", " Prev/next  ")
-        self._append_footer_action(text, theme, "[j/k]", " Scroll  ")
+        if scrollable:
+            self._append_footer_action(text, theme, "[j/k]", " Scroll  ")
         if panel == _LOG_PANEL_NUM:
             self._append_footer_action(text, theme, "[Tab]", " Switch log  ")
         if panel in {_SESSIONS_PANEL_NUM, _LOG_PANEL_NUM}:
@@ -885,7 +893,7 @@ class DashboardApp:
             ("Esc", "Return to overview"),
             ("f", "Toggle focus mode for the last selected panel"),
             ("c", "Copy the current rendered view as plain text via OSC 52"),
-            ("j/k", "Scroll down/up (detail mode)"),
+            ("j/k", "Scroll down/up in scrollable detail views"),
             ("Tab", "Cycle log sub-view (logs panel)"),
             ("/", "Edit detail filter (sessions/logs)"),
             ("s", "Cycle session sort (Sessions panel)"),

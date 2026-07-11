@@ -36,13 +36,13 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pip>=26.1",
+    "pip>=26.1.2",
     "pytest>=9.0.0",
-    "pytest-cov>=6.0.0",
     "ruff>=0.6.0",
     "mypy>=1.11.0",
+    "msgpack>=1.2.1",
     "types-PyYAML>=6.0.0",
-    "pip-audit>=2.7.0",
+    "pip-audit>=2.10.1",
 ]
 
 [project.urls]

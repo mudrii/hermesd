@@ -40,5 +40,15 @@ jobs:
         run: uv run pytest tests/ -v -W error::ResourceWarning
       - name: Audit dependencies (pip-audit)
         run: uv run pip-audit
+      - name: Check lockfile
+        run: uv lock --check
       - name: Build package
         run: uv build
+      - name: Smoke test built wheel
+        run: |
+          uv run python -m venv .wheel-smoke
+          .wheel-smoke/bin/python -m pip install dist/*.whl
+          .wheel-smoke/bin/hermesd --version
+          .wheel-smoke/bin/python -m hermesd --version
+      - name: Check package metadata
+        run: uvx twine check dist/*
