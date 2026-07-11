@@ -30,6 +30,15 @@ class GatewayState(BaseModel):
     updates_behind: int = 0
     active_agents: int = 0
     restart_requested: bool = False
+    busy: bool = False
+    drainable: bool = False
+    drain_active: bool = False
+    drain_requested_at: str = ""
+    drain_principal: str = ""
+    drain_suppress_notification: bool = False
+    served_profiles: list[str] = Field(default_factory=list)
+    scale_to_zero_idle_timeout_minutes: int = 0
+    scale_to_zero_relay_only: bool = False
 
 
 class SessionInfo(BaseModel):
@@ -161,6 +170,13 @@ class CronState(BaseModel):
     error_count: int = 0
     max_parallel_jobs: int = 0
     wrap_response: bool = False
+    provider: str = "builtin"
+    chronos_configured: bool = False
+    chronos_portal_configured: bool = False
+    chronos_callback_configured: bool = False
+    chronos_audience_configured: bool = False
+    chronos_jwks_configured: bool = False
+    suggestion_count: int = 0
     jobs: list[CronJob] = Field(default_factory=list)
 
 
@@ -209,6 +225,13 @@ class ConfigSummary(BaseModel):
     gateway_trust_recent_files: bool = False
     gateway_trust_recent_files_seconds: int = 0
     auxiliary_slots: list[str] = Field(default_factory=list)
+    moa_default_preset: str = ""
+    moa_active_preset: str = ""
+    moa_preset_count: int = 0
+    moa_reference_model_count: int = 0
+    moa_aggregator_label: str = ""
+    moa_save_traces: bool = False
+    moa_trace_dir: str = ""
 
 
 class ProviderInfo(BaseModel):
@@ -226,6 +249,8 @@ class CredentialPoolEntry(BaseModel):
     cooldown_remaining: str = ""
     priority: int = 0
     token_present: bool = False
+    expires_at: str = ""
+    last_refresh: str = ""
 
 
 class SkillInfo(BaseModel):
@@ -281,6 +306,11 @@ class MemoryOverview(BaseModel):
     soul_size_bytes: int = 0
     soul_excerpt: str = ""
     memory_files: list[str] = Field(default_factory=list)
+    skill_usage_count: int = 0
+    learned_skill_count: int = 0
+    pinned_skill_count: int = 0
+    agent_created_skill_count: int = 0
+    memory_card_count: int = 0
 
 
 class ProfileSummary(BaseModel):
@@ -327,11 +357,17 @@ class ChannelPlatformInfo(BaseModel):
     states: list[str] = Field(default_factory=list)
     connected: bool = False
     capabilities: list[str] = Field(default_factory=list)
+    family_label: str = ""
+    missing_from_directory: bool = False
 
 
 class ChannelDirectoryState(BaseModel):
     updated_at: str = ""
     platform_count: int = 0
+    alias_count: int = 0
+    alias_platform_count: int = 0
+    stale_alias_count: int = 0
+    missing_directory_platforms: list[str] = Field(default_factory=list)
     platforms: list[ChannelPlatformInfo] = Field(default_factory=list)
 
 
@@ -375,6 +411,16 @@ class KanbanTaskLink(BaseModel):
     child_id: str = ""
 
 
+class KanbanBoardSummary(BaseModel):
+    slug: str = ""
+    current: bool = False
+    task_count: int = 0
+    run_count: int = 0
+    problem_count: int = 0
+    stale_claim_count: int = 0
+    block_kind_counts: dict[str, int] = Field(default_factory=dict)
+
+
 class KanbanState(BaseModel):
     db_present: bool = False
     task_count: int = 0
@@ -383,10 +429,15 @@ class KanbanState(BaseModel):
     comment_count: int = 0
     dispatch_in_gateway: bool = False
     dispatch_interval_seconds: int = 0
+    claim_ttl_seconds: int = 0
     auto_decompose: bool = False
     failure_limit: int = 0
     link_count: int = 0
     attachment_count: int = 0
+    board_count: int = 0
+    current_board: str = ""
+    stale_claim_count: int = 0
+    boards: list[KanbanBoardSummary] = Field(default_factory=list)
     status_counts: dict[str, int] = Field(default_factory=dict)
     assignee_counts: dict[str, int] = Field(default_factory=dict)
     active_tasks: list[KanbanTaskSummary] = Field(default_factory=list)
@@ -413,6 +464,57 @@ class PRMonitorSummary(BaseModel):
     author_pr_count: int = 0
 
 
+class VerificationEventSummary(BaseModel):
+    event_id: int = 0
+    created_at: str = ""
+    session_id: str = ""
+    root: str = ""
+    command: str = ""
+    canonical_command: str = ""
+    kind: str = ""
+    scope: str = ""
+    status: str = ""
+    exit_code: int = 0
+    output_summary: str = ""
+
+
+class VerificationRootSummary(BaseModel):
+    session_id: str = ""
+    root: str = ""
+    last_event_id: int = 0
+    last_edit_at: str = ""
+    changed_path_count: int = 0
+
+
+class ProjectSummary(BaseModel):
+    slug: str = ""
+    name: str = ""
+    board_slug: str = ""
+    primary_path: str = ""
+    archived: bool = False
+    verification_root_count: int = 0
+    kanban_board_present: bool = False
+
+
+class DiscoveredRepoSummary(BaseModel):
+    root: str = ""
+    label: str = ""
+    last_seen: str = ""
+
+
+class GoalSummary(BaseModel):
+    session_id: str = ""
+    goal: str = ""
+    status: str = ""
+    turns_used: int = 0
+    max_turns: int = 0
+    has_contract: bool = False
+    waiting_on_pid: int = 0
+    waiting_on_session: str = ""
+    waiting_reason: str = ""
+    subgoal_count: int = 0
+
+
 class OperationsState(BaseModel):
     dashboard_process_count: int = 0
     desktop_build_stamp: str = ""
@@ -422,6 +524,30 @@ class OperationsState(BaseModel):
     conversation_count: int = 0
     response_count: int = 0
     response_store_size_bytes: int = 0
+    verification_db_present: bool = False
+    verification_event_count: int = 0
+    verification_failed_count: int = 0
+    verification_state_count: int = 0
+    verification_latest_events: list[VerificationEventSummary] = Field(default_factory=list)
+    verification_roots: list[VerificationRootSummary] = Field(default_factory=list)
+    moa_trace_count: int = 0
+    moa_trace_size_bytes: int = 0
+    moa_trace_newest_session_id: str = ""
+    moa_trace_newest_mtime: float | None = None
+    moa_trace_latest_record_summary: str = ""
+    moa_trace_latest_record_keys: list[str] = Field(default_factory=list)
+    projects_db_present: bool = False
+    project_count: int = 0
+    project_archived_count: int = 0
+    project_folder_count: int = 0
+    discovered_repo_count: int = 0
+    project_missing_primary_path_count: int = 0
+    projects: list[ProjectSummary] = Field(default_factory=list)
+    discovered_repos: list[DiscoveredRepoSummary] = Field(default_factory=list)
+    goal_count: int = 0
+    active_goal_count: int = 0
+    waiting_goal_count: int = 0
+    goals: list[GoalSummary] = Field(default_factory=list)
 
 
 class CuratorRun(BaseModel):
@@ -443,6 +569,12 @@ class CuratorRun(BaseModel):
     state_transitions: list[str] = Field(default_factory=list)
     llm_summary: str = ""
     llm_error: str = ""
+    scheduler_state_present: bool = False
+    scheduler_paused: bool = False
+    scheduler_run_count: int = 0
+    scheduler_last_run_at: str = ""
+    scheduler_last_report_path: str = ""
+    consolidate_enabled: bool = False
 
 
 class HealthSummary(BaseModel):

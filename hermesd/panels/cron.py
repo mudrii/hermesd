@@ -71,6 +71,26 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         f"wrap_response={'yes' if c.wrap_response else 'no'}\n\n",
         style=theme.banner_dim,
     )
+    header.append(
+        f"Provider: provider={escape(c.provider)}",
+        style=theme.banner_dim,
+    )
+    if c.suggestion_count:
+        header.append(f"  suggestions={c.suggestion_count}", style=theme.banner_text)
+    if c.provider == "chronos" or c.chronos_configured:
+        configured = "configured" if c.chronos_configured else "partial"
+        parts = []
+        if c.chronos_portal_configured:
+            parts.append("portal")
+        if c.chronos_callback_configured:
+            parts.append("callback")
+        if c.chronos_audience_configured:
+            parts.append("audience")
+        if c.chronos_jwks_configured:
+            parts.append("jwks")
+        suffix = f" ({', '.join(parts)})" if parts else ""
+        header.append(f"  chronos {configured}{suffix}", style=theme.banner_text)
+    header.append("\n\n")
     sections.append(header)
 
     if c.jobs:

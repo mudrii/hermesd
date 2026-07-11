@@ -83,6 +83,8 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
         pool_table.add_column("Status", style=theme.banner_text, min_width=12)
         pool_table.add_column("Req", justify="right", min_width=3)
         pool_table.add_column("Cooldown", style=theme.banner_dim, min_width=8)
+        pool_table.add_column("Expires", style=theme.banner_dim, min_width=8)
+        pool_table.add_column("Refreshed", style=theme.banner_dim, min_width=8)
         pool_table.add_column("Prio", justify="right", min_width=4)
         for entry in sm.credential_pools:
             pool_table.add_row(
@@ -94,6 +96,8 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
                 escape(entry.last_status),
                 str(entry.request_count),
                 escape(entry.cooldown_remaining),
+                escape(entry.expires_at) if entry.expires_at else "—",
+                escape(entry.last_refresh) if entry.last_refresh else "—",
                 str(entry.priority) if entry.priority else "—",
             )
         sections.append(pool_table)

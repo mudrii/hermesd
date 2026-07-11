@@ -29,7 +29,13 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     cur = state.curator
     lines = Text()
     if not cur.run_present:
-        lines.append("  No curation runs", style=theme.banner_dim)
+        if cur.scheduler_state_present:
+            lines.append("  Scheduler: ", style=theme.ui_label)
+            lines.append("paused" if cur.scheduler_paused else "active", style=theme.banner_text)
+            lines.append("\n  Runs: ", style=theme.ui_label)
+            lines.append(str(cur.scheduler_run_count), style=theme.banner_text)
+        else:
+            lines.append("  No curation runs", style=theme.banner_dim)
     else:
         lines.append("  Last run: ", style=theme.ui_label)
         lines.append(f"{escape(cur.stamp)}\n", style=theme.banner_text)
@@ -54,6 +60,15 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
 def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     cur = state.curator
     if not cur.run_present:
+        if cur.scheduler_state_present:
+            return Panel(
+                _scheduler_group(cur, theme),
+                title=f"[{theme.panel_title_style}]{_TITLE}[/]",
+                title_align="left",
+                border_style=theme.panel_border_style,
+                box=rich.box.HORIZONTALS,
+                padding=(1, 2),
+            )
         return Panel(
             Text("  No curation runs found", style=theme.banner_dim),
             title=f"[{theme.panel_title_style}]{_TITLE}[/]",
@@ -80,6 +95,10 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     summary.add_row("Tool Calls", str(cur.tool_calls_total))
 
     sections: list[RenderableType] = [summary]
+
+    if cur.scheduler_state_present:
+        sections.append(Text("\nScheduler\n", style=f"bold {theme.ui_label}"))
+        sections.append(_scheduler_table(cur, theme))
 
     if cur.tool_call_counts:
         sections.append(Text("\nTool Calls\n", style=f"bold {theme.ui_label}"))
@@ -115,3 +134,27 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         box=rich.box.HORIZONTALS,
         padding=(1, 2),
     )
+
+
+def _scheduler_group(cur: CuratorRun, theme: Theme) -> Group:
+    return Group(
+        Text("Scheduler\n", style=f"bold {theme.ui_label}"),
+        _scheduler_table(cur, theme),
+    )
+
+
+def _scheduler_table(cur: CuratorRun, theme: Theme) -> Table:
+    table = Table(box=None, show_header=False, padding=(0, 2))
+    table.add_column("Key", style=theme.ui_label)
+    table.add_column("Value", style=theme.banner_text)
+    table.add_row("State", "paused" if cur.scheduler_paused else "active")
+    table.add_row("Run Count", str(cur.scheduler_run_count))
+    table.add_row(
+        "Last Run", escape(cur.scheduler_last_run_at) if cur.scheduler_last_run_at else "—"
+    )
+    table.add_row(
+        "Last Report",
+        escape(cur.scheduler_last_report_path) if cur.scheduler_last_report_path else "—",
+    )
+    table.add_row("Consolidate", "consolidate on" if cur.consolidate_enabled else "consolidate off")
+    return table

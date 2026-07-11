@@ -7,6 +7,20 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ## [Unreleased]
 
+### Added
+
+- The Operations panel now reads `~/.hermes/verification_evidence.db` read-only and surfaces verification event totals, failed-check counts, latest evidence rows, and pending changed-path counts so Hermes Agent's coding verification ledger is visible in hermesd.
+- Config now summarizes MoA presets, reference model counts, aggregator, and trace setting; Operations inventories `moa-traces/*.jsonl` with bounded latest-record metadata without rendering trace contents.
+- Operations now reads `projects.db` read-only and surfaces project, folder, discovered-repo, archive, missing-primary-path, newest-repo, and board-mapping summaries.
+- Gateway now surfaces served profiles, external drain markers, busy/drainable state, scale-to-zero idle timeout, and relay-only intent.
+- Kanban now discovers `kanban/boards/*/kanban.db`, marks the current board, and shows per-board task/run/problem counts, stale-claim counts, and typed blocker counts when present.
+- Operations now reads `/goal` state from `state.db` and shows active/waiting goals, contract presence, turn budget, and project correlations to verification roots and Kanban boards.
+- Memory now surfaces a lightweight learning summary from skill usage, learned skill metadata, and memory-card headings.
+- Cron now shows the active scheduler provider, Chronos managed-cron config presence, and persisted cron suggestion counts.
+- Gateway now reports channel-alias inventory from `channel_aliases.json`, stale alias counts, platform family labels, and gateway platforms missing from the channel directory.
+- Skills / Integrations now shows credential expiry and last-refresh metadata when providers persist it safely in `auth.json`.
+- Curator now shows scheduler state from `skills/.curator_state` plus consolidation config even when no run report exists yet.
+
 ### Changed
 
 - Detail footers and help text now advertise `j`/`k` scrolling only for scrollable detail views.

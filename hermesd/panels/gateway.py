@@ -94,8 +94,29 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
             header.append("  (up to date)", style=theme.ui_ok)
     if gw.active_agents:
         header.append(f"\n  {gw.active_agents} active agents", style=theme.ui_accent)
+    if gw.busy:
+        header.append("  busy", style=theme.ui_warn)
+    if gw.drainable:
+        header.append("  drainable", style=theme.banner_dim)
     if gw.restart_requested:
         header.append("  ⚠ restart requested", style=theme.ui_warn)
+    if gw.drain_active:
+        principal = f" by {escape(gw.drain_principal)}" if gw.drain_principal else ""
+        requested_at = f" at {escape(gw.drain_requested_at)}" if gw.drain_requested_at else ""
+        suppress = " suppress-notify" if gw.drain_suppress_notification else ""
+        header.append(
+            f"\n  external drain{principal}{requested_at}{suppress}",
+            style=theme.ui_warn,
+        )
+    if gw.served_profiles:
+        header.append("\n  Served Profiles: ", style=theme.ui_label)
+        header.append(escape(", ".join(gw.served_profiles)), style=theme.banner_text)
+    if gw.scale_to_zero_idle_timeout_minutes:
+        relay = " relay-only" if gw.scale_to_zero_relay_only else ""
+        header.append(
+            f"\n  Scale-to-zero: {gw.scale_to_zero_idle_timeout_minutes}m idle{relay}",
+            style=theme.banner_dim,
+        )
     header.append("\n\n")
 
     sections: list[RenderableType] = [header, table]
@@ -108,6 +129,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         channel_table = Table(box=None, show_header=True, padding=(0, 2))
         channel_table.add_column("Platform", style=theme.ui_label)
         channel_table.add_column("Entries", justify="right", style=theme.ui_accent)
+        channel_table.add_column("Family", style=theme.banner_text)
         channel_table.add_column("States", style=theme.banner_text)
         channel_table.add_column("Capabilities", style=theme.banner_dim)
         for platform in state.channels.platforms:
@@ -115,9 +137,39 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
             capabilities = (
                 escape(", ".join(platform.capabilities)) if platform.capabilities else "—"
             )
-            name = Text(platform.name, style=theme.ui_ok if platform.connected else theme.ui_label)
-            channel_table.add_row(name, str(platform.entry_count), states, capabilities)
+            name_label = (
+                f"{platform.name} (missing directory)"
+                if platform.missing_from_directory
+                else platform.name
+            )
+            name = Text(
+                name_label,
+                style=theme.ui_ok if platform.connected else theme.ui_label,
+            )
+            channel_table.add_row(
+                name,
+                str(platform.entry_count),
+                escape(platform.family_label) if platform.family_label else "—",
+                states,
+                capabilities,
+            )
         sections.append(channel_table)
+
+    if state.channels.alias_count:
+        alias_text = Text()
+        alias_text.append("\nChannel Aliases\n", style=f"bold {theme.ui_label}")
+        alias_text.append(
+            f"  {state.channels.alias_count} aliases across "
+            f"{state.channels.alias_platform_count} platforms",
+            style=theme.banner_text,
+        )
+        if state.channels.stale_alias_count:
+            alias_text.append(
+                f"  {state.channels.stale_alias_count} stale",
+                style=theme.ui_warn,
+            )
+        alias_text.append("\n")
+        sections.append(alias_text)
 
     content = Group(*sections)
 

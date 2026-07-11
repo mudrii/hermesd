@@ -61,6 +61,26 @@ def test_curator_panel_detail_empty_state():
     assert "No curation runs" in text
 
 
+def test_curator_panel_detail_shows_scheduler_state_without_run():
+    run = CuratorRun(
+        scheduler_state_present=True,
+        scheduler_paused=True,
+        scheduler_run_count=7,
+        scheduler_last_run_at="2026-07-10T10:00:00Z",
+        scheduler_last_report_path="logs/curator/2026/run.md",
+        consolidate_enabled=True,
+    )
+    text = render_to_str(
+        render_panel(13, DashboardState(curator=run), Theme(), detail=True),
+        no_color=True,
+    )
+    assert "Scheduler" in text
+    assert "paused" in text
+    assert "7" in text
+    assert "consolidate on" in text
+    assert "logs/curator/2026/run.md" in text
+
+
 def test_curator_panel_detail_shows_error_over_summary():
     run = _RUN.model_copy(update={"llm_error": "model timeout"})
     text = render_to_str(render_panel(13, DashboardState(curator=run), Theme(), detail=True))

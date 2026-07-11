@@ -8,25 +8,34 @@ import pytest
 
 from hermesd.collector import Collector
 from hermesd.models import (
+    ChannelDirectoryState,
     ConfigSummary,
+    CredentialPoolEntry,
     CronState,
     DashboardState,
+    DiscoveredRepoSummary,
     GatewayState,
+    GoalSummary,
+    KanbanBoardSummary,
     KanbanRunSummary,
     KanbanState,
     KanbanTaskLink,
     KanbanTaskSummary,
     LogLine,
     LogState,
+    MemoryOverview,
     ModelCacheSummary,
     OperationsState,
     PlatformStatus,
     PRMonitorSummary,
+    ProjectSummary,
     ProviderInfo,
     SessionInfo,
     SkillsMemory,
     TokenSummary,
     ToolStats,
+    VerificationEventSummary,
+    VerificationRootSummary,
 )
 from hermesd.panels import PANEL_NAMES, render_panel
 from hermesd.theme import Theme
@@ -89,7 +98,7 @@ def test_gateway_panel_compact():
         ),
     )
     panel = render_panel(1, state, Theme(), detail=False)
-    text = render_to_str(panel, width=80)
+    text = render_to_str(panel, width=120, no_color=True)
     assert "Gateway" in text
     assert "Running" in text
 
@@ -111,21 +120,41 @@ def test_gateway_panel_detail():
         channels=ChannelDirectoryState(
             platform_count=2,
             platforms=[
-                ChannelPlatformInfo(name="telegram", entry_count=1, connected=True),
+                ChannelPlatformInfo(
+                    name="telegram",
+                    entry_count=1,
+                    connected=True,
+                    family_label="Telegram",
+                ),
                 ChannelPlatformInfo(
                     name="feishu",
                     entry_count=0,
                     capabilities=["meeting invites"],
+                    family_label="Feishu",
+                    missing_from_directory=True,
                 ),
             ],
         ),
     )
     panel = render_panel(1, state, Theme(), detail=True)
-    text = render_to_str(panel, width=80)
+    text = render_to_str(panel, width=120, no_color=True)
     assert "telegram" in text.lower()
     assert "Channel Directory" in text
     assert "feishu" in text
+    assert "missing directory" in text
+    assert "Telegram" in text
     assert "meeting invites" in text
+
+
+def test_gateway_panel_detail_shows_channel_aliases():
+    state = DashboardState(
+        channels=ChannelDirectoryState(alias_count=3, alias_platform_count=2, stale_alias_count=1),
+    )
+    text = render_to_str(render_panel(1, state, Theme(), detail=True), width=120, no_color=True)
+    assert "Channel Aliases" in text
+    assert "3 aliases" in text
+    assert "2 platforms" in text
+    assert "1 stale" in text
 
 
 def test_gateway_panel_detail_shows_platform_error():
@@ -152,6 +181,34 @@ def test_gateway_panel_detail_shows_platform_error():
     assert "reconnect_failed" in text
     assert "restart" in text.lower()
     assert "3 active agents" in text
+
+
+def test_gateway_panel_detail_shows_lifecycle_state():
+    state = DashboardState(
+        gateway=GatewayState(
+            running=True,
+            pid=12345,
+            state="running",
+            active_agents=2,
+            busy=True,
+            drainable=True,
+            drain_active=True,
+            drain_requested_at="2026-07-10T10:00:00Z",
+            drain_principal="nas",
+            drain_suppress_notification=True,
+            served_profiles=["root", "coding"],
+            scale_to_zero_idle_timeout_minutes=15,
+            scale_to_zero_relay_only=True,
+        )
+    )
+    text = render_to_str(render_panel(1, state, Theme(), detail=True), width=120, no_color=True)
+    assert "busy" in text
+    assert "drainable" in text
+    assert "external drain" in text
+    assert "nas" in text
+    assert "root, coding" in text
+    assert "15m idle" in text
+    assert "relay-only" in text
 
 
 def test_gateway_panel_compact_shows_platform_error_marker():
@@ -322,11 +379,50 @@ def test_config_panel_compact_empty_config():
     assert "Provider: —" in text
 
 
+def test_config_panel_detail_shows_moa_summary():
+    state = DashboardState(
+        config=ConfigSummary(
+            moa_default_preset="council",
+            moa_active_preset="council",
+            moa_preset_count=1,
+            moa_reference_model_count=2,
+            moa_aggregator_label="openrouter/claude-opus",
+            moa_save_traces=True,
+        )
+    )
+    text = render_to_str(render_panel(5, state, Theme(), detail=True), width=120, no_color=True)
+    assert "MoA" in text
+    assert "council" in text
+    assert "2 refs" in text
+    assert "openrouter/claude-opus" in text
+    assert "traces on" in text
+
+
 def test_cron_panel_compact():
     state = DashboardState(cron=CronState(last_tick_ago_seconds=42.0, job_count=0))
     panel = render_panel(6, state, Theme(), detail=False)
     text = render_to_str(panel, width=80)
     assert "42s ago" in text
+
+
+def test_cron_panel_detail_shows_provider_and_chronos_config():
+    state = DashboardState(
+        cron=CronState(
+            provider="chronos",
+            chronos_configured=True,
+            chronos_portal_configured=True,
+            chronos_callback_configured=True,
+            chronos_audience_configured=True,
+            chronos_jwks_configured=True,
+            suggestion_count=2,
+        )
+    )
+    text = render_to_str(render_panel(6, state, Theme(), detail=True), width=120, no_color=True)
+    assert "provider=chronos" in text
+    assert "chronos configured" in text
+    assert "portal" in text
+    assert "callback" in text
+    assert "suggestions=2" in text
 
 
 def test_overview_panel_compact():
@@ -341,6 +437,29 @@ def test_overview_panel_compact():
     text = render_to_str(panel, width=80, no_color=True)
     assert "Skills: 70 (28 cat)" in text
     assert "Skills / Integrations" in text
+
+
+def test_skills_panel_detail_shows_provider_freshness():
+    state = DashboardState(
+        skills_memory=SkillsMemory(
+            credential_pools=[
+                CredentialPoolEntry(
+                    name="vertex",
+                    label="Vertex",
+                    auth_type="oauth",
+                    source="adc",
+                    token_present=True,
+                    last_status="ok",
+                    expires_at="2026-07-11T12:00:00Z",
+                    last_refresh="2026-07-11T11:00:00Z",
+                )
+            ]
+        )
+    )
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=220, no_color=True)
+    assert "Expires" in text
+    assert "Refreshed" in text
+    assert "2026-07-11T12:00:00Z" in text
 
 
 def test_logs_panel_compact():
@@ -361,12 +480,31 @@ def test_memory_panel_empty():
     assert "Memory" in text
 
 
+def test_memory_panel_detail_shows_learning_summary():
+    state = DashboardState(
+        memory=MemoryOverview(
+            memory_file_count=2,
+            skill_usage_count=2,
+            learned_skill_count=1,
+            pinned_skill_count=1,
+            agent_created_skill_count=1,
+            memory_card_count=3,
+        )
+    )
+    text = render_to_str(render_panel(10, state, Theme(), detail=True), width=120, no_color=True)
+    assert "Learning" in text
+    assert "2 used skills" in text
+    assert "1 learned" in text
+    assert "3 memory cards" in text
+
+
 def test_kanban_panel_compact():
     state = DashboardState(
         kanban=KanbanState(
             db_present=True,
             task_count=5,
             run_count=3,
+            stale_claim_count=1,
             dispatch_in_gateway=True,
             status_counts={"done": 4, "in_progress": 1},
         )
@@ -375,6 +513,7 @@ def test_kanban_panel_compact():
     text = render_to_str(panel, width=80, no_color=True)
     assert "Tasks: 5" in text
     assert "Runs: 3" in text
+    assert "Stale Claims: 1" in text
     assert "Dispatch: gateway" in text
     assert "in_progress: 1" in text
 
@@ -402,7 +541,18 @@ def test_kanban_panel_detail():
             run_count=1,
             event_count=1,
             comment_count=1,
+            stale_claim_count=1,
             dispatch_in_gateway=False,
+            board_count=1,
+            boards=[
+                KanbanBoardSummary(
+                    slug="main",
+                    current=True,
+                    task_count=2,
+                    run_count=1,
+                    stale_claim_count=1,
+                )
+            ],
             status_counts={"blocked": 1, "in_progress": 1},
             active_tasks=[
                 KanbanTaskSummary(
@@ -430,6 +580,8 @@ def test_kanban_panel_detail():
     assert "t_active" in text
     assert "t_blocked" in text
     assert "Status Counts" in text
+    assert "Stale Claims" in text
+    assert "main" in text
 
 
 def test_kanban_panel_detail_shows_branch_and_guarded_link_attachment_rows():
@@ -517,6 +669,33 @@ def test_kanban_panel_detail_hides_link_attachment_rows_when_zero():
     text = render_to_str(render_panel(11, state, Theme(), detail=True), width=120)
     assert "Decomposition Links" not in text
     assert "Attachments" not in text
+
+
+def test_kanban_panel_detail_shows_multi_board_summary():
+    state = DashboardState(
+        kanban=KanbanState(
+            db_present=True,
+            task_count=3,
+            board_count=3,
+            current_board="alpha",
+            boards=[
+                KanbanBoardSummary(slug="root", task_count=1),
+                KanbanBoardSummary(
+                    slug="alpha",
+                    current=True,
+                    task_count=1,
+                    problem_count=1,
+                    block_kind_counts={"needs_input": 1},
+                ),
+                KanbanBoardSummary(slug="beta", task_count=1),
+            ],
+        )
+    )
+    text = render_to_str(render_panel(11, state, Theme(), detail=True), width=120, no_color=True)
+    assert "Boards" in text
+    assert "alpha" in text
+    assert "current" in text
+    assert "needs_input:1" in text
 
 
 def test_kanban_panel_detail_recent_runs():
@@ -657,6 +836,138 @@ def test_operations_panel_detail_shows_response_store():
     assert "3 responses" in text
     assert "20.5K" in text
     assert "No operations artifacts found" not in text
+
+
+def test_operations_panel_detail_shows_verification_evidence():
+    state = DashboardState(
+        operations=OperationsState(
+            verification_db_present=True,
+            verification_event_count=2,
+            verification_failed_count=1,
+            verification_state_count=1,
+            verification_latest_events=[
+                VerificationEventSummary(
+                    event_id=2,
+                    created_at="2026-07-10T10:05:00Z",
+                    session_id="sess-a",
+                    root="/repo",
+                    command="uv run ruff check .",
+                    canonical_command="ruff check",
+                    kind="lint",
+                    scope="full",
+                    status="failed",
+                    exit_code=1,
+                    output_summary="F401 unused import",
+                )
+            ],
+            verification_roots=[
+                VerificationRootSummary(
+                    session_id="sess-a",
+                    root="/repo",
+                    last_event_id=2,
+                    last_edit_at="2026-07-10T10:06:00Z",
+                    changed_path_count=2,
+                )
+            ],
+        )
+    )
+    text = render_to_str(render_panel(12, state, Theme(), detail=True), width=140, no_color=True)
+    assert "Verification Evidence" in text
+    assert "2 events" in text
+    assert "1 failed" in text
+    assert "ruff check" in text
+    assert "F401 unused import" in text
+    assert "2 changed" in text
+    assert "No operations artifacts found" not in text
+
+
+def test_operations_panel_detail_shows_moa_traces_and_projects():
+    state = DashboardState(
+        operations=OperationsState(
+            moa_trace_count=2,
+            moa_trace_size_bytes=2048,
+            moa_trace_newest_session_id="sess-moa",
+            moa_trace_newest_mtime=time.time() - 60,
+            moa_trace_latest_record_summary="ok council",
+            moa_trace_latest_record_keys=["preset", "status"],
+            projects_db_present=True,
+            project_count=2,
+            project_archived_count=1,
+            project_folder_count=3,
+            discovered_repo_count=4,
+            project_missing_primary_path_count=1,
+            projects=[
+                ProjectSummary(
+                    slug="hermesd",
+                    name="hermesd",
+                    board_slug="main",
+                    primary_path="/repo/hermesd",
+                )
+            ],
+            discovered_repos=[
+                DiscoveredRepoSummary(
+                    root="/repo/hermesd",
+                    label="hermesd",
+                    last_seen="2026-07-12T00:00:00Z",
+                )
+            ],
+        )
+    )
+    text = render_to_str(render_panel(12, state, Theme(), detail=True), width=140, no_color=True)
+    assert "MoA Traces" in text
+    assert "sess-moa" in text
+    assert "Projects" in text
+    assert "hermesd" in text
+    assert "main" in text
+    assert "4 discovered" in text
+    assert "1 missing paths" in text
+    assert "Latest Record" in text
+    assert "ok council" in text
+    assert "Newest Discovered Repos" in text
+    assert "2026-07-12T00:00:00Z" in text
+
+
+def test_operations_panel_detail_shows_goals_and_project_correlations():
+    state = DashboardState(
+        operations=OperationsState(
+            goal_count=1,
+            active_goal_count=1,
+            waiting_goal_count=1,
+            goals=[
+                GoalSummary(
+                    session_id="sess-goal",
+                    goal="Ship visibility",
+                    status="active",
+                    turns_used=3,
+                    max_turns=8,
+                    has_contract=True,
+                    waiting_on_pid=4242,
+                    waiting_reason="tests running",
+                    subgoal_count=1,
+                )
+            ],
+            projects_db_present=True,
+            project_count=1,
+            projects=[
+                ProjectSummary(
+                    slug="hermesd",
+                    name="hermesd",
+                    board_slug="main",
+                    primary_path="/repo/hermesd",
+                    verification_root_count=2,
+                    kanban_board_present=True,
+                )
+            ],
+        )
+    )
+    text = render_to_str(render_panel(12, state, Theme(), detail=True), width=150, no_color=True)
+    assert "Goals" in text
+    assert "Ship visibility" in text
+    assert "3/8" in text
+    assert "contract" in text
+    assert "pid 4242" in text
+    assert "2 verified roots" in text
+    assert "board present" in text
 
 
 def test_operations_panel_detail_size_and_age_labels():

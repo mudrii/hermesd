@@ -51,6 +51,21 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     summary.add_row("MEMORY.md", f"{memory.memory_word_count} words")
     summary.add_row("USER.md", f"{memory.user_word_count} words")
     summary.add_row("SOUL.md", _soul_summary(memory.soul_size_bytes, memory.soul_excerpt))
+    if (
+        memory.skill_usage_count
+        or memory.learned_skill_count
+        or memory.pinned_skill_count
+        or memory.agent_created_skill_count
+        or memory.memory_card_count
+    ):
+        summary.add_row(
+            "Learning",
+            f"{memory.skill_usage_count} used skills  "
+            f"{memory.learned_skill_count} learned  "
+            f"{memory.pinned_skill_count} pinned  "
+            f"{memory.agent_created_skill_count} agent-created  "
+            f"{memory.memory_card_count} memory cards",
+        )
     sections.append(summary)
 
     if memory.memory_files:

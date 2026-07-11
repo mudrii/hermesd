@@ -84,6 +84,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     table.add_row("Code Execution", _code_execution_label(c))
     table.add_row("Kanban Dispatch", _kanban_config_label(c))
     table.add_row("Gateway Media", _gateway_media_label(c))
+    table.add_row("MoA", _moa_label(c))
     table.add_row("Auxiliary Slots", str(len(c.auxiliary_slots)))
     sections.append(table)
 
@@ -172,4 +173,19 @@ def _gateway_media_label(config: ConfigSummary) -> str:
     parts = ["strict" if config.gateway_strict_media_delivery else "relaxed"]
     if config.gateway_trust_recent_files:
         parts.append(f"trust-recent={config.gateway_trust_recent_files_seconds}s")
+    return " ".join(parts)
+
+
+def _moa_label(config: ConfigSummary) -> str:
+    if not config.moa_default_preset and not config.moa_preset_count:
+        return "—"
+    preset = config.moa_active_preset or config.moa_default_preset or "—"
+    parts = [
+        f"{preset}",
+        f"{config.moa_preset_count} presets",
+        f"{config.moa_reference_model_count} refs",
+    ]
+    if config.moa_aggregator_label:
+        parts.append(config.moa_aggregator_label)
+    parts.append("traces on" if config.moa_save_traces else "traces off")
     return " ".join(parts)

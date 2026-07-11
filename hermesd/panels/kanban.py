@@ -29,6 +29,15 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         lines.append(f"{kanban.task_count}", style=theme.banner_text)
         lines.append("  Runs: ", style=theme.ui_label)
         lines.append(f"{kanban.run_count}\n", style=theme.banner_text)
+        if kanban.board_count:
+            lines.append("  Boards: ", style=theme.ui_label)
+            lines.append(f"{kanban.board_count}", style=theme.banner_text)
+            if kanban.current_board:
+                lines.append(f" current={kanban.current_board}", style=theme.banner_dim)
+            lines.append("\n")
+        if kanban.stale_claim_count:
+            lines.append("  Stale Claims: ", style=theme.ui_label)
+            lines.append(f"{kanban.stale_claim_count}\n", style=theme.ui_warn)
         lines.append("  Dispatch: ", style=theme.ui_label)
         lines.append(
             "gateway" if kanban.dispatch_in_gateway else "disabled",
@@ -68,7 +77,43 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         summary.add_row("Decomposition Links", str(kanban.link_count))
     if kanban.attachment_count:
         summary.add_row("Attachments", str(kanban.attachment_count))
+    if kanban.board_count:
+        summary.add_row("Boards", str(kanban.board_count))
+    if kanban.current_board:
+        summary.add_row("Current Board", escape(kanban.current_board))
+    if kanban.stale_claim_count:
+        summary.add_row("Stale Claims", str(kanban.stale_claim_count))
     sections.append(summary)
+
+    if kanban.boards:
+        sections.append(Text("\nBoards\n", style=f"bold {theme.ui_label}"))
+        board_table = Table(box=None, show_header=True, padding=(0, 1))
+        board_table.add_column("Board", style=theme.ui_accent)
+        board_table.add_column("Current", style=theme.banner_text)
+        board_table.add_column("Tasks", justify="right", style=theme.banner_text)
+        board_table.add_column("Runs", justify="right", style=theme.banner_text)
+        board_table.add_column("Problems", justify="right", style=theme.ui_warn)
+        board_table.add_column("Stale", justify="right", style=theme.ui_warn)
+        board_table.add_column("Block Kinds", style=theme.banner_dim)
+        for board in kanban.boards:
+            block_kinds = (
+                ", ".join(
+                    f"{escape(kind)}:{count}"
+                    for kind, count in sorted(board.block_kind_counts.items())
+                )
+                if board.block_kind_counts
+                else "—"
+            )
+            board_table.add_row(
+                escape(board.slug),
+                "current" if board.current else "—",
+                str(board.task_count),
+                str(board.run_count),
+                str(board.problem_count),
+                str(board.stale_claim_count),
+                block_kinds,
+            )
+        sections.append(board_table)
 
     if kanban.task_links:
         sections.append(Text("\nDecomposition Tree\n", style=f"bold {theme.ui_label}"))

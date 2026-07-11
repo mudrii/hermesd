@@ -28,19 +28,19 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 
 | # | Panel | What It Shows |
 |---|-------|---------------|
-| 1 | **Gateway & Platforms** | Live gateway PID, Hermes version, update status, per-platform connection dots, and channel-directory inventory |
+| 1 | **Gateway & Platforms** | Live gateway PID, Hermes version, update status, drain/scale-to-zero state, channel aliases/staleness, platform families, per-platform connection dots, and channel-directory inventory |
 | 2 | **Sessions** | Active/total count, message/tool/API call totals, cwd, archived state, handoff metadata, and parent-session lineage |
 | 3 | **Tokens / Cost** | Today's and all-time token usage, estimated cost (~USD) from token counts, recent-window and model/provider breakdowns |
 | 4 | **Tools** | Available tools count, per-session call stats, background processes, filesystem checkpoints, full tool name grid |
-| 5 | **Config** | Model, provider, personality, Tool Search, dashboard auth, kanban, code execution, gateway, routing and memory/session settings |
-| 6 | **Cron** | Scheduler tick, cron config, job table with schedule, delivery target, error count, latest error, and output metadata |
-| 7 | **Skills / Integrations** | Provider auth status, credential pools, hooks/plugins/MCP inventory, BOOT.md presence, skills with descriptions |
+| 5 | **Config** | Model, provider, personality, MoA, Tool Search, dashboard auth, kanban, code execution, gateway, routing and memory/session settings |
+| 6 | **Cron** | Scheduler tick/provider, Chronos config presence, suggestion count, job table with schedule, delivery target, error count, latest error, and output metadata |
+| 7 | **Skills / Integrations** | Provider auth status/freshness, credential pools, hooks/plugins/MCP inventory, BOOT.md presence, skills with descriptions |
 | 8 | **Logs** | Tailed agent, gateway, errors, cron, desktop, dashboard, GUI, update, gateway-error, crash, audit, MCP-stderr, and workspace logs with Tab switching and inline filtering |
 | 9 | **Profiles** | Read-only profile discovery with session counts, log freshness, skill counts, DB size, and SOUL excerpts |
-| 10 | **Memory** | Memory provider, MEMORY.md/USER.md word counts, SOUL.md size/excerpt, and memory file inventory |
-| 11 | **Kanban** | Read-only kanban task/run/event/comment counts, dispatch config, active workers, blocked/failing tasks, and recent runs |
-| 12 | **Operations** | Dashboard process count, Desktop build stamp, model-cache summaries, and PR monitor state |
-| 13 | **Curator** | Newest memory-curation run: skill before/after counts, archived/pruned/added totals, model/provider, duration, tool-call total + per-tool breakdown, state-transition trail, and LLM summary or error |
+| 10 | **Memory** | Memory provider, MEMORY.md/USER.md word counts, learning summary, SOUL.md size/excerpt, and memory file inventory |
+| 11 | **Kanban** | Read-only kanban task/run/event/comment counts, multi-board summaries, stale claims, dispatch config, active workers, blocked/failing tasks, and recent runs |
+| 12 | **Operations** | Dashboard process count, Desktop build stamp, Response Store, verification evidence, goals, MoA trace metadata, Projects/correlations/newest repos, model-cache summaries, and PR monitor state |
+| 13 | **Curator** | Scheduler state plus newest memory-curation run: skill before/after counts, archived/pruned/added totals, model/provider, duration, tool-call total + per-tool breakdown, state-transition trail, and LLM summary or error |
 
 ### Key Features
 
@@ -76,7 +76,7 @@ The main dashboard shows all 13 panels at a glance. The header starts with the i
 
 ### [1] Gateway & Platforms — Is Everything Connected?
 
-Press `1` to expand. Shows whether the gateway process is alive (with correct PID even after launchd restarts), Hermes version with update status, and a per-platform table with connection state, last-seen timestamps, and an **Error** column surfacing per-platform connection failures (e.g. discord "failed to reconnect"), plus the active-agent count and a restart-requested marker. Catches the "gateway says running but the PID is dead" case.
+Press `1` to expand. Shows whether the gateway process is alive (with correct PID even after launchd restarts), Hermes version with update status, served profiles, busy/drainable state, external drain markers, scale-to-zero idle timeout and relay-only intent, channel-alias inventory/staleness, platform family labels, and a per-platform table with connection state, last-seen timestamps, and an **Error** column surfacing per-platform connection failures (e.g. discord "failed to reconnect"), plus the active-agent count and a restart-requested marker. Catches the "gateway says running but the PID is dead" case.
 
 ![Gateway Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-01-gateway.png)
 
@@ -100,7 +100,7 @@ Press `4` for four sections: **Tool Calls** showing the current call leaders by 
 
 ### [5] Config — Current Agent Configuration
 
-Press `5` for the full config key-value table: model, provider, personality, max turns, reasoning effort, compression threshold, secret redaction, approval mode, provider routing summary, smart routing, fallback model, dashboard theme/auth/public URL, session reset mode, memory provider, Tool Search, toolsets, code execution, kanban dispatch settings, gateway media trust, and auxiliary slot count. Tool Gateway domain, scheme, Firecrawl endpoint, and route token presence are shown from config plus environment with secret-bearing values redacted.
+Press `5` for the full config key-value table: model, provider, personality, max turns, reasoning effort, compression threshold, secret redaction, approval mode, provider routing summary, smart routing, fallback model, dashboard theme/auth/public URL, session reset mode, memory provider, Tool Search, toolsets, code execution, kanban dispatch settings, gateway media trust, MoA preset/reference/aggregator/trace settings, and auxiliary slot count. Tool Gateway domain, scheme, Firecrawl endpoint, and route token presence are shown from config plus environment with secret-bearing values redacted.
 
 ![Config Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-05-config.png)
 
@@ -136,19 +136,19 @@ Press `0` to expand. The Memory panel shows the configured memory provider, memo
 
 ### [11] Kanban — What Are Workers Doing?
 
-Use `]` from panel 10 or `--snapshot-panel 11` to expand. The Kanban panel reads `~/.hermes/kanban.db` in read-only mode and shows board counts, configured dispatch mode, status breakdowns, active worker claims, blocked/failing tasks, recent run outcomes, a parent→child **Decomposition Tree** (`task_links`), and a **Task Metadata** table (branch, workspace, goal mode, current step) when those columns are populated.
+Use `]` from panel 10 or `--snapshot-panel 11` to expand. The Kanban panel reads `~/.hermes/kanban.db` and `~/.hermes/kanban/boards/*/kanban.db` in read-only mode and shows board counts, the current board, stale claim counts, typed blocker counts, configured dispatch mode, status breakdowns, active worker claims, blocked/failing tasks, recent run outcomes, a parent→child **Decomposition Tree** (`task_links`), and a **Task Metadata** table (branch, workspace, goal mode, current step) when those columns are populated.
 
 ![Kanban Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-11-kanban.png)
 
 ### [12] Operations — What Runtime Artifacts Exist?
 
-Use `]` from Kanban or `--snapshot-panel 12` to expand. The Operations panel summarizes dashboard background processes, Desktop build metadata, **Response Store** stats (conversation/response row counts + size from `response_store.db`), model-cache provider/model counts, cache ages, and PR monitor files across all of the agent's naming families (flat + subdirectory) with per-repo dedup.
+Use `]` from Kanban or `--snapshot-panel 12` to expand. The Operations panel summarizes dashboard background processes, Desktop build metadata, **Response Store** stats (conversation/response row counts + size from `response_store.db`), **Verification Evidence** from `verification_evidence.db`, active/waiting **Goals** from `state.db`, **MoA Traces** inventory and bounded latest-record metadata from `moa-traces/*.jsonl`, **Projects** from `projects.db` with missing primary paths, newest discovered repos, and verification/Kanban correlations, model-cache provider/model counts, cache ages, and PR monitor files across all of the agent's naming families (flat + subdirectory) with per-repo dedup.
 
 ![Operations Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-12-operations.png)
 
 ### [13] Curator — What Did the Last Memory Curation Do?
 
-Use `]` from Operations or `--snapshot-panel 13` to expand. The Curator panel reads the newest usable non-symlinked `~/.hermes/logs/curator/<stamp>/run.json` and shows the skill before/after/delta counts, archived/added/pruned/consolidated totals, the model and provider used, run duration, total tool calls plus a per-tool call breakdown, the state-transition trail, and the LLM summary (or error).
+Use `]` from Operations or `--snapshot-panel 13` to expand. The Curator panel reads `skills/.curator_state` for scheduler pause/run/report state and the newest usable non-symlinked `~/.hermes/logs/curator/<stamp>/run.json` for skill before/after/delta counts, archived/added/pruned/consolidated totals, the model and provider used, run duration, total tool calls plus a per-tool call breakdown, the state-transition trail, and the LLM summary (or error).
 
 ![Curator Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-13-curator.png)
 

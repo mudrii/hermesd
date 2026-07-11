@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import time
 from pathlib import Path
@@ -858,6 +859,772 @@ def test_collect_response_store_ignores_symlinked_wal_sidecar(hermes_home: Path,
     assert state.operations.conversation_count == 1
     assert state.operations.response_count == 1
     assert "operations" not in state.health.failed_sources
+    c.close()
+
+
+def test_collect_verification_evidence_counts_latest_events_and_pending_roots(hermes_home: Path):
+    db_path = hermes_home / "verification_evidence.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE verification_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            root TEXT NOT NULL,
+            command TEXT NOT NULL,
+            canonical_command TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            status TEXT NOT NULL,
+            exit_code INTEGER NOT NULL,
+            output_summary TEXT NOT NULL
+        );
+        CREATE TABLE verification_state (
+            session_id TEXT NOT NULL,
+            root TEXT NOT NULL,
+            last_event_id INTEGER,
+            last_edit_at TEXT,
+            changed_paths_json TEXT NOT NULL DEFAULT '[]',
+            PRIMARY KEY (session_id, root)
+        );
+        INSERT INTO verification_events VALUES
+            (1, '2026-07-10T10:00:00Z', 'sess-a', '/repo', '/repo',
+             'uv run pytest tests/test_api.py', 'pytest', 'test', 'targeted',
+             'passed', 0, '12 passed'),
+            (2, '2026-07-10T10:05:00Z', 'sess-a', '/repo', '/repo',
+             'uv run ruff check .', 'ruff check', 'lint', 'full',
+             'failed', 1, 'F401 unused import');
+        INSERT INTO verification_state VALUES (
+            'sess-a', '/repo', 2, '2026-07-10T10:06:00Z',
+            '["hermesd/collector.py", "tests/test_collector_extended.py"]'
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    ops = state.operations
+
+    assert ops.verification_db_present is True
+    assert ops.verification_event_count == 2
+    assert ops.verification_failed_count == 1
+    assert ops.verification_state_count == 1
+    assert ops.verification_latest_events[0].event_id == 2
+    assert ops.verification_latest_events[0].status == "failed"
+    assert ops.verification_latest_events[0].output_summary == "F401 unused import"
+    assert ops.verification_roots[0].changed_path_count == 2
+    assert "operations" not in state.health.failed_sources
+    c.close()
+
+
+def test_collect_verification_evidence_preserves_last_good_on_corrupt_db(hermes_home: Path):
+    db_path = hermes_home / "verification_evidence.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE verification_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            root TEXT NOT NULL,
+            command TEXT NOT NULL,
+            canonical_command TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            status TEXT NOT NULL,
+            exit_code INTEGER NOT NULL,
+            output_summary TEXT NOT NULL
+        );
+        CREATE TABLE verification_state (
+            session_id TEXT NOT NULL,
+            root TEXT NOT NULL,
+            last_event_id INTEGER,
+            last_edit_at TEXT,
+            changed_paths_json TEXT NOT NULL DEFAULT '[]',
+            PRIMARY KEY (session_id, root)
+        );
+        INSERT INTO verification_events VALUES (
+            1, '2026-07-10T10:00:00Z', 'sess-a', '/repo', '/repo',
+            'uv run pytest', 'pytest', 'test', 'full', 'passed', 0, '12 passed'
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    first = c.collect()
+    db_path.write_bytes(b"not a sqlite database")
+    second = c.collect()
+
+    assert second.operations.verification_db_present is True
+    assert second.operations.verification_event_count == first.operations.verification_event_count
+    assert (
+        second.operations.verification_latest_events == first.operations.verification_latest_events
+    )
+    assert "operations" in second.health.failed_sources
+    c.close()
+
+
+def test_collect_moa_config_and_trace_inventory(hermes_home: Path):
+    (hermes_home / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "moa": {
+                    "default_preset": "council",
+                    "active_preset": "council",
+                    "save_traces": True,
+                    "trace_dir": "",
+                    "presets": {
+                        "council": {
+                            "reference_models": [
+                                {"provider": "openai-codex", "model": "gpt-5.5"},
+                                {"provider": "openrouter", "model": "deepseek-v4"},
+                            ],
+                            "aggregator": {"provider": "openrouter", "model": "claude-opus"},
+                            "enabled": True,
+                        }
+                    },
+                }
+            }
+        )
+    )
+    trace_dir = hermes_home / "moa-traces"
+    trace_dir.mkdir()
+    (trace_dir / "sess-moa.jsonl").write_text(
+        json.dumps({"session_id": "sess-moa", "preset": "council", "status": "ok"}) + "\n"
+    )
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.config.moa_default_preset == "council"
+    assert state.config.moa_active_preset == "council"
+    assert state.config.moa_save_traces is True
+    assert state.config.moa_preset_count == 1
+    assert state.config.moa_reference_model_count == 2
+    assert state.config.moa_aggregator_label == "openrouter/claude-opus"
+    assert state.operations.moa_trace_count == 1
+    assert state.operations.moa_trace_newest_session_id == "sess-moa"
+    assert state.operations.moa_trace_size_bytes > 0
+    assert state.operations.moa_trace_latest_record_summary == "ok council"
+    assert state.operations.moa_trace_latest_record_keys == ["preset", "session_id", "status"]
+    c.close()
+
+
+def test_collect_projects_db_summary(hermes_home: Path):
+    db_path = hermes_home / "projects.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            slug TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            icon TEXT,
+            color TEXT,
+            board_slug TEXT,
+            primary_path TEXT,
+            created_at TEXT NOT NULL,
+            archived INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE project_folders (
+            project_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            label TEXT,
+            is_primary INTEGER NOT NULL DEFAULT 0,
+            added_at TEXT NOT NULL
+        );
+        CREATE TABLE discovered_repos (
+            root TEXT PRIMARY KEY,
+            label TEXT,
+            last_seen TEXT NOT NULL
+        );
+        INSERT INTO projects VALUES
+            ('p1', 'hermesd', 'hermesd', '', '', '', 'main', '/repo/hermesd',
+             '2026-07-10T00:00:00Z', 0),
+            ('p2', 'archive', 'archive', '', '', '', '', '/repo/archive',
+             '2026-07-09T00:00:00Z', 1),
+            ('p3', 'missing', 'missing', '', '', '', '', '',
+             '2026-07-08T00:00:00Z', 0);
+        INSERT INTO project_folders VALUES
+            ('p1', '/repo/hermesd', 'primary', 1, '2026-07-10T00:00:00Z'),
+            ('p2', '/repo/archive', 'primary', 1, '2026-07-09T00:00:00Z');
+        INSERT INTO discovered_repos VALUES
+            ('/repo/hermes-agent', 'Hermes Agent', '2026-07-11T00:00:00Z'),
+            ('/repo/hermesd', 'hermesd', '2026-07-12T00:00:00Z');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    ops = state.operations
+
+    assert ops.projects_db_present is True
+    assert ops.project_count == 3
+    assert ops.project_archived_count == 1
+    assert ops.project_folder_count == 2
+    assert ops.discovered_repo_count == 2
+    assert ops.project_missing_primary_path_count == 1
+    assert ops.projects[0].slug == "hermesd"
+    assert ops.projects[0].board_slug == "main"
+    assert ops.discovered_repos[0].root == "/repo/hermesd"
+    c.close()
+
+
+def test_project_correlations_require_safe_boards_and_path_boundaries(
+    hermes_home: Path, tmp_path: Path
+):
+    verification_db = hermes_home / "verification_evidence.db"
+    conn = sqlite3.connect(str(verification_db))
+    conn.executescript(
+        """
+        CREATE TABLE verification_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            root TEXT NOT NULL,
+            command TEXT NOT NULL,
+            canonical_command TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            status TEXT NOT NULL,
+            exit_code INTEGER NOT NULL,
+            output_summary TEXT NOT NULL
+        );
+        CREATE TABLE verification_state (
+            session_id TEXT NOT NULL,
+            root TEXT NOT NULL,
+            last_event_id INTEGER,
+            last_edit_at TEXT,
+            changed_paths_json TEXT NOT NULL DEFAULT '[]',
+            PRIMARY KEY (session_id, root)
+        );
+        INSERT INTO verification_state VALUES
+            ('sess-a', '/repo/app', 1, '2026-07-10T10:00:00Z', '[]'),
+            ('sess-b', '/repo/application', 2, '2026-07-10T10:01:00Z', '[]');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    outside_db = tmp_path / "kanban.db"
+    conn = sqlite3.connect(str(outside_db))
+    create_kanban_db_tables(conn)
+    conn.close()
+    (hermes_home / "kanban.db").symlink_to(outside_db)
+
+    projects_db = hermes_home / "projects.db"
+    conn = sqlite3.connect(str(projects_db))
+    conn.executescript(
+        """
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            slug TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            icon TEXT,
+            color TEXT,
+            board_slug TEXT,
+            primary_path TEXT,
+            created_at TEXT NOT NULL,
+            archived INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO projects VALUES (
+            'p1', 'app', 'App', '', '', '', 'root', '/repo/app',
+            '2026-07-10T00:00:00Z', 0
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.operations.projects[0].verification_root_count == 1
+    assert state.operations.projects[0].kanban_board_present is False
+    c.close()
+
+
+def test_collect_gateway_lifecycle_drain_and_served_profiles(hermes_home: Path):
+    (hermes_home / "config.yaml").write_text(
+        yaml.dump({"scale_to_zero": {"idle_timeout_minutes": 15, "relay_only": True}})
+    )
+    (hermes_home / "gateway_state.json").write_text(
+        json.dumps(
+            {
+                "pid": 12345,
+                "gateway_state": "running",
+                "active_agents": 2,
+                "served_profiles": ["root", "coding"],
+                "platforms": {},
+            }
+        )
+    )
+    (hermes_home / ".drain_request.json").write_text(
+        json.dumps(
+            {
+                "requested_at": "2026-07-10T10:00:00Z",
+                "principal": "nas",
+                "suppress_notification": True,
+            }
+        )
+    )
+
+    c = Collector(hermes_home, pid_exists=lambda pid: pid == 12345)
+    state = c.collect()
+    gw = state.gateway
+
+    assert gw.running is True
+    assert gw.busy is True
+    assert gw.drainable is False
+    assert gw.drain_active is True
+    assert gw.drain_principal == "nas"
+    assert gw.drain_suppress_notification is True
+    assert gw.served_profiles == ["root", "coding"]
+    assert gw.scale_to_zero_idle_timeout_minutes == 15
+    assert gw.scale_to_zero_relay_only is True
+    c.close()
+
+
+def test_collect_gateway_derives_relay_only_from_connected_platforms(hermes_home: Path):
+    (hermes_home / "config.yaml").write_text(
+        yaml.dump({"scale_to_zero": {"idle_timeout_minutes": 10}})
+    )
+    (hermes_home / "gateway_state.json").write_text(
+        json.dumps(
+            {
+                "pid": 12345,
+                "gateway_state": "running",
+                "platforms": {"raft": {"state": "connected"}},
+            }
+        )
+    )
+
+    c = Collector(hermes_home, pid_exists=lambda pid: pid == 12345)
+    state = c.collect()
+
+    assert state.gateway.scale_to_zero_idle_timeout_minutes == 10
+    assert state.gateway.scale_to_zero_relay_only is True
+    c.close()
+
+
+def test_collect_gateway_treats_absent_connected_platforms_as_relay_only(
+    hermes_home: Path,
+):
+    (hermes_home / "config.yaml").write_text(
+        yaml.dump({"scale_to_zero": {"idle_timeout_minutes": 10}})
+    )
+    (hermes_home / "gateway_state.json").write_text(
+        json.dumps({"pid": 12345, "gateway_state": "running", "platforms": {}})
+    )
+
+    c = Collector(hermes_home, pid_exists=lambda pid: pid == 12345)
+    state = c.collect()
+
+    assert state.gateway.scale_to_zero_relay_only is True
+    c.close()
+
+
+def test_collect_cron_suggestion_count(hermes_home: Path):
+    cron_dir = hermes_home / "cron"
+    (cron_dir / "suggestions.json").write_text(
+        json.dumps({"suggestions": [{"name": "standup"}, {"name": "review"}]})
+    )
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.cron.suggestion_count == 2
+    c.close()
+
+
+def test_collect_channels_flags_alias_staleness_families_and_missing_directory(
+    hermes_home: Path,
+):
+    (hermes_home / "gateway_state.json").write_text(
+        json.dumps(
+            {
+                "platforms": {
+                    "telegram": {"state": "connected"},
+                    "whatsapp_cloud": {"state": "disconnected"},
+                }
+            }
+        )
+    )
+    (hermes_home / "channel_directory.json").write_text(
+        json.dumps({"platforms": {"telegram": [{"state": "connected"}]}})
+    )
+    (hermes_home / "channel_aliases.json").write_text(
+        json.dumps(
+            {
+                "telegram": {
+                    "123": {"label": "Ops", "stale": True},
+                    "456": {"label": "Builds"},
+                }
+            }
+        )
+    )
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.channels.alias_count == 2
+    assert state.channels.stale_alias_count == 1
+    assert state.channels.missing_directory_platforms == ["whatsapp_cloud"]
+    platforms = {platform.name: platform for platform in state.channels.platforms}
+    assert platforms["telegram"].family_label == "Telegram"
+    assert platforms["whatsapp_cloud"].family_label == "WhatsApp Cloud"
+    assert platforms["whatsapp_cloud"].missing_from_directory is True
+    c.close()
+
+
+def test_collect_kanban_discovers_multi_board_summaries(hermes_home: Path):
+    (hermes_home / "config.yaml").write_text(yaml.dump({"kanban": {"claim_ttl_seconds": 120}}))
+    root_db = hermes_home / "kanban.db"
+    conn = sqlite3.connect(str(root_db))
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, claim_expires) VALUES (?, ?, ?, ?, ?)",
+        ("root-task", "Root task", "todo", 1, 1),
+    )
+    conn.commit()
+    conn.close()
+
+    boards_dir = hermes_home / "kanban" / "boards"
+    alpha_dir = boards_dir / "alpha"
+    beta_dir = boards_dir / "beta"
+    alpha_dir.mkdir(parents=True)
+    beta_dir.mkdir()
+    (hermes_home / "kanban" / "current").write_text("alpha\n")
+
+    stale_heartbeat = int(time.time()) - 180
+    for board_dir, task_id, status, block_kind, last_heartbeat in (
+        (alpha_dir, "alpha-task", "blocked", "needs_input", 0),
+        (beta_dir, "beta-task", "done", "", stale_heartbeat),
+    ):
+        conn = sqlite3.connect(str(board_dir / "kanban.db"))
+        create_kanban_db_tables(conn)
+        conn.execute("ALTER TABLE tasks ADD COLUMN block_kind TEXT")
+        claim_expires = 1 if task_id == "alpha-task" else 0
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at, claim_expires, "
+            "last_heartbeat_at, block_kind) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                f"{task_id} title",
+                status,
+                1,
+                claim_expires,
+                last_heartbeat,
+                block_kind,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.kanban.board_count == 3
+    assert state.kanban.current_board == "alpha"
+    assert state.kanban.claim_ttl_seconds == 120
+    assert state.kanban.stale_claim_count == 1
+    boards = {board.slug: board for board in state.kanban.boards}
+    assert boards["root"].task_count == 1
+    assert boards["root"].stale_claim_count == 1
+    assert boards["alpha"].current is True
+    assert boards["alpha"].task_count == 1
+    assert boards["alpha"].problem_count == 1
+    assert boards["alpha"].stale_claim_count == 1
+    assert boards["alpha"].block_kind_counts == {"needs_input": 1}
+    assert boards["beta"].task_count == 1
+    assert boards["beta"].stale_claim_count == 1
+    c.close()
+
+
+def test_collect_kanban_preserves_last_good_when_board_db_corrupts(hermes_home: Path):
+    boards_dir = hermes_home / "kanban" / "boards"
+    board_dir = boards_dir / "alpha"
+    board_dir.mkdir(parents=True)
+    (hermes_home / "kanban" / "current").write_text("alpha\n")
+    db_path = board_dir / "kanban.db"
+    conn = sqlite3.connect(str(db_path))
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES (?, ?, ?, ?)",
+        ("alpha-task", "Alpha task", "todo", 1),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    first = c.collect()
+    assert first.kanban.board_count == 1
+
+    db_path.write_bytes(b"not a sqlite database")
+    second = c.collect()
+
+    assert second.kanban == first.kanban
+    assert "kanban" in second.health.failed_sources
+    c.close()
+
+
+def test_collect_kanban_preserves_last_good_when_current_board_becomes_unsafe(
+    hermes_home: Path, tmp_path: Path
+):
+    board_dir = hermes_home / "kanban" / "boards" / "alpha"
+    board_dir.mkdir(parents=True)
+    current = hermes_home / "kanban" / "current"
+    current.write_text("alpha\n")
+    conn = sqlite3.connect(str(board_dir / "kanban.db"))
+    create_kanban_db_tables(conn)
+    conn.close()
+
+    c = Collector(hermes_home)
+    first = c.collect()
+    assert first.kanban.current_board == "alpha"
+
+    outside_current = tmp_path / "current"
+    outside_current.write_text("beta\n")
+    current.unlink()
+    current.symlink_to(outside_current)
+    second = c.collect()
+
+    assert second.kanban == first.kanban
+    assert "kanban" in second.health.failed_sources
+    c.close()
+
+
+def test_collect_moa_traces_preserves_last_good_when_trace_dir_disappears(
+    hermes_home: Path,
+):
+    (hermes_home / "config.yaml").write_text(yaml.dump({"moa": {"save_traces": True}}))
+    trace_dir = hermes_home / "moa-traces"
+    trace_dir.mkdir()
+    (trace_dir / "sess-moa.jsonl").write_text(json.dumps({"status": "ok"}) + "\n")
+
+    c = Collector(hermes_home)
+    first = c.collect()
+    assert first.operations.moa_trace_count == 1
+
+    shutil.rmtree(trace_dir)
+    second = c.collect()
+
+    assert second.operations == first.operations
+    assert "operations" in second.health.failed_sources
+    c.close()
+
+
+def test_collect_projects_preserves_last_good_when_projects_db_corrupts(hermes_home: Path):
+    db_path = hermes_home / "projects.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            slug TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            icon TEXT,
+            color TEXT,
+            board_slug TEXT,
+            primary_path TEXT,
+            created_at TEXT NOT NULL,
+            archived INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO projects VALUES (
+            'p1', 'hermesd', 'hermesd', '', '', '', '', '/repo/hermesd',
+            '2026-07-10T00:00:00Z', 0
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    first = c.collect()
+    assert first.operations.project_count == 1
+
+    db_path.write_bytes(b"not a sqlite database")
+    second = c.collect()
+
+    assert second.operations == first.operations
+    assert "operations" in second.health.failed_sources
+    c.close()
+
+
+def test_collect_goal_state_from_state_meta(hermes_home: Path):
+    state_db = hermes_home / "state.db"
+    conn = sqlite3.connect(str(state_db))
+    create_state_db_tables(conn)
+    conn.executescript(
+        """
+        CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO state_meta VALUES (
+            'goal:sess-goal',
+            '{"goal":"Ship visibility","status":"active","turns_used":3,"max_turns":8,
+              "waiting_on_pid":4242,"waiting_reason":"tests running",
+              "subgoals":["finish docs"],"contract":{"outcome":"green tests"}}'
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.operations.goal_count == 1
+    assert state.operations.active_goal_count == 1
+    assert state.operations.waiting_goal_count == 1
+    assert state.operations.goals[0].session_id == "sess-goal"
+    assert state.operations.goals[0].has_contract is True
+    c.close()
+
+
+def test_collect_goal_state_preserves_last_good_on_corrupt_state_db(hermes_home: Path):
+    state_db = hermes_home / "state.db"
+    conn = sqlite3.connect(str(state_db))
+    create_state_db_tables(conn)
+    conn.executescript(
+        """
+        CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO state_meta VALUES (
+            'goal:sess-goal',
+            '{"goal":"Ship visibility","status":"active","contract":{"outcome":"green tests"}}'
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    first = c.collect()
+    assert first.operations.goal_count == 1
+
+    state_db.write_bytes(b"not a sqlite database")
+    second = c.collect()
+
+    assert second.operations == first.operations
+    assert "operations" in second.health.failed_sources
+    c.close()
+
+
+def test_collect_chronos_config_health(hermes_home: Path):
+    (hermes_home / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "cron": {
+                    "provider": "chronos",
+                    "chronos": {
+                        "portal_url": "https://portal.example",
+                        "callback_url": "https://agent.example",
+                        "expected_audience": "hermes-agent",
+                        "nas_jwks_url": "https://portal.example/jwks",
+                    },
+                }
+            }
+        )
+    )
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.cron.provider == "chronos"
+    assert state.cron.chronos_configured is True
+    c.close()
+
+
+def test_collect_curator_scheduler_and_consolidate_config(hermes_home: Path):
+    (hermes_home / "config.yaml").write_text(yaml.dump({"curator": {"consolidate": True}}))
+    (hermes_home / "skills" / ".curator_state").write_text(
+        json.dumps(
+            {
+                "paused": True,
+                "run_count": 7,
+                "last_run_at": "2026-07-10T10:00:00Z",
+                "last_report_path": "logs/curator/2026/run.md",
+            }
+        )
+    )
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.curator.scheduler_state_present is True
+    assert state.curator.scheduler_paused is True
+    assert state.curator.scheduler_run_count == 7
+    assert state.curator.consolidate_enabled is True
+    c.close()
+
+
+def test_collect_provider_auth_freshness(hermes_home: Path):
+    (hermes_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "credential_pool": {
+                    "vertex": [
+                        {
+                            "label": "Vertex",
+                            "auth_type": "oauth",
+                            "source": "adc",
+                            "last_status": "ok",
+                            "access_expires_at": "2026-07-11T12:00:00Z",
+                            "last_refresh": "2026-07-11T11:00:00Z",
+                        }
+                    ]
+                }
+            }
+        )
+    )
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.skills_memory.credential_pools[0].expires_at == "2026-07-11T12:00:00Z"
+    assert state.skills_memory.credential_pools[0].last_refresh == "2026-07-11T11:00:00Z"
+    c.close()
+
+
+def test_collect_memory_learning_summary(hermes_home: Path):
+    (hermes_home / "skills" / ".usage.json").write_text(
+        json.dumps(
+            {
+                "dev-lint": {"use_count": 4},
+                "research": {"use_count": 1, "pinned": True, "created_by": "agent"},
+                "profile-helper": {"use_count": 2, "profile_skill": True},
+            }
+        )
+    )
+    learned = hermes_home / "skills" / "learned"
+    learned.mkdir()
+    skill_dir = learned / "dev-lint"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: dev-lint\npinned: true\ncreated_by: agent\n---\nBody\n"
+    )
+    (hermes_home / "memories" / "MEMORY.md").write_text("## First\nBody\n## Second\nBody\n")
+    (hermes_home / "memories" / "USER.md").write_text("## Profile\nBody\n")
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.memory.skill_usage_count == 3
+    assert state.memory.learned_skill_count == 3
+    assert state.memory.pinned_skill_count == 2
+    assert state.memory.agent_created_skill_count == 2
+    assert state.memory.memory_card_count == 3
     c.close()
 
 

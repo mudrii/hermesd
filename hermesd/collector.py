@@ -35,9 +35,12 @@ from hermesd.models import (
     CronState,
     CuratorRun,
     DashboardState,
+    DiscoveredRepoSummary,
     GatewayState,
+    GoalSummary,
     HealthSummary,
     HookInfo,
+    KanbanBoardSummary,
     KanbanRunSummary,
     KanbanState,
     KanbanTaskLink,
@@ -54,6 +57,7 @@ from hermesd.models import (
     PRMonitorSummary,
     ProfilesState,
     ProfileSummary,
+    ProjectSummary,
     ProviderInfo,
     RuntimeStatus,
     SessionInfo,
@@ -65,6 +69,8 @@ from hermesd.models import (
     TokenWindowSummary,
     ToolGatewayRoute,
     ToolStats,
+    VerificationEventSummary,
+    VerificationRootSummary,
 )
 from hermesd.paths import HermesPaths
 from hermesd.theme import normalize_skin_name
@@ -510,6 +516,11 @@ class Collector:
                 else:
                     running = False
         version, behind = self._collect_hermes_version()
+        cfg = self._read_yaml_cached()
+        gateway_cfg = _as_dict(cfg.get("gateway"))
+        scale_cfg = _as_dict(cfg.get("scale_to_zero")) or _as_dict(gateway_cfg.get("scale_to_zero"))
+        active_agents = _coerce_int(data.get("active_agents"))
+        drain_request = self._read_json_cached(self._paths.shared_path(".drain_request.json"))
         return GatewayState(
             pid=pid,
             running=running,
@@ -517,8 +528,21 @@ class Collector:
             platforms=platforms,
             hermes_version=version,
             updates_behind=behind,
-            active_agents=_coerce_int(data.get("active_agents")),
+            active_agents=active_agents,
             restart_requested=bool(data.get("restart_requested")),
+            busy=running and active_agents > 0,
+            drainable=running and active_agents == 0,
+            drain_active=bool(drain_request),
+            drain_requested_at=str(drain_request.get("requested_at") or ""),
+            drain_principal=str(
+                drain_request.get("principal") or drain_request.get("requested_by") or ""
+            ),
+            drain_suppress_notification=bool(drain_request.get("suppress_notification")),
+            served_profiles=[
+                str(profile) for profile in _as_list(data.get("served_profiles")) if profile
+            ],
+            scale_to_zero_idle_timeout_minutes=_coerce_int(scale_cfg.get("idle_timeout_minutes")),
+            scale_to_zero_relay_only=_scale_to_zero_relay_only(scale_cfg, platforms),
         )
 
     def _find_gateway_launchd_pid(self) -> int | None:
@@ -750,6 +774,8 @@ class Collector:
         kanban_cfg = _as_dict(cfg.get("kanban"))
         gateway_cfg = _as_dict(cfg.get("gateway"))
         auxiliary_cfg = _as_dict(cfg.get("auxiliary"))
+        moa_cfg = _as_dict(cfg.get("moa"))
+        moa_summary = _moa_config_summary(moa_cfg)
         personality = agent_cfg.get("active_personality", "")
         if not personality:
             personalities = _as_dict(agent_cfg.get("personalities"))
@@ -811,6 +837,13 @@ class Collector:
                 gateway_cfg.get("trust_recent_files_seconds")
             ),
             auxiliary_slots=sorted(str(name) for name in auxiliary_cfg if name),
+            moa_default_preset=moa_summary["default_preset"],
+            moa_active_preset=moa_summary["active_preset"],
+            moa_preset_count=_coerce_int(moa_summary["preset_count"]),
+            moa_reference_model_count=_coerce_int(moa_summary["reference_model_count"]),
+            moa_aggregator_label=moa_summary["aggregator_label"],
+            moa_save_traces=bool(moa_cfg.get("save_traces")),
+            moa_trace_dir=str(moa_cfg.get("trace_dir") or ""),
         )
 
     def _collect_tool_gateway_routes(self, cfg: dict[str, Any]) -> list[ToolGatewayRoute]:
@@ -889,13 +922,24 @@ class Collector:
             error_count=error_count,
             max_parallel_jobs=_coerce_int(cron_cfg.get("max_parallel_jobs")),
             wrap_response=bool(cron_cfg.get("wrap_response")),
+            provider=str(cron_cfg.get("provider") or "builtin"),
+            chronos_configured=_chronos_configured(_as_dict(cron_cfg.get("chronos"))),
+            chronos_portal_configured=bool(_as_dict(cron_cfg.get("chronos")).get("portal_url")),
+            chronos_callback_configured=bool(_as_dict(cron_cfg.get("chronos")).get("callback_url")),
+            chronos_audience_configured=bool(
+                _as_dict(cron_cfg.get("chronos")).get("expected_audience")
+            ),
+            chronos_jwks_configured=bool(_as_dict(cron_cfg.get("chronos")).get("nas_jwks_url")),
+            suggestion_count=_cron_suggestion_count(self._paths.shared_path("cron")),
             jobs=jobs,
         )
 
     def _collect_channels(self, gateway: GatewayState) -> ChannelDirectoryState:
         directory = self._read_json_cached(self._paths.shared_path("channel_directory.json"))
+        aliases = _as_dict(self._read_json_cached(self._paths.shared_path("channel_aliases.json")))
         platforms = _as_dict(directory.get("platforms"))
         gateway_states = {platform.name: platform.state for platform in gateway.platforms}
+        missing_platforms = sorted(name for name in gateway_states if name not in platforms)
         platform_infos: list[ChannelPlatformInfo] = []
         for name, raw_entries in sorted(platforms.items()):
             entries = raw_entries if isinstance(raw_entries, list) else []
@@ -916,11 +960,27 @@ class Collector:
                     states=states,
                     connected=gateway_state == "connected",
                     capabilities=_channel_capabilities(str(name)),
+                    family_label=_platform_family_label(str(name)),
+                )
+            )
+        for name in missing_platforms:
+            platform_infos.append(
+                ChannelPlatformInfo(
+                    name=name,
+                    states=[gateway_states[name]] if gateway_states[name] else [],
+                    connected=gateway_states[name] == "connected",
+                    capabilities=_channel_capabilities(name),
+                    family_label=_platform_family_label(name),
+                    missing_from_directory=True,
                 )
             )
         return ChannelDirectoryState(
             updated_at=str(directory.get("updated_at") or ""),
             platform_count=len(platform_infos),
+            alias_count=sum(len(_as_dict(entries)) for entries in aliases.values()),
+            alias_platform_count=sum(1 for entries in aliases.values() if _as_dict(entries)),
+            stale_alias_count=_stale_alias_count(aliases),
+            missing_directory_platforms=missing_platforms,
             platforms=platform_infos,
         )
 
@@ -929,8 +989,10 @@ class Collector:
         kanban_cfg = _as_dict(cfg.get("kanban"))
         base_state = KanbanState(
             db_present=self._paths.shared_path("kanban.db").exists(),
+            current_board=self._read_current_kanban_board(),
             dispatch_in_gateway=bool(kanban_cfg.get("dispatch_in_gateway")),
             dispatch_interval_seconds=_coerce_int(kanban_cfg.get("dispatch_interval_seconds")),
+            claim_ttl_seconds=_kanban_claim_ttl_seconds(kanban_cfg),
             auto_decompose=bool(kanban_cfg.get("auto_decompose")),
             failure_limit=_coerce_int(kanban_cfg.get("failure_limit")),
         )
@@ -938,12 +1000,74 @@ class Collector:
         if not db_path.exists():
             if self._last_state is not None and self._last_state.kanban.db_present:
                 raise RuntimeError("kanban.db disappeared")
-            return base_state
+            return self._with_kanban_boards(base_state)
         if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
             if self._last_state is not None and self._last_state.kanban.db_present:
                 raise RuntimeError("kanban.db replaced by unsafe path")
-            return base_state
-        return _read_kanban_state(db_path, base_state)
+            return self._with_kanban_boards(base_state)
+        return self._with_kanban_boards(_read_kanban_state(db_path, base_state))
+
+    def _read_current_kanban_board(self) -> str:
+        path = self._paths.shared_path("kanban", "current")
+        if path.is_symlink() or not _path_resolves_under(path, self._paths.root_home):
+            if self._last_state is not None and self._last_state.kanban.current_board:
+                raise RuntimeError("kanban current board replaced by unsafe path")
+            return ""
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError:
+            if self._last_state is not None and self._last_state.kanban.current_board:
+                raise
+        return ""
+
+    def _with_kanban_boards(self, state: KanbanState) -> KanbanState:
+        boards: list[KanbanBoardSummary] = []
+        root_db = self._paths.shared_path("kanban.db")
+        if (
+            root_db.exists()
+            and not root_db.is_symlink()
+            and _path_resolves_under(root_db, self._paths.root_home)
+        ):
+            boards.append(
+                KanbanBoardSummary(
+                    slug="root",
+                    current=state.current_board in {"", "root", "default"},
+                    task_count=state.task_count,
+                    run_count=state.run_count,
+                    problem_count=sum(
+                        state.status_counts.get(status, 0)
+                        for status in ("blocked", "failed", "error")
+                    ),
+                    stale_claim_count=state.stale_claim_count,
+                )
+            )
+
+        boards_dir = self._paths.shared_path("kanban", "boards")
+        if (
+            boards_dir.exists()
+            and boards_dir.is_dir()
+            and not boards_dir.is_symlink()
+            and _path_resolves_under(boards_dir, self._paths.root_home)
+        ):
+            for board_dir in sorted(boards_dir.iterdir()):
+                db_path = board_dir / "kanban.db"
+                if (
+                    not board_dir.is_dir()
+                    or board_dir.is_symlink()
+                    or not db_path.exists()
+                    or db_path.is_symlink()
+                    or not _path_resolves_under(db_path, self._paths.root_home)
+                ):
+                    continue
+                summary = _read_kanban_board_summary(
+                    db_path,
+                    slug=board_dir.name,
+                    current=board_dir.name == state.current_board,
+                    claim_ttl_seconds=state.claim_ttl_seconds,
+                )
+                if summary is not None:
+                    boards.append(summary)
+        return state.model_copy(update={"board_count": len(boards), "boards": boards})
 
     def _collect_operations(
         self,
@@ -968,7 +1092,11 @@ class Collector:
             model_caches=self._collect_model_caches(),
             pr_monitors=self._collect_pr_monitors(),
         )
-        return self._with_response_store(operations)
+        operations = self._with_response_store(operations)
+        operations = self._with_verification_evidence(operations)
+        operations = self._with_goals(operations)
+        operations = self._with_moa_traces(operations)
+        return self._with_projects(operations)
 
     def _with_response_store(self, operations: OperationsState) -> OperationsState:
         db_path = self._paths.shared_path("response_store.db")
@@ -991,14 +1119,104 @@ class Collector:
                 }
             )
 
+    def _with_verification_evidence(self, operations: OperationsState) -> OperationsState:
+        db_path = self._paths.profile_path("verification_evidence.db")
+        if not db_path.exists():
+            if self._last_state is not None and self._last_state.operations.verification_db_present:
+                raise RuntimeError("verification_evidence.db disappeared")
+            return operations
+        if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
+            if self._last_state is not None and self._last_state.operations.verification_db_present:
+                raise RuntimeError("verification_evidence.db replaced by unsafe path")
+            return operations
+        with _connect_readonly_sqlite(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+            return _read_verification_evidence(conn, operations)
+
+    def _with_moa_traces(self, operations: OperationsState) -> OperationsState:
+        cfg = self._read_yaml_cached()
+        moa_cfg = _as_dict(cfg.get("moa"))
+        trace_dir_value = str(moa_cfg.get("trace_dir") or "")
+        trace_dir = (
+            Path(trace_dir_value).expanduser()
+            if trace_dir_value
+            else self._paths.shared_path("moa-traces")
+        )
+        if not trace_dir.is_absolute():
+            trace_dir = self._paths.shared_path(trace_dir_value)
+        if (
+            trace_dir.is_symlink()
+            or not _path_resolves_under(trace_dir, self._paths.root_home)
+            or not trace_dir.is_dir()
+        ):
+            if self._last_state is not None and self._last_state.operations.moa_trace_count:
+                raise RuntimeError("MoA trace directory disappeared or became unsafe")
+            return operations
+        traces = [
+            path
+            for path in trace_dir.glob("*.jsonl")
+            if path.is_file()
+            and not path.is_symlink()
+            and _path_resolves_under(path, self._paths.root_home)
+        ]
+        if not traces:
+            return operations
+        newest = max(traces, key=lambda path: path.stat().st_mtime)
+        latest_record = _moa_latest_record_summary(newest, self._log_tail_bytes)
+        return operations.model_copy(
+            update={
+                "moa_trace_count": len(traces),
+                "moa_trace_size_bytes": sum(_file_size(path) for path in traces),
+                "moa_trace_newest_session_id": newest.stem,
+                "moa_trace_newest_mtime": _mtime(newest),
+                "moa_trace_latest_record_summary": latest_record[0],
+                "moa_trace_latest_record_keys": latest_record[1],
+            }
+        )
+
+    def _with_projects(self, operations: OperationsState) -> OperationsState:
+        db_path = self._paths.profile_path("projects.db")
+        if not db_path.exists():
+            if self._last_state is not None and self._last_state.operations.projects_db_present:
+                raise RuntimeError("projects.db disappeared")
+            return operations
+        if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
+            if self._last_state is not None and self._last_state.operations.projects_db_present:
+                raise RuntimeError("projects.db replaced by unsafe path")
+            return operations
+        with _connect_readonly_sqlite(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+            return _read_projects_state(conn, operations, self._paths)
+
+    def _with_goals(self, operations: OperationsState) -> OperationsState:
+        db_path = self._paths.profile_path("state.db")
+        if (
+            not db_path.exists()
+            or db_path.is_symlink()
+            or not _path_resolves_under(db_path, self._paths.root_home)
+        ):
+            if self._last_state is not None and self._last_state.operations.goal_count:
+                raise RuntimeError("state.db goal state disappeared or became unsafe")
+            return operations
+        with _connect_readonly_sqlite(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            return _read_goal_state(conn, operations)
+
     def _collect_curator(self) -> CuratorRun:
+        base_run = _curator_with_scheduler_state(
+            CuratorRun(),
+            self._read_json_cached(self._paths.profile_path("skills", ".curator_state")),
+            _as_dict(self._read_yaml_cached().get("curator")),
+        )
         curator_dir = self._paths.shared_path("logs", "curator")
         if (
             curator_dir.is_symlink()
             or not _path_resolves_under(curator_dir, self._paths.root_home)
             or not curator_dir.is_dir()
         ):
-            return CuratorRun()
+            return base_run
         # Skip symlinked run dirs and any path that escapes the Hermes home,
         # matching the symlink hardening on the cron/checkpoint readers.
         run_dirs = sorted(
@@ -1007,7 +1225,7 @@ class Collector:
             if p.is_dir() and not p.is_symlink() and _path_resolves_under(p, self._paths.root_home)
         )
         if not run_dirs:
-            return CuratorRun()
+            return base_run
         data: JsonMapping = {}
         newest: Path | None = None
         for candidate in reversed(run_dirs):
@@ -1019,7 +1237,7 @@ class Collector:
                 newest = candidate
                 break
         if newest is None:
-            return CuratorRun()
+            return base_run
         counts = _as_dict(data.get("counts"))
         tool_call_counts = _int_mapping(data.get("tool_call_counts"))
         state_transitions = [
@@ -1027,29 +1245,33 @@ class Collector:
             for entry in _as_list(data.get("state_transitions"))
             if isinstance(entry, dict)
         ]
-        return CuratorRun(
-            run_present=True,
-            stamp=newest.name,
-            started_at=str(data.get("started_at") or ""),
-            duration_seconds=_coerce_float(data.get("duration_seconds")),
-            model=str(data.get("model") or ""),
-            provider=str(data.get("provider") or ""),
-            count_before=_coerce_int(counts.get("before")),
-            count_after=_coerce_int(counts.get("after")),
-            count_delta=_coerce_int(counts.get("delta")),
-            archived_count=_coerce_int(counts.get("archived_this_run"))
-            or _len_if_sized(data.get("archived")),
-            added_count=_coerce_int(counts.get("added_this_run"))
-            or _len_if_sized(data.get("added")),
-            pruned_count=_coerce_int(counts.get("pruned_this_run"))
-            or _len_if_sized(data.get("pruned")),
-            consolidated_count=_coerce_int(counts.get("consolidated_this_run"))
-            or _len_if_sized(data.get("consolidated")),
-            tool_calls_total=_coerce_int(counts.get("tool_calls_total")),
-            tool_call_counts=tool_call_counts,
-            state_transitions=state_transitions,
-            llm_summary=str(data.get("llm_summary") or ""),
-            llm_error=str(data.get("llm_error") or ""),
+        return _curator_with_scheduler_state(
+            CuratorRun(
+                run_present=True,
+                stamp=newest.name,
+                started_at=str(data.get("started_at") or ""),
+                duration_seconds=_coerce_float(data.get("duration_seconds")),
+                model=str(data.get("model") or ""),
+                provider=str(data.get("provider") or ""),
+                count_before=_coerce_int(counts.get("before")),
+                count_after=_coerce_int(counts.get("after")),
+                count_delta=_coerce_int(counts.get("delta")),
+                archived_count=_coerce_int(counts.get("archived_this_run"))
+                or _len_if_sized(data.get("archived")),
+                added_count=_coerce_int(counts.get("added_this_run"))
+                or _len_if_sized(data.get("added")),
+                pruned_count=_coerce_int(counts.get("pruned_this_run"))
+                or _len_if_sized(data.get("pruned")),
+                consolidated_count=_coerce_int(counts.get("consolidated_this_run"))
+                or _len_if_sized(data.get("consolidated")),
+                tool_calls_total=_coerce_int(counts.get("tool_calls_total")),
+                tool_call_counts=tool_call_counts,
+                state_transitions=state_transitions,
+                llm_summary=str(data.get("llm_summary") or ""),
+                llm_error=str(data.get("llm_error") or ""),
+            ),
+            self._read_json_cached(self._paths.profile_path("skills", ".curator_state")),
+            _as_dict(self._read_yaml_cached().get("curator")),
         )
 
     def _collect_model_caches(self) -> list[ModelCacheSummary]:
@@ -1170,6 +1392,7 @@ class Collector:
             if memories_dir.is_dir()
             else []
         )
+        learning_summary = _learning_summary(self._paths.profile_path("skills"))
 
         return MemoryOverview(
             provider=str(memory_cfg.get("provider") or ""),
@@ -1179,6 +1402,12 @@ class Collector:
             soul_size_bytes=_file_size(soul_path),
             soul_excerpt=_read_soul_excerpt(soul_path),
             memory_files=memory_files,
+            skill_usage_count=learning_summary["used"],
+            learned_skill_count=learning_summary["learned"],
+            pinned_skill_count=learning_summary["pinned"],
+            agent_created_skill_count=learning_summary["agent"],
+            memory_card_count=_memory_card_count(memories_dir / "MEMORY.md")
+            + _memory_card_count(memories_dir / "USER.md"),
         )
 
     def _collect_hooks(self) -> list[HookInfo]:
@@ -1358,6 +1587,13 @@ class Collector:
                     priority=_coerce_int(entry.get("priority")),
                     token_present=_has_secret_material(entry)
                     or _has_secret_material(provider_entry),
+                    expires_at=_credential_expiry(entry, provider_entry),
+                    last_refresh=str(
+                        entry.get("last_refresh")
+                        or entry.get("refreshed_at")
+                        or provider_entry.get("last_refresh")
+                        or ""
+                    ),
                 )
             )
         return entries
@@ -1815,6 +2051,94 @@ def _read_soul_excerpt(path: Path) -> str:
     return ""
 
 
+def _learning_summary(skills_dir: Path) -> dict[str, int]:
+    usage = _skill_usage_metadata(skills_dir / ".usage.json")
+    learned = set(_learned_skill_names(skills_dir))
+    pinned = set()
+    agent_created = set()
+
+    for name, metadata in usage.items():
+        if _usage_indicates_learned(metadata):
+            learned.add(name)
+        if bool(metadata.get("pinned")):
+            pinned.add(name)
+        if str(metadata.get("created_by") or metadata.get("source") or "") == "agent":
+            agent_created.add(name)
+
+    learned_dir = skills_dir / "learned"
+    if learned_dir.is_dir() and not learned_dir.is_symlink():
+        for skill_dir in sorted(learned_dir.iterdir()):
+            if not skill_dir.is_dir() or skill_dir.is_symlink():
+                continue
+            name = skill_dir.name
+            metadata = _skill_frontmatter(skill_dir / "SKILL.md")
+            learned.add(name)
+            if bool(metadata.get("pinned")):
+                pinned.add(name)
+            if str(metadata.get("created_by") or metadata.get("source") or "") == "agent":
+                agent_created.add(name)
+
+    return {
+        "used": len(usage),
+        "learned": len(learned),
+        "pinned": len(pinned),
+        "agent": len(agent_created),
+    }
+
+
+def _skill_usage_metadata(path: Path) -> dict[str, dict[str, Any]]:
+    if path.is_symlink() or not path.is_file():
+        return {}
+    with contextlib.suppress(OSError, json.JSONDecodeError):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {str(name): _as_dict(raw) for name, raw in data.items()}
+    return {}
+
+
+def _usage_indicates_learned(metadata: dict[str, Any]) -> bool:
+    return bool(
+        metadata.get("learned")
+        or metadata.get("agent_created")
+        or metadata.get("profile_skill")
+        or metadata.get("pinned")
+        or str(metadata.get("created_by") or metadata.get("source") or "") == "agent"
+    )
+
+
+def _learned_skill_names(skills_dir: Path) -> list[str]:
+    learned_dir = skills_dir / "learned"
+    if not learned_dir.is_dir() or learned_dir.is_symlink():
+        return []
+    return [
+        skill_dir.name
+        for skill_dir in sorted(learned_dir.iterdir())
+        if skill_dir.is_dir() and not skill_dir.is_symlink()
+    ]
+
+
+def _skill_frontmatter(path: Path) -> dict[str, Any]:
+    with contextlib.suppress(OSError, yaml.YAMLError):
+        lines = path.read_text(errors="replace").splitlines()
+        if not lines or lines[0].strip() != "---":
+            return {}
+        frontmatter: list[str] = []
+        for line in lines[1:]:
+            if line.strip() == "---":
+                data = yaml.safe_load("\n".join(frontmatter)) or {}
+                return data if isinstance(data, dict) else {}
+            frontmatter.append(line)
+    return {}
+
+
+def _memory_card_count(path: Path) -> int:
+    with contextlib.suppress(OSError):
+        return sum(
+            1 for line in path.read_text(errors="replace").splitlines() if line.startswith("## ")
+        )
+    return 0
+
+
 def _read_tail_text(path: Path, max_bytes: int) -> str:
     """Read at most the last max_bytes of path, decoded with replacement."""
     with path.open("rb") as handle:
@@ -1854,6 +2178,117 @@ def _provider_model_label(cfg: dict[str, Any]) -> str:
     if provider and model:
         return f"{provider}/{model}"
     return provider or model
+
+
+def _moa_config_summary(cfg: dict[str, Any]) -> dict[str, Any]:
+    presets = _as_dict(cfg.get("presets"))
+    default_preset = str(cfg.get("default_preset") or "")
+    if not default_preset and presets:
+        default_preset = next(iter(presets))
+    active_preset = str(cfg.get("active_preset") or "")
+    selected_preset = _as_dict(presets.get(active_preset) or presets.get(default_preset))
+    if not selected_preset and not presets:
+        selected_preset = cfg
+    references = [
+        item for item in _as_list(selected_preset.get("reference_models")) if isinstance(item, dict)
+    ]
+    return {
+        "default_preset": default_preset,
+        "active_preset": active_preset,
+        "preset_count": len(presets),
+        "reference_model_count": len(references),
+        "aggregator_label": _provider_model_label(_as_dict(selected_preset.get("aggregator"))),
+    }
+
+
+def _scale_to_zero_relay_only(
+    cfg: dict[str, Any],
+    platforms: list[PlatformStatus],
+) -> bool:
+    if "relay_only" in cfg or "relay_only_when_idle" in cfg:
+        return bool(cfg.get("relay_only") or cfg.get("relay_only_when_idle"))
+    connected = [platform.name for platform in platforms if platform.state == "connected"]
+    return not connected or all(_platform_is_relay_only(name) for name in connected)
+
+
+def _platform_is_relay_only(name: str) -> bool:
+    normalized = name.lower().replace("-", "_")
+    return normalized in {"raft", "photon", "imessage"}
+
+
+def _kanban_claim_ttl_seconds(cfg: dict[str, Any]) -> int:
+    for key in ("claim_ttl_seconds", "worker_claim_ttl_seconds", "claim_timeout_seconds"):
+        value = _coerce_int(cfg.get(key))
+        if value > 0:
+            return value
+    return 300
+
+
+def _moa_latest_record_summary(path: Path, max_bytes: int) -> tuple[str, list[str]]:
+    with contextlib.suppress(OSError):
+        for line in reversed(_read_tail_text(path, max_bytes).splitlines()):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            with contextlib.suppress(json.JSONDecodeError):
+                data = json.loads(stripped)
+                if isinstance(data, dict):
+                    keys = sorted(str(key) for key in data)[:8]
+                    labels = [
+                        str(data.get(field) or "")
+                        for field in ("event", "type", "status", "phase", "preset")
+                        if data.get(field)
+                    ]
+                    return (" ".join(labels[:3]) or "json record", keys)
+    return "", []
+
+
+def _chronos_configured(cfg: dict[str, Any]) -> bool:
+    return bool(
+        cfg.get("portal_url")
+        and cfg.get("callback_url")
+        and cfg.get("expected_audience")
+        and cfg.get("nas_jwks_url")
+    )
+
+
+def _cron_suggestion_count(cron_dir: Path) -> int:
+    candidates = [
+        cron_dir / "suggestions.json",
+        cron_dir / "cron_suggestions.json",
+        cron_dir / "suggestions",
+    ]
+    total = 0
+    for path in candidates:
+        if path.is_symlink() or not _path_resolves_under(path, cron_dir.parent):
+            continue
+        if path.is_file():
+            with contextlib.suppress(OSError, json.JSONDecodeError):
+                data = json.loads(path.read_text(encoding="utf-8"))
+                total += _suggestion_count_from_data(data)
+        elif path.is_dir():
+            with contextlib.suppress(OSError):
+                total += sum(
+                    1
+                    for child in path.iterdir()
+                    if child.is_file()
+                    and not child.is_symlink()
+                    and child.suffix.lower() in {".json", ".yaml", ".yml", ".md"}
+                    and _path_resolves_under(child, cron_dir.parent)
+                )
+    return total
+
+
+def _suggestion_count_from_data(data: object) -> int:
+    if isinstance(data, list):
+        return len(data)
+    if isinstance(data, dict):
+        for key in ("suggestions", "items", "jobs"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return len(value)
+        return len(data)
+    return 0
 
 
 def _provider_routing_summary(cfg: dict[str, Any]) -> str:
@@ -2028,6 +2463,10 @@ def _read_kanban_state(db_path: Path, base_state: KanbanState) -> KanbanState:
                 "comment_count": _table_count(conn, "task_comments"),
                 "link_count": _table_count_or_zero(conn, "task_links"),
                 "attachment_count": _table_count_or_zero(conn, "task_attachments"),
+                "stale_claim_count": _stale_claim_count_from_tasks(
+                    conn,
+                    base_state.claim_ttl_seconds,
+                ),
                 "status_counts": status_counts,
                 "assignee_counts": assignee_counts,
                 "active_tasks": [_kanban_task_from_row(row) for row in active_rows],
@@ -2037,6 +2476,298 @@ def _read_kanban_state(db_path: Path, base_state: KanbanState) -> KanbanState:
                 "recent_runs": [_kanban_run_from_row(row) for row in run_rows],
             }
         )
+
+
+def _read_kanban_board_summary(
+    db_path: Path,
+    *,
+    slug: str,
+    current: bool,
+    claim_ttl_seconds: int,
+) -> KanbanBoardSummary | None:
+    with _connect_readonly_sqlite(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        return KanbanBoardSummary(
+            slug=slug,
+            current=current,
+            task_count=_table_count(conn, "tasks"),
+            run_count=_table_count_or_zero(conn, "task_runs"),
+            problem_count=_count_rows_or_zero(
+                conn,
+                "SELECT COUNT(*) FROM tasks WHERE status IN ('blocked', 'failed', 'error')",
+            ),
+            stale_claim_count=_stale_claim_count_from_tasks(conn, claim_ttl_seconds),
+            block_kind_counts=(
+                _count_by(
+                    conn,
+                    "SELECT block_kind, COUNT(*) FROM tasks "
+                    "WHERE COALESCE(block_kind, '') != '' GROUP BY block_kind",
+                )
+                if _column_exists(conn, "tasks", "block_kind")
+                else {}
+            ),
+        )
+
+
+def _read_verification_evidence(
+    conn: sqlite3.Connection,
+    operations: OperationsState,
+) -> OperationsState:
+    return operations.model_copy(
+        update={
+            "verification_db_present": True,
+            "verification_event_count": _table_count(conn, "verification_events"),
+            "verification_failed_count": _verification_failed_count(conn),
+            "verification_state_count": _table_count_or_zero(conn, "verification_state"),
+            "verification_latest_events": _read_verification_events(conn),
+            "verification_roots": _read_verification_roots(conn),
+        }
+    )
+
+
+def _read_goal_state(conn: sqlite3.Connection, operations: OperationsState) -> OperationsState:
+    goals = _read_goal_summaries(conn)
+    return operations.model_copy(
+        update={
+            "goal_count": len(goals),
+            "active_goal_count": sum(1 for goal in goals if goal.status == "active"),
+            "waiting_goal_count": sum(
+                1 for goal in goals if goal.waiting_on_pid or goal.waiting_on_session
+            ),
+            "goals": goals,
+        }
+    )
+
+
+def _read_goal_summaries(conn: sqlite3.Connection) -> list[GoalSummary]:
+    if not _table_exists(conn, "state_meta"):
+        return []
+    rows = _query_rows(
+        conn,
+        "SELECT key, value FROM state_meta WHERE key LIKE 'goal:%' ORDER BY key LIMIT 8",
+    )
+    goals: list[GoalSummary] = []
+    for row in rows:
+        raw_value = str(row.get("value") or "")
+        with contextlib.suppress(json.JSONDecodeError):
+            data = json.loads(raw_value)
+            if isinstance(data, dict):
+                goals.append(_goal_summary_from_row(str(row.get("key") or ""), data))
+    return goals
+
+
+def _goal_summary_from_row(key: str, data: dict[str, Any]) -> GoalSummary:
+    contract = _as_dict(data.get("contract"))
+    return GoalSummary(
+        session_id=key.removeprefix("goal:"),
+        goal=str(data.get("goal") or ""),
+        status=str(data.get("status") or ""),
+        turns_used=_coerce_int(data.get("turns_used")),
+        max_turns=_coerce_int(data.get("max_turns")),
+        has_contract=any(value not in (None, "", [], {}) for value in contract.values()),
+        waiting_on_pid=_coerce_int(data.get("waiting_on_pid")),
+        waiting_on_session=str(data.get("waiting_on_session") or ""),
+        waiting_reason=str(data.get("waiting_reason") or ""),
+        subgoal_count=len(_as_list(data.get("subgoals"))),
+    )
+
+
+def _read_projects_state(
+    conn: sqlite3.Connection,
+    operations: OperationsState,
+    paths: HermesPaths,
+) -> OperationsState:
+    return operations.model_copy(
+        update={
+            "projects_db_present": True,
+            "project_count": _table_count(conn, "projects"),
+            "project_archived_count": _count_rows_or_zero(
+                conn,
+                "SELECT COUNT(*) FROM projects WHERE archived != 0",
+            ),
+            "project_folder_count": _table_count_or_zero(conn, "project_folders"),
+            "discovered_repo_count": _table_count_or_zero(conn, "discovered_repos"),
+            "project_missing_primary_path_count": _count_rows_or_zero(
+                conn,
+                "SELECT COUNT(*) FROM projects WHERE COALESCE(primary_path, '') = ''",
+            ),
+            "projects": _read_project_summaries(conn, operations.verification_roots, paths),
+            "discovered_repos": _read_discovered_repos(conn),
+        }
+    )
+
+
+def _curator_with_scheduler_state(
+    run: CuratorRun,
+    state: dict[str, Any],
+    curator_cfg: dict[str, Any],
+) -> CuratorRun:
+    if not state and not curator_cfg:
+        return run
+    return run.model_copy(
+        update={
+            "scheduler_state_present": bool(state),
+            "scheduler_paused": bool(state.get("paused")),
+            "scheduler_run_count": _coerce_int(state.get("run_count")),
+            "scheduler_last_run_at": str(state.get("last_run_at") or ""),
+            "scheduler_last_report_path": str(state.get("last_report_path") or ""),
+            "consolidate_enabled": bool(curator_cfg.get("consolidate")),
+        }
+    )
+
+
+def _read_project_summaries(
+    conn: sqlite3.Connection,
+    verification_roots: list[VerificationRootSummary],
+    paths: HermesPaths,
+) -> list[ProjectSummary]:
+    with contextlib.suppress(sqlite3.Error):
+        rows = _query_rows(
+            conn,
+            "SELECT slug, name, board_slug, primary_path, archived "
+            "FROM projects ORDER BY archived ASC, created_at DESC, slug ASC LIMIT 8",
+        )
+        return [
+            ProjectSummary(
+                slug=str(row.get("slug") or ""),
+                name=str(row.get("name") or ""),
+                board_slug=str(row.get("board_slug") or ""),
+                primary_path=str(row.get("primary_path") or ""),
+                archived=bool(row.get("archived")),
+                verification_root_count=_project_verification_root_count(
+                    str(row.get("primary_path") or ""),
+                    verification_roots,
+                ),
+                kanban_board_present=_kanban_board_present(
+                    paths,
+                    str(row.get("board_slug") or ""),
+                ),
+            )
+            for row in rows
+        ]
+    return []
+
+
+def _read_discovered_repos(conn: sqlite3.Connection) -> list[DiscoveredRepoSummary]:
+    if not _table_exists(conn, "discovered_repos"):
+        return []
+    with contextlib.suppress(sqlite3.Error):
+        rows = _query_rows(
+            conn,
+            "SELECT root, label, last_seen FROM discovered_repos "
+            "ORDER BY COALESCE(last_seen, '') DESC, root ASC LIMIT 5",
+        )
+        return [
+            DiscoveredRepoSummary(
+                root=str(row.get("root") or ""),
+                label=str(row.get("label") or ""),
+                last_seen=str(row.get("last_seen") or ""),
+            )
+            for row in rows
+        ]
+    return []
+
+
+def _project_verification_root_count(
+    primary_path: str,
+    verification_roots: list[VerificationRootSummary],
+) -> int:
+    if not primary_path:
+        return 0
+    return sum(
+        1 for root in verification_roots if _same_path_or_descendant(root.root, primary_path)
+    )
+
+
+def _kanban_board_present(paths: HermesPaths, board_slug: str) -> bool:
+    if not board_slug:
+        return False
+    if board_slug in {"root", "default"}:
+        path = paths.shared_path("kanban.db")
+        return (
+            path.exists() and not path.is_symlink() and _path_resolves_under(path, paths.root_home)
+        )
+    path = paths.shared_path("kanban", "boards", board_slug, "kanban.db")
+    return path.exists() and not path.is_symlink() and _path_resolves_under(path, paths.root_home)
+
+
+def _same_path_or_descendant(candidate: str, parent: str) -> bool:
+    candidate_path = candidate.rstrip(os.sep)
+    parent_path = parent.rstrip(os.sep)
+    if not candidate_path or not parent_path:
+        return False
+    return candidate_path == parent_path or candidate_path.startswith(parent_path + os.sep)
+
+
+def _read_verification_events(conn: sqlite3.Connection) -> list[VerificationEventSummary]:
+    rows = _query_rows(
+        conn,
+        "SELECT id, created_at, session_id, root, command, canonical_command, "
+        "kind, scope, status, exit_code, output_summary "
+        "FROM verification_events ORDER BY id DESC LIMIT 8",
+    )
+    return [
+        VerificationEventSummary(
+            event_id=_coerce_int(row.get("id")),
+            created_at=str(row.get("created_at") or ""),
+            session_id=str(row.get("session_id") or ""),
+            root=str(row.get("root") or ""),
+            command=str(row.get("command") or ""),
+            canonical_command=str(row.get("canonical_command") or ""),
+            kind=str(row.get("kind") or ""),
+            scope=str(row.get("scope") or ""),
+            status=str(row.get("status") or ""),
+            exit_code=_coerce_int(row.get("exit_code")),
+            output_summary=str(row.get("output_summary") or ""),
+        )
+        for row in rows
+    ]
+
+
+def _read_verification_roots(conn: sqlite3.Connection) -> list[VerificationRootSummary]:
+    if not _table_exists(conn, "verification_state"):
+        return []
+    rows = _query_rows(
+        conn,
+        "SELECT session_id, root, last_event_id, last_edit_at, changed_paths_json "
+        "FROM verification_state "
+        "ORDER BY COALESCE(last_edit_at, '') DESC, COALESCE(last_event_id, 0) DESC "
+        "LIMIT 8",
+    )
+    return [
+        VerificationRootSummary(
+            session_id=str(row.get("session_id") or ""),
+            root=str(row.get("root") or ""),
+            last_event_id=_coerce_int(row.get("last_event_id")),
+            last_edit_at=str(row.get("last_edit_at") or ""),
+            changed_path_count=_json_list_count(row.get("changed_paths_json")),
+        )
+        for row in rows
+    ]
+
+
+def _verification_failed_count(conn: sqlite3.Connection) -> int:
+    cur = conn.execute("SELECT COUNT(*) FROM verification_events WHERE status != 'passed'")
+    row = cur.fetchone()
+    return int(row[0] or 0) if row is not None else 0
+
+
+def _count_rows_or_zero(conn: sqlite3.Connection, sql: str) -> int:
+    with contextlib.suppress(sqlite3.Error):
+        cur = conn.execute(sql)
+        row = cur.fetchone()
+        return int(row[0] or 0) if row is not None else 0
+    return 0
+
+
+def _json_list_count(value: object) -> int:
+    if not isinstance(value, str) or not value:
+        return 0
+    with contextlib.suppress(json.JSONDecodeError):
+        decoded = json.loads(value)
+        if isinstance(decoded, list):
+            return len(decoded)
+    return 0
 
 
 def _context_limit_for(context_lengths: Mapping[str, int], model: str, base_url: str) -> int:
@@ -2119,6 +2850,40 @@ def _table_count_or_zero(conn: sqlite3.Connection, table_name: str) -> int:
     with contextlib.suppress(sqlite3.Error):
         return _table_count(conn, table_name)
     return 0
+
+
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    cur = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+        (table_name,),
+    )
+    return cur.fetchone() is not None
+
+
+def _column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
+    with contextlib.suppress(sqlite3.Error):
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        return any(str(row[1] or "") == column_name for row in rows)
+    return False
+
+
+def _stale_claim_count_from_tasks(conn: sqlite3.Connection, claim_ttl_seconds: int) -> int:
+    if not _table_exists(conn, "tasks"):
+        return 0
+    now = int(time.time())
+    ttl = claim_ttl_seconds if claim_ttl_seconds > 0 else 300
+    conditions = []
+    if _column_exists(conn, "tasks", "claim_expires"):
+        conditions.append(f"COALESCE(claim_expires, 0) > 0 AND claim_expires < {now}")
+    if _column_exists(conn, "tasks", "last_heartbeat_at"):
+        conditions.append(f"COALESCE(last_heartbeat_at, 0) > 0 AND last_heartbeat_at < {now - ttl}")
+    if not conditions:
+        return 0
+    return _count_rows_or_zero(
+        conn,
+        "SELECT COUNT(*) FROM tasks WHERE "
+        + " OR ".join(f"({condition})" for condition in conditions),
+    )
 
 
 def _read_task_links(conn: sqlite3.Connection) -> list[KanbanTaskLink]:
@@ -2212,6 +2977,35 @@ def _channel_capabilities(name: str) -> list[str]:
     if name == "feishu":
         return ["meeting invites"]
     return []
+
+
+def _platform_family_label(name: str) -> str:
+    normalized = name.lower().replace("-", "_")
+    families = {
+        "whatsapp_cloud": "WhatsApp Cloud",
+        "whatsapp_baileys": "WhatsApp Baileys",
+        "teams": "Teams",
+        "microsoft_teams": "Teams",
+        "photon": "Photon/iMessage",
+        "imessage": "Photon/iMessage",
+        "raft": "Raft",
+        "slack": "Slack",
+        "discord": "Discord",
+        "telegram": "Telegram",
+        "matrix": "Matrix",
+        "feishu": "Feishu",
+    }
+    return families.get(normalized, name)
+
+
+def _stale_alias_count(aliases: dict[str, Any]) -> int:
+    count = 0
+    for entries in aliases.values():
+        for value in _as_dict(entries).values():
+            entry = _as_dict(value)
+            if entry and bool(entry.get("stale") or entry.get("is_stale") or entry.get("expired")):
+                count += 1
+    return count
 
 
 def _is_dashboard_process(command: str) -> bool:
@@ -2564,6 +3358,20 @@ def _credential_auth_type(entry: dict[str, Any], provider_entry: dict[str, Any])
         return "oauth"
     if merged_keys & _API_KEY_FIELD_NAMES:
         return "api_key"
+    return ""
+
+
+def _credential_expiry(entry: dict[str, Any], provider_entry: dict[str, Any]) -> str:
+    for key in (
+        "expires_at",
+        "access_expires_at",
+        "token_expires_at",
+        "agent_key_expires_at",
+        "expiry",
+    ):
+        value = entry.get(key) or provider_entry.get(key)
+        if value:
+            return str(value)
     return ""
 
 
