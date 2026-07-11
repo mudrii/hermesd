@@ -15,33 +15,35 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v6.0.3
-      - uses: astral-sh/setup-uv@v8.2.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           python-version: ${{ matrix.python-version }}
+          version: "0.11.28"
           enable-cache: true
-      - name: Create virtual environment
-        run: uv venv --python ${{ matrix.python-version }}
-      - name: Install
-        run: uv pip install -e ".[dev]"
+      - name: Check lockfile
+        run: uv lock --check
+      - name: Install locked dependencies
+        run: uv sync --locked --all-extras --dev
       - name: Lint (ruff)
         run: uv run ruff check .
       - name: Format check (ruff)
         run: uv run ruff format --check .
       - name: Type check (mypy)
         run: uv run mypy hermesd
+      - name: Compile check
+        run: uv run python -m compileall hermesd
       - name: Test
         run: uv run pytest tests/ -v -W error::ResourceWarning
       - name: Audit dependencies (pip-audit)
         run: uv run pip-audit
-      - name: Check lockfile
-        run: uv lock --check
       - name: Build package
         run: uv build
       - name: Smoke test built wheel
@@ -50,5 +52,9 @@ jobs:
           .wheel-smoke/bin/python -m pip install dist/*.whl
           .wheel-smoke/bin/hermesd --version
           .wheel-smoke/bin/python -m hermesd --version
+          uv run python -m venv .sdist-smoke
+          .sdist-smoke/bin/python -m pip install dist/*.tar.gz
+          .sdist-smoke/bin/hermesd --version
+          .sdist-smoke/bin/python -m hermesd --version
       - name: Check package metadata
-        run: uvx twine check dist/*
+        run: uv run twine check dist/*

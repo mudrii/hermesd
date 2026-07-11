@@ -335,13 +335,14 @@ git clone https://github.com/mudrii/hermesd.git
 cd hermesd
 uv venv .venv --python 3.11
 source .venv/bin/activate
-uv pip install -e ".[dev]"
+uv sync --locked --all-extras --dev
 
 # Run the full local gate set for the active interpreter.
 # CI runs the same checks across Python 3.11, 3.12, and 3.13.
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy hermesd
+uv run python -m compileall hermesd
 uv run pytest tests/ -v -W error::ResourceWarning
 uv run pip-audit
 uv lock --check
@@ -350,7 +351,11 @@ python -m venv /tmp/hermesd-wheel-smoke
 /tmp/hermesd-wheel-smoke/bin/python -m pip install dist/hermesd-*.whl
 /tmp/hermesd-wheel-smoke/bin/hermesd --version
 /tmp/hermesd-wheel-smoke/bin/python -m hermesd --version
-uvx twine check dist/*
+python -m venv /tmp/hermesd-sdist-smoke
+/tmp/hermesd-sdist-smoke/bin/python -m pip install dist/hermesd-*.tar.gz
+/tmp/hermesd-sdist-smoke/bin/hermesd --version
+/tmp/hermesd-sdist-smoke/bin/python -m hermesd --version
+uv run twine check dist/*
 
 # Run the dashboard
 hermesd
@@ -360,7 +365,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full TDD-first contributor work
 
 ### Releases
 
-User-facing release notes live in [`CHANGELOG.md`](CHANGELOG.md). Before tagging, bump the package version in `pyproject.toml`, keep `flake.nix` aligned, move user-facing `[Unreleased]` notes into a dated release section, and update screenshot URLs if the release refreshes images. PyPI publishing is driven from GitHub Releases: tag the release as `vYYYY.M.D`, publish the release on GitHub, and the `python-publish` workflow reruns the test matrix, builds and smoke-tests the distributions, checks package metadata, then uploads to PyPI via OIDC.
+User-facing release notes live in [`CHANGELOG.md`](CHANGELOG.md). Before tagging, bump the package version in `pyproject.toml`, keep `flake.nix` aligned, move user-facing `[Unreleased]` notes into a dated release section matching the package version, and update screenshot URLs if the release refreshes images. PyPI publishing is driven from GitHub Releases: tag the release as `vYYYY.M.D`, publish the release on GitHub, and the `python-publish` workflow reruns the test matrix, verifies that the tag, package version, changelog section, and distribution filenames match, smoke-tests the wheel and sdist, checks package metadata, then uploads to PyPI via OIDC. GitHub Actions dependencies are pinned to immutable SHAs with version comments and tracked by Dependabot.
 
 ### Project Structure
 

@@ -43,6 +43,7 @@ dev = [
     "msgpack>=1.2.1",
     "types-PyYAML>=6.0.0",
     "pip-audit>=2.10.1",
+    "twine>=6.2.0",
 ]
 
 [project.urls]

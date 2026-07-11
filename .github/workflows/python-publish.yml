@@ -7,64 +7,119 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: publish-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v6.0.3
-      - uses: astral-sh/setup-uv@v8.2.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           python-version: ${{ matrix.python-version }}
+          version: "0.11.28"
           enable-cache: true
-      - name: Create virtual environment
-        run: uv venv --python ${{ matrix.python-version }}
-      - name: Install
-        run: uv pip install -e ".[dev]"
+      - name: Check lockfile
+        run: uv lock --check
+      - name: Install locked dependencies
+        run: uv sync --locked --all-extras --dev
       - name: Lint (ruff)
         run: uv run ruff check .
       - name: Format check (ruff)
         run: uv run ruff format --check .
       - name: Type check (mypy)
         run: uv run mypy hermesd
+      - name: Compile check
+        run: uv run python -m compileall hermesd
       - name: Test
         run: uv run pytest tests/ -v -W error::ResourceWarning
       - name: Audit dependencies (pip-audit)
         run: uv run pip-audit
-      - name: Check lockfile
-        run: uv lock --check
 
   release-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    if: ${{ !github.event.release.prerelease }}
+    timeout-minutes: 15
     needs: test
     steps:
-      - uses: actions/checkout@v6.0.3
-      - uses: astral-sh/setup-uv@v8.2.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           python-version: "3.11"
+          version: "0.11.28"
       - name: Check lockfile
         run: uv lock --check
+      - name: Install locked dependencies
+        run: uv sync --locked --all-extras --dev
+      - name: Verify release metadata
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          uv run python - <<'PY'
+          from pathlib import Path
+          import os
+          import tomllib
+
+          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          expected_tag = f"v{version}"
+          release_tag = os.environ["RELEASE_TAG"]
+          if release_tag != expected_tag:
+              raise SystemExit(f"release tag {release_tag!r} does not match {expected_tag!r}")
+
+          changelog = Path("CHANGELOG.md").read_text()
+          if f"## [{version}]" not in changelog:
+              raise SystemExit(f"CHANGELOG.md is missing release section [{version}]")
+          PY
       - name: Build release distributions
         run: uv build
+      - name: Verify release distributions
+        run: |
+          uv run python - <<'PY'
+          from pathlib import Path
+          import tomllib
+
+          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          expected = {
+              Path(f"dist/hermesd-{version}.tar.gz"),
+              Path(f"dist/hermesd-{version}-py3-none-any.whl"),
+          }
+          actual = {path for path in Path("dist").iterdir() if path.is_file()}
+          if actual != expected:
+              expected_list = ", ".join(sorted(str(path) for path in expected))
+              actual_list = ", ".join(sorted(str(path) for path in actual))
+              raise SystemExit(f"unexpected release distributions: {actual_list}; expected {expected_list}")
+          PY
       - name: Smoke test built wheel
         run: |
           uv run python -m venv .wheel-smoke
           .wheel-smoke/bin/python -m pip install dist/*.whl
           .wheel-smoke/bin/hermesd --version
           .wheel-smoke/bin/python -m hermesd --version
+          uv run python -m venv .sdist-smoke
+          .sdist-smoke/bin/python -m pip install dist/*.tar.gz
+          .sdist-smoke/bin/hermesd --version
+          .sdist-smoke/bin/python -m hermesd --version
       - name: Check package metadata
-        run: uvx twine check dist/*
+        run: uv run twine check dist/*
       - name: Upload distributions
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-dists
-          path: dist/
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
 
   pypi-publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    if: ${{ !github.event.release.prerelease }}
+    timeout-minutes: 10
     needs: release-build
     permissions:
       contents: read
@@ -74,9 +129,19 @@ jobs:
       url: https://pypi.org/p/hermesd
     steps:
       - name: Retrieve release distributions
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: release-dists
           path: dist/
+      - name: Verify downloaded release distributions
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          expected_sdist="dist/hermesd-${version}.tar.gz"
+          expected_wheel="dist/hermesd-${version}-py3-none-any.whl"
+          test -f "${expected_sdist}"
+          test -f "${expected_wheel}"
+          test "$(find dist -type f | wc -l | tr -d ' ')" = "2"
       - name: Publish release distributions to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1

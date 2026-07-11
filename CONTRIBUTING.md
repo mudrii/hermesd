@@ -9,7 +9,7 @@ git clone https://github.com/mudrii/hermesd.git
 cd hermesd
 uv venv .venv --python 3.11
 source .venv/bin/activate
-uv pip install -e ".[dev]"
+uv sync --locked --all-extras --dev
 uv run pytest tests/ -v
 ```
 
@@ -28,6 +28,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
    uv run ruff check .
    uv run ruff format --check .
    uv run mypy hermesd
+   uv run python -m compileall hermesd
    uv run pip-audit
    uv lock --check
    uv build
@@ -35,7 +36,11 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
    /tmp/hermesd-wheel-smoke/bin/python -m pip install dist/hermesd-*.whl
    /tmp/hermesd-wheel-smoke/bin/hermesd --version
    /tmp/hermesd-wheel-smoke/bin/python -m hermesd --version
-   uvx twine check dist/*
+   python -m venv /tmp/hermesd-sdist-smoke
+   /tmp/hermesd-sdist-smoke/bin/python -m pip install dist/hermesd-*.tar.gz
+   /tmp/hermesd-sdist-smoke/bin/hermesd --version
+   /tmp/hermesd-sdist-smoke/bin/python -m hermesd --version
+   uv run twine check dist/*
    ```
 
 7. **Test the TUI manually** — run `hermesd` and verify your changes look correct
@@ -52,7 +57,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 5. Bump the package version in `pyproject.toml` and the editable-package entry in `uv.lock`.
 6. Keep `flake.nix` version metadata aligned with `pyproject.toml` when Nix support remains advertised.
 7. Update README screenshot URLs when release screenshots change, and keep package metadata safe for PyPI rendering.
-8. Create and publish a GitHub Release tagged `vYYYY.M.D`; PyPI publishing runs from `.github/workflows/python-publish.yml` after the release is published.
+8. Create and publish a GitHub Release tagged `vYYYY.M.D`; PyPI publishing runs from `.github/workflows/python-publish.yml` after the release is published. The workflow rejects mismatched package/changelog versions, skips prereleases, pins GitHub Actions to immutable SHAs with version comments, and tracks action updates with Dependabot.
 
 ## Code Guidelines
 
