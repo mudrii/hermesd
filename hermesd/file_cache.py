@@ -82,6 +82,13 @@ class LastGoodFileCache:
             key = str(path)
             try:
                 mtime = path.stat().st_mtime_ns
+            except FileNotFoundError:
+                # The source is gone, not transiently unreadable: evict rather
+                # than serve a deleted file's value forever.
+                mtimes.pop(key, None)
+                bad_mtimes.pop(key, None)
+                values.pop(key, None)
+                return default_factory()
             except OSError:
                 return values.get(key, default_factory())
             if mtimes.get(key) == mtime and key in values:

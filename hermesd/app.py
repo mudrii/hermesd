@@ -31,6 +31,10 @@ _DOTS_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "
 # but this many consecutive failures mean the terminal is unrecoverable.
 _MAX_CONSECUTIVE_INPUT_FAILURES = 5
 _PANEL_NUMBERS = tuple(sorted(PANEL_NAMES))
+# Upper bound on a single OSC 52 clipboard write. Terminals buffer the whole
+# escape sequence, so an unbounded dump of a huge view can stall or drop it.
+_OSC52_MAX_BYTES = 96 * 1024
+_OSC52_TRUNCATION_MARKER = f"\n[hermesd: copy truncated at {_OSC52_MAX_BYTES} bytes]\n"
 
 
 def _panel_num_by_name(name: str) -> int:
@@ -217,6 +221,11 @@ class DashboardApp:
         self._input_thread: threading.Thread | None = None
         self._message_search_thread: threading.Thread | None = None
         self._message_search_inflight = ""
+        # True while a worker is still willing to pick up _message_search_inflight.
+        # Cleared by the worker under _lock in the same critical section that
+        # observes an empty queue, so a query enqueued while the thread object
+        # is merely unwinding cannot be dropped.
+        self._message_search_active = False
         self._closed = threading.Event()
         self._console = Console(force_terminal=not no_color, no_color=no_color)
 
@@ -250,6 +259,13 @@ class DashboardApp:
                     live.update(self._build_layout())
         except KeyboardInterrupt:
             pass
+        except Exception as exc:
+            # Top-level render boundary: a panel or Live failure must not reach
+            # the user as a traceback. Report one line and exit non-zero;
+            # SystemExit passes through main() untouched, so the process ends
+            # with status 1 after the finally block has closed everything.
+            print(f"hermesd: render failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
         finally:
             self._running.clear()
             self.close()
@@ -299,7 +315,7 @@ class DashboardApp:
         self._console.print(self.render_snapshot_text(panel_num=panel_num), end="")
 
     def copy_current_view(self) -> str:
-        copied_text = self.render_current_view_text()
+        copied_text = _truncate_for_osc52(self.render_current_view_text())
         sequence = _osc52_sequence(copied_text)
         console = self._console
         # Hold the console's render lock so the raw OSC52 write cannot
@@ -474,7 +490,13 @@ class DashboardApp:
 
     def handle_key(self, key: str) -> str | None:
         with self._view_lock:
-            return self._handle_key_locked(key)
+            action = self._handle_key_locked(key)
+        if action == "copy":
+            # Rendering the whole layout is slow; do it after the view lock is
+            # released so the render loop is not blocked by the input thread.
+            self.copy_current_view()
+            return None
+        return action
 
     def _handle_key_locked(self, key: str) -> str | None:
         if not key:
@@ -514,8 +536,8 @@ class DashboardApp:
             self._view.toggle_focus()
             return None
         if key == "c":
-            self.copy_current_view()
-            return None
+            # Deferred to handle_key so the render happens outside _view_lock.
+            return "copy"
         if key == "]":
             self._view.focus_next()
             return None
@@ -670,21 +692,24 @@ class DashboardApp:
             if self._state.session_message_match_query == message_query:
                 return
             self._message_search_inflight = message_query
-            if self._message_search_thread is not None and self._message_search_thread.is_alive():
+            if self._message_search_active:
                 return
             thread = threading.Thread(
                 target=self._search_session_messages_worker,
                 daemon=True,
             )
             self._message_search_thread = thread
+            self._message_search_active = True
         thread.start()
 
     def _search_session_messages_worker(self) -> None:
-        while not self._closed.is_set():
+        while True:
             with self._lock:
                 message_query = self._message_search_inflight
-            if not message_query:
-                return
+                if not message_query or self._closed.is_set():
+                    self._message_search_inflight = ""
+                    self._message_search_active = False
+                    return
             search_error = ""
             try:
                 match_ids = self._collector.search_session_ids_by_message(message_query)
@@ -694,6 +719,7 @@ class DashboardApp:
             with self._lock:
                 if self._closed.is_set():
                     self._message_search_inflight = ""
+                    self._message_search_active = False
                     return
                 if self._message_search_inflight != message_query:
                     continue
@@ -708,7 +734,6 @@ class DashboardApp:
                 elif self._input_error and self._input_error.startswith("message search error:"):
                     self._input_error = None
                 self._message_search_inflight = ""
-                return
 
     def _build_header(
         self,
@@ -1071,6 +1096,16 @@ def _normalize_json_payload(value: object) -> object:
     if isinstance(value, set):
         return sorted(value)
     return value
+
+
+def _truncate_for_osc52(text: str) -> str:
+    """Cap a clipboard payload at _OSC52_MAX_BYTES, marking where it was cut."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= _OSC52_MAX_BYTES:
+        return text
+    budget = _OSC52_MAX_BYTES - len(_OSC52_TRUNCATION_MARKER.encode("utf-8"))
+    head = encoded[:budget].decode("utf-8", errors="ignore")
+    return f"{head}{_OSC52_TRUNCATION_MARKER}"
 
 
 def _osc52_sequence(text: str) -> str:

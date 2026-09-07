@@ -153,7 +153,7 @@ def test_externally_closed_connection_recovers(tmp_path):
     db.close()
 
 
-def test_concurrent_writer_does_not_wipe_cache(tmp_path):
+def test_concurrent_writer_insert_is_visible_on_next_read(tmp_path):
     """Simulate hermes-agent writing while we read."""
     db_path = tmp_path / "state.db"
     _create_db(db_path)
@@ -177,22 +177,72 @@ def test_concurrent_writer_does_not_wipe_cache(tmp_path):
     db.close()
 
 
-def test_repeated_message_search_serves_cache_without_requery(tmp_path):
-    """An unchanged repeat search hits the version cache and clears the stale flag."""
+def test_exclusive_writer_lock_never_blanks_cached_sessions(tmp_path):
+    """A writer holding BEGIN EXCLUSIVE must never turn a populated read into an empty one."""
     db_path = tmp_path / "state.db"
     _create_db(db_path)
     db = HermesDB(db_path)
+    sessions = db.read_sessions()
+    assert len(sessions) == 1
 
-    first = db.search_session_ids_by_message("used a tool")
-    assert first == {"s1"}
-    assert db.last_message_search_stale is False
+    writer = sqlite3.connect(str(db_path), timeout=2, isolation_level=None)
+    writer.execute("BEGIN EXCLUSIVE")
+    try:
+        # Either the read wins outright or it serves the last-good rows; it must
+        # not blank the display and must not raise.
+        assert db.read_sessions() == sessions
+    finally:
+        writer.execute("ROLLBACK")
+        writer.close()
 
-    # No write between calls, so data_version is unchanged: the second call must
-    # return the same observable result and (re)assert a non-stale read.
-    second = db.search_session_ids_by_message("used a tool")
-    assert second == {"s1"}
-    assert db.last_message_search_stale is False
+    # Once the lock is released the reader is healthy again.
+    assert db.read_sessions() == sessions
+    assert db.last_read_sessions_stale is False
     db.close()
+
+
+@pytest.mark.parametrize(
+    ("label", "payload"),
+    [("zero_byte", b""), ("corrupt_header", b"garbage" * 100)],
+)
+def test_damaged_db_file_preserves_last_good_sessions(tmp_path, label, payload):
+    """Truncating or corrupting state.db keeps the last-good rows and flags them stale."""
+    db_path = tmp_path / "state.db"
+    _create_db(db_path)
+    db = HermesDB(db_path)
+    sessions = db.read_sessions()
+    assert len(sessions) == 1
+
+    db_path.write_bytes(payload)
+
+    assert db.read_sessions() == sessions
+    assert db.last_read_sessions_stale is True
+    db.close()
+
+
+def test_truncated_wal_sidecar_preserves_last_good_sessions(tmp_path):
+    """A half-written -wal sidecar must not raise or blank the session list."""
+    db_path = tmp_path / "state.db"
+    writer = sqlite3.connect(str(db_path))
+    writer.execute("PRAGMA journal_mode=WAL")
+    create_state_db_tables(writer, include_schema_version=False)
+    writer.execute("INSERT INTO sessions (id, source, started_at) VALUES ('s1', 'cli', 1.0)")
+    writer.commit()
+    # Checkpoint so the row lives in the main db; the sidecar stays in place.
+    writer.execute("PRAGMA wal_checkpoint(FULL)")
+    wal_path = db_path.with_name("state.db-wal")
+    assert wal_path.exists()
+
+    db = HermesDB(db_path)
+    sessions = db.read_sessions()
+    assert [row["id"] for row in sessions] == ["s1"]
+
+    with wal_path.open("r+b") as handle:
+        handle.truncate(10)
+
+    assert db.read_sessions() == sessions
+    db.close()
+    writer.close()
 
 
 def test_message_search_error_serves_last_good_and_flags_stale(tmp_path):

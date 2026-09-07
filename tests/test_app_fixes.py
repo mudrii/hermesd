@@ -13,9 +13,8 @@ from __future__ import annotations
 import os
 import select
 import signal
-import termios
+import sys
 import threading
-import tty
 from pathlib import Path
 
 import pytest
@@ -27,29 +26,6 @@ from hermesd.app import (
     DashboardApp,
     ViewState,
 )
-
-
-class FakeStdin:
-    def isatty(self) -> bool:
-        return True
-
-    def fileno(self) -> int:
-        return 123
-
-
-@pytest.fixture
-def fake_terminal(monkeypatch):
-    restored: dict[str, object] = {}
-    monkeypatch.setattr("sys.stdin", FakeStdin())
-    monkeypatch.setattr(termios, "tcgetattr", lambda fd: ["old-settings"])
-    monkeypatch.setattr(tty, "setcbreak", lambda fd: None)
-    monkeypatch.setattr(select, "select", lambda read, write, err, timeout: ([123], [], []))
-    monkeypatch.setattr(
-        termios,
-        "tcsetattr",
-        lambda fd, when, settings: restored.update(fd=fd, settings=settings),
-    )
-    return restored
 
 
 def test_input_loop_survives_transient_read_error(
@@ -502,3 +478,30 @@ def test_close_interrupts_and_joins_message_search_thread(populated_hermes_home)
 
     assert calls == ["interrupt", "close"]
     assert not thread.is_alive()
+
+
+def test_main_exits_with_code_one_when_render_fails(
+    populated_hermes_home: Path, monkeypatch, capsys
+):
+    """A render failure inside run() reaches the CLI as exit code 1, not a traceback."""
+
+    class FailingApp:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self):
+            print("hermesd: render failed: RuntimeError: boom", file=sys.stderr)
+            raise SystemExit(1)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("hermesd.app.DashboardApp", FailingApp)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--hermes-home", str(populated_hermes_home), "--no-color"])
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert "render failed" in captured.err

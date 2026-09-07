@@ -971,3 +971,36 @@ def profiled_hermes_home(hermes_home: Path) -> Path:
     (profile_home / "memories" / "PROFILE.md").write_text("profile memory\n")
 
     return hermes_home
+
+
+class FakeStdin:
+    """Minimal tty-like stdin stand-in for input-thread tests."""
+
+    def isatty(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        return 123
+
+
+@pytest.fixture
+def fake_terminal(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Stub termios/tty/select so `_input_loop` can run without a real terminal.
+
+    Returns the dict that records the `termios.tcsetattr` restore call.
+    """
+    import select
+    import termios
+    import tty
+
+    restored: dict[str, object] = {}
+    monkeypatch.setattr("sys.stdin", FakeStdin())
+    monkeypatch.setattr(termios, "tcgetattr", lambda fd: ["old-settings"])
+    monkeypatch.setattr(tty, "setcbreak", lambda fd: None)
+    monkeypatch.setattr(select, "select", lambda read, write, err, timeout: ([123], [], []))
+    monkeypatch.setattr(
+        termios,
+        "tcsetattr",
+        lambda fd, when, settings: restored.update(fd=fd, settings=settings),
+    )
+    return restored

@@ -12,6 +12,9 @@ from typing import Any, TypeVar
 T = TypeVar("T")
 _RECONNECT_ERROR_THRESHOLD = 3
 _CONNECT_BACKOFF_READS = 2
+# Caps the LIKE fallback result set. The scan itself is unbounded on a miss;
+# this bounds what a pathological match can hand back to the UI.
+_LIKE_SEARCH_LIMIT = 500
 
 
 class HermesDB:
@@ -53,6 +56,7 @@ class HermesDB:
         self._messages_fts_supports_session_id: bool | None = None
         self._messages_fts_available: bool | None = None
         self._session_column_names: set[str] | None = None
+        self._message_column_names: set[str] | None = None
         self._snapshot_dir: tempfile.TemporaryDirectory[str] | None = None
         self._closed = False
         self._connect()
@@ -84,6 +88,7 @@ class HermesDB:
             self._messages_fts_supports_session_id = None
             self._messages_fts_available = None
             self._session_column_names = None
+            self._message_column_names = None
         except (OSError, sqlite3.OperationalError):
             self._close_connection()
             self._connected_mtime_ns = None
@@ -211,8 +216,28 @@ class HermesDB:
 
     def _read_all_sessions(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
         columns = ", ".join(self._session_columns(conn))
-        cur = conn.execute(f"SELECT {columns} FROM sessions ORDER BY started_at DESC")
+        # last_activity_at only exists on newer hermes-agent schemas; older
+        # databases must keep the original started_at ordering.
+        order_by = (
+            "COALESCE(last_activity_at, started_at)"
+            if "last_activity_at" in self._session_column_set(conn)
+            else "started_at"
+        )
+        where = self._hidden_session_filter(conn)
+        cur = conn.execute(f"SELECT {columns} FROM sessions{where} ORDER BY {order_by} DESC")
         return [dict(row) for row in cur.fetchall()]
+
+    def _hidden_session_filter(self, conn: sqlite3.Connection) -> str:
+        """Return the WHERE clause hiding soft-deleted sessions, or '' on old schemas."""
+        if "hidden" not in self._session_column_set(conn):
+            return ""
+        return " WHERE COALESCE(hidden, 0) = 0"
+
+    def _session_column_set(self, conn: sqlite3.Connection) -> set[str]:
+        if self._session_column_names is None:
+            cur = conn.execute("PRAGMA table_info(sessions)")
+            self._session_column_names = {str(row["name"]) for row in cur.fetchall()}
+        return self._session_column_names
 
     def _session_columns(self, conn: sqlite3.Connection) -> list[str]:
         wanted_columns = [
@@ -245,10 +270,8 @@ class HermesDB:
             "handoff_platform",
             "handoff_error",
         ]
-        if self._session_column_names is None:
-            cur = conn.execute("PRAGMA table_info(sessions)")
-            self._session_column_names = {str(row["name"]) for row in cur.fetchall()}
-        return [column for column in wanted_columns if column in self._session_column_names]
+        available = self._session_column_set(conn)
+        return [column for column in wanted_columns if column in available]
 
     def read_session_count(self) -> int:
         with self._lock:
@@ -271,7 +294,8 @@ class HermesDB:
             return self._cached_session_count
 
     def _read_session_count(self, conn: sqlite3.Connection) -> int:
-        cur = conn.execute("SELECT COUNT(*) FROM sessions")
+        # Must agree with read_sessions: hidden rows are not shown, so not counted.
+        cur = conn.execute(f"SELECT COUNT(*) FROM sessions{self._hidden_session_filter(conn)}")
         row = cur.fetchone()
         return int(row[0]) if row is not None else 0
 
@@ -292,12 +316,23 @@ class HermesDB:
             return self._cached_tool_stats
 
     def _read_tool_stats(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        # messages.active exists only on newer hermes-agent schemas; 0 marks a
+        # message compacted out of the live transcript, which must not be counted.
+        active_filter = (
+            " AND COALESCE(active, 1) = 1" if self._filters_inactive_messages(conn) else ""
+        )
         cur = conn.execute(
             "SELECT tool_name, COUNT(*) as call_count "
-            "FROM messages WHERE tool_name IS NOT NULL "
+            f"FROM messages WHERE tool_name IS NOT NULL{active_filter} "
             "GROUP BY tool_name ORDER BY call_count DESC"
         )
         return [dict(row) for row in cur.fetchall()]
+
+    def _message_columns(self, conn: sqlite3.Connection) -> set[str]:
+        if self._message_column_names is None:
+            cur = conn.execute("PRAGMA table_info(messages)")
+            self._message_column_names = {str(row["name"]) for row in cur.fetchall()}
+        return self._message_column_names
 
     def search_session_ids_by_message(self, query: str) -> set[str]:
         normalized = query.strip()
@@ -324,6 +359,8 @@ class HermesDB:
                     except sqlite3.Error:
                         session_ids = self._search_session_ids_by_like(conn, normalized)
                     else:
+                        # FTS matches whole tokens, so a mid-token substring
+                        # legitimately misses; LIKE is what finds it.
                         if not session_ids:
                             session_ids = self._search_session_ids_by_like(conn, normalized)
                 else:
@@ -397,29 +434,41 @@ class HermesDB:
             cur = conn.execute("PRAGMA table_info(messages_fts)")
             columns = {str(row[1]) for row in cur.fetchall()}
             self._messages_fts_supports_session_id = "session_id" in columns
-        if self._messages_fts_supports_session_id:
-            cur = conn.execute(
-                "SELECT DISTINCT session_id FROM messages_fts WHERE messages_fts MATCH ?",
-                (fts_query,),
-            )
+        active_only = self._filters_inactive_messages(conn)
+        if self._messages_fts_supports_session_id and not active_only:
+            sql = "SELECT DISTINCT session_id FROM messages_fts WHERE messages_fts MATCH ?"
         else:
-            cur = conn.execute(
+            # Joining messages on rowid is required to read session_id when the
+            # FTS table lacks it, and to apply the active filter when it has it.
+            active_filter = " AND COALESCE(messages.active, 1) = 1" if active_only else ""
+            sql = (
                 "SELECT DISTINCT messages.session_id "
                 "FROM messages_fts "
                 "JOIN messages ON messages.id = messages_fts.rowid "
-                "WHERE messages_fts MATCH ?",
-                (fts_query,),
+                f"WHERE messages_fts MATCH ?{active_filter}"
             )
+        cur = conn.execute(sql, (fts_query,))
         return {str(row[0]) for row in cur.fetchall() if row[0]}
+
+    def _filters_inactive_messages(self, conn: sqlite3.Connection) -> bool:
+        """True when messages.active exists, marking rows compacted out of the transcript."""
+        return "active" in self._message_columns(conn)
 
     def _search_session_ids_by_like(self, conn: sqlite3.Connection, query: str) -> set[str]:
         pattern = f"%{_escape_like_pattern(query.lower())}%"
+        # The OR pair must stay parenthesised: AND binds tighter, so an unbracketed
+        # active filter would only constrain the tool_name branch.
+        active_filter = (
+            " AND COALESCE(active, 1) = 1" if self._filters_inactive_messages(conn) else ""
+        )
         cur = conn.execute(
             "SELECT DISTINCT session_id "
             "FROM messages "
-            "WHERE LOWER(COALESCE(content, '')) LIKE ? ESCAPE '\\' "
-            "OR LOWER(COALESCE(tool_name, '')) LIKE ? ESCAPE '\\'",
-            (pattern, pattern),
+            "WHERE (LOWER(COALESCE(content, '')) LIKE ? ESCAPE '\\' "
+            "OR LOWER(COALESCE(tool_name, '')) LIKE ? ESCAPE '\\')"
+            f"{active_filter} "
+            "LIMIT ?",
+            (pattern, pattern, _LIKE_SEARCH_LIMIT),
         )
         return {str(row[0]) for row in cur.fetchall() if row[0]}
 

@@ -136,6 +136,10 @@ class BackgroundProcessInfo(BaseModel):
     watcher_message_id: str = ""
     watcher_interval: int = 0
     watch_patterns: list[str] = Field(default_factory=list)
+    # spawn-ledger.json fields (empty for legacy processes.json entries).
+    purpose: str = ""
+    port: int = 0
+    profile: str = ""
 
 
 class CheckpointInfo(BaseModel):

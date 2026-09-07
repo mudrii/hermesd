@@ -132,6 +132,59 @@ def test_file_cache_handles_concurrent_reads(tmp_path):
     assert errors == []
 
 
+@pytest.mark.parametrize("kind", ["json", "yaml", "json_list"])
+def test_deleted_file_evicts_cache_and_returns_default(tmp_path, kind):
+    """A deleted source file must stop serving its last-good value forever."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "data.src"
+    if kind == "json":
+        path.write_text(json.dumps({"value": 1}))
+        read, loaded, default = cache.read_json_mapping, {"value": 1}, {}
+    elif kind == "yaml":
+        path.write_text(yaml.safe_dump({"value": 1}))
+        read, loaded, default = cache.read_yaml_mapping, {"value": 1}, {}
+    else:
+        path.write_text(json.dumps([{"value": 1}]))
+        read, loaded, default = cache.read_json_list, [{"value": 1}], []
+    assert read(path) == loaded
+
+    path.unlink()
+
+    assert read(path) == default
+    # Recreating the file must be picked up rather than serving the evicted value.
+    if kind == "json":
+        path.write_text(json.dumps({"value": 2}))
+        assert read(path) == {"value": 2}
+    elif kind == "yaml":
+        path.write_text(yaml.safe_dump({"value": 2}))
+        assert read(path) == {"value": 2}
+    else:
+        path.write_text(json.dumps([{"value": 2}]))
+        assert read(path) == [{"value": 2}]
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="chmod 000 does not block stat when running as root",
+)
+def test_unstatable_file_preserves_last_good_value(tmp_path):
+    """A transient stat error (not deletion) keeps serving the last-good value."""
+    cache = LastGoodFileCache()
+    directory = tmp_path / "locked"
+    directory.mkdir()
+    path = directory / "data.json"
+    path.write_text(json.dumps({"value": 1}))
+    assert cache.read_json_mapping(path) == {"value": 1}
+
+    directory.chmod(0o000)
+    try:
+        assert cache.read_json_mapping(path) == {"value": 1}
+    finally:
+        directory.chmod(0o755)
+
+    assert cache.read_json_mapping(path) == {"value": 1}
+
+
 @pytest.mark.parametrize("kind", ["json", "yaml"])
 def test_invalid_utf8_preserves_last_good_value(tmp_path, kind):
     cache = LastGoodFileCache()

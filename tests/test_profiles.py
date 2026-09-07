@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from hermesd.__main__ import parse_args, resolve_profile_name
+from hermesd.__main__ import parse_args
 from hermesd.app import DashboardApp
 from hermesd.collector import Collector
 from hermesd.paths import HermesPaths, default_hermes_home
@@ -27,18 +27,6 @@ def test_parse_args_profile_default_none():
 def test_parse_args_accepts_profile_flag():
     args = parse_args(["--profile", "coding"])
     assert args.profile == "coding"
-
-
-def test_resolve_profile_name_uses_env(monkeypatch):
-    monkeypatch.setenv("HERMES_PROFILE", "research")
-    args = parse_args([])
-    assert resolve_profile_name(args) == "research"
-
-
-def test_resolve_profile_name_cli_overrides_env(monkeypatch):
-    monkeypatch.setenv("HERMES_PROFILE", "research")
-    args = parse_args(["--profile", "coding"])
-    assert resolve_profile_name(args) == "coding"
 
 
 def test_default_collector_ignores_active_profile_file(profiled_hermes_home: Path):

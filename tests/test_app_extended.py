@@ -14,6 +14,7 @@ from rich.console import Console
 from hermesd import __version__
 from hermesd.app import (
     _LOG_PANEL_NUM,
+    _OSC52_MAX_BYTES,
     _PROFILES_PANEL_NUM,
     _SESSIONS_PANEL_NUM,
     _SKILLS_PANEL_NUM,
@@ -349,22 +350,6 @@ def test_handle_key_digit_9_enters_profiles_detail(populated_hermes_home: Path):
     app.close()
 
 
-def test_handle_key_escape_in_overview_noop(populated_hermes_home: Path):
-    app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app.handle_key("\x1b")
-    assert app._view.mode == "overview"
-    app.close()
-
-
-def test_handle_key_escape_sequence_not_digit(populated_hermes_home: Path):
-    """Arrow keys like \\x1b[2~ must not be treated as digit '2'."""
-    app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app.handle_key("\x1b[2~")
-    assert app._view.mode == "overview"
-    assert app._view.detail_panel is None
-    app.close()
-
-
 def test_handle_key_multi_char_ignored(populated_hermes_home: Path):
     """Multi-char input that isn't an escape sequence is ignored."""
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
@@ -576,62 +561,89 @@ def test_render_snapshot_json_sorts_set_backed_fields(populated_hermes_home: Pat
     app.close()
 
 
-def test_collector_loop_marks_state_stale_on_collect_error(populated_hermes_home: Path):
-    app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    real_collector = app._collector
-    app._set_state(app._collector.collect())
+def _run_collector_loop_once(app: DashboardApp, collect) -> None:
+    """Drive exactly one iteration of the collector loop with the given collect()."""
 
-    class FailingCollector:
-        def collect(self):
-            raise RuntimeError("collector failed")
-
+    class StubCollector:
         def close(self):
             pass
 
-    app._collector = FailingCollector()
-    app._running.set()
-    app._force_refresh.set()
-
+    stub = StubCollector()
     collect_called = threading.Event()
 
-    def fail_once_and_stop():
+    def collect_once_and_stop():
         app._running.clear()
         collect_called.set()
-        raise RuntimeError("collector failed")
+        return collect()
 
-    app._collector.collect = fail_once_and_stop
+    stub.collect = collect_once_and_stop
+    app._collector = stub
+    app._running.set()
+    app._force_refresh.set()
 
     thread = threading.Thread(target=app._collector_loop)
     thread.start()
     assert collect_called.wait(timeout=5), "collector loop never invoked collect"
     thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
+def test_collector_loop_marks_state_stale_and_keeps_last_good_payload(
+    populated_hermes_home: Path,
+):
+    """A failed collect marks the state stale but preserves the last good payload."""
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    real_collector = app._collector
+    good_state = real_collector.collect().model_copy(
+        update={"health": HealthSummary(total_sources=7, ok_sources=7)}
+    )
+    app._set_state(good_state)
+    assert app._state.sessions, "fixture must provide sessions to preserve"
+    good_sessions = app._state.sessions
+    good_gateway = app._state.gateway
+
+    def failing_collect():
+        raise RuntimeError("collector failed")
+
+    _run_collector_loop_once(app, failing_collect)
 
     assert app._state.is_stale is True
-    assert not thread.is_alive()
+    assert app._state.sessions == good_sessions
+    assert app._state.gateway == good_gateway
+    assert app._state.health.total_sources == 7
     real_collector.close()
     app.close()
 
 
-def test_input_loop_handles_quit_and_restores_terminal(populated_hermes_home: Path, monkeypatch):
+def test_collector_loop_clears_stale_after_next_successful_collect(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    real_collector = app._collector
+    app._set_state(real_collector.collect())
+
+    def failing_collect():
+        raise RuntimeError("collector failed")
+
+    _run_collector_loop_once(app, failing_collect)
+    assert app._state.is_stale is True
+
+    recovered = real_collector.collect().model_copy(
+        update={"health": HealthSummary(total_sources=3, ok_sources=3)}
+    )
+    _run_collector_loop_once(app, lambda: recovered)
+
+    assert app._state.is_stale is False
+    assert app._state.health.total_sources == 3
+    real_collector.close()
+    app.close()
+
+
+def test_input_loop_handles_quit_and_restores_terminal(
+    populated_hermes_home: Path, fake_terminal, monkeypatch
+):
     import os
-    import select
-    import termios
-    import tty
 
-    class FakeStdin:
-        def isatty(self) -> bool:
-            return True
-
-        def fileno(self) -> int:
-            return 123
-
-    restored: dict[str, object] = {}
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app._running.set()
-    monkeypatch.setattr("sys.stdin", FakeStdin())
-    monkeypatch.setattr(termios, "tcgetattr", lambda fd: ["old-settings"])
-    monkeypatch.setattr(tty, "setcbreak", lambda fd: None)
-    monkeypatch.setattr(select, "select", lambda read, write, err, timeout: ([123], [], []))
 
     def fake_read(fd: int, size: int) -> bytes:
         assert size == 64
@@ -639,55 +651,31 @@ def test_input_loop_handles_quit_and_restores_terminal(populated_hermes_home: Pa
 
     monkeypatch.setattr(os, "read", fake_read)
 
-    def fake_tcsetattr(fd: int, when: int, settings: object) -> None:
-        restored["fd"] = fd
-        restored["settings"] = settings
-
-    monkeypatch.setattr(termios, "tcsetattr", fake_tcsetattr)
-
     app._input_loop()
 
     assert app._running.is_set() is False
-    assert restored == {"fd": 123, "settings": ["old-settings"]}
+    assert fake_terminal == {"fd": 123, "settings": ["old-settings"]}
     app.close()
 
 
-def test_input_loop_records_error_and_restores_terminal(populated_hermes_home: Path, monkeypatch):
+def test_input_loop_records_error_and_restores_terminal(
+    populated_hermes_home: Path, fake_terminal, monkeypatch
+):
     import os
-    import select
-    import termios
-    import tty
 
-    class FakeStdin:
-        def isatty(self) -> bool:
-            return True
-
-        def fileno(self) -> int:
-            return 123
-
-    restored: dict[str, object] = {}
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app._running.set()
-    monkeypatch.setattr("sys.stdin", FakeStdin())
-    monkeypatch.setattr(termios, "tcgetattr", lambda fd: ["old-settings"])
-    monkeypatch.setattr(tty, "setcbreak", lambda fd: None)
-    monkeypatch.setattr(select, "select", lambda read, write, err, timeout: ([123], [], []))
 
     def fail_read(fd: int, size: int) -> bytes:
         raise OSError("stdin failed")
 
-    def fake_tcsetattr(fd: int, when: int, settings: object) -> None:
-        restored["fd"] = fd
-        restored["settings"] = settings
-
     monkeypatch.setattr(os, "read", fail_read)
-    monkeypatch.setattr(termios, "tcsetattr", fake_tcsetattr)
 
     app._input_loop()
 
     assert app._running.is_set() is False
     assert app._input_error == "input error: stdin failed"
-    assert restored == {"fd": 123, "settings": ["old-settings"]}
+    assert fake_terminal == {"fd": 123, "settings": ["old-settings"]}
     app.close()
 
 
@@ -1234,27 +1222,16 @@ def test_input_loop_returns_immediately_without_tty(populated_hermes_home: Path,
     app.close()
 
 
-def test_input_loop_polls_until_input_ready(populated_hermes_home: Path, monkeypatch):
+def test_input_loop_polls_until_input_ready(
+    populated_hermes_home: Path, fake_terminal, monkeypatch
+):
     """An empty select poll is skipped; the next ready poll is processed."""
     import os
     import select
-    import termios
-    import tty
-
-    class FakeStdin:
-        def isatty(self) -> bool:
-            return True
-
-        def fileno(self) -> int:
-            return 123
 
     selects = iter([([], [], []), ([123], [], [])])
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app._running.set()
-    monkeypatch.setattr("sys.stdin", FakeStdin())
-    monkeypatch.setattr(termios, "tcgetattr", lambda fd: ["old-settings"])
-    monkeypatch.setattr(termios, "tcsetattr", lambda fd, when, settings: None)
-    monkeypatch.setattr(tty, "setcbreak", lambda fd: None)
     monkeypatch.setattr(select, "select", lambda read, write, err, timeout: next(selects))
     monkeypatch.setattr(os, "read", lambda fd, size: b"q")
 
@@ -1264,39 +1241,21 @@ def test_input_loop_polls_until_input_ready(populated_hermes_home: Path, monkeyp
     app.close()
 
 
-def test_input_loop_stops_on_stdin_eof_without_quitting(populated_hermes_home: Path, monkeypatch):
+def test_input_loop_stops_on_stdin_eof_without_quitting(
+    populated_hermes_home: Path, fake_terminal, monkeypatch
+):
     """EOF on stdin ends input handling but does not quit the dashboard."""
     import os
-    import select
-    import termios
-    import tty
 
-    class FakeStdin:
-        def isatty(self) -> bool:
-            return True
-
-        def fileno(self) -> int:
-            return 123
-
-    restored: dict[str, object] = {}
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app._running.set()
-    monkeypatch.setattr("sys.stdin", FakeStdin())
-    monkeypatch.setattr(termios, "tcgetattr", lambda fd: ["old-settings"])
-    monkeypatch.setattr(tty, "setcbreak", lambda fd: None)
-    monkeypatch.setattr(select, "select", lambda read, write, err, timeout: ([123], [], []))
     monkeypatch.setattr(os, "read", lambda fd, size: b"")
-    monkeypatch.setattr(
-        termios,
-        "tcsetattr",
-        lambda fd, when, settings: restored.update(fd=fd, settings=settings),
-    )
 
     app._input_loop()
 
     assert app._running.is_set() is True
     assert app._input_error is None
-    assert restored == {"fd": 123, "settings": ["old-settings"]}
+    assert fake_terminal == {"fd": 123, "settings": ["old-settings"]}
     app.close()
 
 
@@ -1559,4 +1518,203 @@ def test_sessions_filter_and_sort_render_after_keypress_workflow(populated_herme
     assert "Sort: cost" in copied
     assert "telegram" in copied
     assert "cli" not in copied
+    app.close()
+
+
+class _DepthTrackingLock:
+    """RLock wrapper that records how many nested acquisitions are held."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.depth = 0
+
+    def __enter__(self):
+        self._lock.acquire()
+        self.depth += 1
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.depth -= 1
+        self._lock.release()
+
+
+def test_copy_key_renders_outside_view_lock(populated_hermes_home: Path, monkeypatch):
+    """The 'c' key must not render the whole layout while holding _view_lock."""
+    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    app._console = Console(
+        file=io.StringIO(), width=120, height=40, force_terminal=True, no_color=True
+    )
+    lock = _DepthTrackingLock()
+    app._view_lock = lock
+    depths: list[int] = []
+    original_build = app._build_layout
+
+    def spy_build(console=None):
+        depths.append(lock.depth)
+        return original_build(console=console)
+
+    monkeypatch.setattr(app, "_build_layout", spy_build)
+
+    app.handle_key("c")
+
+    assert depths, "copy must render the layout"
+    assert depths == [0] * len(depths)
+    app.close()
+
+
+def test_copy_key_still_emits_osc52_payload(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    buffer = io.StringIO()
+    app._console = Console(file=buffer, width=120, height=40, force_terminal=True, no_color=True)
+
+    assert app.handle_key("c") is None
+
+    assert "Gateway & Platforms" in _decoded_osc52_payload(buffer.getvalue())
+    app.close()
+
+
+def test_copy_current_view_caps_oversized_payload(populated_hermes_home: Path, monkeypatch):
+    """A huge view is truncated so the terminal is not flooded with one OSC 52 write."""
+    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    buffer = io.StringIO()
+    app._console = Console(file=buffer, width=120, height=40, force_terminal=True, no_color=True)
+    monkeypatch.setattr(app, "render_current_view_text", lambda: "x" * (_OSC52_MAX_BYTES * 3))
+
+    copied = app.copy_current_view()
+
+    payload = _decoded_osc52_payload(buffer.getvalue())
+    assert len(payload.encode("utf-8")) <= _OSC52_MAX_BYTES
+    assert payload == copied
+    assert payload.endswith("\n")
+    assert "truncated" in payload
+    assert payload.startswith("x")
+    app.close()
+
+
+def test_copy_current_view_leaves_normal_payload_untouched(
+    populated_hermes_home: Path, monkeypatch
+):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    buffer = io.StringIO()
+    app._console = Console(file=buffer, width=120, height=40, force_terminal=True, no_color=True)
+    monkeypatch.setattr(app, "render_current_view_text", lambda: "small view")
+
+    copied = app.copy_current_view()
+
+    assert copied == "small view"
+    assert _decoded_osc52_payload(buffer.getvalue()) == "small view"
+    app.close()
+
+
+def test_ensure_search_runs_query_queued_while_old_thread_lingers(
+    populated_hermes_home: Path,
+    monkeypatch,
+):
+    """A finished worker whose thread object is still alive must not swallow a new query."""
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._set_state(app._collector.collect())
+    linger = threading.Event()
+    stale_thread = threading.Thread(target=lambda: linger.wait(5), daemon=True)
+    stale_thread.start()
+    app._message_search_thread = stale_thread
+    calls: list[str] = []
+
+    def recording_search(query: str) -> set[str]:
+        calls.append(query)
+        return {"sess_001"}
+
+    monkeypatch.setattr(app._collector, "search_session_ids_by_message", recording_search)
+    try:
+        app._ensure_session_message_search("second")
+        assert app._message_search_thread is not stale_thread
+        app._message_search_thread.join(timeout=2)
+    finally:
+        linger.set()
+        stale_thread.join(timeout=2)
+
+    assert calls == ["second"]
+    assert app._state.session_message_match_query == "second"
+    app.close()
+
+
+def test_message_search_worker_releases_slot_when_it_exits(
+    populated_hermes_home: Path, monkeypatch
+):
+    """Once the worker returns, a later query starts a fresh worker instead of being dropped."""
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._set_state(app._collector.collect())
+    calls: list[str] = []
+
+    def recording_search(query: str) -> set[str]:
+        calls.append(query)
+        return {query}
+
+    monkeypatch.setattr(app._collector, "search_session_ids_by_message", recording_search)
+
+    app._ensure_session_message_search("first")
+    app._message_search_thread.join(timeout=2)
+    first_thread = app._message_search_thread
+    assert first_thread.is_alive() is False
+
+    app._ensure_session_message_search("second")
+    app._message_search_thread.join(timeout=2)
+
+    assert calls == ["first", "second"]
+    assert app._state.session_message_match_query == "second"
+    assert app._state.session_message_match_ids == {"second"}
+    app.close()
+
+
+def test_input_loop_survives_invalid_utf8_bytes(
+    populated_hermes_home: Path, fake_terminal, monkeypatch
+):
+    """Undecodable bytes from the terminal are replaced, not raised, on the input thread."""
+    import os
+
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._running.set()
+    reads = iter([b"\xff\xfe", b"\x1b\xff", b"q"])
+    monkeypatch.setattr(os, "read", lambda fd, size: next(reads))
+
+    app._input_loop()
+
+    assert app._running.is_set() is False
+    assert app._input_error is None
+    assert app._view.mode == "overview"
+    app.close()
+
+
+def test_input_loop_survives_tcgetattr_failure_without_restoring(
+    populated_hermes_home: Path, monkeypatch
+):
+    """If the terminal cannot be read at startup, the thread records the error and stops."""
+    import termios
+    import tty
+
+    class FakeStdin:
+        def isatty(self) -> bool:
+            return True
+
+        def fileno(self) -> int:
+            return 123
+
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._running.set()
+    monkeypatch.setattr("sys.stdin", FakeStdin())
+
+    def fail_tcgetattr(fd: int):
+        raise termios.error("not a terminal")
+
+    def fail_tcsetattr(fd: int, when: int, settings: object) -> None:
+        raise AssertionError("must not restore settings that were never captured")
+
+    monkeypatch.setattr(termios, "tcgetattr", fail_tcgetattr)
+    monkeypatch.setattr(termios, "tcsetattr", fail_tcsetattr)
+    monkeypatch.setattr(tty, "setcbreak", lambda fd: None)
+
+    app._input_loop()
+
+    assert app._running.is_set() is False
+    assert app._input_error is not None
+    assert "not a terminal" in app._input_error
     app.close()

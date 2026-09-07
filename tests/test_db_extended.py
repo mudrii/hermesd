@@ -5,8 +5,209 @@ import sqlite3
 import time
 from pathlib import Path
 
-from hermesd.db import HermesDB
+from hermesd.db import _LIKE_SEARCH_LIMIT, HermesDB
 from tests.conftest import create_state_db_tables
+
+
+def _create_hermes_agent_db(path: Path) -> None:
+    """Create a newer hermes-agent schema with hidden/last_activity_at/active."""
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            model TEXT,
+            started_at REAL NOT NULL,
+            last_activity_at REAL,
+            hidden INTEGER DEFAULT 0,
+            message_count INTEGER DEFAULT 0,
+            tool_call_count INTEGER DEFAULT 0
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT,
+            tool_name TEXT,
+            timestamp REAL NOT NULL,
+            active INTEGER DEFAULT 1
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_read_sessions_excludes_hidden_rows(tmp_path: Path):
+    """hermes-agent marks soft-deleted sessions hidden=1; they must not be shown."""
+    db_path = tmp_path / "state.db"
+    _create_hermes_agent_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        INSERT INTO sessions (id, source, started_at, hidden)
+            VALUES ('sess_visible', 'cli', 1.0, 0);
+        INSERT INTO sessions (id, source, started_at, hidden)
+            VALUES ('sess_hidden', 'cli', 2.0, 1);
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_null', 'cli', 3.0);
+    """)
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path)
+    assert {row["id"] for row in db.read_sessions()} == {"sess_visible", "sess_null"}
+    db.close()
+
+
+def test_read_session_count_excludes_hidden_rows(tmp_path: Path):
+    """The session count must agree with the filtered session list."""
+    db_path = tmp_path / "state.db"
+    _create_hermes_agent_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        INSERT INTO sessions (id, source, started_at, hidden)
+            VALUES ('sess_visible', 'cli', 1.0, 0);
+        INSERT INTO sessions (id, source, started_at, hidden)
+            VALUES ('sess_hidden', 'cli', 2.0, 1);
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_null', 'cli', 3.0);
+    """)
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path)
+    assert db.read_session_count() == 2
+    assert db.read_session_count() == len(db.read_sessions())
+    db.close()
+
+
+def test_read_session_count_legacy_schema_counts_every_row(hermes_home):
+    """An older DB without a hidden column counts all sessions."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.executescript("""
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_a', 'cli', 1.0);
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_b', 'cli', 2.0);
+    """)
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path)
+    assert db.read_session_count() == 2
+    db.close()
+
+
+def test_read_sessions_orders_by_last_activity_at(tmp_path: Path):
+    """A revived old session sorts ahead of a newer one with no later activity."""
+    db_path = tmp_path / "state.db"
+    _create_hermes_agent_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        INSERT INTO sessions (id, source, started_at, last_activity_at)
+            VALUES ('sess_revived', 'cli', 1.0, 100.0);
+        INSERT INTO sessions (id, source, started_at, last_activity_at)
+            VALUES ('sess_recent', 'cli', 50.0, NULL);
+        INSERT INTO sessions (id, source, started_at, last_activity_at)
+            VALUES ('sess_old', 'cli', 2.0, 3.0);
+    """)
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path)
+    assert [row["id"] for row in db.read_sessions()] == [
+        "sess_revived",
+        "sess_recent",
+        "sess_old",
+    ]
+    db.close()
+
+
+def test_read_sessions_legacy_schema_orders_by_started_at(hermes_home):
+    """An older DB without hidden/last_activity_at still reads and sorts correctly."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.executescript("""
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_a', 'cli', 1.0);
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_b', 'cli', 9.0);
+    """)
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path)
+    assert [row["id"] for row in db.read_sessions()] == ["sess_b", "sess_a"]
+    db.close()
+
+
+def test_tool_stats_exclude_inactive_messages(tmp_path: Path):
+    """Compacted-away messages (active=0) must not inflate tool call counts."""
+    db_path = tmp_path / "state.db"
+    _create_hermes_agent_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_1', 'cli', 1.0);
+        INSERT INTO messages (session_id, role, tool_name, timestamp, active)
+            VALUES ('sess_1', 'assistant', 'shell_exec', 1.0, 1);
+        INSERT INTO messages (session_id, role, tool_name, timestamp, active)
+            VALUES ('sess_1', 'assistant', 'shell_exec', 2.0, 0);
+        INSERT INTO messages (session_id, role, tool_name, timestamp, active)
+            VALUES ('sess_1', 'assistant', 'browser_open', 3.0, 0);
+        INSERT INTO messages (session_id, role, tool_name, timestamp)
+            VALUES ('sess_1', 'assistant', 'shell_exec', 4.0);
+    """)
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path)
+    stats = db.read_tool_stats()
+    assert stats == [{"tool_name": "shell_exec", "call_count": 2}]
+    db.close()
+
+
+def test_tool_stats_legacy_schema_counts_every_row(hermes_home):
+    """Without an active column every tool row still counts."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.executescript("""
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_1', 'cli', 1.0);
+        INSERT INTO messages (session_id, role, tool_name, timestamp)
+            VALUES ('sess_1', 'assistant', 'shell_exec', 1.0);
+        INSERT INTO messages (session_id, role, tool_name, timestamp)
+            VALUES ('sess_1', 'assistant', 'shell_exec', 2.0);
+    """)
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path)
+    assert db.read_tool_stats() == [{"tool_name": "shell_exec", "call_count": 2}]
+    db.close()
+
+
+def test_repeated_message_search_serves_cache_without_requery(tmp_path: Path):
+    """An unchanged repeat search hits the version cache and clears the stale flag."""
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.executescript("""
+        INSERT INTO sessions (id, source, started_at) VALUES ('s1', 'cli', 1.0);
+        INSERT INTO messages (session_id, role, content, tool_name, timestamp)
+            VALUES ('s1', 'assistant', 'used a tool', 'shell_exec', 1.0);
+    """)
+    conn.commit()
+    conn.close()
+    db = HermesDB(db_path)
+
+    first = db.search_session_ids_by_message("used a tool")
+    assert first == {"s1"}
+    assert db.last_message_search_stale is False
+
+    # No write between calls, so data_version is unchanged: the second call must
+    # return the same observable result and (re)assert a non-stale read.
+    second = db.search_session_ids_by_message("used a tool")
+    assert second == {"s1"}
+    assert db.last_message_search_stale is False
+    db.close()
 
 
 def test_read_sessions(sample_db, hermes_home):
@@ -428,6 +629,134 @@ def test_search_falls_back_to_like_when_fts_returns_no_rows(hermes_home):
     db = HermesDB(db_path)
     # "oo:ba" is not a token prefix, so the quoted FTS phrase finds nothing;
     # the LIKE fallback matches the substring.
+    assert db.search_session_ids_by_message("oo:ba") == {"sess_sub"}
+    db.close()
+
+
+def test_search_like_result_is_bounded_by_a_limit(hermes_home):
+    """The LIKE scan must return a bounded result set, not every matching session."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    for index in range(_LIKE_SEARCH_LIMIT + 25):
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at) VALUES (?, 'cli', ?)",
+            (f"sess_{index:04d}", float(index)),
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            (f"sess_{index:04d}", "user", "needle text", float(index)),
+        )
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path)
+    assert len(db.search_session_ids_by_message("needle")) == _LIKE_SEARCH_LIMIT
+    db.close()
+
+
+def test_search_excludes_inactive_messages_via_fts(tmp_path: Path):
+    """A hit that only exists in a compacted-away message must not surface its session."""
+    db_path = tmp_path / "state.db"
+    _create_hermes_agent_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_live', 'cli', 1.0);
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_compacted', 'cli', 2.0);
+        INSERT INTO messages (session_id, role, content, timestamp, active)
+            VALUES ('sess_live', 'user', 'needle text', 1.0, 1);
+        INSERT INTO messages (session_id, role, content, timestamp, active)
+            VALUES ('sess_compacted', 'user', 'needle text', 2.0, 0);
+        CREATE VIRTUAL TABLE messages_fts USING fts5(
+            content, tool_name, session_id UNINDEXED, content='messages', content_rowid='id'
+        );
+        INSERT INTO messages_fts (rowid, content, tool_name, session_id)
+        SELECT id, content, tool_name, session_id FROM messages;
+    """)
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path)
+    assert db.search_session_ids_by_message("needle") == {"sess_live"}
+    db.close()
+
+
+def test_search_excludes_inactive_messages_via_like(tmp_path: Path):
+    """The LIKE path applies the same active filter as the FTS path."""
+    db_path = tmp_path / "state.db"
+    _create_hermes_agent_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_live', 'cli', 1.0);
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_compacted', 'cli', 2.0);
+        INSERT INTO messages (session_id, role, content, timestamp, active)
+            VALUES ('sess_live', 'user', 'needle text', 1.0, 1);
+        INSERT INTO messages (session_id, role, content, timestamp, active)
+            VALUES ('sess_compacted', 'user', 'needle text', 2.0, 0);
+        INSERT INTO messages (session_id, role, tool_name, timestamp, active)
+            VALUES ('sess_compacted', 'assistant', 'needle_tool', 3.0, 0);
+    """)
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path)
+    assert db.search_session_ids_by_message("needle") == {"sess_live"}
+    db.close()
+
+
+def test_search_only_inactive_match_returns_no_session(tmp_path: Path):
+    """When every match is inactive, the search finds nothing at all."""
+    db_path = tmp_path / "state.db"
+    _create_hermes_agent_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_compacted', 'cli', 1.0);
+        INSERT INTO messages (session_id, role, content, timestamp, active)
+            VALUES ('sess_compacted', 'user', 'needle text', 1.0, 0);
+    """)
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path)
+    assert db.search_session_ids_by_message("needle") == set()
+    db.close()
+
+
+def test_search_legacy_schema_matches_without_active_column(hermes_home):
+    """An older DB has no active column, so every message stays searchable."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.executescript("""
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_a', 'cli', 1.0);
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_b', 'cli', 2.0);
+        INSERT INTO messages (session_id, role, content, timestamp)
+            VALUES ('sess_a', 'user', 'needle text', 1.0);
+        INSERT INTO messages (session_id, role, content, timestamp)
+            VALUES ('sess_b', 'user', 'needle text', 2.0);
+    """)
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path)
+    assert db.search_session_ids_by_message("needle") == {"sess_a", "sess_b"}
+    db.close()
+
+
+def test_search_falls_back_to_like_when_fts_table_is_absent(hermes_home):
+    """Without an FTS index, substring search still works through LIKE."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.executescript("""
+        INSERT INTO sessions (id, source, started_at) VALUES ('sess_sub', 'cli', 1.0);
+        INSERT INTO messages (session_id, role, content, timestamp)
+            VALUES ('sess_sub', 'user', 'foo:bar', 1.0);
+    """)
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path)
     assert db.search_session_ids_by_message("oo:ba") == {"sess_sub"}
     db.close()
 

@@ -10,6 +10,10 @@ and this project uses date-based versions in `YYYY.M.D` form.
 ### Fixed
 
 - Config detail view no longer crashes with a Rich `MarkupError` when `code_execution_mode` or MoA preset config values contain `[`; both labels are now escaped like their siblings.
+- Sessions hidden by hermes-agent 0.21 (`sessions.hidden = 1`) are excluded from the session list and the header count, and sessions are ordered by `COALESCE(last_activity_at, started_at)` so revived sessions sort where the agent shows them; older schemas without those columns keep the previous behaviour.
+- Tool-call statistics and message search skip messages compacted out of the live transcript (`messages.active = 0`) on hermes-agent 0.21 schemas, so counts and search hits reflect what the agent still holds in context.
+- The LIKE fallback for message search is bounded to 500 sessions, so a pathological match cannot hand an unbounded result set to the UI.
+- A file that is deleted under `~/.hermes` (for example `.drain_request.json`) is evicted from the last-good cache instead of being served forever; only transiently unreadable files keep their last-good value.
 - Every panel now strips ANSI and terminal control sequences from collected data, so crafted or corrupt input can no longer redraw the display or issue terminal clipboard commands.
 - Cron jobs with non-string JSON fields (e.g. a numeric `id`) no longer crash the whole cron source to fallback; all string fields are coerced.
 - One corrupt per-board `kanban.db` no longer discards the root board and all healthy boards; a last-good summary is preserved when available and Kanban health is marked degraded.
@@ -23,6 +27,17 @@ and this project uses date-based versions in `YYYY.M.D` form.
 - Snapshot mode creates missing parent directories for `--snapshot-file` and handles SIGINT/SIGTERM cleanly instead of dumping a traceback; an interrupted snapshot now exits with the conventional signal exit code (130/143) and a notice, and a second signal force-kills a wedged collect.
 - `file_cache` keys on `st_mtime_ns`, so same-second fixes to malformed files are picked up; profile-scoped paths and databases re-validate symlink targets on every collection/connect; invalid UTF-8 theme config falls back safely; `RuntimeStatus.agent_running` now defaults to not-running instead of reporting a running agent when the first collect fails.
 - Follow-up hardening from a second review pass: the terminal-text sanitizer now removes OSC/DCS/APC payloads too (hyperlinks, clipboard sequences) instead of leaving them as visible garbage; kanban per-board tolerance also covers WAL-snapshot `OSError`s (e.g. a sidecar vanishing mid-copy); the cron excerpt cache keys on the mtime of the file actually read; the available-tools cache tracks every session file's mtime (not just the max); and Skills detail scrolling clamps to a full 20-row window instead of shrinking to a stub at the bottom.
+- A failure while rendering a frame now prints a single-line `hermesd: render failed: ...` message to stderr and exits with status 1 after the terminal is restored, instead of dumping a traceback out of the live loop.
+- A session message-search query typed while the previous search was finishing is no longer dropped: worker availability is tracked explicitly instead of inferred from a thread object that may still be unwinding.
+- Copying the current view with `c` renders outside the view lock, so the input thread no longer blocks the render loop for the length of a full re-render, and the OSC 52 payload is capped at 96 KiB with a truncation marker.
+- The tools panel reads the live tool inventory from `cache/banner_snapshot.json` and only falls back to the legacy `sessions/` scan, so hermes-agent 0.21 (which no longer writes per-session files) again shows the available tools; the fallback now caches only extracted tool names instead of retaining every parsed session document for the life of the process.
+- PR-monitor state written to `cron/state/pr_monitor.json` is now surfaced in Operations; its `.bak` and `.lock` siblings are ignored.
+- Background processes come from the live `spawn-ledger.json` registry (with the process purpose, port, and profile), falling back to the legacy `processes.json` when the ledger is absent or empty.
+- A log line consisting mostly of whitespace no longer stalls a refresh: the log-line pattern is fully bounded (it previously backtracked cubically, seconds per line) and each line is truncated to 4096 characters before parsing.
+- A `null` or wrong-typed value in `config.yaml` (for example `max_turns: null` or `max_turns: unlimited`) or in `cron/jobs.json` (`enabled: null`) no longer fails the whole config or cron source; values are coerced and defaults applied.
+- Goal state is re-read only when `state.db` changes, and per-repo checkpoint commit counts only when the repository's refs change, removing a database snapshot copy and two git subprocesses per repository from every refresh.
+- Plain-text reads under `~/.hermes` (memory files, `SOUL.md`, skill frontmatter, hook and plugin manifests, checkpoint workdir markers, the gateway pid file, cron suggestions) now refuse symlinks that escape the Hermes home and read at most 256 KiB, so an oversized or redirected file cannot stall or mislead the dashboard.
+- Quitting no longer waits for a full collection pass: `close()` signals the in-flight pass, which stops after the current source and keeps last-good values for the rest.
 
 ### Changed
 

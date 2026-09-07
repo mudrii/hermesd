@@ -139,21 +139,30 @@ def test_app_handle_bracket_navigation_wraps_at_boundaries(populated_hermes_home
     app.close()
 
 
-def test_app_handle_key_escape(populated_hermes_home: Path):
+@pytest.mark.parametrize(
+    ("setup_key", "key", "expected_mode", "expected_panel"),
+    [
+        ("3", "\x1b", "overview", None),  # lone Esc leaves detail
+        ("3", "\x1b[A", "detail", 3),  # Up arrow must not exit detail
+        (None, "\x1b", "overview", None),  # Esc in overview is a no-op
+        (None, "\x1b[2~", "overview", None),  # CSI is not read as digit "2"
+    ],
+    ids=["esc-exits-detail", "arrow-kept-in-detail", "esc-overview-noop", "csi-not-digit"],
+)
+def test_app_handle_escape_keys(
+    populated_hermes_home: Path,
+    setup_key: str | None,
+    key: str,
+    expected_mode: str,
+    expected_panel: int | None,
+):
+    """Lone Esc exits detail; multi-byte escape sequences are inert."""
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app.handle_key("3")
-    app.handle_key("\x1b")  # single Esc byte
-    assert app._view.mode == "overview"
-    app.close()
-
-
-def test_app_handle_key_escape_sequence_ignored(populated_hermes_home: Path):
-    """Multi-byte escape sequences (arrow keys, etc.) must not exit detail."""
-    app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    app.handle_key("3")
-    app.handle_key("\x1b[A")  # Up arrow
-    assert app._view.mode == "detail"
-    assert app._view.detail_panel == 3
+    if setup_key is not None:
+        app.handle_key(setup_key)
+    app.handle_key(key)
+    assert app._view.mode == expected_mode
+    assert app._view.detail_panel == expected_panel
     app.close()
 
 
@@ -300,6 +309,105 @@ def test_run_exits_cleanly_on_keyboard_interrupt(
     monkeypatch.setattr(app, "_build_layout", interrupting_build)
     app.run()  # must not raise
     assert app._running.is_set() is False
+    assert app._closed.is_set() is True
+
+
+def test_run_reports_render_failure_and_exits_nonzero(
+    populated_hermes_home: Path, monkeypatch, restore_signal_handlers, capsys
+):
+    """A render error is a one-line stderr message plus exit code 1, not a traceback."""
+    import io
+
+    from rich.console import Console
+
+    import hermesd.app as app_module
+
+    class ImmediateStopEvent(threading.Event):
+        def wait(self, timeout: float | None = None) -> bool:
+            return False
+
+    class PassthroughLive:
+        def __init__(self, renderable, *, console, refresh_per_second, screen):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def update(self, renderable):
+            pass
+
+    app = DashboardApp(populated_hermes_home, refresh_rate=1)
+    app._console = Console(file=io.StringIO(), width=80, height=24, force_terminal=True)
+    app._stop_requested = ImmediateStopEvent()
+    monkeypatch.setattr(app_module, "Live", PassthroughLive)
+    original_build = app._build_layout
+    calls: list[int] = []
+
+    def failing_build(console=None):
+        calls.append(1)
+        if len(calls) > 1:
+            raise RuntimeError("layout exploded")
+        return original_build(console=console)
+
+    monkeypatch.setattr(app, "_build_layout", failing_build)
+
+    with pytest.raises(SystemExit) as excinfo:
+        app.run()
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert "hermesd: render failed: RuntimeError: layout exploded" in captured.err
+    assert "Traceback" not in captured.err
+    assert app._running.is_set() is False
+    assert app._closed.is_set() is True
+
+
+def test_run_closes_threads_and_collector_when_loop_quits(
+    populated_hermes_home: Path, monkeypatch, restore_signal_handlers
+):
+    """After a normal quit, both daemon threads have exited and the collector is closed."""
+    import io
+
+    from rich.console import Console
+
+    import hermesd.app as app_module
+
+    class StopsOnEnter:
+        def __init__(self, renderable, *, console, refresh_per_second, screen):
+            pass
+
+        def __enter__(self):
+            app._running.clear()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def update(self, renderable):
+            pass
+
+    app = DashboardApp(populated_hermes_home, refresh_rate=1)
+    app._console = Console(file=io.StringIO(), width=80, height=24, force_terminal=True)
+    monkeypatch.setattr(app_module, "Live", StopsOnEnter)
+    collector_closes: list[int] = []
+    real_collector_close = app._collector.close
+
+    def spy_close() -> None:
+        collector_closes.append(1)
+        real_collector_close()
+
+    monkeypatch.setattr(app._collector, "close", spy_close)
+
+    app.run()
+
+    assert app._collector_thread is not None
+    assert app._input_thread is not None
+    assert app._collector_thread.is_alive() is False
+    assert app._input_thread.is_alive() is False
+    assert collector_closes == [1]
     assert app._closed.is_set() is True
 
 
