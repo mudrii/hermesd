@@ -28,6 +28,7 @@ from hermesd.collect.common import (
     _coerce_float,
     _coerce_int,
     _db_source_mtime_ns,
+    _exists_strict,
     _file_signature,
     _file_size,
     _int_mapping,
@@ -1812,7 +1813,7 @@ class Collector:
         streams = [
             self._tail_log_stream(name, path, max_lines)
             for name, path, max_lines in stream_specs
-            if path.exists() or str(path) in self._log_cache
+            if _exists_strict(path) or str(path) in self._log_cache
         ]
         cron_lines = self._tail_latest_cron_output(
             self._paths.shared_path("cron", "output"), _LOG_TAIL_LINES

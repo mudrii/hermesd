@@ -572,7 +572,11 @@ def test_cron_excerpt_refreshes_when_output_file_is_replaced(hermes_home: Path):
 def test_cron_excerpt_serves_last_good_when_output_file_cannot_be_stat_ed(
     hermes_home: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """An unstattable output file has no signature, so the cached excerpt is kept."""
+    """An unstattable output file cannot be discovered, so the cached excerpt is kept.
+
+    Both Path.stat and Path.is_file are patched: 3.14 routes is_file() through
+    os.stat directly, so patching Path.stat alone no longer hides the file.
+    """
     output_root = hermes_home / "cron" / "output"
     job_dir = output_root / "job-1"
     job_dir.mkdir(parents=True)
@@ -591,7 +595,15 @@ def test_cron_excerpt_serves_last_good_when_output_file_cannot_be_stat_ed(
                 raise OSError("stat denied")
             return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
 
+        real_is_file = Path.is_file
+
+        def failing_is_file(self: Path, *args: object, **kwargs: object) -> bool:
+            if self == output_file:
+                raise OSError("stat denied")
+            return real_is_file(self, *args, **kwargs)  # type: ignore[arg-type]
+
         monkeypatch.setattr(Path, "stat", failing_stat)
+        monkeypatch.setattr(Path, "is_file", failing_is_file)
         output_file.write_text("new output\n")
         second = c._latest_cron_output_excerpt(output_root, "job-1", 32768)
     finally:

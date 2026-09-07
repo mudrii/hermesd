@@ -54,6 +54,19 @@ def _safe_capped_file(path: Path, root: Path) -> bool:
     return _file_size(path) <= _MAX_TEXT_READ_BYTES
 
 
+def _exists_strict(path: Path) -> bool:
+    """Like Path.exists(), but only absence is False; other OSErrors propagate.
+
+    Python 3.14 made Path.exists() return False on EACCES too, which would turn
+    an unreadable ~/.hermes directory into "no data" instead of a failed source.
+    """
+    try:
+        path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return True
+
+
 def _read_tail_text(path: Path, max_bytes: int) -> str:
     """Read at most the last max_bytes of path, decoded with replacement."""
     with path.open("rb") as handle:
