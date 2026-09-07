@@ -15,6 +15,10 @@ _LOG_LINE_PATTERN = re.compile(
 
 # Log lines are truncated to this width before parsing/redaction.
 _MAX_LOG_LINE_CHARS = 4096
+# Lines kept per log stream. Errors get a shorter tail: the panel shows them
+# alongside every other stream and a long error burst would crowd it out.
+_LOG_TAIL_LINES = 20
+_ERROR_LOG_TAIL_LINES = 10
 
 
 def _latest_log_mtime(logs_dir: Path) -> float | None:

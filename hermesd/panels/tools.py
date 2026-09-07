@@ -10,7 +10,7 @@ from rich.text import Text
 
 from hermesd.models import DashboardState
 from hermesd.panels.formatting import escape_terminal_text as escape
-from hermesd.panels.formatting import sanitize_terminal_text
+from hermesd.panels.formatting import sanitize_terminal_text, section_heading
 from hermesd.theme import Theme
 
 
@@ -43,101 +43,15 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
 
 
 def _render_detail(state: DashboardState, theme: Theme) -> Panel:
-    sections: list[RenderableType] = []
-
-    # Table 1: Tool call stats
-    calls_header = Text()
-    calls_header.append(
-        f"Tool Calls ({state.total_tool_calls} total)\n", style=f"bold {theme.ui_label}"
-    )
-    sections.append(calls_header)
-
-    if state.tool_stats:
-        calls_table = Table(box=None, show_header=True, padding=(0, 2))
-        calls_table.add_column("Name", style=theme.ui_label)
-        calls_table.add_column("Calls", justify="right", style=theme.ui_accent)
-        for ts in state.tool_stats:
-            calls_table.add_row(escape(ts.name), str(ts.call_count))
-        sections.append(calls_table)
-    else:
-        sections.append(Text("  No tool call data\n", style=theme.banner_dim))
-
-    # Table 2: Available tools
-    sections.append(Text("\n"))
-    tools_header = Text()
-    tools_header.append(
-        f"Available Tools ({state.available_tools})\n", style=f"bold {theme.ui_label}"
-    )
-    sections.append(tools_header)
-
-    if state.available_tool_names:
-        tools_table = Table(box=None, show_header=False, padding=(0, 2))
-        tools_table.add_column("Tool", style=theme.banner_text)
-        tools_table.add_column("Tool", style=theme.banner_text)
-        tools_table.add_column("Tool", style=theme.banner_text)
-        names = state.available_tool_names
-        for i in range(0, len(names), 3):
-            row = [escape(names[i]) if i < len(names) else ""]
-            row.append(escape(names[i + 1]) if i + 1 < len(names) else "")
-            row.append(escape(names[i + 2]) if i + 2 < len(names) else "")
-            tools_table.add_row(*row)
-        sections.append(tools_table)
-    else:
-        sections.append(Text("  No active session with tools\n", style=theme.banner_dim))
-
-    sections.append(Text("\n"))
-    process_header = Text()
-    process_header.append(
-        f"Background Processes ({len(state.background_processes)})\n",
-        style=f"bold {theme.ui_label}",
-    )
-    sections.append(process_header)
-
-    if state.background_processes:
-        process_table = Table(box=None, show_header=True, padding=(0, 1))
-        process_table.add_column("Session", style=theme.ui_label, min_width=14)
-        process_table.add_column("PID", justify="right", style=theme.ui_accent, min_width=5)
-        process_table.add_column("Notify", style=theme.banner_text, min_width=6)
-        process_table.add_column("Watch", style=theme.banner_dim, min_width=8)
-        process_table.add_column("Started", style=theme.banner_dim, min_width=8)
-        process_table.add_column("Command", style=theme.banner_text, ratio=1)
-        for process in state.background_processes:
-            process_table.add_row(
-                escape(process.session_id),
-                str(process.pid) if process.pid else "—",
-                "Yes" if process.notify_on_complete else "No",
-                _watch_summary(process.watch_patterns, process.watcher_interval),
-                _started_label(process.started_at),
-                escape(process.command),
-            )
-        sections.append(process_table)
-    else:
-        sections.append(Text("  No running background processes\n", style=theme.banner_dim))
-
-    sections.append(Text("\n"))
-    checkpoint_header = Text()
-    checkpoint_header.append(
-        f"Checkpoints ({len(state.checkpoints)})\n",
-        style=f"bold {theme.ui_label}",
-    )
-    sections.append(checkpoint_header)
-
-    if state.checkpoints:
-        checkpoint_table = Table(box=None, show_header=True, padding=(0, 1))
-        checkpoint_table.add_column("Workdir", style=theme.ui_label, min_width=16)
-        checkpoint_table.add_column("Commits", justify="right", style=theme.ui_accent, min_width=7)
-        checkpoint_table.add_column("Latest", style=theme.banner_text, ratio=1)
-        checkpoint_table.add_column("When", style=theme.banner_dim, min_width=8)
-        for checkpoint in state.checkpoints:
-            checkpoint_table.add_row(
-                escape(checkpoint.workdir_name or checkpoint.repo_id),
-                str(checkpoint.commit_count),
-                escape(checkpoint.last_reason) if checkpoint.last_reason else "—",
-                _started_label(checkpoint.last_checkpoint_at or 0.0),
-            )
-        sections.append(checkpoint_table)
-    else:
-        sections.append(Text("  No filesystem checkpoints\n", style=theme.banner_dim))
+    sections: list[RenderableType] = [
+        *_tool_calls_section(state, theme),
+        Text("\n"),
+        *_available_tools_section(state, theme),
+        Text("\n"),
+        *_background_processes_section(state, theme),
+        Text("\n"),
+        *_checkpoints_section(state, theme),
+    ]
 
     return Panel(
         Group(*sections),
@@ -147,6 +61,83 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         box=rich.box.HORIZONTALS,
         padding=(1, 2),
     )
+
+
+def _tool_calls_section(state: DashboardState, theme: Theme) -> list[RenderableType]:
+    header = section_heading(
+        f"Tool Calls ({state.total_tool_calls} total)", theme, leading_blank=False
+    )
+    if not state.tool_stats:
+        return [header, Text("  No tool call data\n", style=theme.banner_dim)]
+    calls_table = Table(box=None, show_header=True, padding=(0, 2))
+    calls_table.add_column("Name", style=theme.ui_label)
+    calls_table.add_column("Calls", justify="right", style=theme.ui_accent)
+    for ts in state.tool_stats:
+        calls_table.add_row(escape(ts.name), str(ts.call_count))
+    return [header, calls_table]
+
+
+def _available_tools_section(state: DashboardState, theme: Theme) -> list[RenderableType]:
+    header = section_heading(
+        f"Available Tools ({state.available_tools})", theme, leading_blank=False
+    )
+    names = state.available_tool_names
+    if not names:
+        return [header, Text("  No active session with tools\n", style=theme.banner_dim)]
+    tools_table = Table(box=None, show_header=False, padding=(0, 2))
+    tools_table.add_column("Tool", style=theme.banner_text)
+    tools_table.add_column("Tool", style=theme.banner_text)
+    tools_table.add_column("Tool", style=theme.banner_text)
+    for i in range(0, len(names), 3):
+        row = [escape(names[i]) if i < len(names) else ""]
+        row.append(escape(names[i + 1]) if i + 1 < len(names) else "")
+        row.append(escape(names[i + 2]) if i + 2 < len(names) else "")
+        tools_table.add_row(*row)
+    return [header, tools_table]
+
+
+def _background_processes_section(state: DashboardState, theme: Theme) -> list[RenderableType]:
+    header = section_heading(
+        f"Background Processes ({len(state.background_processes)})", theme, leading_blank=False
+    )
+    if not state.background_processes:
+        return [header, Text("  No running background processes\n", style=theme.banner_dim)]
+    process_table = Table(box=None, show_header=True, padding=(0, 1))
+    process_table.add_column("Session", style=theme.ui_label, min_width=14)
+    process_table.add_column("PID", justify="right", style=theme.ui_accent, min_width=5)
+    process_table.add_column("Notify", style=theme.banner_text, min_width=6)
+    process_table.add_column("Watch", style=theme.banner_dim, min_width=8)
+    process_table.add_column("Started", style=theme.banner_dim, min_width=8)
+    process_table.add_column("Command", style=theme.banner_text, ratio=1)
+    for process in state.background_processes:
+        process_table.add_row(
+            escape(process.session_id),
+            str(process.pid) if process.pid else "—",
+            "Yes" if process.notify_on_complete else "No",
+            _watch_summary(process.watch_patterns, process.watcher_interval),
+            _started_label(process.started_at),
+            escape(process.command),
+        )
+    return [header, process_table]
+
+
+def _checkpoints_section(state: DashboardState, theme: Theme) -> list[RenderableType]:
+    header = section_heading(f"Checkpoints ({len(state.checkpoints)})", theme, leading_blank=False)
+    if not state.checkpoints:
+        return [header, Text("  No filesystem checkpoints\n", style=theme.banner_dim)]
+    checkpoint_table = Table(box=None, show_header=True, padding=(0, 1))
+    checkpoint_table.add_column("Workdir", style=theme.ui_label, min_width=16)
+    checkpoint_table.add_column("Commits", justify="right", style=theme.ui_accent, min_width=7)
+    checkpoint_table.add_column("Latest", style=theme.banner_text, ratio=1)
+    checkpoint_table.add_column("When", style=theme.banner_dim, min_width=8)
+    for checkpoint in state.checkpoints:
+        checkpoint_table.add_row(
+            escape(checkpoint.workdir_name or checkpoint.repo_id),
+            str(checkpoint.commit_count),
+            escape(checkpoint.last_reason) if checkpoint.last_reason else "—",
+            _started_label(checkpoint.last_checkpoint_at or 0.0),
+        )
+    return [header, checkpoint_table]
 
 
 def _watch_summary(patterns: list[str], watcher_interval: int) -> str:

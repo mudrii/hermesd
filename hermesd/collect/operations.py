@@ -105,10 +105,6 @@ def _verification_failed_count(conn: sqlite3.Connection) -> int:
     return int(row[0] or 0) if row is not None else 0
 
 
-def _read_goal_state(conn: sqlite3.Connection, operations: OperationsState) -> OperationsState:
-    return operations.model_copy(update=_goal_state_update(conn))
-
-
 def _goal_state_update(conn: sqlite3.Connection) -> dict[str, Any]:
     goals = _read_goal_summaries(conn)
     return {

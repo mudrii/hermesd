@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from hermesd.collect.common import (
+    _EXCERPT_MAX_CHARS,
     _as_dict,
     _mtime,
     _path_resolves_under,
@@ -64,7 +65,7 @@ def _latest_cron_output_excerpt(
     for line in lines:
         stripped = line.strip()
         if stripped and "[SILENT]" not in stripped.upper():
-            return stripped[:80], silent, latest.name, latest_mtime
+            return stripped[:_EXCERPT_MAX_CHARS], silent, latest.name, latest_mtime
     return "", silent, latest.name, latest_mtime
 
 

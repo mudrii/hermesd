@@ -8,7 +8,7 @@ from rich.text import Text
 
 from hermesd.models import ConfigSummary, DashboardState
 from hermesd.panels.formatting import escape_terminal_text as escape
-from hermesd.panels.formatting import sanitize_terminal_text
+from hermesd.panels.formatting import sanitize_terminal_text, section_heading
 from hermesd.theme import Theme
 
 
@@ -47,8 +47,24 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
 
 def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     c = state.config
-    sections: list[RenderableType] = []
+    sections: list[RenderableType] = [_settings_table(c, theme)]
 
+    if c.tool_gateway_routes:
+        sections.append(section_heading("Tool Gateway (dashboard-local env)", theme))
+        sections.append(_tool_gateway_table(c, theme))
+        sections.append(_tool_gateway_routes_table(c, theme))
+
+    return Panel(
+        Group(*sections),
+        title=f"[{theme.panel_title_style}]\\[5] Config[/]",
+        title_align="left",
+        border_style=theme.panel_border_style,
+        box=rich.box.HORIZONTALS,
+        padding=(1, 2),
+    )
+
+
+def _settings_table(c: ConfigSummary, theme: Theme) -> Table:
     table = Table(box=None, show_header=False, padding=(0, 2))
     table.add_column("Key", style=theme.ui_label)
     table.add_column("Value", style=theme.ui_accent)
@@ -87,47 +103,33 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     table.add_row("Gateway Media", _gateway_media_label(c))
     table.add_row("MoA", escape(_moa_label(c)))
     table.add_row("Auxiliary Slots", str(len(c.auxiliary_slots)))
-    sections.append(table)
+    return table
 
-    if c.tool_gateway_routes:
-        sections.append(
-            Text("\nTool Gateway (dashboard-local env)\n", style=f"bold {theme.ui_label}")
-        )
 
-        gateway_table = Table(box=None, show_header=False, padding=(0, 2))
-        gateway_table.add_column("Key", style=theme.ui_label)
-        gateway_table.add_column("Value", style=theme.ui_accent)
-        gateway_table.add_row(
-            "Domain", escape(c.tool_gateway_domain) if c.tool_gateway_domain else "—"
-        )
-        gateway_table.add_row(
-            "Scheme", escape(c.tool_gateway_scheme) if c.tool_gateway_scheme else "—"
-        )
-        gateway_table.add_row(
-            "Firecrawl", escape(c.firecrawl_gateway_url) if c.firecrawl_gateway_url else "—"
-        )
-        sections.append(gateway_table)
-
-        routes_table = Table(box=None, show_header=True, padding=(0, 2))
-        routes_table.add_column("Tool", style=theme.ui_label)
-        routes_table.add_column("Mode", style=theme.banner_text)
-        routes_table.add_column("Token", style=theme.ui_accent)
-        for route in c.tool_gateway_routes:
-            routes_table.add_row(
-                escape(route.tool),
-                escape(route.mode),
-                "Yes" if route.token_present else "No",
-            )
-        sections.append(routes_table)
-
-    return Panel(
-        Group(*sections),
-        title=f"[{theme.panel_title_style}]\\[5] Config[/]",
-        title_align="left",
-        border_style=theme.panel_border_style,
-        box=rich.box.HORIZONTALS,
-        padding=(1, 2),
+def _tool_gateway_table(c: ConfigSummary, theme: Theme) -> Table:
+    gateway_table = Table(box=None, show_header=False, padding=(0, 2))
+    gateway_table.add_column("Key", style=theme.ui_label)
+    gateway_table.add_column("Value", style=theme.ui_accent)
+    gateway_table.add_row("Domain", escape(c.tool_gateway_domain) if c.tool_gateway_domain else "—")
+    gateway_table.add_row("Scheme", escape(c.tool_gateway_scheme) if c.tool_gateway_scheme else "—")
+    gateway_table.add_row(
+        "Firecrawl", escape(c.firecrawl_gateway_url) if c.firecrawl_gateway_url else "—"
     )
+    return gateway_table
+
+
+def _tool_gateway_routes_table(c: ConfigSummary, theme: Theme) -> Table:
+    routes_table = Table(box=None, show_header=True, padding=(0, 2))
+    routes_table.add_column("Tool", style=theme.ui_label)
+    routes_table.add_column("Mode", style=theme.banner_text)
+    routes_table.add_column("Token", style=theme.ui_accent)
+    for route in c.tool_gateway_routes:
+        routes_table.add_row(
+            escape(route.tool),
+            escape(route.mode),
+            "Yes" if route.token_present else "No",
+        )
+    return routes_table
 
 
 def _dashboard_auth_label(config: ConfigSummary) -> str:

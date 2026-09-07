@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from hermesd.models import DashboardState, ToolStats
+from hermesd.models import BackgroundProcessInfo, DashboardState, ToolStats
 from hermesd.panels import render_panel
+from hermesd.panels.tools import render_tools
 from hermesd.theme import Theme
 from tests.conftest import render_to_str
 
@@ -95,3 +96,13 @@ def test_tools_compact_shows_summary():
     text = render_to_str(panel, width=100)
     assert "29 available" in text
     assert "10 calls" in text
+
+
+def test_tools_detail_handles_absurd_started_at() -> None:
+    state = DashboardState(
+        background_processes=[
+            BackgroundProcessInfo(session_id="s", command="make", started_at=1e18)
+        ]
+    )
+    rendered = render_to_str(render_tools(state, Theme(), detail=True))
+    assert "—" in rendered

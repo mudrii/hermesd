@@ -21,6 +21,7 @@ from rich.text import Text
 
 from hermesd import __version__
 from hermesd.collector import Collector
+from hermesd.defaults import DEFAULT_LOG_TAIL_BYTES, DEFAULT_REFRESH_RATE
 from hermesd.models import DashboardState
 from hermesd.panels import PANEL_NAMES, render_panel
 from hermesd.theme import Theme, load_theme
@@ -181,10 +182,10 @@ class DashboardApp:
     def __init__(
         self,
         hermes_home: Path,
-        refresh_rate: int = 5,
+        refresh_rate: int = DEFAULT_REFRESH_RATE,
         no_color: bool = False,
         profile_name: str | None = None,
-        log_tail_bytes: int = 32768,
+        log_tail_bytes: int = DEFAULT_LOG_TAIL_BYTES,
     ) -> None:
         if refresh_rate <= 0:
             raise ValueError("refresh_rate must be positive")

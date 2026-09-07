@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import sqlite3
-import time
 from pathlib import Path
 from typing import Any
 
@@ -28,16 +27,20 @@ from hermesd.models import (
 )
 from hermesd.paths import HermesPaths
 
+# Fallback for kanban.claim_ttl_seconds: a task claim older than this with no
+# heartbeat is treated as abandoned. Mirrors hermes-agent's own default.
+_DEFAULT_CLAIM_TTL_SECONDS = 300
+
 
 def _kanban_claim_ttl_seconds(cfg: dict[str, Any]) -> int:
     for key in ("claim_ttl_seconds", "worker_claim_ttl_seconds", "claim_timeout_seconds"):
         value = _coerce_int(cfg.get(key))
         if value > 0:
             return value
-    return 300
+    return _DEFAULT_CLAIM_TTL_SECONDS
 
 
-def _read_kanban_state(db_path: Path, base_state: KanbanState) -> KanbanState:
+def _read_kanban_state(db_path: Path, base_state: KanbanState, *, now: float) -> KanbanState:
     with _connect_readonly_sqlite(db_path) as conn:
         conn.row_factory = sqlite3.Row
         status_counts = _count_by(conn, "SELECT status, COUNT(*) FROM tasks GROUP BY status")
@@ -77,6 +80,7 @@ def _read_kanban_state(db_path: Path, base_state: KanbanState) -> KanbanState:
                 "stale_claim_count": _stale_claim_count_from_tasks(
                     conn,
                     base_state.claim_ttl_seconds,
+                    now,
                 ),
                 "status_counts": status_counts,
                 "assignee_counts": assignee_counts,
@@ -95,6 +99,7 @@ def _read_kanban_board_summary(
     slug: str,
     current: bool,
     claim_ttl_seconds: int,
+    now: float,
 ) -> KanbanBoardSummary:
     with _connect_readonly_sqlite(db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -107,7 +112,7 @@ def _read_kanban_board_summary(
                 conn,
                 "SELECT COUNT(*) FROM tasks WHERE status IN ('blocked', 'failed', 'error')",
             ),
-            stale_claim_count=_stale_claim_count_from_tasks(conn, claim_ttl_seconds),
+            stale_claim_count=_stale_claim_count_from_tasks(conn, claim_ttl_seconds, now),
             block_kind_counts=(
                 _count_by(
                     conn,
@@ -120,11 +125,13 @@ def _read_kanban_board_summary(
         )
 
 
-def _stale_claim_count_from_tasks(conn: sqlite3.Connection, claim_ttl_seconds: int) -> int:
+def _stale_claim_count_from_tasks(
+    conn: sqlite3.Connection, claim_ttl_seconds: int, now_epoch: float
+) -> int:
     if not _table_exists(conn, "tasks"):
         return 0
-    now = int(time.time())
-    ttl = claim_ttl_seconds if claim_ttl_seconds > 0 else 300
+    now = int(now_epoch)
+    ttl = claim_ttl_seconds if claim_ttl_seconds > 0 else _DEFAULT_CLAIM_TTL_SECONDS
     conditions = []
     if _column_exists(conn, "tasks", "claim_expires"):
         conditions.append(f"COALESCE(claim_expires, 0) > 0 AND claim_expires < {now}")

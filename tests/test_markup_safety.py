@@ -359,6 +359,12 @@ def _state_for(panel_num: int) -> DashboardState:
     raise AssertionError(f"no state builder for panel {panel_num}")
 
 
+# Panels 3 (Tokens / Cost) and 12 (Operations) render only numeric aggregates in
+# their compact views — no untrusted free-text field reaches the screen there, so
+# the literal-bracket assertion cannot apply to them.
+_NO_FREE_TEXT_COMPACT_PANELS = {3, 12}
+
+
 @pytest.mark.parametrize("panel_num", range(1, 14))
 @pytest.mark.parametrize("detail", [False, True])
 def test_panel_does_not_crash_on_markup_injection(panel_num: int, detail: bool) -> None:
@@ -379,12 +385,13 @@ def test_panel_does_not_crash_on_markup_injection(panel_num: int, detail: bool) 
 def test_panel_preserves_literal_brackets(panel_num: int, detail: bool) -> None:
     state = _state_for(panel_num)
     rendered = render_to_str(render_panel(panel_num, state, Theme(), detail=detail))
+    if not detail and panel_num in _NO_FREE_TEXT_COMPACT_PANELS:
+        return
     # The bracket pair must survive as literal text, not be parsed away as a
-    # Rich style tag. Compact views only show a subset of fields, so require
-    # the literal in at least the detail view where every field is rendered.
-    if detail:
-        assert PAIR in rendered, f"panel {panel_num} detail stripped literal {PAIR!r}"
-        assert CLOSER in rendered, f"panel {panel_num} detail dropped literal {CLOSER!r}"
+    # Rich style tag.
+    view = "detail" if detail else "compact"
+    assert PAIR in rendered, f"panel {panel_num} {view} stripped literal {PAIR!r}"
+    assert CLOSER in rendered, f"panel {panel_num} {view} dropped literal {CLOSER!r}"
 
 
 @pytest.mark.parametrize(

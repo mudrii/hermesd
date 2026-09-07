@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from hermesd.db import snapshot_wal_database
+from hermesd.db import _SQLITE_TIMEOUT_SECONDS, snapshot_wal_database
 
 
 @contextlib.contextmanager
@@ -17,7 +17,11 @@ def _connect_readonly_sqlite(db_path: Path) -> Iterator[sqlite3.Connection]:
     if db_path.with_name(f"{db_path.name}-wal").exists():
         snapshot_dir, snapshot_db = snapshot_wal_database(db_path, prefix="hermesd-kanban-")
         try:
-            conn = sqlite3.connect(f"{snapshot_db.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
+            conn = sqlite3.connect(
+                f"{snapshot_db.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=_SQLITE_TIMEOUT_SECONDS,
+            )
             yield conn
             return
         finally:
@@ -27,12 +31,41 @@ def _connect_readonly_sqlite(db_path: Path) -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(
         f"{db_path.resolve().as_uri()}?mode=ro&immutable=1",
         uri=True,
-        timeout=2,
+        timeout=_SQLITE_TIMEOUT_SECONDS,
     )
     try:
         yield conn
     finally:
         conn.close()
+
+
+# Every table hermesd reads by name. `_table_count` and `_column_exists` splice
+# the name straight into SQL because SQLite cannot bind an identifier, so an
+# unlisted name is rejected instead of reaching the database.
+_KNOWN_TABLES = frozenset(
+    {
+        "conversations",
+        "discovered_repos",
+        "project_folders",
+        "projects",
+        "responses",
+        "task_attachments",
+        "task_comments",
+        "task_events",
+        "task_links",
+        "task_runs",
+        "tasks",
+        "verification_events",
+        "verification_state",
+    }
+)
+
+
+def _checked_table(table_name: str) -> str:
+    """Return table_name if it is a known hermes table, else raise."""
+    if table_name not in _KNOWN_TABLES:
+        raise ValueError(f"unknown table name: {table_name!r}")
+    return table_name
 
 
 def _query_rows(conn: sqlite3.Connection, sql: str) -> list[dict[str, Any]]:
@@ -41,7 +74,9 @@ def _query_rows(conn: sqlite3.Connection, sql: str) -> list[dict[str, Any]]:
 
 
 def _table_count(conn: sqlite3.Connection, table_name: str) -> int:
-    cur = conn.execute(f"SELECT COUNT(*) FROM {table_name}")
+    # SQLite cannot bind an identifier, so the name is interpolated. It is
+    # validated against _KNOWN_TABLES first; every caller passes a literal.
+    cur = conn.execute(f"SELECT COUNT(*) FROM {_checked_table(table_name)}")
     row = cur.fetchone()
     return int(row[0]) if row is not None else 0
 
@@ -62,7 +97,8 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
 
 def _column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
     with contextlib.suppress(sqlite3.Error):
-        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        # Same identifier-interpolation carve-out as _table_count.
+        rows = conn.execute(f"PRAGMA table_info({_checked_table(table_name)})").fetchall()
         return any(str(row[1] or "") == column_name for row in rows)
     return False
 

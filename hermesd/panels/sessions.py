@@ -16,6 +16,7 @@ from hermesd.panels.formatting import (
     fmt_tokens,
     fmt_usd,
     sanitize_terminal_text,
+    section_heading,
 )
 from hermesd.theme import Theme
 
@@ -92,6 +93,65 @@ def _render_detail(
     sessions = _sort_sessions(
         _filter_sessions(state.sessions, filter_query, message_match_ids), session_sort
     )
+
+    sections: list[RenderableType] = [
+        _detail_header(state, theme, sessions, filter_query, session_sort)
+    ]
+    runtime_table = _runtime_table(sessions, theme)
+    if runtime_table is not None:
+        sections.append(section_heading("Runtime", theme, leading_blank=False))
+        sections.append(runtime_table)
+    billing_table = _billing_table(sessions, theme)
+    if billing_table is not None:
+        sections.append(section_heading("Billing & Context", theme))
+        sections.append(billing_table)
+    sections.append(section_heading("Sessions", theme))
+    sections.append(
+        _sessions_table(sessions, theme)
+        if sessions
+        else Text("  No matching sessions\n", style=theme.banner_dim)
+    )
+    if len(sessions) > _DETAIL_MAX_SESSION_ROWS:
+        sections.append(
+            Text(
+                f"  … and {len(sessions) - _DETAIL_MAX_SESSION_ROWS} more\n",
+                style=theme.banner_dim,
+            )
+        )
+
+    return Panel(
+        Group(*sections),
+        title=f"[{theme.panel_title_style}]\\[2] Sessions[/]",
+        title_align="left",
+        border_style=theme.panel_border_style,
+        box=rich.box.HORIZONTALS,
+        padding=(1, 2),
+    )
+
+
+def _detail_header(
+    state: DashboardState,
+    theme: Theme,
+    sessions: list[SessionInfo],
+    filter_query: str,
+    session_sort: str,
+) -> Text:
+    header = Text()
+    if filter_query:
+        header.append("Filter: ", style=theme.ui_label)
+        header.append(sanitize_terminal_text(filter_query), style=theme.ui_accent)
+        header.append(f"  ({len(sessions)}/{len(state.sessions)} matches)", style=theme.banner_dim)
+    if filter_query or session_sort != "recent":
+        header.append("  ", style=theme.banner_dim)
+    if session_sort != "recent":
+        header.append("Sort: ", style=theme.ui_label)
+        header.append(sanitize_terminal_text(session_sort), style=theme.ui_accent)
+    if filter_query or session_sort != "recent":
+        header.append("\n\n", style=theme.banner_dim)
+    return header
+
+
+def _sessions_table(sessions: list[SessionInfo], theme: Theme) -> Table:
     table = Table(box=None, show_header=True, padding=(0, 1))
     table.add_column("ID", style=theme.session_label)
     table.add_column("Source", style=theme.ui_label)
@@ -125,51 +185,7 @@ def _render_detail(
             fmt_tokens(s.output_tokens),
             fmt_usd(s.estimated_cost_usd),
         )
-
-    header = Text()
-    if filter_query:
-        header.append("Filter: ", style=theme.ui_label)
-        header.append(sanitize_terminal_text(filter_query), style=theme.ui_accent)
-        header.append(f"  ({len(sessions)}/{len(state.sessions)} matches)", style=theme.banner_dim)
-    if filter_query or session_sort != "recent":
-        header.append("  ", style=theme.banner_dim)
-    if session_sort != "recent":
-        header.append("Sort: ", style=theme.ui_label)
-        header.append(sanitize_terminal_text(session_sort), style=theme.ui_accent)
-    if filter_query or session_sort != "recent":
-        header.append("\n\n", style=theme.banner_dim)
-
-    sections: list[RenderableType] = [header]
-    runtime_table = _runtime_table(sessions, theme)
-    if runtime_table is not None:
-        sections.append(Text("Runtime\n", style=f"bold {theme.ui_label}"))
-        sections.append(runtime_table)
-    billing_table = _billing_table(sessions, theme)
-    if billing_table is not None:
-        sections.append(Text("\nBilling & Context\n", style=f"bold {theme.ui_label}"))
-        sections.append(billing_table)
-    sections.extend(
-        [
-            Text("\nSessions\n", style=f"bold {theme.ui_label}"),
-            table if sessions else Text("  No matching sessions\n", style=theme.banner_dim),
-        ]
-    )
-    if len(sessions) > _DETAIL_MAX_SESSION_ROWS:
-        sections.append(
-            Text(
-                f"  … and {len(sessions) - _DETAIL_MAX_SESSION_ROWS} more\n",
-                style=theme.banner_dim,
-            )
-        )
-
-    return Panel(
-        Group(*sections),
-        title=f"[{theme.panel_title_style}]\\[2] Sessions[/]",
-        title_align="left",
-        border_style=theme.panel_border_style,
-        box=rich.box.HORIZONTALS,
-        padding=(1, 2),
-    )
+    return table
 
 
 def _filter_sessions(

@@ -10,18 +10,23 @@ from typing import Any
 # Upper bound on any plain-text file read whole (memory cards, manifests,
 # frontmatter, excerpts): ~/.hermes is untrusted input for a read-only viewer.
 _MAX_TEXT_READ_BYTES = 256 * 1024
+# Width of the one-line previews shown in compact panels (SOUL.md and cron
+# output excerpts); wide enough for a headline, short enough for a cell.
+_EXCERPT_MAX_CHARS = 80
 
 
-def _today_epoch() -> float:
+def _today_epoch(now: float) -> float:
+    """Epoch seconds of local midnight on the day containing `now`."""
     import datetime
 
-    now = datetime.datetime.now()
-    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    moment = datetime.datetime.fromtimestamp(now)
+    midnight = moment.replace(hour=0, minute=0, second=0, microsecond=0)
     return midnight.timestamp()
 
 
-def _local_date() -> str:
-    return time.strftime("%Y-%m-%d")
+def _local_date(now: float) -> str:
+    """Local calendar date of `now` as YYYY-MM-DD."""
+    return time.strftime("%Y-%m-%d", time.localtime(now))
 
 
 def _file_size(path: Path) -> int:
@@ -84,12 +89,19 @@ def _file_signature(path: Path) -> tuple[str, int, int] | None:
     return str(path), stat.st_mtime_ns, stat.st_size
 
 
-def _profile_db_mtime(db_path: Path) -> float | None:
-    mtimes = [
-        mtime
-        for candidate in (db_path, db_path.with_name(f"{db_path.name}-wal"))
-        if (mtime := _mtime(candidate)) is not None
-    ]
+def _db_source_mtime_ns(db_path: Path) -> int | None:
+    """Newest mtime of a SQLite db and its -wal sidecar, in nanoseconds.
+
+    None when neither path can be stat'd, which callers treat as "unknown"
+    rather than "unchanged". Nanoseconds because a float st_mtime collides on
+    filesystems with 1-second granularity.
+    """
+    mtimes = []
+    for candidate in (db_path, db_path.with_name(f"{db_path.name}-wal")):
+        try:
+            mtimes.append(candidate.stat().st_mtime_ns)
+        except OSError:
+            continue
     return max(mtimes) if mtimes else None
 
 

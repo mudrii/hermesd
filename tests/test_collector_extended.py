@@ -171,7 +171,7 @@ def test_collect_after_close_raises(populated_hermes_home: Path):
 def test_today_epoch_is_midnight():
     import datetime
 
-    epoch = _today_epoch()
+    epoch = _today_epoch(time.time())
     dt = datetime.datetime.fromtimestamp(epoch)
     assert dt.hour == 0
     assert dt.minute == 0
@@ -282,7 +282,7 @@ def test_collect_tokens_today_filters_by_date(
     # Pin the "today" cutoff to two hours ago so the assertion is deterministic
     # regardless of wall-clock time: sample_db's sessions (≤1h old) count toward
     # today, sess_old (2 days old) does not — with no midnight-boundary flake.
-    monkeypatch.setattr("hermesd.collector._today_epoch", lambda: time.time() - 7200)
+    monkeypatch.setattr("hermesd.collector._today_epoch", lambda _now: time.time() - 7200)
     conn = sqlite3.connect(str(sample_db))
     yesterday = time.time() - 86400 * 2
     conn.execute(
@@ -3532,7 +3532,7 @@ def test_read_kanban_state_reads_wal_database(hermes_home: Path):
     writer.commit()
     assert db_path.with_name("kanban.db-wal").exists()
 
-    state = _read_kanban_state(db_path, KanbanState(db_present=True))
+    state = _read_kanban_state(db_path, KanbanState(db_present=True), now=time.time())
     writer.close()
 
     assert state.task_count == 1

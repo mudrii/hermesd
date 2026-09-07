@@ -16,7 +16,7 @@ from hermesd.models import (
 )
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
-from tests.conftest import render_to_str
+from tests.conftest import build_skills_state, render_to_str
 
 
 def test_skills_detail_shows_providers_table():
@@ -228,16 +228,8 @@ def test_skills_detail_shows_integrations_sections():
 
 
 def test_skills_detail_scroll_offset():
-    skills = [
-        SkillInfo(name=f"skill-{i}", category="cat", description=f"Desc {i}") for i in range(30)
-    ]
-    state = DashboardState(
-        skills_memory=SkillsMemory(
-            skill_count=30,
-            skill_categories=1,
-            providers=[],
-            skills=skills,
-        ),
+    state = build_skills_state(
+        30, category="cat", name_template="skill-{i}", description_template="Desc {i}"
     )
     # Scroll to offset 5 (the window is 20 rows, so 30 skills leave room)
     panel = render_panel(7, state, Theme(), detail=True, scroll_offset=5)
@@ -251,21 +243,47 @@ def test_skills_detail_scroll_offset():
     assert "skill-12" not in text
 
 
-def test_skills_detail_scroll_offset_zero():
-    skills = [
-        SkillInfo(name=f"skill-{i}", category="cat", description=f"Desc {i}") for i in range(5)
-    ]
-    state = DashboardState(
-        skills_memory=SkillsMemory(
-            skill_count=5,
-            skill_categories=1,
-            providers=[],
-            skills=skills,
-        ),
-    )
+def test_skills_detail_small_list_shows_every_row_and_no_hint():
+    """A list shorter than the window renders whole, with no scroll hint."""
+    state = build_skills_state(5)
     panel = render_panel(7, state, Theme(), detail=True, scroll_offset=0)
     text = render_to_str(panel, width=100, no_color=True)
-    assert "skill-0" in text
+    assert "skill-00" in text
+    assert "skill-04" in text
+    assert "/5]" not in text
+
+
+def test_skills_detail_caps_visible_window():
+    state = build_skills_state(40)
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=100, no_color=True)
+    assert "[1-20/40]" in text
+    assert "skill-39" not in text
+
+
+def test_skills_detail_scroll_pages_the_window():
+    state = build_skills_state(40)
+    text = render_to_str(
+        render_panel(7, state, Theme(), detail=True, scroll_offset=20), width=100, no_color=True
+    )
+    assert "[21-40/40]" in text
+    assert "skill-39" in text
+
+
+def test_skills_detail_scroll_clamps_to_full_window():
+    """Scrolling past the end must clamp to a full window, not a 1-row stub."""
+    state = build_skills_state(40)
+    text = render_to_str(
+        render_panel(7, state, Theme(), detail=True, scroll_offset=39), width=100, no_color=True
+    )
+    assert "[21-40/40]" in text
+    assert "skill-20" in text
+
+
+def test_detail_max_scroll_offset_skills_accounts_for_window():
+    from hermesd.app import _SKILLS_PANEL_NUM, _detail_max_scroll_offset
+
+    state = build_skills_state(30)
+    assert _detail_max_scroll_offset(_SKILLS_PANEL_NUM, state, "", "") == 10
 
 
 def test_skills_detail_uses_dash_for_empty_descriptions_after_scrolling():

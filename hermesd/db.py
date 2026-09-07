@@ -9,12 +9,18 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
+from hermesd.collect.common import _db_source_mtime_ns, _safe_child_path
+
 T = TypeVar("T")
 _RECONNECT_ERROR_THRESHOLD = 3
 _CONNECT_BACKOFF_READS = 2
 # Caps the LIKE fallback result set. The scan itself is unbounded on a miss;
 # this bounds what a pathological match can hand back to the UI.
 _LIKE_SEARCH_LIMIT = 500
+# Seconds sqlite3 waits on a locked database before raising. hermesd is a
+# read-only viewer refreshing on a timer: fail fast and keep last-good data
+# rather than stall the render loop behind a writer.
+_SQLITE_TIMEOUT_SECONDS = 2
 
 
 class HermesDB:
@@ -73,7 +79,9 @@ class HermesDB:
         try:
             db_path, uri_params = self._open_target()
             self._uri = f"{db_path.resolve().as_uri()}?{uri_params}"
-            conn = sqlite3.connect(self._uri, uri=True, timeout=2, check_same_thread=False)
+            conn = sqlite3.connect(
+                self._uri, uri=True, timeout=_SQLITE_TIMEOUT_SECONDS, check_same_thread=False
+            )
             conn.row_factory = sqlite3.Row
             with self._connection_ref_lock:
                 self._conn = conn
@@ -108,9 +116,7 @@ class HermesDB:
             self._snapshot_dir = None
 
     def _open_target(self) -> tuple[Path, str]:
-        if self._allowed_root is not None and not _safe_sidecar_path(
-            self._path, self._allowed_root
-        ):
+        if self._allowed_root is not None and not _safe_child_path(self._path, self._allowed_root):
             raise OSError(f"Refusing to open database outside allowed root: {self._path}")
         if not self._path.with_name(f"{self._path.name}-wal").exists():
             return self._path, "mode=ro&immutable=1"
@@ -122,13 +128,7 @@ class HermesDB:
         return snapshot_db
 
     def _source_mtime_ns(self) -> int | None:
-        mtimes = []
-        for path in (self._path, self._path.with_name(f"{self._path.name}-wal")):
-            try:
-                mtimes.append(path.stat().st_mtime_ns)
-            except OSError:
-                continue
-        return max(mtimes) if mtimes else None
+        return _db_source_mtime_ns(self._path)
 
     def _source_changed(self) -> bool:
         current_mtime = self._source_mtime_ns()
@@ -506,23 +506,12 @@ def snapshot_wal_database(
         shutil.copy2(db_path, snapshot_db)
         for suffix in ("-wal", "-shm"):
             source = db_path.with_name(f"{db_path.name}{suffix}")
-            if source.exists() and _safe_sidecar_path(source, db_path.parent):
+            if source.exists() and _safe_child_path(source, db_path.parent):
                 shutil.copy2(source, snapshot_root / source.name)
     except OSError:
         snapshot_dir.cleanup()
         raise
     return snapshot_dir, snapshot_db
-
-
-def _safe_sidecar_path(path: Path, root: Path) -> bool:
-    if path.is_symlink():
-        return False
-    try:
-        resolved_path = path.resolve(strict=False)
-        resolved_root = root.resolve(strict=False)
-    except (OSError, RuntimeError):
-        return False
-    return resolved_path == resolved_root or resolved_path.is_relative_to(resolved_root)
 
 
 def _quote_fts_query(query: str) -> str:

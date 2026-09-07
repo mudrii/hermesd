@@ -7,9 +7,13 @@ import sqlite3
 import subprocess
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from rich.console import Console
+
+if TYPE_CHECKING:
+    from hermesd.models import DashboardState
 
 _AMBIENT_RUNTIME_ENV = ("HERMES_HOME", "HERMES_PROFILE", "NO_COLOR", "FORCE_COLOR")
 
@@ -1004,3 +1008,30 @@ def fake_terminal(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         lambda fd, when, settings: restored.update(fd=fd, settings=settings),
     )
     return restored
+
+
+def build_skills_state(
+    count: int,
+    *,
+    category: str = "dev",
+    name_template: str = "skill-{i:02d}",
+    description_template: str = "",
+) -> DashboardState:
+    """A DashboardState holding `count` skills in a single category."""
+    from hermesd.models import DashboardState, SkillInfo, SkillsMemory
+
+    return DashboardState(
+        skills_memory=SkillsMemory(
+            skill_count=count,
+            skill_categories=1,
+            providers=[],
+            skills=[
+                SkillInfo(
+                    name=name_template.format(i=i),
+                    category=category,
+                    description=description_template.format(i=i),
+                )
+                for i in range(count)
+            ],
+        )
+    )

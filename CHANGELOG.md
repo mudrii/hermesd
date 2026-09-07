@@ -41,6 +41,8 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ### Changed
 
+- Internal: `collector.py` is split into a `hermesd/collect/` package of per-domain readers, with `hermesd.collector` kept as the public facade; no behaviour or import path changes.
+- Internal: long panel `_render_detail` functions are split into named per-section helpers, with the shared section heading and age formatter moved to `hermesd/panels/formatting.py`; rendered output is byte-identical.
 - Removed the dead `_cache_hits` counter and unified the duplicated WAL-snapshot-to-tempdir logic between `db.py` and `collector.py` into one shared helper.
 - Package metadata now uses a PEP 639 SPDX license expression (`License-Expression: MIT`); Hatchling 1.32 emits Core Metadata 2.5 and Twine 7 validates the resulting artifacts.
 - Dev-toolchain floor pins raised (`pip>=26.2` for PYSEC-2026-3721) and documented with an explanatory comment.

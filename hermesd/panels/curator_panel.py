@@ -8,6 +8,7 @@ from rich.text import Text
 
 from hermesd.models import CuratorRun, DashboardState
 from hermesd.panels.formatting import escape_terminal_text as escape
+from hermesd.panels.formatting import section_heading
 from hermesd.theme import Theme
 
 _TITLE = "\\[13] Curator"
@@ -97,11 +98,11 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     sections: list[RenderableType] = [summary]
 
     if cur.scheduler_state_present:
-        sections.append(Text("\nScheduler\n", style=f"bold {theme.ui_label}"))
+        sections.append(section_heading("Scheduler", theme))
         sections.append(_scheduler_table(cur, theme))
 
     if cur.tool_call_counts:
-        sections.append(Text("\nTool Calls\n", style=f"bold {theme.ui_label}"))
+        sections.append(section_heading("Tool Calls", theme))
         tools = Table(box=None, show_header=True, padding=(0, 2))
         tools.add_column("Tool", style=theme.ui_label)
         tools.add_column("Calls", justify="right", style=theme.banner_text)
@@ -110,7 +111,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         sections.append(tools)
 
     if cur.state_transitions:
-        sections.append(Text("\nState Transitions\n", style=f"bold {theme.ui_label}"))
+        sections.append(section_heading("State Transitions", theme))
         transitions = Text()
         for transition in cur.state_transitions[:10]:
             transitions.append(f"  {escape(transition)}\n", style=theme.banner_dim)
@@ -120,7 +121,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         sections.append(Text("\nError\n", style=f"bold {theme.ui_error}"))
         sections.append(Text(f"  {escape(cur.llm_error)}", style=theme.ui_error))
     elif cur.llm_summary:
-        sections.append(Text("\nSummary\n", style=f"bold {theme.ui_label}"))
+        sections.append(section_heading("Summary", theme))
         summary_text = cur.llm_summary[:_SUMMARY_MAX_CHARS]
         if len(cur.llm_summary) > _SUMMARY_MAX_CHARS:
             summary_text += "…"
@@ -138,7 +139,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
 
 def _scheduler_group(cur: CuratorRun, theme: Theme) -> Group:
     return Group(
-        Text("Scheduler\n", style=f"bold {theme.ui_label}"),
+        section_heading("Scheduler", theme, leading_blank=False),
         _scheduler_table(cur, theme),
     )
 

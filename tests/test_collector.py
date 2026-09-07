@@ -729,11 +729,11 @@ def test_collect_recomputes_today_summaries_when_local_date_changes(
     }
     monkeypatch.setattr(
         "hermesd.collector._local_date",
-        lambda: str(today_context["date"]),
+        lambda _now: str(today_context["date"]),
     )
     monkeypatch.setattr(
         "hermesd.collector._today_epoch",
-        lambda: float(today_context["cutoff"]),
+        lambda _now: float(today_context["cutoff"]),
     )
     c = Collector(hermes_home)
     state1 = c.collect()

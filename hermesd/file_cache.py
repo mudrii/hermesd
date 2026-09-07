@@ -4,7 +4,7 @@ import json
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import TypeGuard, TypeVar
 
 import yaml
 
@@ -37,7 +37,7 @@ class LastGoodFileCache:
             bad_mtimes=self._json_bad_mtimes,
             load=lambda: _load_json(path),
             load_errors=(OSError, UnicodeError, json.JSONDecodeError),
-            is_valid=lambda value: isinstance(value, dict),
+            is_valid=_is_json_mapping,
             default_factory=dict,
         )
 
@@ -49,9 +49,7 @@ class LastGoodFileCache:
             bad_mtimes=self._json_list_bad_mtimes,
             load=lambda: _load_json(path),
             load_errors=(OSError, UnicodeError, json.JSONDecodeError),
-            is_valid=lambda value: (
-                isinstance(value, list) and all(isinstance(entry, dict) for entry in value)
-            ),
+            is_valid=_is_json_object_list,
             default_factory=list,
         )
 
@@ -63,7 +61,7 @@ class LastGoodFileCache:
             bad_mtimes=self._yaml_bad_mtimes,
             load=lambda: _load_yaml(path),
             load_errors=(OSError, UnicodeError, yaml.YAMLError),
-            is_valid=lambda value: isinstance(value, dict),
+            is_valid=_is_json_mapping,
             default_factory=dict,
         )
 
@@ -75,7 +73,7 @@ class LastGoodFileCache:
         bad_mtimes: dict[str, int],
         load: Callable[[], object],
         load_errors: tuple[type[Exception], ...],
-        is_valid: Callable[[object], bool],
+        is_valid: Callable[[object], TypeGuard[T]],
         default_factory: Callable[[], T],
     ) -> T:
         with self._lock:
@@ -105,10 +103,18 @@ class LastGoodFileCache:
                 return values.get(key, default_factory())
             mtimes[key] = mtime
             bad_mtimes.pop(key, None)
-            # cast is unavoidable: load() returns untyped JSON/YAML (object);
-            # is_valid() has already checked the shape T expects at runtime.
-            values[key] = cast(T, value)
+            # is_valid is a TypeGuard, so `value` is narrowed to T here: the
+            # runtime shape check and the static type stay in lock step.
+            values[key] = value
             return values[key]
+
+
+def _is_json_mapping(value: object) -> TypeGuard[JsonMapping]:
+    return isinstance(value, dict)
+
+
+def _is_json_object_list(value: object) -> TypeGuard[JsonObjectList]:
+    return isinstance(value, list) and all(isinstance(entry, dict) for entry in value)
 
 
 def _load_json(path: Path) -> object:

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from hermesd.collect.common import _as_dict, _read_text_capped
+from hermesd.collect.common import _EXCERPT_MAX_CHARS, _as_dict, _read_text_capped
 
 
 def _count_skills(skills_dir: Path) -> int:
@@ -36,11 +37,22 @@ def _read_soul_excerpt(path: Path, root: Path | None = None) -> str:
     for line in _read_text_capped(path, root).splitlines():
         stripped = line.strip()
         if stripped:
-            return stripped[:80]
+            return stripped[:_EXCERPT_MAX_CHARS]
     return ""
 
 
-def _learning_summary(skills_dir: Path, usage: dict[str, Any]) -> dict[str, int]:
+# Signature of the SKILL.md frontmatter reader. The Collector passes a
+# signature-cached reader so an unchanged SKILL.md is parsed once, not per tick.
+_FrontmatterReader = Callable[[Path, Path | None], dict[str, Any]]
+
+
+def _learning_summary(
+    skills_dir: Path,
+    usage: dict[str, Any],
+    *,
+    frontmatter: _FrontmatterReader | None = None,
+) -> dict[str, int]:
+    read_frontmatter = frontmatter if frontmatter is not None else _skill_frontmatter
     usage_metadata = {str(name): _as_dict(raw) for name, raw in usage.items()}
     learned = set(_learned_skill_names(skills_dir))
     pinned = set()
@@ -60,7 +72,7 @@ def _learning_summary(skills_dir: Path, usage: dict[str, Any]) -> dict[str, int]
             if not skill_dir.is_dir() or skill_dir.is_symlink():
                 continue
             name = skill_dir.name
-            metadata = _skill_frontmatter(skill_dir / "SKILL.md", skills_dir)
+            metadata = read_frontmatter(skill_dir / "SKILL.md", skills_dir)
             learned.add(name)
             if bool(metadata.get("pinned")):
                 pinned.add(name)
@@ -112,3 +124,9 @@ def _skill_frontmatter(path: Path, root: Path | None = None) -> dict[str, Any]:
 
 def _memory_card_count(path: Path, root: Path | None = None) -> int:
     return sum(1 for line in _read_text_capped(path, root).splitlines() if line.startswith("## "))
+
+
+def _skill_description(path: Path, root: Path | None = None) -> str:
+    """The `description` field of a SKILL.md frontmatter block, or ""."""
+    description = _skill_frontmatter(path, root).get("description")
+    return description if isinstance(description, str) else ""

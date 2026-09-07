@@ -21,14 +21,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple, Never, TypeVar
 
-import yaml
-
 from hermesd.collect.common import (
     _MAX_TEXT_READ_BYTES,
     _as_dict,
     _as_list,
     _coerce_float,
     _coerce_int,
+    _db_source_mtime_ns,
     _file_signature,
     _file_size,
     _int_mapping,
@@ -36,7 +35,6 @@ from hermesd.collect.common import (
     _local_date,
     _mtime,
     _path_resolves_under,
-    _profile_db_mtime,
     _read_tail_text,
     _read_text_capped,
     _safe_capped_file,
@@ -71,7 +69,9 @@ from hermesd.collect.kanban import (
     _read_kanban_state,
 )
 from hermesd.collect.logs import (
+    _ERROR_LOG_TAIL_LINES,
     _LOG_LINE_PATTERN,
+    _LOG_TAIL_LINES,
     _MAX_LOG_LINE_CHARS,
     _extract_session_id,
     _latest_log_mtime,
@@ -111,6 +111,8 @@ from hermesd.collect.skills import (
     _learning_summary,
     _memory_card_count,
     _read_soul_excerpt,
+    _skill_description,
+    _skill_frontmatter,
     _word_count,
 )
 from hermesd.collect.sqlite_util import (
@@ -118,12 +120,14 @@ from hermesd.collect.sqlite_util import (
     _table_count_or_zero,
 )
 from hermesd.collect.system import (
+    _RECENT_ACTIVITY_WINDOW_SECONDS,
     _git_checkpoint_summary,
     _git_ref_signature,
     _latest_runtime_activity_age,
     _pid_exists,
 )
 from hermesd.db import HermesDB
+from hermesd.defaults import DEFAULT_LOG_TAIL_BYTES
 from hermesd.file_cache import JsonMapping, JsonObjectList, LastGoodFileCache
 from hermesd.models import (
     BackgroundProcessInfo,
@@ -226,7 +230,7 @@ class Collector:
         hermes_home: Path,
         pid_exists: Callable[[int], bool] | None = None,
         profile_name: str | None = None,
-        log_tail_bytes: int = 32768,
+        log_tail_bytes: int = DEFAULT_LOG_TAIL_BYTES,
         db_factory: Callable[[Path], HermesDB] | None = None,
         file_cache: LastGoodFileCache | None = None,
         clock: Callable[[], float] = time.time,
@@ -267,12 +271,16 @@ class Collector:
                 tuple[str, bool, str, float | None],
             ],
         ] = {}
-        self._profile_count_cache: dict[str, tuple[float | None, int]] = {}
+        self._profile_count_cache: dict[str, tuple[int | None, int]] = {}
         self._kanban_board_cache: dict[str, KanbanBoardSummary] = {}
-        self._goal_state_cache: tuple[float | None, dict[str, Any]] | None = None
+        self._goal_state_cache: tuple[int | None, dict[str, Any]] | None = None
         self._checkpoint_summary_cache: dict[
             str, tuple[tuple[int, ...], tuple[int, float | None, str]]
         ] = {}
+        # Derived values (word counts, card counts, excerpts, frontmatter)
+        # keyed on the source file's signature, so an unchanged SKILL.md /
+        # MEMORY.md / USER.md / SOUL.md is not re-read on every tick.
+        self._derived_file_cache: dict[str, tuple[tuple[str, int, int] | None, Any]] = {}
         self._kanban_board_errors: list[str] = []
         self._derived_rows: list[dict[str, Any]] | None = None
         self._derived_date = ""
@@ -476,7 +484,7 @@ class Collector:
         # HermesDB returns the same cached list object while data_version is
         # unchanged, so row identity is a cheap invalidation key. The local
         # date is part of the key because "today" aggregates shift at midnight.
-        today = _local_date()
+        today = _local_date(self._clock())
         if rows is not self._derived_rows or today != self._derived_date:
             self._derived_cache = {}
             self._derived_rows = rows
@@ -504,6 +512,35 @@ class Collector:
             health.mark_failed("sessions", "read_sessions returned cached rows after sqlite error")
         self._last_session_rows = session_rows
         return session_rows
+
+    def _signature_cached(self, kind: str, path: Path, compute: Callable[[], T]) -> T:
+        """Memoize a value derived from path until the file's signature changes.
+
+        A file that cannot be stat'd has no usable key, so its value is
+        recomputed; that path is also the cheap one (no successful open).
+        """
+        key = f"{kind}:{path}"
+        signature = _file_signature(path)
+        cached = self._derived_file_cache.get(key)
+        if cached is not None and signature is not None and cached[0] == signature:
+            # type-ignore[no-any-return]: heterogeneous per-kind cache; each
+            # call site pins T via its compute callable.
+            return cached[1]  # type: ignore[no-any-return]
+        value = compute()
+        self._derived_file_cache[key] = (signature, value)
+        return value
+
+    def _cached_word_count(self, path: Path, root: Path) -> int:
+        return self._signature_cached("words", path, lambda: _word_count(path, root))
+
+    def _cached_card_count(self, path: Path, root: Path) -> int:
+        return self._signature_cached("cards", path, lambda: _memory_card_count(path, root))
+
+    def _cached_soul_excerpt(self, path: Path, root: Path) -> str:
+        return self._signature_cached("soul", path, lambda: _read_soul_excerpt(path, root))
+
+    def _cached_frontmatter(self, path: Path, root: Path | None = None) -> dict[str, Any]:
+        return self._signature_cached("frontmatter", path, lambda: _skill_frontmatter(path, root))
 
     def _read_json_cached(self, path: Path) -> JsonMapping:
         return self._file_cache.read_json_mapping(path)
@@ -697,7 +734,7 @@ class Collector:
         rows = self._session_rows_or_read(rows)
         return _summarize_tokens(
             rows,
-            started_at_min=_today_epoch(),
+            started_at_min=_today_epoch(self._clock()),
         )
 
     def _collect_tokens_total(self, rows: list[dict[str, Any]] | None = None) -> TokenSummary:
@@ -1111,7 +1148,7 @@ class Collector:
             if self._last_state is not None and self._last_state.kanban.db_present:
                 raise RuntimeError("kanban.db replaced by unsafe path")
             return self._with_kanban_boards(base_state)
-        return self._with_kanban_boards(_read_kanban_state(db_path, base_state))
+        return self._with_kanban_boards(_read_kanban_state(db_path, base_state, now=self._clock()))
 
     def _read_current_kanban_board(self) -> str:
         path = self._paths.shared_path("kanban", "current")
@@ -1173,6 +1210,7 @@ class Collector:
                         slug=board_dir.name,
                         current=board_dir.name == state.current_board,
                         claim_ttl_seconds=state.claim_ttl_seconds,
+                        now=self._clock(),
                     )
                 except (sqlite3.Error, OSError) as exc:
                     self._kanban_board_errors.append(
@@ -1324,7 +1362,7 @@ class Collector:
         # Opening state.db snapshots its WAL to a temp dir on every tick, on top
         # of the snapshot HermesDB already takes; only redo it when state.db
         # (or its -wal) changes.
-        mtime = _profile_db_mtime(db_path)
+        mtime = _db_source_mtime_ns(db_path)
         cached = self._goal_state_cache
         if cached is not None and mtime is not None and cached[0] == mtime:
             return operations.model_copy(update=cached[1])
@@ -1335,11 +1373,13 @@ class Collector:
         return operations.model_copy(update=update)
 
     def _collect_curator(self) -> CuratorRun:
-        base_run = _curator_with_scheduler_state(
-            CuratorRun(),
-            self._read_json_cached(self._paths.profile_path("skills", ".curator_state")),
-            _as_dict(self._read_yaml_cached().get("curator")),
+        # Read the scheduler state and curator config once for the whole pass;
+        # both the no-run fallback and the populated run apply the same overlay.
+        scheduler_state = self._read_json_cached(
+            self._paths.profile_path("skills", ".curator_state")
         )
+        curator_cfg = _as_dict(self._read_yaml_cached().get("curator"))
+        base_run = _curator_with_scheduler_state(CuratorRun(), scheduler_state, curator_cfg)
         curator_dir = self._paths.shared_path("logs", "curator")
         if (
             curator_dir.is_symlink()
@@ -1400,8 +1440,8 @@ class Collector:
                 llm_summary=str(data.get("llm_summary") or ""),
                 llm_error=str(data.get("llm_error") or ""),
             ),
-            self._read_json_cached(self._paths.profile_path("skills", ".curator_state")),
-            _as_dict(self._read_yaml_cached().get("curator")),
+            scheduler_state,
+            curator_cfg,
         )
 
     def _collect_model_caches(self) -> list[ModelCacheSummary]:
@@ -1526,25 +1566,28 @@ class Collector:
             if memories_dir.is_dir()
             else []
         )
+        memory_md = memories_dir / "MEMORY.md"
+        user_md = memories_dir / "USER.md"
         learning_summary = _learning_summary(
             self._paths.profile_path("skills"),
             self._read_json_cached(self._paths.profile_path("skills", ".usage.json")),
+            frontmatter=self._cached_frontmatter,
         )
 
         return MemoryOverview(
             provider=str(memory_cfg.get("provider") or ""),
             memory_file_count=len(memory_files),
-            memory_word_count=_word_count(memories_dir / "MEMORY.md", root),
-            user_word_count=_word_count(memories_dir / "USER.md", root),
+            memory_word_count=self._cached_word_count(memory_md, root),
+            user_word_count=self._cached_word_count(user_md, root),
             soul_size_bytes=_file_size(soul_path),
-            soul_excerpt=_read_soul_excerpt(soul_path, root),
+            soul_excerpt=self._cached_soul_excerpt(soul_path, root),
             memory_files=memory_files,
             skill_usage_count=learning_summary["used"],
             learned_skill_count=learning_summary["learned"],
             pinned_skill_count=learning_summary["pinned"],
             agent_created_skill_count=learning_summary["agent"],
-            memory_card_count=_memory_card_count(memories_dir / "MEMORY.md", root)
-            + _memory_card_count(memories_dir / "USER.md", root),
+            memory_card_count=self._cached_card_count(memory_md, root)
+            + self._cached_card_count(user_md, root),
         )
 
     def _collect_hooks(self) -> list[HookInfo]:
@@ -1685,26 +1728,11 @@ class Collector:
         skills_dir = self._paths.profile_path("skills")
         # Skills are at skills/<category>/<name>/SKILL.md
         skill_md = skills_dir / category / name / "SKILL.md"
-        if not skill_md.exists():
-            return ""
-        try:
-            lines = _read_text_capped(skill_md, skills_dir).splitlines()
-            if lines and lines[0].strip() == "---":
-                frontmatter_lines: list[str] = []
-                for line in lines[1:]:
-                    if line.strip() == "---":
-                        data = yaml.safe_load("\n".join(frontmatter_lines)) or {}
-                        if isinstance(data, dict):
-                            description = data.get("description")
-                            if isinstance(description, str):
-                                return description
-                        break
-                    frontmatter_lines.append(line)
-        except OSError:
-            pass
-        except yaml.YAMLError:
-            pass
-        return ""
+        return self._signature_cached(
+            "skill_desc",
+            skill_md,
+            lambda: _skill_description(skill_md, skills_dir),
+        )
 
     def _collect_providers(self, data: dict[str, Any]) -> list[ProviderInfo]:
         if not data:
@@ -1749,26 +1777,40 @@ class Collector:
 
     def _collect_logs(self) -> LogState:
         stream_specs = [
-            ("agent", self._paths.profile_path("logs", "agent.log"), 20),
-            ("gateway", self._paths.profile_path("logs", "gateway.log"), 20),
-            ("errors", self._paths.profile_path("logs", "errors.log"), 10),
-            ("desktop", self._paths.shared_path("logs", "desktop.log"), 20),
-            ("dashboard", self._paths.shared_path("logs", "dashboard.log"), 20),
-            ("gui", self._paths.shared_path("logs", "gui.log"), 20),
-            ("update", self._paths.shared_path("logs", "update.log"), 20),
-            ("gateway.error", self._paths.shared_path("logs", "gateway.error.log"), 20),
-            ("tui crash", self._paths.shared_path("logs", "tui_gateway_crash.log"), 20),
-            ("audit", self._paths.shared_path("logs", "audit.log"), 20),
-            ("mcp.stderr", self._paths.shared_path("logs", "mcp-stderr.log"), 20),
-            ("workspace", self._paths.shared_path("logs", "workspace.log"), 20),
-            ("workspace.error", self._paths.shared_path("logs", "workspace.error.log"), 20),
+            ("agent", self._paths.profile_path("logs", "agent.log"), _LOG_TAIL_LINES),
+            ("gateway", self._paths.profile_path("logs", "gateway.log"), _LOG_TAIL_LINES),
+            ("errors", self._paths.profile_path("logs", "errors.log"), _ERROR_LOG_TAIL_LINES),
+            ("desktop", self._paths.shared_path("logs", "desktop.log"), _LOG_TAIL_LINES),
+            ("dashboard", self._paths.shared_path("logs", "dashboard.log"), _LOG_TAIL_LINES),
+            ("gui", self._paths.shared_path("logs", "gui.log"), _LOG_TAIL_LINES),
+            ("update", self._paths.shared_path("logs", "update.log"), _LOG_TAIL_LINES),
+            (
+                "gateway.error",
+                self._paths.shared_path("logs", "gateway.error.log"),
+                _LOG_TAIL_LINES,
+            ),
+            (
+                "tui crash",
+                self._paths.shared_path("logs", "tui_gateway_crash.log"),
+                _LOG_TAIL_LINES,
+            ),
+            ("audit", self._paths.shared_path("logs", "audit.log"), _LOG_TAIL_LINES),
+            ("mcp.stderr", self._paths.shared_path("logs", "mcp-stderr.log"), _LOG_TAIL_LINES),
+            ("workspace", self._paths.shared_path("logs", "workspace.log"), _LOG_TAIL_LINES),
+            (
+                "workspace.error",
+                self._paths.shared_path("logs", "workspace.error.log"),
+                _LOG_TAIL_LINES,
+            ),
         ]
         streams = [
             self._tail_log_stream(name, path, max_lines)
             for name, path, max_lines in stream_specs
             if path.exists() or str(path) in self._log_cache
         ]
-        cron_lines = self._tail_latest_cron_output(self._paths.shared_path("cron", "output"), 20)
+        cron_lines = self._tail_latest_cron_output(
+            self._paths.shared_path("cron", "output"), _LOG_TAIL_LINES
+        )
         if cron_lines:
             streams.append(
                 LogStream(
@@ -1806,9 +1848,11 @@ class Collector:
     def _collect_runtime_status(
         self, gateway: GatewayState, sessions: list[SessionInfo]
     ) -> RuntimeStatus:
-        last_activity_age = _latest_runtime_activity_age(self._paths)
+        last_activity_age = _latest_runtime_activity_age(self._paths, self._clock())
         has_active_sessions = any(session.is_active for session in sessions)
-        recent_activity = last_activity_age is not None and last_activity_age <= 300
+        recent_activity = (
+            last_activity_age is not None and last_activity_age <= _RECENT_ACTIVITY_WINDOW_SECONDS
+        )
         agent_running = gateway.running or has_active_sessions or recent_activity
         banner = "" if agent_running else "AGENT OFFLINE"
         return RuntimeStatus(
@@ -1842,7 +1886,7 @@ class Collector:
             latest_log_mtime=_latest_log_mtime(logs_path) if logs_safe else None,
             skill_count=_count_skills(skills_path) if skills_safe else 0,
             db_size_bytes=_file_size(db_path) if db_safe else 0,
-            soul_excerpt=_read_soul_excerpt(soul_path, profile_home) if soul_safe else "",
+            soul_excerpt=(self._cached_soul_excerpt(soul_path, profile_home) if soul_safe else ""),
         )
 
     def _last_profile_exists(self, name: str) -> bool:
@@ -1853,7 +1897,7 @@ class Collector:
     def _profile_session_count(self, name: str, db_path: Path) -> int:
         # Opening a profile DB snapshots WAL files to a temp dir, so only
         # re-open and re-count when the db (or its -wal) mtime changes.
-        mtime = _profile_db_mtime(db_path)
+        mtime = _db_source_mtime_ns(db_path)
         cached = self._profile_count_cache.get(name)
         if cached is not None and mtime is not None and cached[0] == mtime:
             return cached[1]

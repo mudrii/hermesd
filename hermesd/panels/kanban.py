@@ -8,9 +8,9 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from hermesd.models import DashboardState, KanbanTaskSummary
+from hermesd.models import DashboardState, KanbanState, KanbanTaskSummary
 from hermesd.panels.formatting import escape_terminal_text as escape
-from hermesd.panels.formatting import sanitize_terminal_text
+from hermesd.panels.formatting import fmt_age_seconds, sanitize_terminal_text, section_heading
 from hermesd.theme import Theme
 
 
@@ -63,8 +63,56 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
 
 def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     kanban = state.kanban
-    sections: list[RenderableType] = []
+    sections: list[RenderableType] = [_summary_table(kanban, theme)]
 
+    if kanban.boards:
+        sections.append(section_heading("Boards", theme))
+        sections.append(_boards_table(kanban, theme))
+
+    if kanban.task_links:
+        sections.append(section_heading("Decomposition Tree", theme))
+        sections.append(_task_links_table(kanban, theme))
+
+    if kanban.status_counts:
+        sections.append(section_heading("Status Counts", theme))
+        sections.append(_status_counts_table(kanban, theme))
+
+    if kanban.active_tasks:
+        sections.append(section_heading("Active Workers", theme))
+        sections.append(_task_table(kanban.active_tasks, theme))
+
+    if kanban.problem_tasks:
+        sections.append(section_heading("Blocked / Failing Tasks", theme))
+        sections.append(_task_table(kanban.problem_tasks, theme))
+
+    task_metadata = _task_metadata_table(
+        [*kanban.active_tasks, *kanban.problem_tasks, *kanban.recent_tasks],
+        theme,
+    )
+    if task_metadata is not None:
+        sections.append(section_heading("Task Metadata", theme))
+        sections.append(task_metadata)
+
+    if kanban.recent_runs:
+        sections.append(section_heading("Recent Runs", theme))
+        sections.append(_recent_runs_table(kanban, theme))
+
+    if len(sections) == 1 and not kanban.db_present:
+        sections.append(
+            Text("\n  Kanban is not initialized in this Hermes home\n", style=theme.banner_dim)
+        )
+
+    return Panel(
+        Group(*sections),
+        title=f"[{theme.panel_title_style}]\\[11] Kanban[/]",
+        title_align="left",
+        border_style=theme.panel_border_style,
+        box=rich.box.HORIZONTALS,
+        padding=(1, 2),
+    )
+
+
+def _summary_table(kanban: KanbanState, theme: Theme) -> Table:
     summary = Table(box=None, show_header=False, padding=(0, 2))
     summary.add_column("Key", style=theme.ui_label)
     summary.add_column("Value", style=theme.banner_text)
@@ -87,105 +135,74 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         summary.add_row("Current Board", escape(kanban.current_board))
     if kanban.stale_claim_count:
         summary.add_row("Stale Claims", str(kanban.stale_claim_count))
-    sections.append(summary)
+    return summary
 
-    if kanban.boards:
-        sections.append(Text("\nBoards\n", style=f"bold {theme.ui_label}"))
-        board_table = Table(box=None, show_header=True, padding=(0, 1))
-        board_table.add_column("Board", style=theme.ui_accent)
-        board_table.add_column("Current", style=theme.banner_text)
-        board_table.add_column("Tasks", justify="right", style=theme.banner_text)
-        board_table.add_column("Runs", justify="right", style=theme.banner_text)
-        board_table.add_column("Problems", justify="right", style=theme.ui_warn)
-        board_table.add_column("Stale", justify="right", style=theme.ui_warn)
-        board_table.add_column("Block Kinds", style=theme.banner_dim)
-        for board in kanban.boards:
-            block_kinds = (
-                ", ".join(
-                    f"{escape(kind)}:{count}"
-                    for kind, count in sorted(board.block_kind_counts.items())
-                )
-                if board.block_kind_counts
-                else "—"
+
+def _boards_table(kanban: KanbanState, theme: Theme) -> Table:
+    board_table = Table(box=None, show_header=True, padding=(0, 1))
+    board_table.add_column("Board", style=theme.ui_accent)
+    board_table.add_column("Current", style=theme.banner_text)
+    board_table.add_column("Tasks", justify="right", style=theme.banner_text)
+    board_table.add_column("Runs", justify="right", style=theme.banner_text)
+    board_table.add_column("Problems", justify="right", style=theme.ui_warn)
+    board_table.add_column("Stale", justify="right", style=theme.ui_warn)
+    board_table.add_column("Block Kinds", style=theme.banner_dim)
+    for board in kanban.boards:
+        block_kinds = (
+            ", ".join(
+                f"{escape(kind)}:{count}" for kind, count in sorted(board.block_kind_counts.items())
             )
-            board_table.add_row(
-                escape(board.slug),
-                "current" if board.current else "—",
-                str(board.task_count),
-                str(board.run_count),
-                str(board.problem_count),
-                str(board.stale_claim_count),
-                block_kinds,
-            )
-        sections.append(board_table)
-
-    if kanban.task_links:
-        sections.append(Text("\nDecomposition Tree\n", style=f"bold {theme.ui_label}"))
-        links = Table(box=None, show_header=True, padding=(0, 2))
-        links.add_column("Parent", style=theme.ui_accent)
-        links.add_column("Child", style=theme.banner_text)
-        for link in kanban.task_links:
-            links.add_row(escape(link.parent_id), escape(link.child_id))
-        sections.append(links)
-
-    if kanban.status_counts:
-        sections.append(Text("\nStatus Counts\n", style=f"bold {theme.ui_label}"))
-        status_table = Table(box=None, show_header=True, padding=(0, 2))
-        status_table.add_column("Status", style=theme.ui_accent)
-        status_table.add_column("Count", justify="right", style=theme.banner_text)
-        for status, count in sorted(kanban.status_counts.items()):
-            status_table.add_row(escape(status), str(count))
-        sections.append(status_table)
-
-    if kanban.active_tasks:
-        sections.append(Text("\nActive Workers\n", style=f"bold {theme.ui_label}"))
-        sections.append(_task_table(kanban.active_tasks, theme))
-
-    if kanban.problem_tasks:
-        sections.append(Text("\nBlocked / Failing Tasks\n", style=f"bold {theme.ui_label}"))
-        sections.append(_task_table(kanban.problem_tasks, theme))
-
-    task_metadata = _task_metadata_table(
-        [*kanban.active_tasks, *kanban.problem_tasks, *kanban.recent_tasks],
-        theme,
-    )
-    if task_metadata is not None:
-        sections.append(Text("\nTask Metadata\n", style=f"bold {theme.ui_label}"))
-        sections.append(task_metadata)
-
-    if kanban.recent_runs:
-        sections.append(Text("\nRecent Runs\n", style=f"bold {theme.ui_label}"))
-        runs = Table(box=None, show_header=True, padding=(0, 1))
-        runs.add_column("Run", justify="right", style=theme.ui_accent)
-        runs.add_column("Task", style=theme.ui_label)
-        runs.add_column("Profile", style=theme.banner_text)
-        runs.add_column("Status", style=theme.banner_text)
-        runs.add_column("Outcome", style=theme.banner_dim)
-        runs.add_column("Error", style=theme.ui_error)
-        for run in kanban.recent_runs:
-            runs.add_row(
-                str(run.run_id),
-                escape(run.task_id),
-                escape(run.profile) if run.profile else "—",
-                escape(run.status),
-                escape(run.outcome) if run.outcome else "—",
-                escape(run.error[:80]) if run.error else "—",
-            )
-        sections.append(runs)
-
-    if len(sections) == 1 and not kanban.db_present:
-        sections.append(
-            Text("\n  Kanban is not initialized in this Hermes home\n", style=theme.banner_dim)
+            if board.block_kind_counts
+            else "—"
         )
+        board_table.add_row(
+            escape(board.slug),
+            "current" if board.current else "—",
+            str(board.task_count),
+            str(board.run_count),
+            str(board.problem_count),
+            str(board.stale_claim_count),
+            block_kinds,
+        )
+    return board_table
 
-    return Panel(
-        Group(*sections),
-        title=f"[{theme.panel_title_style}]\\[11] Kanban[/]",
-        title_align="left",
-        border_style=theme.panel_border_style,
-        box=rich.box.HORIZONTALS,
-        padding=(1, 2),
-    )
+
+def _task_links_table(kanban: KanbanState, theme: Theme) -> Table:
+    links = Table(box=None, show_header=True, padding=(0, 2))
+    links.add_column("Parent", style=theme.ui_accent)
+    links.add_column("Child", style=theme.banner_text)
+    for link in kanban.task_links:
+        links.add_row(escape(link.parent_id), escape(link.child_id))
+    return links
+
+
+def _status_counts_table(kanban: KanbanState, theme: Theme) -> Table:
+    status_table = Table(box=None, show_header=True, padding=(0, 2))
+    status_table.add_column("Status", style=theme.ui_accent)
+    status_table.add_column("Count", justify="right", style=theme.banner_text)
+    for status, count in sorted(kanban.status_counts.items()):
+        status_table.add_row(escape(status), str(count))
+    return status_table
+
+
+def _recent_runs_table(kanban: KanbanState, theme: Theme) -> Table:
+    runs = Table(box=None, show_header=True, padding=(0, 1))
+    runs.add_column("Run", justify="right", style=theme.ui_accent)
+    runs.add_column("Task", style=theme.ui_label)
+    runs.add_column("Profile", style=theme.banner_text)
+    runs.add_column("Status", style=theme.banner_text)
+    runs.add_column("Outcome", style=theme.banner_dim)
+    runs.add_column("Error", style=theme.ui_error)
+    for run in kanban.recent_runs:
+        runs.add_row(
+            str(run.run_id),
+            escape(run.task_id),
+            escape(run.profile) if run.profile else "—",
+            escape(run.status),
+            escape(run.outcome) if run.outcome else "—",
+            escape(run.error[:80]) if run.error else "—",
+        )
+    return runs
 
 
 def _task_table(tasks: list[KanbanTaskSummary], theme: Theme) -> Table:
@@ -253,9 +270,4 @@ def _task_metadata_table(tasks: list[KanbanTaskSummary], theme: Theme) -> Table 
 def _age_label(timestamp: int) -> str:
     if timestamp <= 0:
         return "—"
-    age = max(0, int(time.time()) - timestamp)
-    if age < 60:
-        return f"{age}s"
-    if age < 3600:
-        return f"{age // 60}m"
-    return f"{age // 3600}h"
+    return fmt_age_seconds(max(0, int(time.time()) - timestamp))

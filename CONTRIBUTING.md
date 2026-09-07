@@ -76,7 +76,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 
 1. Create `hermesd/panels/your_panel.py` with a `render_your_panel(state, theme, detail=False)` function
 2. Add your data to `hermesd/models.py` (Pydantic model)
-3. Collect the data in `hermesd/collector.py`
+3. Collect the data in the matching `hermesd/collect/*.py` reader, wired in via `hermesd/collector.py`
 4. Register in `hermesd/panels/__init__.py`: add a `_render_your_panel(ctx: PanelRenderContext)` wrapper, add it to `_RENDERERS`, and add the label to `PANEL_NAMES`
 5. Add tests in `tests/test_your_panel.py`
 6. Update the overview layout specs in `hermesd/app.py` (`_WIDE_LAYOUT_SPEC`, `_COMPACT_LAYOUT_SPEC`, `_TALL_NARROW_LAYOUT_SPEC`) if the new panel needs overview placement
@@ -84,7 +84,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 ## Adding Data to an Existing Panel
 
 1. Add fields to the relevant model in `hermesd/models.py`
-2. Populate them in `hermesd/collector.py`
+2. Populate them in the matching `hermesd/collect/*.py` reader, wired in via `hermesd/collector.py`
 3. Render them in the panel's `_render_compact` and/or `_render_detail` functions
 4. Add tests
 

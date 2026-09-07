@@ -111,8 +111,10 @@ def _summarize_breakdown(rows: list[dict[str, Any]], key_name: str) -> list[Toke
     )
 
 
-# Approximate fallback cost per 1M tokens (USD), not billing authority.
-# Provider-reported costs win; keep these estimates reviewed when common model pricing changes.
+# Approximate fallback cost per 1M tokens (USD), used only when a session row
+# carries no provider-reported cost. Not billing authority: provider-reported
+# costs always win (see _resolved_session_cost). Figures are list prices for the
+# GPT-4o / Claude Sonnet tier as of 2026-07; re-check when that tier reprices.
 _COST_PER_M = {
     "input": 2.50,  # GPT-4o / Claude Sonnet class
     "output": 10.00,

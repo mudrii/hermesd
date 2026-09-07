@@ -4,6 +4,7 @@ import re
 
 from hermesd.models import CuratorRun, DashboardState
 from hermesd.panels import render_panel
+from hermesd.panels.curator_panel import render_curator
 from hermesd.theme import Theme
 from tests.conftest import render_to_str
 
@@ -120,3 +121,10 @@ def test_curator_panel_detail_short_summary_not_truncated():
     text = render_to_str(render_panel(13, DashboardState(curator=run), Theme(), detail=True))
     assert "…" not in text
     assert "B" * 100 in text
+
+
+def test_curator_compact_blank_stamp_falls_back_to_dash() -> None:
+    state = DashboardState(curator=CuratorRun(run_present=True, stamp=""))
+    rendered = render_to_str(render_curator(state, Theme()))
+    assert "Last run:" in rendered
+    assert "—" in rendered

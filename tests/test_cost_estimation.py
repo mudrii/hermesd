@@ -317,7 +317,7 @@ def test_collector_estimates_when_cost_is_null(hermes_home: Path, monkeypatch: p
     now = time.time()
     # Pin the "today" cutoff just before the session so it deterministically
     # counts toward today's total (no midnight-boundary flake).
-    monkeypatch.setattr("hermesd.collector._today_epoch", lambda: now - 1)
+    monkeypatch.setattr("hermesd.collector._today_epoch", lambda _now: now - 1)
     conn.execute(
         "INSERT INTO sessions (id, source, started_at, input_tokens, output_tokens, "
         "cache_read_tokens, estimated_cost_usd) VALUES (?, ?, ?, ?, ?, ?, NULL)",

@@ -47,7 +47,10 @@ hermesd --log-tail-bytes 8192        # cap per-refresh log reads for large files
 hermesd/
   __main__.py     CLI entry point (argparse)
   app.py          Rich TUI: Live context, input thread, adaptive layout
-  collector.py    Reads all ~/.hermes data sources (JSON, YAML, SQLite, files)
+  collector.py    Collector orchestration + public facade over collect/
+  collect/        Per-domain readers (sessions, kanban, cron, skills,
+                  operations, config, logs, redaction, sqlite, system, common)
+  defaults.py     Shared refresh-rate and log-tail-bytes defaults
   db.py           Read-only SQLite with PRAGMA data_version caching
   file_cache.py   mtime-keyed JSON/YAML cache
   models.py       Pydantic models for DashboardState
@@ -84,7 +87,7 @@ Canonical contributor workflow lives in [`CONTRIBUTING.md`](CONTRIBUTING.md). Th
 
 1. **Write the failing test first** — this project mandates TDD/ATDD (see `.codex/skills/py-rig/SKILL.md`).
 2. Add data model fields to `models.py`.
-3. Populate them in `collector.py`.
+3. Populate them in the matching `collect/*.py` reader and wire it into `collector.py`.
 4. Render in `panels/*.py` (both `_render_compact` and `_render_detail`).
 5. Make tests pass with the minimum change; refactor while green.
 6. Update `app.py` layout if adding new panels; add a `_render_*_panel(ctx: PanelRenderContext)` wrapper in `panels/__init__.py`, register it in `_RENDERERS` and `PANEL_NAMES`, then add its panel number to `_WIDE_LAYOUT_SPEC`, `_COMPACT_LAYOUT_SPEC`, and `_TALL_NARROW_LAYOUT_SPEC` in `app.py` as needed.

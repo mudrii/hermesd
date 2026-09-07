@@ -5,11 +5,19 @@ from __future__ import annotations
 import contextlib
 import os
 import subprocess
-import time
 from pathlib import Path
 
 from hermesd.collect.common import _coerce_float, _coerce_int, _mtime, _mtime_ns
 from hermesd.paths import HermesPaths
+
+# Seconds a `git` call may run before it is abandoned. Two git subprocesses
+# per checkpoint repo run on every collect tick, so a hung repo must not
+# stall the pass.
+_GIT_SUBPROCESS_TIMEOUT_SECONDS = 2
+# An agent that touched state.db, the session index, the agent log or the
+# gateway state within this window counts as running even with no live
+# session and no gateway process.
+_RECENT_ACTIVITY_WINDOW_SECONDS = 300.0
 
 
 def _pid_exists(pid: int) -> bool:
@@ -50,7 +58,7 @@ def _git_checkpoint_summary(repo_dir: Path) -> tuple[int, float | None, str]:
             capture_output=True,
             text=True,
             check=False,
-            timeout=2,
+            timeout=_GIT_SUBPROCESS_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
         return 0, None, ""
@@ -66,7 +74,7 @@ def _git_checkpoint_summary(repo_dir: Path) -> tuple[int, float | None, str]:
             capture_output=True,
             text=True,
             check=False,
-            timeout=2,
+            timeout=_GIT_SUBPROCESS_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
         # A non-UTF-8 commit subject must not fail the whole checkpoints source.
@@ -84,8 +92,7 @@ def _git_checkpoint_summary(repo_dir: Path) -> tuple[int, float | None, str]:
     return commit_count, (timestamp or None), reason
 
 
-def _latest_runtime_activity_age(paths: HermesPaths) -> float | None:
-    now = time.time()
+def _latest_runtime_activity_age(paths: HermesPaths, now: float) -> float | None:
     candidates = [
         paths.profile_path("state.db"),
         paths.profile_path("sessions", "sessions.json"),

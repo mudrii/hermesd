@@ -8,6 +8,7 @@ from pathlib import Path
 from types import FrameType
 
 from hermesd import __version__
+from hermesd.defaults import DEFAULT_LOG_TAIL_BYTES, DEFAULT_REFRESH_RATE
 from hermesd.paths import default_hermes_home
 
 
@@ -42,8 +43,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--refresh-rate",
         type=_positive_int,
-        default=5,
-        help="Polling interval in seconds (default: 5)",
+        default=DEFAULT_REFRESH_RATE,
+        help=f"Polling interval in seconds (default: {DEFAULT_REFRESH_RATE})",
     )
     parser.add_argument(
         "--profile",
@@ -82,10 +83,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--log-tail-bytes",
         type=_positive_int,
-        default=32768,
+        default=DEFAULT_LOG_TAIL_BYTES,
         help=(
             "Bytes read from the end of each log file and cron output excerpt "
-            "per refresh (default: 32768)"
+            f"per refresh (default: {DEFAULT_LOG_TAIL_BYTES})"
         ),
     )
     parser.add_argument(

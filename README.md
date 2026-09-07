@@ -401,7 +401,20 @@ hermesd/
   __init__.py          Version string
   __main__.py          CLI entry point (argparse)
   app.py               Rich TUI: Live context, input thread, adaptive layout
-  collector.py         Reads all ~/.hermes data sources
+  collector.py         Collector orchestration + public facade over collect/
+  collect/        Per-domain readers behind the collector facade
+    common.py     Coercion, path-safety and file-stat primitives
+    config.py     config.yaml and auth.json summaries
+    cron.py       Cron output discovery, excerpts, suggestions
+    kanban.py     Kanban board SQL readers and board discovery
+    logs.py       Log line parsing constants and helpers
+    operations.py Verification, goals, projects, MoA, curator
+    redaction.py  Secret redaction for URLs, argv, config, log text
+    sessions.py   Session, token and cost analytics
+    skills.py     Skill, memory and SOUL filesystem readers
+    sqlite_util.py Read-only SQLite helpers
+    system.py     Process liveness, git checkpoints, activity age
+  defaults.py          Shared refresh-rate and log-tail-bytes defaults
   db.py                Read-only SQLite with data_version caching
   file_cache.py        mtime-keyed JSON/YAML cache
   models.py            Pydantic models for dashboard state
@@ -432,7 +445,7 @@ hermesd uses **TDD-first** contribution (see [`CONTRIBUTING.md`](CONTRIBUTING.md
 
 1. Write the failing test in `tests/test_your_panel.py` — acceptance-level (full `Collector → DashboardState → render` flow) + unit tests for edge cases
 2. Add data model to `hermesd/models.py`
-3. Collect data in `hermesd/collector.py`
+3. Collect data in the matching `hermesd/collect/*.py` reader, wired in via `hermesd/collector.py`
 4. Create `hermesd/panels/your_panel.py` with `render_*(state, theme, detail)` function
 5. Register in `hermesd/panels/__init__.py` (`PANEL_NAMES` and `_RENDERERS`)
 6. Add the panel number to the overview layout specs in `hermesd/app.py` (`_WIDE_LAYOUT_SPEC`, `_COMPACT_LAYOUT_SPEC`, `_TALL_NARROW_LAYOUT_SPEC`) as needed
