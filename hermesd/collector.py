@@ -24,6 +24,7 @@ from typing import Any, Literal, NamedTuple, Never, TypeVar
 
 from hermesd.collect.common import (
     _MAX_TEXT_READ_BYTES,
+    _age_seconds,
     _as_dict,
     _as_list,
     _coerce_float,
@@ -74,7 +75,9 @@ from hermesd.collect.cron import (
 )
 from hermesd.collect.gateway import (
     _config_generation,
+    _config_stale,
     _gateway_ledger_fields,
+    _gateway_start_epoch,
     _GatewayLedgerRows,
     _heartbeat_liveness,
     _lifecycle_status,
@@ -218,6 +221,14 @@ class _StateDbReadout:
 
     state: StateDbRead
     ledgers: _GatewayLedgerRows
+
+
+def _state_db_readout(conn: sqlite3.Connection) -> _StateDbReadout:
+    """Every state.db-backed source's raw rows, read from one connection."""
+    return _StateDbReadout(
+        state=_read_state_db_tables(conn),
+        ledgers=_read_gateway_ledger_rows(conn),
+    )
 
 
 # Fields each gateway sub-source owns, used to restore just that source's
@@ -840,6 +851,12 @@ class Collector:
     def _read_json_cached(self, path: Path) -> JsonMapping:
         return self._file_cache.read_json_mapping(path)
 
+    def _read_json_confined(self, path: Path) -> JsonMapping:
+        """Read a JSON mapping under ~/.hermes; a path that escapes reads as absent."""
+        if not _safe_child_path(path, self._paths.root_home):
+            return {}
+        return self._read_json_cached(path)
+
     def _read_json_list_cached(self, path: Path) -> JsonObjectList:
         return self._file_cache.read_json_list(path)
 
@@ -895,14 +912,14 @@ class Collector:
         scale_cfg = _as_dict(cfg.get("scale_to_zero")) or _as_dict(gateway_cfg.get("scale_to_zero"))
         active_agents = _coerce_int(data.get("active_agents"))
         drain_request = self._read_json_cached(self._paths.shared_path(".drain_request.json"))
-        config_generation = _config_generation(data, self._paths.root_home)
+        config_generation = _config_generation(data)
         return GatewayState(
             code_sha=str(data.get("code_sha") or ""),
             code_version=str(data.get("code_version") or ""),
             config_fingerprint=config_generation.fingerprint,
             config_generation_short=config_generation.short,
             config_sources=config_generation.sources,
-            config_stale=config_generation.stale,
+            config_stale=self._config_stale(data, now),
             session_store_status=str(_as_dict(data.get("session_store")).get("status") or ""),
             exit_reason=str(data.get("exit_reason") or ""),
             pid=pid,
@@ -926,6 +943,23 @@ class Collector:
             ],
             scale_to_zero_idle_timeout_minutes=_coerce_int(scale_cfg.get("idle_timeout_minutes")),
             scale_to_zero_relay_only=_scale_to_zero_relay_only(scale_cfg, platforms),
+        )
+
+    def _config_stale(self, gateway_state: JsonMapping, now: float) -> bool:
+        """Whether config.yaml changed since the running gateway started.
+
+        The recorded ``config_generation`` mtimes are not used: no current
+        hermes-agent writes them, so the stamps left in gateway_state.json are
+        months old and would report stale forever.
+        """
+        start_epoch = _gateway_start_epoch(
+            self._read_json_confined(self._paths.shared_path("state", "gateway.heartbeat")),
+            self._read_json_confined(self._paths.shared_path("state", "gateway.lifecycle.json")),
+            gateway_state,
+            now,
+        )
+        return _config_stale(
+            self._paths.shared_path("config.yaml"), self._paths.root_home, start_epoch
         )
 
     def _last_gateway_fields(self, gateway: GatewayState, fields: tuple[str, ...]) -> GatewayState:
@@ -1122,7 +1156,7 @@ class Collector:
 
     def _collect_active_surfaces(self) -> list[ActiveSurface]:
         """Live agent surfaces from runtime/active_sessions.json."""
-        data = self._read_json_cached(self._paths.profile_path("runtime", "active_sessions.json"))
+        data = self._read_json_confined(self._paths.profile_path("runtime", "active_sessions.json"))
         surfaces = []
         for raw_entry in _as_list(data.get("entries")):
             entry = _as_dict(raw_entry)
@@ -1510,7 +1544,7 @@ class Collector:
                 )
 
         heartbeat_age, last_success_age = _cron_ticker_ages(
-            self._paths.shared_path("cron"), now=self._clock()
+            self._paths.shared_path("cron"), now=self._clock(), root=self._paths.root_home
         )
         return CronState(
             last_tick_ago_seconds=last_tick,
@@ -1536,10 +1570,19 @@ class Collector:
     def _collect_cron_executions(self, cron: CronState) -> CronExecutionsState:
         """Execution history and incidents, named from the already-collected jobs."""
         job_names = {job.job_id: job.name for job in cron.jobs if job.job_id}
+        db_path = self._paths.shared_path("cron", "executions.db")
+        # A database that still exists but no longer resolves under ~/.hermes
+        # was swapped for something else; that is a failure, not an absence.
+        if _exists_strict(db_path) and not _safe_child_path(db_path, self._paths.root_home):
+            last = self._last_state.cron_executions if self._last_state is not None else None
+            if last is not None and last.db_present:
+                raise RuntimeError("cron/executions.db replaced by unsafe path")
+            return CronExecutionsState()
         return _read_cron_executions_state(
-            self._paths.shared_path("cron", "executions.db"),
+            db_path,
             job_names,
             now=self._clock(),
+            root=self._paths.root_home,
         )
 
     def _collect_channels(self, gateway: GatewayState) -> ChannelDirectoryState:
@@ -1596,7 +1639,7 @@ class Collector:
         cfg = self._read_yaml_cached()
         kanban_cfg = _as_dict(cfg.get("kanban"))
         base_state = KanbanState(
-            db_present=self._paths.shared_path("kanban.db").exists(),
+            db_present=_exists_strict(self._paths.shared_path("kanban.db")),
             current_board=self._read_current_kanban_board(),
             dispatch_in_gateway=bool(kanban_cfg.get("dispatch_in_gateway")),
             dispatch_interval_seconds=_coerce_int(kanban_cfg.get("dispatch_interval_seconds")),
@@ -1605,7 +1648,7 @@ class Collector:
             failure_limit=_coerce_int(kanban_cfg.get("failure_limit")),
         )
         db_path = self._paths.shared_path("kanban.db")
-        if not db_path.exists():
+        if not _exists_strict(db_path):
             if self._last_state is not None and self._last_state.kanban.db_present:
                 raise RuntimeError("kanban.db disappeared")
             return self._with_kanban_boards(base_state)
@@ -1700,7 +1743,9 @@ class Collector:
         dashboard_process_count = sum(
             1 for process in background_processes if _is_dashboard_process(process.command)
         )
-        desktop_stamp = self._read_json_cached(self._paths.shared_path("desktop-build-stamp.json"))
+        desktop_stamp = self._read_json_confined(
+            self._paths.shared_path("desktop-build-stamp.json")
+        )
         stamp_label = str(
             desktop_stamp.get("version")
             or desktop_stamp.get("stamp")
@@ -1710,7 +1755,7 @@ class Collector:
             or str(desktop_stamp.get("contentHash") or "")[:12]
             or ""
         )
-        web_ui_stamp = self._read_json_cached(self._paths.shared_path("web-ui-build-stamp.json"))
+        web_ui_stamp = self._read_json_confined(self._paths.shared_path("web-ui-build-stamp.json"))
         operations = OperationsState(
             dashboard_process_count=dashboard_process_count,
             desktop_build_stamp=stamp_label,
@@ -1729,7 +1774,7 @@ class Collector:
 
     def _with_response_store(self, operations: OperationsState) -> OperationsState:
         db_path = self._paths.shared_path("response_store.db")
-        if not db_path.exists():
+        if not _exists_strict(db_path):
             if self._last_state is not None and self._last_state.operations.response_store_present:
                 raise RuntimeError("response_store.db disappeared")
             return operations
@@ -1750,7 +1795,7 @@ class Collector:
 
     def _with_verification_evidence(self, operations: OperationsState) -> OperationsState:
         db_path = self._paths.profile_path("verification_evidence.db")
-        if not db_path.exists():
+        if not _exists_strict(db_path):
             if self._last_state is not None and self._last_state.operations.verification_db_present:
                 raise RuntimeError("verification_evidence.db disappeared")
             return operations
@@ -1806,7 +1851,7 @@ class Collector:
 
     def _with_projects(self, operations: OperationsState) -> OperationsState:
         db_path = self._paths.profile_path("projects.db")
-        if not db_path.exists():
+        if not _exists_strict(db_path):
             if self._last_state is not None and self._last_state.operations.projects_db_present:
                 raise RuntimeError("projects.db disappeared")
             return operations
@@ -1847,13 +1892,14 @@ class Collector:
     def _read_state_db(self) -> _StateDbReadout | None:
         """Operations tables and gateway ledgers from one state.db pass; None when absent.
 
-        Opening state.db snapshots its WAL to a temp dir, on top of the snapshot
-        HermesDB already takes, so the readout is redone only when state.db (or
-        its -wal) changes and is shared by every source in a pass.
+        Runs on the connection HermesDB already holds for the very same
+        state.db, so the WAL is snapshotted once per change instead of twice
+        per tick; the readout is redone only when state.db (or its -wal)
+        changes and is shared by every source in a pass.
         """
         db_path = self._paths.profile_path("state.db")
         if (
-            not db_path.exists()
+            not _exists_strict(db_path)
             or db_path.is_symlink()
             or not _path_resolves_under(db_path, self._paths.root_home)
         ):
@@ -1862,12 +1908,7 @@ class Collector:
         cached = self._state_db_cache
         if cached is not None and mtime is not None and cached[0] == mtime:
             return cached[1]
-        with _connect_readonly_sqlite(db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            readout = _StateDbReadout(
-                state=_read_state_db_tables(conn),
-                ledgers=_read_gateway_ledger_rows(conn),
-            )
+        readout = self._db.run_readout(_state_db_readout)
         if mtime is not None:
             self._state_db_cache = (mtime, readout)
         return readout
@@ -2083,10 +2124,7 @@ class Collector:
 
     def _file_age_seconds(self, path: Path) -> float | None:
         """Age of ``path`` against the injected clock, clamped at zero."""
-        mtime = _mtime(path)
-        if mtime is None:
-            return None
-        return max(0.0, self._clock() - mtime)
+        return _age_seconds(_mtime(path), self._clock())
 
     def _collect_memory(self) -> MemoryOverview:
         cfg = self._read_yaml_cached()

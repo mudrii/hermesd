@@ -14,7 +14,9 @@ from subprocess import CompletedProcess
 import pytest
 import yaml
 
+import hermesd.collect.sqlite_util as sqlite_util_module
 import hermesd.collector as collector_module
+import hermesd.db as db_module
 from hermesd.collector import (
     Collector,
     _git_checkpoint_summary,
@@ -1087,16 +1089,21 @@ def test_pr_monitor_digit_keys_with_non_dict_values_use_legacy_reading(hermes_ho
     assert monitor.open_count == 0
 
 
-def _count_sqlite_connects(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
-    original = collector_module._connect_readonly_sqlite
-    seen: list[Path] = []
+def _count_sqlite_connects(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every real SQLite open, so a second state.db copy cannot hide."""
+    original = sqlite3.connect
+    seen: list[str] = []
 
-    def counting(db_path: Path):
-        seen.append(Path(db_path))
-        return original(db_path)
+    def counting(target, *args, **kwargs):
+        seen.append(str(target))
+        return original(target, *args, **kwargs)
 
-    monkeypatch.setattr(collector_module, "_connect_readonly_sqlite", counting)
+    monkeypatch.setattr(sqlite3, "connect", counting)
     return seen
+
+
+def _state_db_opens(connects: list[str]) -> int:
+    return sum(1 for target in connects if "state.db" in target)
 
 
 def test_goal_state_is_cached_while_state_db_is_unchanged(
@@ -1111,7 +1118,7 @@ def test_goal_state_is_cached_while_state_db_is_unchanged(
     finally:
         c.close()
 
-    assert [p.name for p in connects].count("state.db") == 1
+    assert _state_db_opens(connects) == 1
 
 
 def test_goal_state_recomputed_when_state_db_changes(
@@ -1128,7 +1135,7 @@ def test_goal_state_recomputed_when_state_db_changes(
     finally:
         c.close()
 
-    assert [p.name for p in connects].count("state.db") == 2
+    assert _state_db_opens(connects) == 2
 
 
 def _count_git_summaries(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
@@ -1289,14 +1296,31 @@ def test_delegation_oversized_json_columns_are_capped(hermes_home: Path):
     insert_delegation(
         conn,
         "deleg_big",
-        task_json=json.dumps({"goal": "x" * 8000}),
-        result_json=json.dumps({"results": [{"status": "ok", "error": "y" * 8000}]}),
+        task_json=json.dumps({"goal": "x" * 70_000}),
+        result_json=json.dumps({"results": [{"status": "ok", "error": "y" * 70_000}]}),
     )
     conn.commit()
     conn.close()
     entry = _collect_ops(hermes_home).operations.delegations[0]
     assert entry.goal == ""
     assert entry.result_status == ""
+
+
+def test_delegation_json_columns_under_the_cap_are_decoded(hermes_home: Path):
+    """The 4 KiB cap blanked realistic delegation payloads; 64 KiB does not."""
+    conn = _open_state_db(hermes_home)
+    create_async_delegations_table(conn)
+    insert_delegation(
+        conn,
+        "deleg_medium",
+        task_json=json.dumps({"goal": "ship it", "context": "c" * 8000}),
+        result_json=json.dumps({"results": [{"status": "ok", "summary": "s" * 8000}]}),
+    )
+    conn.commit()
+    conn.close()
+    entry = _collect_ops(hermes_home).operations.delegations[0]
+    assert entry.goal == "ship it"
+    assert entry.result_status == "ok"
 
 
 def test_delegation_text_fields_clip_to_80_chars(hermes_home: Path):
@@ -1668,3 +1692,112 @@ def test_blocked_scripts_unreadable_dir_keeps_last_good_and_names_source(
     assert second.operations.blocked_script_count == 1
     assert second.operations.blocked_script_names == ["blocked-a.sh"]
     assert second.operations.delegation_count == 3
+
+
+def test_oversized_goal_json_is_refused(hermes_home: Path):
+    """Goal records share the delegation JSON cap instead of decoding unbounded."""
+    conn = _open_state_db(hermes_home)
+    create_state_db_tables(conn)
+    create_state_meta_table(
+        conn,
+        {
+            "goal:sess-small": json.dumps({"goal": "ship it", "status": "active"}),
+            "goal:sess-huge": json.dumps({"goal": "x" * 70_000, "status": "active"}),
+        },
+    )
+    conn.commit()
+    conn.close()
+
+    ops = _collect_ops(hermes_home).operations
+
+    assert [goal.session_id for goal in ops.goals] == ["sess-small"]
+    assert ops.goal_count == 1
+
+
+def test_goal_json_under_the_cap_is_decoded(hermes_home: Path):
+    conn = _open_state_db(hermes_home)
+    create_state_db_tables(conn)
+    create_state_meta_table(
+        conn,
+        {"goal:sess-a": json.dumps({"goal": "ship it", "notes": "n" * 8000, "status": "active"})},
+    )
+    conn.commit()
+    conn.close()
+
+    ops = _collect_ops(hermes_home).operations
+
+    assert [goal.goal for goal in ops.goals] == ["ship it"]
+
+
+def test_state_db_wal_is_snapshotted_once_per_change(
+    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """HermesDB and the operations readout must share one WAL snapshot per tick."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    create_state_db_tables(conn)
+    create_state_meta_table(conn, {"goal:sess-a": json.dumps({"goal": "g", "status": "active"})})
+    conn.commit()
+
+    snapshots: list[Path] = []
+    original = db_module.snapshot_wal_database
+
+    def counting(target: Path, *, prefix: str):
+        snapshots.append(Path(target))
+        return original(target, prefix=prefix)
+
+    monkeypatch.setattr(db_module, "snapshot_wal_database", counting)
+    monkeypatch.setattr(sqlite_util_module, "snapshot_wal_database", counting)
+
+    c = Collector(hermes_home)
+    try:
+        assert c.collect().operations.goal_count == 1
+        after_first = len(snapshots)
+        c.collect()
+        assert len(snapshots) == after_first
+
+        conn.execute(
+            "INSERT INTO state_meta VALUES (?, ?)",
+            ("goal:sess-b", json.dumps({"goal": "g2", "status": "active"})),
+        )
+        conn.commit()
+        assert c.collect().operations.goal_count == 2
+    finally:
+        c.close()
+        conn.close()
+
+    assert [path.name for path in snapshots] == ["state.db", "state.db"]
+
+
+def test_corrupt_state_db_keeps_last_good_operations_rows(hermes_home: Path, sample_db: Path):
+    """The shared readout raises; every state.db-backed source falls back."""
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert first.operations.delegation_count > 0
+
+        sample_db.write_bytes(b"not a sqlite database")
+        second = c.collect()
+    finally:
+        c.close()
+
+    assert second.operations.delegations == first.operations.delegations
+    assert second.operations.delegation_count == first.operations.delegation_count
+    assert "operations" in second.health.failed_sources
+
+
+def test_symlinked_build_stamps_outside_home_read_as_absent(hermes_home: Path, tmp_path: Path):
+    outside_desktop = tmp_path / "desktop-build-stamp.json"
+    outside_desktop.write_text(json.dumps({"version": "9.9.9"}))
+    outside_web = tmp_path / "web-ui-build-stamp.json"
+    outside_web.write_text(json.dumps({"contentHash": "deadbeefcafe", "builtAt": "2026-01-01Z"}))
+    (hermes_home / "desktop-build-stamp.json").symlink_to(outside_desktop)
+    (hermes_home / "web-ui-build-stamp.json").symlink_to(outside_web)
+
+    state = _collect_ops(hermes_home)
+
+    assert state.operations.desktop_build_stamp == ""
+    assert state.operations.web_ui_build_hash == ""
+    assert state.operations.web_ui_built_age_seconds is None
+    assert "operations" not in state.health.failed_sources

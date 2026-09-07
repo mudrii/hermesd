@@ -9,7 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
-from hermesd.collect.common import _db_source_mtime_ns, _safe_child_path
+from hermesd.collect.common import _db_source_mtime_ns, _exists_strict, _safe_child_path
 
 T = TypeVar("T")
 _RECONNECT_ERROR_THRESHOLD = 3
@@ -86,7 +86,10 @@ class HermesDB:
         if self._closed:
             return
         self._close_connection()
-        if not self._path.exists():
+        # _exists_strict, not Path.exists(): on Python 3.14 an unreadable
+        # parent directory would otherwise read as "no database" and blank the
+        # session panel instead of failing the source.
+        if not _exists_strict(self._path):
             self._connected_mtime_ns = None
             self._consecutive_errors = 0
             self._mark_cached_reads_stale()
@@ -491,6 +494,24 @@ class HermesDB:
                 if self._cached_message_search_query != normalized:
                     return set()
             return self._cached_message_search_results
+
+    def run_readout(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+        """Run `fn` against the shared read-only connection, reconnecting if needed.
+
+        The connection is already a WAL snapshot, so callers that need extra
+        tables out of the same database reuse this instead of taking a second
+        full copy of it every tick. ``sqlite3.Error`` propagates on purpose:
+        the calling source treats it as a failure and keeps its last-good data.
+        """
+        with self._lock:
+            conn = self._ensure_connection()
+            if conn is None:
+                raise sqlite3.OperationalError(f"database unavailable: {self._path}")
+            try:
+                return fn(conn)
+            except sqlite3.Error:
+                self._record_read_error()
+                raise
 
     def _read_cached(
         self,

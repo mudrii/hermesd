@@ -1049,29 +1049,73 @@ def test_gateway_state_exit_reason_is_surfaced(hermes_home: Path):
     assert gateway.exit_reason == "crashed on boot"
 
 
-def test_config_stale_when_live_config_is_newer_than_recorded(hermes_home: Path):
-    config = hermes_home / "config.yaml"
-    config.write_text("model: {}\n")
-    recorded = config.stat().st_mtime_ns - 1_000_000_000
-    _write_gateway_state(
-        hermes_home, config_generation=_config_generation(hermes_home, mtime_ns=recorded)
-    )
+def _write_config(path: Path, *, mtime: float) -> Path:
+    path.write_text("model: {}\n")
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+def test_config_stale_when_config_is_newer_than_the_gateway_start(hermes_home: Path):
+    _write_config(hermes_home / "config.yaml", mtime=NOW - 100)
+    _write_gateway_state(hermes_home, config_generation=_config_generation(hermes_home, mtime_ns=1))
+    _write_heartbeat(hermes_home, start_time=NOW - 5000)
 
     gateway = _collect(hermes_home).gateway
 
     assert gateway.config_stale is True
+    # The recorded generation stays informational, never a staleness input.
     assert gateway.config_fingerprint == "0123456789abcdef0123456789abcdef"
     assert gateway.config_generation_short == "0123456789ab"
     assert [source.name for source in gateway.config_sources] == ["config.yaml"]
 
 
-def test_config_not_stale_when_recorded_mtime_matches(hermes_home: Path):
-    config = hermes_home / "config.yaml"
-    config.write_text("model: {}\n")
-    recorded = config.stat().st_mtime_ns
-    _write_gateway_state(
-        hermes_home, config_generation=_config_generation(hermes_home, mtime_ns=recorded)
-    )
+def test_config_not_stale_when_config_predates_the_gateway_start(hermes_home: Path):
+    _write_config(hermes_home / "config.yaml", mtime=NOW - 9000)
+    _write_gateway_state(hermes_home, config_generation=_config_generation(hermes_home, mtime_ns=1))
+    _write_heartbeat(hermes_home, start_time=NOW - 5000)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.config_stale is False
+
+
+def test_config_stale_evaluates_a_symlinked_config(hermes_home: Path, tmp_path: Path):
+    """Dotfiles setups link config.yaml at a repo copy; it is still the live file."""
+    dotfiles = tmp_path / "dotfiles"
+    dotfiles.mkdir()
+    target = _write_config(dotfiles / "config.yaml", mtime=NOW - 100)
+    (hermes_home / "config.yaml").symlink_to(target)
+    _write_gateway_state(hermes_home)
+    _write_heartbeat(hermes_home, start_time=NOW - 5000)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.config_stale is True
+
+
+def test_config_stale_falls_back_to_the_lifecycle_start_time(hermes_home: Path):
+    _write_config(hermes_home / "config.yaml", mtime=NOW - 100)
+    _write_gateway_state(hermes_home)
+    _write_lifecycle(hermes_home, start_time=NOW - 5000)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.config_stale is True
+
+
+def test_config_not_stale_without_any_known_start_time(hermes_home: Path):
+    _write_config(hermes_home / "config.yaml", mtime=NOW - 100)
+    _write_gateway_state(hermes_home)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.config_stale is False
+
+
+def test_config_stale_ignores_a_monotonic_start_time(hermes_home: Path):
+    """hermes-agent records a monotonic clock reading under the same key."""
+    _write_config(hermes_home / "config.yaml", mtime=NOW - 100)
+    _write_gateway_state(hermes_home, start_time=178874708938)
 
     gateway = _collect(hermes_home).gateway
 
@@ -1430,17 +1474,16 @@ def test_goal_state_still_collected_alongside_gateway_ledgers(hermes_home: Path)
 def test_state_db_is_read_once_per_unchanged_collect(hermes_home: Path, monkeypatch):
     _write_gateway_state(hermes_home)
     _write_ledgers(hermes_home)
-    from hermesd import collector as collector_module
 
-    connects: list[Path] = []
-    original = collector_module._connect_readonly_sqlite
+    connects: list[str] = []
+    original = sqlite3.connect
 
-    def counting_connect(db_path: Path):
-        if db_path.name == "state.db":
-            connects.append(db_path)
-        return original(db_path)
+    def counting_connect(target, *args, **kwargs):
+        if "state.db" in str(target):
+            connects.append(str(target))
+        return original(target, *args, **kwargs)
 
-    monkeypatch.setattr(collector_module, "_connect_readonly_sqlite", counting_connect)
+    monkeypatch.setattr(sqlite3, "connect", counting_connect)
 
     collector = Collector(hermes_home, pid_exists=lambda pid: True, clock=_clock)
     try:
@@ -1525,3 +1568,64 @@ def test_config_stale_ignores_unstattable_source(hermes_home: Path):
 
     assert gateway.config_stale is False
     assert [source.name for source in gateway.config_sources] == ["gone"]
+
+
+# --------------------------------------------------------------------------
+# H. pid liveness bounds
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("pid", [0, -1, -4242, 2**31, 2**40, 2**63])
+def test_pid_exists_rejects_out_of_range_pids(pid: int):
+    """os.kill raises OverflowError above pid_t; that must not fail a source."""
+    assert _pid_exists(pid) is False
+
+
+def test_pid_exists_survives_os_kill_overflow(monkeypatch):
+    def exploding_kill(pid: int, signal_number: int) -> None:
+        raise OverflowError("Python int too large to convert to C int")
+
+    monkeypatch.setattr(os, "kill", exploding_kill)
+
+    assert _pid_exists(4242) is False
+
+
+def test_huge_pids_across_runtime_files_keep_their_sources_healthy(hermes_home: Path):
+    """A 2**40 pid in any liveness file used to fail the whole source."""
+    huge = 2**40
+    _write_gateway_state(hermes_home, pid=huge)
+    _write_lifecycle(hermes_home, phase="running", pid=huge)
+    runtime = hermes_home / "runtime"
+    runtime.mkdir(exist_ok=True)
+    (runtime / "active_sessions.json").write_text(
+        json.dumps({"entries": [{"session_id": "s1", "surface": "cli", "pid": huge}]})
+    )
+    (hermes_home / "spawn-ledger.json").write_text(
+        json.dumps([{"pid": huge, "command": "hermes serve", "purpose": "gateway"}])
+    )
+
+    collector = Collector(hermes_home, clock=_clock)
+    try:
+        state = collector.collect()
+    finally:
+        collector.close()
+
+    for source in ("gateway", "gateway_lifecycle", "active_sessions", "background_processes"):
+        assert source not in state.health.failed_sources
+    assert state.gateway.running is False
+    assert state.active_surfaces[0].alive is False
+    assert state.background_processes[0].alive is False
+
+
+def test_symlinked_active_sessions_outside_home_reads_as_absent(hermes_home: Path, tmp_path: Path):
+    outside = tmp_path / "active_sessions.json"
+    outside.write_text(json.dumps({"entries": [{"session_id": "s1", "pid": 1}]}))
+    runtime = hermes_home / "runtime"
+    runtime.mkdir(exist_ok=True)
+    (runtime / "active_sessions.json").symlink_to(outside)
+    _write_gateway_state(hermes_home)
+
+    state = _collect(hermes_home)
+
+    assert state.active_surfaces == []
+    assert "active_sessions" not in state.health.failed_sources

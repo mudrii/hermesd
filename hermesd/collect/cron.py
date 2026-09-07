@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import datetime
 import json
 import math
 import sqlite3
@@ -13,15 +12,19 @@ from typing import Any
 
 from hermesd.collect.common import (
     _EXCERPT_MAX_CHARS,
+    _age_seconds,
     _as_dict,
     _coerce_float,
     _coerce_int,
+    _iso_to_epoch,
     _mtime,
     _path_resolves_under,
     _read_tail_text,
     _read_text_capped,
+    _safe_child_path,
     _safe_mtime,
 )
+from hermesd.collect.logs import _MAX_LOG_LINE_CHARS
 from hermesd.collect.redaction import _redact_secret_text
 from hermesd.collect.sqlite_util import (
     _connect_readonly_sqlite,
@@ -50,6 +53,15 @@ _INCIDENTS_LIMIT = 5
 # keeps arriving while last_success falls ten beats behind means failing.
 _TICKER_HEARTBEAT_STALE_SECONDS = 120.0
 _TICKER_LAST_SUCCESS_STALE_SECONDS = 600.0
+
+
+def _truncate_lines(text: str) -> list[str]:
+    """Split cron output into lines, each capped like a log line.
+
+    A single unbounded line would otherwise be scanned whole by the secret
+    redactor and the [SILENT] probe on every refresh.
+    """
+    return [line[:_MAX_LOG_LINE_CHARS] for line in text.splitlines()]
 
 
 def _latest_cron_output_file(
@@ -90,7 +102,7 @@ def _latest_cron_output_excerpt(
         return "", False, "", None
     latest_mtime = _mtime(latest)
     try:
-        lines = _read_tail_text(latest, max_bytes).splitlines()
+        lines = _truncate_lines(_read_tail_text(latest, max_bytes))
     except OSError:
         return "", False, "", None
     silent = any("[SILENT]" in line.upper() for line in lines)
@@ -129,7 +141,7 @@ def _tail_latest_cron_output(
     if latest_file is None:
         return []
     try:
-        lines = _read_tail_text(latest_file, max_bytes).splitlines()[-max_lines:]
+        lines = _truncate_lines(_read_tail_text(latest_file, max_bytes))[-max_lines:]
     except OSError:
         return []
     return [LogLine(message=_redact_secret_text(line.strip())) for line in lines if line.strip()]
@@ -200,26 +212,6 @@ def _delivery_target_label(directory: dict[str, Any], deliver: str) -> str:
     return deliver
 
 
-def _parse_iso_epoch(value: str) -> float | None:
-    """Epoch seconds for an ISO-8601 stamp, assuming UTC when no offset is given."""
-    if not value:
-        return None
-    try:
-        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.UTC)
-    return parsed.timestamp()
-
-
-def _age_since(epoch: float | None, now: float) -> float | None:
-    """Non-negative age of `epoch` at `now`, or None when the stamp is unusable."""
-    if epoch is None or not math.isfinite(epoch):
-        return None
-    return max(0.0, now - epoch)
-
-
 def _cron_error_excerpt(error: str) -> str:
     """First non-blank line of an execution/incident error, redacted and capped."""
     for line in error.splitlines():
@@ -230,8 +222,8 @@ def _cron_error_excerpt(error: str) -> str:
 
 
 def _execution_duration(started_at: str, finished_at: str) -> float | None:
-    started = _parse_iso_epoch(started_at)
-    finished = _parse_iso_epoch(finished_at)
+    started = _iso_to_epoch(started_at)
+    finished = _iso_to_epoch(finished_at)
     if started is None or finished is None:
         return None
     return max(0.0, finished - started)
@@ -239,7 +231,7 @@ def _execution_duration(started_at: str, finished_at: str) -> float | None:
 
 def _claimed_sort_key(row: dict[str, Any]) -> float:
     """Claim epoch for newest-first ordering; unparseable stamps sort last."""
-    claimed = _parse_iso_epoch(str(row.get("claimed_at") or ""))
+    claimed = _iso_to_epoch(str(row.get("claimed_at") or ""))
     return -math.inf if claimed is None else claimed
 
 
@@ -256,7 +248,7 @@ def _execution_from_row(
         job_id=job_id,
         job_name=job_names.get(job_id) or job_id,
         status=str(row.get("status") or ""),
-        started_age_seconds=_age_since(_parse_iso_epoch(started_at), now),
+        started_age_seconds=_age_seconds(_iso_to_epoch(started_at), now),
         duration_seconds=_execution_duration(started_at, str(row.get("finished_at") or "")),
         error_excerpt=_cron_error_excerpt(str(row.get("error") or "")),
     )
@@ -283,7 +275,7 @@ def _job_execution_stats(
                 ),
                 last_error_excerpt=_cron_error_excerpt(str(row.get("error") or "")),
             )
-        claimed = _parse_iso_epoch(str(row.get("claimed_at") or ""))
+        claimed = _iso_to_epoch(str(row.get("claimed_at") or ""))
         if claimed is None or claimed < window_start:
             continue
         entry = stats[job_id]
@@ -324,10 +316,10 @@ def _incident_from_row(
         job_name=job_names.get(job_id) or job_id,
         state=str(row.get("state") or ""),
         failure_type=str(row.get("failure_type") or ""),
-        first_seen_age_seconds=_age_since(
-            _parse_iso_epoch(str(row.get("first_seen_at") or "")), now
+        first_seen_age_seconds=_age_seconds(
+            _iso_to_epoch(str(row.get("first_seen_at") or "")), now
         ),
-        last_seen_age_seconds=_age_since(_parse_iso_epoch(str(row.get("last_seen_at") or "")), now),
+        last_seen_age_seconds=_age_seconds(_iso_to_epoch(str(row.get("last_seen_at") or "")), now),
         error_excerpt=_cron_error_excerpt(str(row.get("error") or "")),
     )
 
@@ -363,9 +355,14 @@ def _read_cron_executions_state(
     job_names: Mapping[str, str],
     *,
     now: float,
+    root: Path,
 ) -> CronExecutionsState:
-    """Bounded read of cron/executions.db: 24h counters, recent runs, incidents."""
-    if db_path.is_symlink() or not db_path.is_file():
+    """Bounded read of cron/executions.db: 24h counters, recent runs, incidents.
+
+    `root` confines the database: checking only ``db_path.is_symlink()`` misses
+    a symlinked ``cron/`` directory pointing outside the Hermes home.
+    """
+    if not _safe_child_path(db_path, root) or not db_path.is_file():
         return CronExecutionsState()
     with _connect_readonly_sqlite(db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -384,9 +381,9 @@ def _read_cron_executions_state(
         )
 
 
-def _cron_ticker_epoch(path: Path) -> float | None:
+def _cron_ticker_epoch(path: Path, root: Path) -> float | None:
     """The single epoch float held in a ticker stamp file, or None if unusable."""
-    raw = _read_text_capped(path).strip()
+    raw = _read_text_capped(path, root).strip()
     if not raw:
         return None
     try:
@@ -396,11 +393,16 @@ def _cron_ticker_epoch(path: Path) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
-def _cron_ticker_ages(cron_dir: Path, *, now: float) -> tuple[float | None, float | None]:
+def _cron_ticker_ages(
+    cron_dir: Path,
+    *,
+    now: float,
+    root: Path,
+) -> tuple[float | None, float | None]:
     """Ages of the ticker heartbeat and last-success stamps, clamped at zero."""
     return (
-        _age_since(_cron_ticker_epoch(cron_dir / "ticker_heartbeat"), now),
-        _age_since(_cron_ticker_epoch(cron_dir / "ticker_last_success"), now),
+        _age_seconds(_cron_ticker_epoch(cron_dir / "ticker_heartbeat", root), now),
+        _age_seconds(_cron_ticker_epoch(cron_dir / "ticker_last_success", root), now),
     )
 
 
