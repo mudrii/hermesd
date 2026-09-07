@@ -35,7 +35,7 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 | 3 | **Tokens / Cost** | Today's and all-time token usage, authoritative vs estimated cost, cost-status reconciliation, recent-window rollups, and model/provider/endpoint breakdowns |
 | 4 | **Tools** | Available tools count, per-session call stats, background processes, filesystem checkpoints, full tool name grid |
 | 5 | **Config** | Model, provider, personality, MoA, Tool Search, dashboard auth, kanban, code execution, gateway, routing and memory/session settings, agent limits (delegation, goals, tool-loop guardrails, live sessions, streaming, logging) and integrations (MCP, plugins, updates, proxy presence) |
-| 6 | **Cron** | Scheduler tick/provider, Chronos config presence, suggestion count, job table with schedule, delivery target, error count, latest error, and output metadata |
+| 6 | **Cron** | Scheduler tick/provider, ticker health, open incidents, Chronos config presence, suggestion count, job table with schedule, delivery target, 24 h run counters, error count, latest error, and output metadata |
 | 7 | **Skills / Integrations** | Provider auth status/freshness, credential pools, hooks/plugins/MCP inventory, MCP schema cache with never-connected hint, prompted-skill snapshot, BOOT.md presence, skills with descriptions |
 | 8 | **Logs** | Tailed agent, gateway, errors, cron, desktop, dashboard, GUI, update, gateway-error, crash, audit, MCP-stderr, and workspace logs with Tab switching and inline filtering |
 | 9 | **Profiles** | Read-only profile discovery with session counts, log freshness, skill counts, DB size, and SOUL excerpts |
@@ -111,6 +111,12 @@ Two further sub-sections summarise the hermes-agent 0.21 config sections when th
 ### [6] Cron — Scheduled Jobs
 
 Press `6` to see cron scheduler state, provider, Chronos managed-cron config presence, persisted suggestion counts, max parallelism, response wrapping mode, all configured jobs, delivery targets, current state, last execution status, latest error, and latest saved output metadata from `~/.hermes/cron/output/`. `[SILENT]` runs are surfaced explicitly so “nothing to report” is distinguishable from missing output.
+
+**Ticker health** is derived from `~/.hermes/cron/ticker_heartbeat` and `~/.hermes/cron/ticker_last_success` (one epoch float each, written by the 60 s ticker): `ok` when the heartbeat is under 120 s old and the last success under 600 s, `failing` when the heartbeat is fresh but the last success has fallen behind, `stale` when the heartbeat itself has stopped, and `unknown` when neither file exists. Both ages are shown in the detail view; the existing `cron/.tick.lock` age remains as the fallback tick indicator.
+
+**Execution history** comes from `~/.hermes/cron/executions.db` (read-only, bounded queries — never a full table scan). Each job shows its last-24-hour counters (`7✓ 2✗ 1▶` for completed / failed / running) alongside the last run's status, duration (`finished_at − started_at`), and first-line error excerpt. The detail view adds a **Recent Executions** table (the last 10 runs with job name, status, start age, duration, and error excerpt) and an **Open Incidents** table from `cron_incidents` (job, state, failure type, first/last seen age, error excerpt) with open and unacked counts. Both degrade to empty summaries — never an error — when the database or either table is missing, as on older agents.
+
+The job rows also surface the newer `cron/jobs.json` keys: `failure_streak` (shown as `✗3` in the compact row), `paused_at`/`paused_reason` (`⏸` — either one alone is enough to mark a job paused), `last_delivery_error`, `last_dispatch` lateness and kind, `repeat` progress, and `no_agent` script-only jobs.
 
 ![Cron Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-06-cron.png)
 
@@ -312,6 +318,8 @@ hermesd is a **read-only companion** — it reads files from `~/.hermes/` and ne
   gateway.pid ─────────────────>
   config.yaml ─────────────────>
   cron/jobs.json ──────────────>
+  cron/executions.db ──────────>
+  cron/ticker_* ───────────────>
   kanban.db ───────────────────>
   channel_directory.json ──────>
   model cache JSON ────────────>
@@ -409,7 +417,8 @@ hermesd/
   collect/        Per-domain readers behind the collector facade
     common.py     Coercion, path-safety and file-stat primitives
     config.py     config.yaml and auth.json summaries
-    cron.py       Cron output discovery, excerpts, suggestions
+    cron.py       Cron output discovery, excerpts, suggestions,
+                  executions.db history/incidents, ticker health
     kanban.py     Kanban board SQL readers and board discovery
     logs.py       Log line parsing constants and helpers
     operations.py Verification, goals, projects, MoA, curator

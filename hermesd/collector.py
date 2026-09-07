@@ -59,10 +59,16 @@ from hermesd.collect.config import (
 )
 from hermesd.collect.cron import (
     _chronos_configured,
+    _cron_job_dispatch,
+    _cron_job_paused,
+    _cron_job_repeat,
     _cron_suggestion_count,
+    _cron_ticker_ages,
+    _cron_ticker_health,
     _delivery_target_label,
     _latest_cron_output_excerpt,
     _latest_cron_output_file,
+    _read_cron_executions_state,
     _tail_latest_cron_output,
 )
 from hermesd.collect.kanban import (
@@ -140,6 +146,7 @@ from hermesd.models import (
     CheckpointInfo,
     ConfigSummary,
     CredentialPoolEntry,
+    CronExecutionsState,
     CronJob,
     CronState,
     CuratorRun,
@@ -398,6 +405,13 @@ class Collector:
             _SourceSpec("checkpoints", "checkpoints", self._collect_checkpoints, list),
             _SourceSpec("config", "config", self._collect_config, ConfigSummary),
             _SourceSpec("cron", "cron", self._collect_cron, CronState),
+            # Split from "cron" so a corrupt executions.db keeps jobs.json data.
+            _SourceSpec(
+                "cron_executions",
+                "cron_executions",
+                lambda: self._collect_cron_executions(results["cron"]),
+                CronExecutionsState,
+            ),
             _SourceSpec(
                 "channels",
                 "channels",
@@ -1057,6 +1071,9 @@ class Collector:
                 # A raw null must fall back to the model default, not fail the job.
                 raw_enabled = j.get("enabled", True)
                 enabled = True if raw_enabled is None else bool(raw_enabled)
+                dispatch_lateness, dispatch_kind = _cron_job_dispatch(j)
+                repeat_times, repeat_completed = _cron_job_repeat(j)
+                paused, paused_reason = _cron_job_paused(j)
                 jobs.append(
                     CronJob(
                         job_id=str(j.get("id") or ""),
@@ -1076,11 +1093,26 @@ class Collector:
                         next_run_at=str(j.get("next_run_at") or ""),
                         last_status=str(last_status) if last_status is not None else None,
                         last_error=str(j.get("last_error") or ""),
+                        failure_streak=_coerce_int(j.get("failure_streak")),
+                        paused=paused,
+                        paused_reason=paused_reason,
+                        last_delivery_error=str(j.get("last_delivery_error") or ""),
+                        dispatch_lateness_seconds=dispatch_lateness,
+                        dispatch_kind=dispatch_kind,
+                        repeat_times=repeat_times,
+                        repeat_completed=repeat_completed,
+                        no_agent=bool(j.get("no_agent")),
                     )
                 )
 
+        heartbeat_age, last_success_age = _cron_ticker_ages(
+            self._paths.shared_path("cron"), now=self._clock()
+        )
         return CronState(
             last_tick_ago_seconds=last_tick,
+            ticker_heartbeat_age_seconds=heartbeat_age,
+            ticker_last_success_age_seconds=last_success_age,
+            ticker_health=_cron_ticker_health(heartbeat_age, last_success_age),
             job_count=len(jobs),
             error_count=error_count,
             max_parallel_jobs=_coerce_int(cron_cfg.get("max_parallel_jobs")),
@@ -1095,6 +1127,15 @@ class Collector:
             chronos_jwks_configured=bool(_as_dict(cron_cfg.get("chronos")).get("nas_jwks_url")),
             suggestion_count=_cron_suggestion_count(self._paths.shared_path("cron")),
             jobs=jobs,
+        )
+
+    def _collect_cron_executions(self, cron: CronState) -> CronExecutionsState:
+        """Execution history and incidents, named from the already-collected jobs."""
+        job_names = {job.job_id: job.name for job in cron.jobs if job.job_id}
+        return _read_cron_executions_state(
+            self._paths.shared_path("cron", "executions.db"),
+            job_names,
+            now=self._clock(),
         )
 
     def _collect_channels(self, gateway: GatewayState) -> ChannelDirectoryState:

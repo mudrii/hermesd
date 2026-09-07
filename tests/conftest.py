@@ -913,6 +913,7 @@ def populated_hermes_home(
     sample_kanban_db,
     sample_mcp_schema_cache,
     sample_skills_prompt_snapshot,
+    sample_cron_executions_db,
 ) -> Path:
     """A fully populated mock ~/.hermes."""
     return hermes_home
@@ -1172,3 +1173,192 @@ def create_state_db_with_session(path: Path) -> None:
     )
     conn.commit()
     conn.close()
+
+
+CRON_EXECUTIONS_SCHEMA = """
+CREATE TABLE executions (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    process_id TEXT NOT NULL,
+    pid INTEGER NOT NULL,
+    process_started_at INTEGER,
+    status TEXT NOT NULL CHECK(status IN
+        ('claimed','running','completed','failed','unknown')),
+    claimed_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    error TEXT,
+    handoff_pending INTEGER NOT NULL DEFAULT 0,
+    handoff_started_at REAL
+);
+CREATE INDEX idx_executions_job_claimed ON executions(job_id, claimed_at DESC, id DESC);
+CREATE INDEX idx_executions_status_claimed ON executions(status, claimed_at DESC, id DESC);
+CREATE TABLE cron_incidents (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    error_sig TEXT NOT NULL,
+    state TEXT NOT NULL,
+    failure_type TEXT NOT NULL DEFAULT 'unknown',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    acked_at TEXT,
+    closed_at TEXT,
+    error TEXT NOT NULL,
+    output_file TEXT
+);
+"""
+
+
+def iso_ago(seconds: float, *, now: float | None = None) -> str:
+    """ISO-8601 UTC timestamp `seconds` before `now`, as hermes-agent writes them."""
+    import datetime
+
+    moment = datetime.datetime.fromtimestamp(
+        (time.time() if now is None else now) - seconds,
+        tz=datetime.UTC,
+    )
+    return moment.isoformat()
+
+
+def create_cron_executions_tables(conn: sqlite3.Connection) -> None:
+    """Create the cron executions.db schema (journal_mode=delete, no WAL sidecar)."""
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.executescript(CRON_EXECUTIONS_SCHEMA)
+
+
+def insert_cron_execution(
+    conn: sqlite3.Connection,
+    execution_id: str,
+    job_id: str,
+    status: str,
+    *,
+    claimed_at: str,
+    started_at: str | None = None,
+    finished_at: str | None = None,
+    error: str | None = None,
+) -> None:
+    """Insert one executions row, defaulting the columns panels never read."""
+    conn.execute(
+        "INSERT INTO executions (id, job_id, source, process_id, pid, process_started_at, "
+        "status, claimed_at, started_at, finished_at, error) "
+        "VALUES (?, ?, 'builtin', 'proc', 1234, 99, ?, ?, ?, ?, ?)",
+        (execution_id, job_id, status, claimed_at, started_at, finished_at, error),
+    )
+
+
+@pytest.fixture
+def sample_cron_executions_db(hermes_home: Path) -> Path:
+    """A cron/executions.db with a 24h execution window and open/closed incidents."""
+    db_path = hermes_home / "cron" / "executions.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        create_cron_executions_tables(conn)
+        insert_cron_execution(
+            conn,
+            "exec_alpha_ok_1",
+            "job-alpha",
+            "completed",
+            claimed_at=iso_ago(300),
+            started_at=iso_ago(299),
+            finished_at=iso_ago(287),
+        )
+        insert_cron_execution(
+            conn,
+            "exec_alpha_ok_2",
+            "job-alpha",
+            "completed",
+            claimed_at=iso_ago(3600),
+            started_at=iso_ago(3599),
+            finished_at=iso_ago(3590),
+        )
+        insert_cron_execution(
+            conn,
+            "exec_alpha_fail",
+            "job-alpha",
+            "failed",
+            claimed_at=iso_ago(7200),
+            started_at=iso_ago(7199),
+            finished_at=iso_ago(7100),
+            error="Script exited with code 1\nstderr: connection refused",
+        )
+        insert_cron_execution(
+            conn,
+            "exec_alpha_running",
+            "job-alpha",
+            "running",
+            claimed_at=iso_ago(30),
+            started_at=iso_ago(29),
+        )
+        # Older than the 24h window: must not reach any counter.
+        insert_cron_execution(
+            conn,
+            "exec_alpha_ancient",
+            "job-alpha",
+            "completed",
+            claimed_at=iso_ago(3 * 86400),
+            started_at=iso_ago(3 * 86400),
+            finished_at=iso_ago(3 * 86400 - 5),
+        )
+        insert_cron_execution(
+            conn,
+            "exec_beta_fail",
+            "job-beta",
+            "failed",
+            claimed_at=iso_ago(600),
+            started_at=iso_ago(599),
+            finished_at=iso_ago(560),
+            error="timeout waiting for the agent\nsecond line ignored",
+        )
+        conn.execute(
+            "INSERT INTO cron_incidents VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "inc_open_unacked",
+                "job-alpha",
+                "sig-a",
+                "detected",
+                "timeout",
+                iso_ago(7200),
+                iso_ago(600),
+                None,
+                None,
+                "Script exited with code 1\nstderr: connection refused",
+                None,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO cron_incidents VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "inc_open_acked",
+                "job-beta",
+                "sig-b",
+                "alerted",
+                "delivery",
+                iso_ago(10800),
+                iso_ago(1200),
+                iso_ago(900),
+                None,
+                "delivery failed",
+                None,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO cron_incidents VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "inc_closed",
+                "job-alpha",
+                "sig-c",
+                "closed",
+                "unknown",
+                iso_ago(200000),
+                iso_ago(190000),
+                iso_ago(189000),
+                iso_ago(189000),
+                "long resolved",
+                None,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
