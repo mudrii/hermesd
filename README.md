@@ -34,9 +34,9 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 | 2 | **Sessions** | Active/total count, message/tool/API call totals, cwd, archived state, handoff metadata, and parent-session lineage |
 | 3 | **Tokens / Cost** | Today's and all-time token usage, authoritative vs estimated cost, cost-status reconciliation, recent-window rollups, and model/provider/endpoint breakdowns |
 | 4 | **Tools** | Available tools count, per-session call stats, background processes, filesystem checkpoints, full tool name grid |
-| 5 | **Config** | Model, provider, personality, MoA, Tool Search, dashboard auth, kanban, code execution, gateway, routing and memory/session settings |
+| 5 | **Config** | Model, provider, personality, MoA, Tool Search, dashboard auth, kanban, code execution, gateway, routing and memory/session settings, agent limits (delegation, goals, tool-loop guardrails, live sessions, streaming, logging) and integrations (MCP, plugins, updates, proxy presence) |
 | 6 | **Cron** | Scheduler tick/provider, Chronos config presence, suggestion count, job table with schedule, delivery target, error count, latest error, and output metadata |
-| 7 | **Skills / Integrations** | Provider auth status/freshness, credential pools, hooks/plugins/MCP inventory, BOOT.md presence, skills with descriptions |
+| 7 | **Skills / Integrations** | Provider auth status/freshness, credential pools, hooks/plugins/MCP inventory, MCP schema cache with never-connected hint, prompted-skill snapshot, BOOT.md presence, skills with descriptions |
 | 8 | **Logs** | Tailed agent, gateway, errors, cron, desktop, dashboard, GUI, update, gateway-error, crash, audit, MCP-stderr, and workspace logs with Tab switching and inline filtering |
 | 9 | **Profiles** | Read-only profile discovery with session counts, log freshness, skill counts, DB size, and SOUL excerpts |
 | 10 | **Memory** | Memory provider, MEMORY.md/USER.md word counts, learning summary, SOUL.md size/excerpt, and memory file inventory |
@@ -104,6 +104,8 @@ Press `4` for four sections: **Tool Calls** showing the current call leaders by 
 
 Press `5` for the full config key-value table: model, provider, personality, max turns, reasoning effort, compression threshold, secret redaction, approval mode, provider routing summary, smart routing, fallback model, dashboard theme/auth/public URL, session reset mode, memory provider, Tool Search, toolsets, code execution, kanban dispatch settings, gateway media trust, MoA preset/reference/aggregator/trace settings, and auxiliary slot count. Tool Gateway domain, scheme, Firecrawl endpoint, and route token presence are shown from config plus environment with secret-bearing values redacted.
 
+Two further sub-sections summarise the hermes-agent 0.21 config sections when they are present: **Agent limits** (delegation on/off with its compression threshold and max parallelism, goals with turn budget, tool-loop guardrails with max repeats, max live sessions, streaming, log level) and **Integrations** (configured MCP server count and names, plugin config entry count, update channel/auto-update, and whether a network proxy is configured). Both sections list only non-default values and fall back to `—`. Values are never rendered for these keys — MCP server configs and proxy URLs can embed credentials, so hermesd reports names, counts, and flags only. The compact view adds one `mcp N · plugins N · goals on` line.
+
 ![Config Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-05-config.png)
 
 ### [6] Cron — Scheduled Jobs
@@ -115,6 +117,8 @@ Press `6` to see cron scheduler state, provider, Chronos managed-cron config pre
 ### [7] Skills & Integrations — What's Installed?
 
 Press `7` for provider and integration visibility in one place: **Providers** with active auth state and safely persisted credential freshness/expiry metadata, **Credential Pools** with redacted metadata, **Hooks** discovered from `~/.hermes/hooks/`, **Plugins** from `~/.hermes/plugins/`, **MCP Servers** from `config.yaml` with secret-bearing args and URL query params redacted, `BOOT.md` presence, and **Skills** grouped by category with descriptions loaded from each skill's `SKILL.md` frontmatter. Use `j`/`k` to scroll through the full skill list.
+
+An **MCP** section summarises `~/.hermes/cache/mcp_schema_cache.json`: how many servers have a cached schema, their names, the cache age, and a **Never connected** hint listing servers configured in `config.yaml` that have never produced a cached schema. Cached payloads are treated as opaque and never rendered. A `Prompted skills: N (snapshot 2h ago)` line summarises `~/.hermes/.skills_prompt_snapshot.json`. The compact view adds `mcp N cached` when the cache is populated.
 
 ![Skills Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-07-skills.png)
 

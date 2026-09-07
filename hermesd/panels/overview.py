@@ -8,7 +8,7 @@ from rich.text import Text
 
 from hermesd.models import DashboardState, SkillsMemory
 from hermesd.panels.formatting import escape_terminal_text as escape
-from hermesd.panels.formatting import sanitize_terminal_text, section_heading
+from hermesd.panels.formatting import fmt_age_seconds, sanitize_terminal_text, section_heading
 from hermesd.theme import Theme
 
 _DETAIL_VISIBLE_SKILL_ROWS = 20
@@ -40,6 +40,11 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append(f"{len(sm.credential_pools)} pools\n", style=theme.banner_text)
     lines.append("  Integrations: ", style=theme.ui_label)
     lines.append(f"{len(sm.plugins)} plug  {len(sm.mcp_servers)} mcp\n", style=theme.banner_text)
+    if state.mcp_cache.mcp_cached_server_count:
+        lines.append("  Schema cache: ", style=theme.ui_label)
+        lines.append(
+            f"mcp {state.mcp_cache.mcp_cached_server_count} cached\n", style=theme.banner_text
+        )
     for p in sm.providers[:4]:
         sym = "✓" if p.is_active else "✗"
         color = theme.ui_ok if p.is_active else theme.banner_dim
@@ -79,6 +84,11 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
         sections.append(section_heading("MCP Servers", theme))
         sections.append(_mcp_servers_table(sm, theme))
 
+    sections.extend(_mcp_cache_section(state, theme))
+
+    if state.skills_prompt.prompted_skill_count:
+        sections.append(_prompted_skills_text(state, theme))
+
     if sm.boot_md_present:
         boot_text = Text()
         boot_text.append("\nBOOT.md\n", style=f"bold {theme.ui_label}")
@@ -96,6 +106,46 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
         box=rich.box.HORIZONTALS,
         padding=(1, 2),
     )
+
+
+def _mcp_cache_section(state: DashboardState, theme: Theme) -> list[RenderableType]:
+    """MCP schema cache block: cached names, age, and a never-connected hint."""
+    cache = state.mcp_cache
+    heading = section_heading("MCP", theme)
+    if not cache.mcp_cached_server_count:
+        return [heading, Text("  —", style=theme.banner_dim)]
+
+    never_cached = [
+        name for name in state.config.mcp_server_names if name not in cache.mcp_cached_server_names
+    ]
+    table = Table(box=None, show_header=False, padding=(0, 2))
+    table.add_column("Key", style=theme.ui_label)
+    table.add_column("Value", style=theme.ui_accent)
+    names = ", ".join(cache.mcp_cached_server_names)
+    table.add_row(
+        "Cached servers",
+        escape(f"{cache.mcp_cached_server_count} ({names})") if names else "—",
+    )
+    table.add_row("Cache age", _age_label(cache.mcp_schema_cache_age_seconds))
+    table.add_row("Never connected", escape(", ".join(never_cached)) if never_cached else "—")
+    return [heading, table]
+
+
+def _prompted_skills_text(state: DashboardState, theme: Theme) -> Text:
+    prompt = state.skills_prompt
+    text = Text()
+    text.append(
+        f"\nPrompted skills: {prompt.prompted_skill_count} "
+        f"(snapshot {_age_label(prompt.prompt_snapshot_age_seconds)} ago)",
+        style=theme.banner_text,
+    )
+    return text
+
+
+def _age_label(age_seconds: float | None) -> str:
+    if age_seconds is None:
+        return "—"
+    return fmt_age_seconds(max(0, int(age_seconds)))
 
 
 def _providers_table(sm: SkillsMemory, theme: Theme) -> Table:

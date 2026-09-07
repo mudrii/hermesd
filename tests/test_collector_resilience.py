@@ -364,3 +364,56 @@ def test_config_yaml_scalar_then_list_then_empty_never_blanks_config(
         assert recovered.config.provider == "acme"
     finally:
         collector.close()
+
+
+def test_corrupt_mcp_schema_cache_keeps_last_good(hermes_home: Path):
+    path = hermes_home / "cache" / "mcp_schema_cache.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"playwright": {"tools": []}, "sheets": {"tools": []}}))
+
+    collector = Collector(hermes_home)
+    try:
+        first = collector.collect()
+        assert first.mcp_cache.mcp_cached_server_names == ["playwright", "sheets"]
+
+        path.write_text("{corrupt")
+        second = collector.collect()
+    finally:
+        collector.close()
+
+    assert second.mcp_cache.mcp_cached_server_count == 2
+    assert second.mcp_cache.mcp_cached_server_names == ["playwright", "sheets"]
+
+
+def test_deleted_mcp_schema_cache_reports_empty(hermes_home: Path):
+    path = hermes_home / "cache" / "mcp_schema_cache.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"playwright": {}}))
+
+    collector = Collector(hermes_home)
+    try:
+        assert collector.collect().mcp_cache.mcp_cached_server_count == 1
+        path.unlink()
+        second = collector.collect()
+    finally:
+        collector.close()
+
+    # A removed cache file is a real state change, not a read fault: the file
+    # cache drops the entry rather than serving a deleted file's value forever.
+    assert second.mcp_cache.mcp_cached_server_count == 0
+    assert "mcp_cache" not in second.health.failed_sources
+
+
+def test_corrupt_skills_prompt_snapshot_keeps_last_good(hermes_home: Path):
+    path = hermes_home / ".skills_prompt_snapshot.json"
+    path.write_text(json.dumps({"version": 1, "skills": [{"name": "dev-lint"}]}))
+
+    collector = Collector(hermes_home)
+    try:
+        assert collector.collect().skills_prompt.prompted_skill_count == 1
+        path.write_text("not json")
+        second = collector.collect()
+    finally:
+        collector.close()
+
+    assert second.skills_prompt.prompted_skill_count == 1

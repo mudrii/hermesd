@@ -9,7 +9,29 @@ from typing import Any
 
 import yaml
 
-from hermesd.collect.common import _EXCERPT_MAX_CHARS, _as_dict, _read_text_capped
+from hermesd.collect.common import _EXCERPT_MAX_CHARS, _as_dict, _as_list, _read_text_capped
+from hermesd.models import MCPSchemaCache, SkillsPromptSnapshot
+
+# Upper bound on cached server names surfaced from the MCP schema cache.
+_MAX_LISTED_NAMES = 20
+
+
+def _mcp_schema_cache_summary(data: dict[str, Any], age_seconds: float | None) -> MCPSchemaCache:
+    """Summarize the MCP schema cache mapping; cached payloads stay opaque."""
+    names = sorted(str(name) for name in data)
+    return MCPSchemaCache(
+        mcp_cached_server_count=len(names),
+        mcp_cached_server_names=names[:_MAX_LISTED_NAMES],
+        mcp_schema_cache_age_seconds=age_seconds,
+    )
+
+
+def _skills_prompt_summary(data: dict[str, Any], age_seconds: float | None) -> SkillsPromptSnapshot:
+    """Summarize ``.skills_prompt_snapshot.json``: prompted skill count and age."""
+    return SkillsPromptSnapshot(
+        prompted_skill_count=len(_as_list(data.get("skills"))),
+        prompt_snapshot_age_seconds=age_seconds,
+    )
 
 
 def _count_skills(skills_dir: Path) -> int:

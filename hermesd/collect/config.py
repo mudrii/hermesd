@@ -8,6 +8,61 @@ from hermesd.collect.common import _as_dict, _as_list, _coerce_int
 from hermesd.collect.redaction import _API_KEY_FIELD_NAMES, _OAUTH_FIELD_NAMES
 from hermesd.models import PlatformStatus
 
+# Upper bound on name lists surfaced from config/cache mappings.
+_MAX_LISTED_NAMES = 20
+
+
+def _config_agent_limits(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Read the optional hermes-agent 0.21 config sections.
+
+    Every section is optional and may carry an unexpected shape; anything that
+    does not match falls back to the ``ConfigSummary`` default. Only names,
+    counts and flags are reported — never a configured value, which may hold a
+    token or a URL with embedded credentials.
+    """
+    delegation = _as_dict(cfg.get("delegation"))
+    goals = _as_dict(cfg.get("goals"))
+    updates = _as_dict(cfg.get("updates"))
+    guardrails = _as_dict(cfg.get("tool_loop_guardrails"))
+    mcp_names = sorted(str(name) for name in _as_dict(cfg.get("mcp_servers")))
+    return {
+        "delegation_enabled": bool(delegation.get("enabled")),
+        "delegation_compression_threshold_tokens": _coerce_int(
+            delegation.get("compression_threshold_tokens")
+        ),
+        "delegation_max_parallel": _coerce_int(delegation.get("max_parallel")),
+        "goals_enabled": bool(goals.get("enabled")),
+        "goals_turn_budget": _coerce_int(goals.get("turn_budget")),
+        "updates_channel": _plain_str(updates.get("channel")),
+        "updates_auto": bool(updates.get("auto")) or bool(updates.get("check")),
+        "mcp_server_count": len(mcp_names),
+        "mcp_server_names": mcp_names[:_MAX_LISTED_NAMES],
+        "plugin_config_count": _config_entry_count(cfg.get("plugins")),
+        "tool_loop_guardrails_enabled": bool(guardrails.get("enabled")),
+        "tool_loop_max_repeats": _coerce_int(guardrails.get("max_repeats")),
+        "max_live_sessions": _coerce_int(cfg.get("max_live_sessions")),
+        "streaming_enabled": bool(_as_dict(cfg.get("streaming")).get("enabled")),
+        "logging_level": _plain_str(_as_dict(cfg.get("logging")).get("level")),
+        "network_proxy_configured": _proxy_configured(_as_dict(cfg.get("network"))),
+    }
+
+
+def _config_entry_count(value: object) -> int:
+    if isinstance(value, dict | list):
+        return len(value)
+    return 0
+
+
+def _plain_str(value: object) -> str:
+    """Stringify a scalar YAML value; anything else (dict, list, bool) is ""."""
+    if isinstance(value, bool) or not isinstance(value, str | int | float):
+        return ""
+    return str(value)
+
+
+def _proxy_configured(network: dict[str, Any]) -> bool:
+    return any(bool(network.get(key)) for key in ("proxy", "http_proxy", "https_proxy"))
+
 
 def _provider_model_label(cfg: dict[str, Any]) -> str:
     provider = str(cfg.get("provider") or "")

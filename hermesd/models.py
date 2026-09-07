@@ -236,6 +236,24 @@ class ConfigSummary(BaseModel):
     moa_aggregator_label: str = ""
     moa_save_traces: bool = False
     moa_trace_dir: str = ""
+    delegation_enabled: bool = False
+    delegation_compression_threshold_tokens: int = 0
+    delegation_max_parallel: int = 0
+    goals_enabled: bool = False
+    goals_turn_budget: int = 0
+    updates_channel: str = ""
+    updates_auto: bool = False
+    # Server names only — MCP server config values may carry credentials.
+    mcp_server_count: int = 0
+    mcp_server_names: list[str] = Field(default_factory=list)
+    plugin_config_count: int = 0
+    tool_loop_guardrails_enabled: bool = False
+    tool_loop_max_repeats: int = 0
+    max_live_sessions: int = 0
+    streaming_enabled: bool = False
+    logging_level: str = ""
+    # Presence only — a proxy URL can embed credentials.
+    network_proxy_configured: bool = False
 
 
 class ProviderInfo(BaseModel):
@@ -300,6 +318,21 @@ class SkillsMemory(BaseModel):
     boot_md_present: bool = False
     boot_md_mtime: float | None = None
     skills: list[SkillInfo] = Field(default_factory=list)
+
+
+class MCPSchemaCache(BaseModel):
+    """Summary of ``cache/mcp_schema_cache.json`` — server names only."""
+
+    mcp_cached_server_count: int = 0
+    mcp_cached_server_names: list[str] = Field(default_factory=list)
+    mcp_schema_cache_age_seconds: float | None = None
+
+
+class SkillsPromptSnapshot(BaseModel):
+    """Summary of ``.skills_prompt_snapshot.json``."""
+
+    prompted_skill_count: int = 0
+    prompt_snapshot_age_seconds: float | None = None
 
 
 class MemoryOverview(BaseModel):
@@ -624,6 +657,8 @@ class DashboardState(BaseModel):
     kanban: KanbanState = Field(default_factory=KanbanState)
     operations: OperationsState = Field(default_factory=OperationsState)
     skills_memory: SkillsMemory = Field(default_factory=SkillsMemory)
+    mcp_cache: MCPSchemaCache = Field(default_factory=MCPSchemaCache)
+    skills_prompt: SkillsPromptSnapshot = Field(default_factory=SkillsPromptSnapshot)
     memory: MemoryOverview = Field(default_factory=MemoryOverview)
     profiles: ProfilesState = Field(default_factory=ProfilesState)
     logs: LogState = Field(default_factory=LogState)

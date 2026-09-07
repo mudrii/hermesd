@@ -27,6 +27,7 @@ from hermesd.models import (
     KanbanTaskSummary,
     LogLine,
     LogState,
+    MCPSchemaCache,
     MCPServerInfo,
     MemoryOverview,
     ModelCacheSummary,
@@ -41,6 +42,7 @@ from hermesd.models import (
     SessionInfo,
     SkillInfo,
     SkillsMemory,
+    SkillsPromptSnapshot,
     TokenAnalytics,
     TokenBreakdown,
     ToolGatewayRoute,
@@ -168,6 +170,20 @@ def _state_for(panel_num: int) -> DashboardState:
                 moa_active_preset=INJECT,
                 moa_preset_count=1,
                 moa_aggregator_label=INJECT,
+                mcp_server_count=1,
+                mcp_server_names=[INJECT],
+                updates_channel=INJECT,
+                logging_level=INJECT,
+                plugin_config_count=1,
+                goals_enabled=True,
+                goals_turn_budget=3,
+                delegation_enabled=True,
+                delegation_max_parallel=2,
+                tool_loop_guardrails_enabled=True,
+                tool_loop_max_repeats=2,
+                max_live_sessions=4,
+                streaming_enabled=True,
+                network_proxy_configured=True,
             ),
         )
     if panel_num == 6:  # Cron
@@ -215,6 +231,16 @@ def _state_for(panel_num: int) -> DashboardState:
                     MCPServerInfo(name=INJECT, transport=INJECT, target=INJECT, tool_filter=INJECT)
                 ],
                 skills=[SkillInfo(name=INJECT, category="dev", description=INJECT)],
+            ),
+            config=ConfigSummary(mcp_server_count=2, mcp_server_names=[INJECT, "cached-server"]),
+            mcp_cache=MCPSchemaCache(
+                mcp_cached_server_count=1,
+                mcp_cached_server_names=["cached-server"],
+                mcp_schema_cache_age_seconds=60.0,
+            ),
+            skills_prompt=SkillsPromptSnapshot(
+                prompted_skill_count=1,
+                prompt_snapshot_age_seconds=120.0,
             ),
         )
     if panel_num == 8:  # Logs

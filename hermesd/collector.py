@@ -44,6 +44,7 @@ from hermesd.collect.common import (
 )
 from hermesd.collect.config import (
     _channel_capabilities,
+    _config_agent_limits,
     _credential_auth_type,
     _credential_expiry,
     _mcp_tool_filter_summary,
@@ -109,10 +110,12 @@ from hermesd.collect.sessions import (
 from hermesd.collect.skills import (
     _count_skills,
     _learning_summary,
+    _mcp_schema_cache_summary,
     _memory_card_count,
     _read_soul_excerpt,
     _skill_description,
     _skill_frontmatter,
+    _skills_prompt_summary,
     _word_count,
 )
 from hermesd.collect.sqlite_util import (
@@ -148,6 +151,7 @@ from hermesd.models import (
     LogLine,
     LogState,
     LogStream,
+    MCPSchemaCache,
     MCPServerInfo,
     MemoryOverview,
     ModelCacheSummary,
@@ -162,6 +166,7 @@ from hermesd.models import (
     SessionInfo,
     SkillInfo,
     SkillsMemory,
+    SkillsPromptSnapshot,
     TokenAnalytics,
     TokenSummary,
     ToolGatewayRoute,
@@ -406,6 +411,13 @@ class Collector:
                 OperationsState,
             ),
             _SourceSpec("skills_memory", "skills", self._collect_skills_memory, SkillsMemory),
+            _SourceSpec("mcp_cache", "mcp_cache", self._collect_mcp_cache, MCPSchemaCache),
+            _SourceSpec(
+                "skills_prompt",
+                "skills_prompt",
+                self._collect_skills_prompt,
+                SkillsPromptSnapshot,
+            ),
             _SourceSpec("memory", "memory", self._collect_memory, MemoryOverview),
             _SourceSpec("profiles", "profiles", self._collect_profiles, ProfilesState),
             _SourceSpec("logs", "logs", self._collect_logs, LogState),
@@ -989,6 +1001,7 @@ class Collector:
             moa_aggregator_label=moa_summary["aggregator_label"],
             moa_save_traces=bool(moa_cfg.get("save_traces")),
             moa_trace_dir=str(moa_cfg.get("trace_dir") or ""),
+            **_config_agent_limits(cfg),
         )
 
     def _collect_tool_gateway_routes(self, cfg: dict[str, Any]) -> list[ToolGatewayRoute]:
@@ -1559,6 +1572,25 @@ class Collector:
             boot_md_mtime=_mtime(boot_md),
             skills=skills,
         )
+
+    def _collect_mcp_cache(self) -> MCPSchemaCache:
+        path = self._paths.shared_path("cache", "mcp_schema_cache.json")
+        if not _safe_or_absent_child_path(path, self._paths.root_home):
+            return MCPSchemaCache()
+        return _mcp_schema_cache_summary(self._read_json_cached(path), self._file_age_seconds(path))
+
+    def _collect_skills_prompt(self) -> SkillsPromptSnapshot:
+        path = self._paths.shared_path(".skills_prompt_snapshot.json")
+        if not _safe_or_absent_child_path(path, self._paths.root_home):
+            return SkillsPromptSnapshot()
+        return _skills_prompt_summary(self._read_json_cached(path), self._file_age_seconds(path))
+
+    def _file_age_seconds(self, path: Path) -> float | None:
+        """Age of ``path`` against the injected clock, clamped at zero."""
+        mtime = _mtime(path)
+        if mtime is None:
+            return None
+        return max(0.0, self._clock() - mtime)
 
     def _collect_memory(self) -> MemoryOverview:
         cfg = self._read_yaml_cached()

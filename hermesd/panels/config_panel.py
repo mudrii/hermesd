@@ -33,7 +33,13 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append("  Gateway Tools: ", style=theme.ui_label)
     lines.append(f"{gateway_count}/{len(c.tool_gateway_routes)}\n", style=theme.banner_text)
     lines.append("  Tool Search: ", style=theme.ui_label)
-    lines.append(sanitize_terminal_text(c.tool_search_enabled) or "—", style=theme.banner_text)
+    lines.append(f"{sanitize_terminal_text(c.tool_search_enabled) or '—'}\n", style=theme.ui_accent)
+    lines.append("  Integrations: ", style=theme.ui_label)
+    lines.append(
+        f"mcp {c.mcp_server_count} · plugins {c.plugin_config_count} "
+        f"· goals {'on' if c.goals_enabled else 'off'}",
+        style=theme.banner_text,
+    )
 
     return Panel(
         lines,
@@ -48,6 +54,8 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
 def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     c = state.config
     sections: list[RenderableType] = [_settings_table(c, theme)]
+    sections.extend(_kv_section("Agent limits", _agent_limit_rows(c), theme))
+    sections.extend(_kv_section("Integrations", _integration_rows(c), theme))
 
     if c.tool_gateway_routes:
         sections.append(section_heading("Tool Gateway (dashboard-local env)", theme))
@@ -104,6 +112,66 @@ def _settings_table(c: ConfigSummary, theme: Theme) -> Table:
     table.add_row("MoA", escape(_moa_label(c)))
     table.add_row("Auxiliary Slots", str(len(c.auxiliary_slots)))
     return table
+
+
+def _kv_section(title: str, rows: list[tuple[str, str]], theme: Theme) -> list[RenderableType]:
+    """A labelled key/value block; "—" when nothing non-default is configured."""
+    heading = section_heading(title, theme)
+    if not rows:
+        return [heading, Text("  —", style=theme.banner_dim)]
+    table = Table(box=None, show_header=False, padding=(0, 2))
+    table.add_column("Key", style=theme.ui_label)
+    table.add_column("Value", style=theme.ui_accent)
+    for key, value in rows:
+        table.add_row(key, escape(value))
+    return [heading, table]
+
+
+def _agent_limit_rows(c: ConfigSummary) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    delegation = [
+        f"compress ≥{c.delegation_compression_threshold_tokens} tok"
+        if c.delegation_compression_threshold_tokens
+        else "",
+        f"max parallel {c.delegation_max_parallel}" if c.delegation_max_parallel else "",
+    ]
+    if c.delegation_enabled or any(delegation):
+        state = "on" if c.delegation_enabled else "off"
+        rows.append(("Delegation", " · ".join([state, *(part for part in delegation if part)])))
+    if c.goals_enabled or c.goals_turn_budget:
+        goals = "on" if c.goals_enabled else "off"
+        if c.goals_turn_budget:
+            goals = f"{goals} · turn budget {c.goals_turn_budget}"
+        rows.append(("Goals", goals))
+    if c.tool_loop_guardrails_enabled or c.tool_loop_max_repeats:
+        guardrails = "on" if c.tool_loop_guardrails_enabled else "off"
+        if c.tool_loop_max_repeats:
+            guardrails = f"{guardrails} · max repeats {c.tool_loop_max_repeats}"
+        rows.append(("Tool Loop Guard", guardrails))
+    if c.max_live_sessions:
+        rows.append(("Max Live Sessions", str(c.max_live_sessions)))
+    if c.streaming_enabled:
+        rows.append(("Streaming", "on"))
+    if c.logging_level:
+        rows.append(("Log Level", c.logging_level))
+    return rows
+
+
+def _integration_rows(c: ConfigSummary) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    if c.mcp_server_count:
+        names = ", ".join(c.mcp_server_names)
+        rows.append(
+            ("MCP Servers", f"{c.mcp_server_count} ({names})" if names else str(c.mcp_server_count))
+        )
+    if c.plugin_config_count:
+        rows.append(("Plugin Config", str(c.plugin_config_count)))
+    if c.updates_channel or c.updates_auto:
+        updates = c.updates_channel or "—"
+        rows.append(("Updates", f"{updates} · auto" if c.updates_auto else updates))
+    if c.network_proxy_configured:
+        rows.append(("Network Proxy", "configured"))
+    return rows
 
 
 def _tool_gateway_table(c: ConfigSummary, theme: Theme) -> Table:

@@ -53,6 +53,8 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ### Added
 
+- Config panel now reads the hermes-agent 0.21 `config.yaml` sections — `delegation`, `goals`, `updates`, `mcp_servers`, `plugins`, `tool_loop_guardrails`, `max_live_sessions`, `streaming`, `logging`, and `network` — into new "Agent limits" and "Integrations" detail sub-sections plus a compact `mcp N · plugins N · goals on` line. Only names, counts and flags are surfaced: MCP server config values are never rendered and a configured `network.proxy` shows as presence only.
+- Skills / Integrations panel now surfaces the MCP schema cache (`~/.hermes/cache/mcp_schema_cache.json`, source `mcp_cache`) as cached server names, cache age, and a never-connected hint for configured-but-uncached servers, plus the skills prompt snapshot (`~/.hermes/.skills_prompt_snapshot.json`, source `skills_prompt`) as a "Prompted skills: N (snapshot 2h ago)" line. Cached payloads stay opaque and both files are ignored when they are symlinks.
 - Test coverage tooling: `pytest-cov` with branch coverage, enforced at 96% in CI; a PTY-based end-to-end TUI integration test; contract tests extended to panels 4, 5, 6, 8, 9, 10, and 11; Unicode/CJK rendering tests; snapshot-file symlink/traversal edge-case tests.
 - `SECURITY.md` with a vulnerability reporting policy, and a Troubleshooting/FAQ section in the README covering non-TTY usage, the AGENT OFFLINE banner, footer health indicators, SQLite WAL snapshotting, and `--log-tail-bytes` tuning.
 - CI now tests Python 3.11–3.14 on Linux plus Python 3.14 on macOS, smoke-runs the Docker image, checks the commit-pinned Nix flake, runs packaging checks in a single-version job, and tracks `uv` and Docker dependency updates with Dependabot.

@@ -562,3 +562,132 @@ def test_collect_curator_skips_symlinked_root_dir(hermes_home: Path, tmp_path: P
     assert state.curator.model == ""
     assert "curator" not in state.health.failed_sources
     c.close()
+
+
+def _collect_state(home: Path, clock_value: float | None = None):
+    kwargs = {} if clock_value is None else {"clock": lambda: clock_value}
+    collector = Collector(home, **kwargs)
+    try:
+        return collector.collect()
+    finally:
+        collector.close()
+
+
+def _write_mcp_cache(home: Path, payload: object) -> Path:
+    path = home / "cache" / "mcp_schema_cache.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(payload if isinstance(payload, str) else json.dumps(payload))
+    return path
+
+
+def test_mcp_cache_present(hermes_home: Path, sample_mcp_schema_cache: Path):
+    mtime = sample_mcp_schema_cache.stat().st_mtime
+    state = _collect_state(hermes_home, clock_value=mtime + 300)
+
+    cache = state.mcp_cache
+    assert cache.mcp_cached_server_count == 2
+    assert cache.mcp_cached_server_names == ["playwright", "sheets"]
+    assert cache.mcp_schema_cache_age_seconds == 300.0
+    assert "sk-should-never-render" not in json.dumps(state.model_dump(mode="json"))
+
+
+def test_mcp_cache_absent(hermes_home: Path):
+    cache = _collect_state(hermes_home).mcp_cache
+    assert cache.mcp_cached_server_count == 0
+    assert cache.mcp_cached_server_names == []
+    assert cache.mcp_schema_cache_age_seconds is None
+
+
+def test_mcp_cache_garbage_is_ignored(hermes_home: Path):
+    _write_mcp_cache(hermes_home, "{not json at all")
+
+    cache = _collect_state(hermes_home).mcp_cache
+    assert cache.mcp_cached_server_count == 0
+    assert cache.mcp_cached_server_names == []
+
+
+def test_mcp_cache_wrong_shape_is_ignored(hermes_home: Path):
+    _write_mcp_cache(hermes_home, ["playwright", "sheets"])
+
+    assert _collect_state(hermes_home).mcp_cache.mcp_cached_server_count == 0
+
+
+def test_mcp_cache_names_capped_and_sorted(hermes_home: Path):
+    _write_mcp_cache(hermes_home, {f"srv-{index:02d}": {} for index in range(25)})
+
+    cache = _collect_state(hermes_home).mcp_cache
+    assert cache.mcp_cached_server_count == 25
+    assert cache.mcp_cached_server_names == sorted(cache.mcp_cached_server_names)
+    assert len(cache.mcp_cached_server_names) == 20
+
+
+def test_mcp_cache_symlinked_file_is_ignored(hermes_home: Path, tmp_path: Path):
+    outside = tmp_path / "outside_mcp.json"
+    outside.write_text(json.dumps({"escaped": {}}))
+    cache_dir = hermes_home / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "mcp_schema_cache.json").symlink_to(outside)
+
+    cache = _collect_state(hermes_home).mcp_cache
+    assert cache.mcp_cached_server_count == 0
+    assert cache.mcp_cached_server_names == []
+
+
+def test_mcp_cache_age_is_clamped_to_zero(hermes_home: Path):
+    path = _write_mcp_cache(hermes_home, {"playwright": {}})
+    mtime = path.stat().st_mtime
+
+    assert _collect_state(hermes_home, mtime - 5000).mcp_cache.mcp_schema_cache_age_seconds == 0.0
+
+
+def test_skills_prompt_snapshot_present(hermes_home: Path, sample_skills_prompt_snapshot: Path):
+    mtime = sample_skills_prompt_snapshot.stat().st_mtime
+    snapshot = _collect_state(hermes_home, clock_value=mtime + 7200).skills_prompt
+
+    assert snapshot.prompted_skill_count == 3
+    assert snapshot.prompt_snapshot_age_seconds == 7200.0
+
+
+def test_skills_prompt_snapshot_absent(hermes_home: Path):
+    snapshot = _collect_state(hermes_home).skills_prompt
+    assert snapshot.prompted_skill_count == 0
+    assert snapshot.prompt_snapshot_age_seconds is None
+
+
+def test_skills_prompt_snapshot_garbage_is_ignored(hermes_home: Path):
+    (hermes_home / ".skills_prompt_snapshot.json").write_text("]]]not json")
+
+    assert _collect_state(hermes_home).skills_prompt.prompted_skill_count == 0
+
+
+def test_skills_prompt_snapshot_wrong_skills_shape(hermes_home: Path):
+    (hermes_home / ".skills_prompt_snapshot.json").write_text(
+        json.dumps({"version": 1, "skills": {"dev-lint": {}}})
+    )
+
+    assert _collect_state(hermes_home).skills_prompt.prompted_skill_count == 0
+
+
+def test_skills_prompt_snapshot_symlinked_file_is_ignored(hermes_home: Path, tmp_path: Path):
+    outside = tmp_path / "outside_snapshot.json"
+    outside.write_text(json.dumps({"skills": [{"name": "escaped"}]}))
+    (hermes_home / ".skills_prompt_snapshot.json").symlink_to(outside)
+
+    assert _collect_state(hermes_home).skills_prompt.prompted_skill_count == 0
+
+
+def test_skills_prompt_snapshot_age_is_clamped_to_zero(hermes_home: Path):
+    path = hermes_home / ".skills_prompt_snapshot.json"
+    path.write_text(json.dumps({"skills": [{"name": "dev-lint"}]}))
+    mtime = path.stat().st_mtime
+
+    snapshot = _collect_state(hermes_home, clock_value=mtime - 900).skills_prompt
+    assert snapshot.prompt_snapshot_age_seconds == 0.0
+
+
+def test_mcp_cache_and_prompt_sources_are_registered(hermes_home: Path):
+    state = _collect_state(hermes_home)
+
+    assert state.health.total_sources > 0
+    assert "mcp_cache" not in state.health.failed_sources
+    assert "skills_prompt" not in state.health.failed_sources
