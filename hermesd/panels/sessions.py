@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from typing import TypedDict
 
 import rich.box
@@ -106,7 +105,7 @@ def _render_detail(
     sections: list[RenderableType] = [
         _detail_header(state, theme, sessions, filter_query, session_sort)
     ]
-    activity_table = _activity_table(sessions, theme)
+    activity_table = _activity_table(sessions, theme, now=state.collected_at)
     if activity_table is not None:
         sections.append(section_heading("Activity", theme, leading_blank=False))
         sections.append(activity_table)
@@ -399,10 +398,10 @@ def _activity_at(session: SessionInfo) -> float:
     return session.last_activity_at or session.started_at
 
 
-def _age_label(timestamp: float) -> str:
+def _age_label(timestamp: float, now: float) -> str:
     if timestamp <= 0:
         return "—"
-    age = max(0, int(time.time() - timestamp))
+    age = max(0, int(now - timestamp))
     if age < 60:
         return f"{age}s"
     if age < 3600:
@@ -416,7 +415,7 @@ def _truncate(value: str, limit: int) -> str:
     return value if len(value) <= limit else f"{value[: limit - 1]}…"
 
 
-def _activity_table(sessions: list[SessionInfo], theme: Theme) -> Table | None:
+def _activity_table(sessions: list[SessionInfo], theme: Theme, *, now: float) -> Table | None:
     """Names, branches, profiles and activity ages — hermes-agent 0.21 columns."""
     activity_sessions = [
         session
@@ -449,7 +448,7 @@ def _activity_table(sessions: list[SessionInfo], theme: Theme) -> Table | None:
             escape(_truncate(branch, _MAX_BRANCH_CHARS)) if branch else "—",
             escape(session.profile_name) if session.profile_name else "—",
             escape(session.chat_type) if session.chat_type else "—",
-            _age_label(_activity_at(session)),
+            _age_label(_activity_at(session), now),
             escape(_truncate(session.last_activity_description, _MAX_ACTIVITY_CHARS))
             if session.last_activity_description
             else "—",

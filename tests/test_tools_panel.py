@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from hermesd.models import BackgroundProcessInfo, DashboardState, ToolStats
+from hermesd.models import (
+    BackgroundProcessInfo,
+    DashboardState,
+    ToolsetAvailability,
+    ToolStats,
+)
 from hermesd.panels import render_panel
 from hermesd.panels.tools import render_tools
 from hermesd.theme import Theme
@@ -178,3 +183,66 @@ def test_tools_detail_empty_process_table_still_renders():
     state = DashboardState(background_processes=[])
     text = render_to_str(render_tools(state, Theme(), detail=True), width=180)
     assert "No running background processes" in text
+
+
+def _availability_state(**fields: object) -> DashboardState:
+    return DashboardState(toolset_availability=ToolsetAvailability(**fields))
+
+
+def test_tools_detail_shows_toolset_availability_line():
+    state = _availability_state(
+        enabled_toolsets=["file", "web", "terminal"],
+        unavailable_toolsets=["bfl", "browser", "kanban"],
+        lazy_tool_count=8,
+        disabled_tool_count=1,
+    )
+
+    text = render_to_str(render_tools(state, Theme(), detail=True), width=180, no_color=True)
+
+    assert "Toolsets: 3 enabled" in text
+    assert "unavailable: bfl, browser, kanban" in text
+    assert "8 lazy" in text
+    assert "1 disabled" in text
+
+
+def test_tools_detail_omits_unavailable_when_all_toolsets_load():
+    state = _availability_state(enabled_toolsets=["file", "web"])
+
+    text = render_to_str(render_tools(state, Theme(), detail=True), width=180, no_color=True)
+
+    assert "Toolsets: 2 enabled" in text
+    assert "unavailable" not in text
+
+
+def test_tools_detail_omits_toolset_line_without_a_snapshot():
+    text = render_to_str(render_tools(DashboardState(), Theme(), detail=True), width=180)
+
+    assert "Toolsets:" not in text
+
+
+def test_tools_compact_marks_unavailable_toolsets():
+    state = _availability_state(enabled_toolsets=["file"], unavailable_toolsets=["kanban"])
+
+    text = render_to_str(render_tools(state, Theme()), width=100, no_color=True)
+
+    assert "1 toolset unavailable" in text
+
+
+def test_tools_compact_has_no_marker_when_all_toolsets_load():
+    state = _availability_state(enabled_toolsets=["file"])
+
+    text = render_to_str(render_tools(state, Theme()), width=100, no_color=True)
+
+    assert "unavailable" not in text
+
+
+def test_tools_detail_escapes_markup_hostile_toolset_names():
+    state = _availability_state(
+        enabled_toolsets=["ok"], unavailable_toolsets=["[bold red]evil\x1b[2J", "[/]x"]
+    )
+
+    text = render_to_str(render_tools(state, Theme(), detail=True), width=180, no_color=True)
+
+    assert "[bold red]evil" in text
+    assert "[/]x" in text
+    assert "\x1b[2J" not in text

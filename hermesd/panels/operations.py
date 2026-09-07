@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import time
-
 import rich.box
 from rich.console import Group, RenderableType
 from rich.panel import Panel
@@ -39,6 +37,9 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     if delegation_line:
         lines.append("  Delegations: ", style=theme.ui_label)
         lines.append(f"{delegation_line}\n", style=theme.banner_text)
+    if ops.blocked_script_count:
+        lines.append("  Blocked scripts: ", style=theme.ui_label)
+        lines.append(f"{ops.blocked_script_count}\n", style=theme.ui_warn)
     lines.append("  Verify: ", style=theme.ui_label)
     if ops.verification_db_present:
         lines.append(
@@ -63,7 +64,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
 
     if ops.model_caches:
         sections.append(_heading("Model Caches", theme))
-        sections.append(_model_caches_table(ops, theme))
+        sections.append(_model_caches_table(ops, theme, now=state.collected_at))
 
     if ops.pr_monitors:
         sections.append(_heading("PR Monitors", theme))
@@ -92,7 +93,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
 
     if ops.moa_trace_count:
         sections.append(_heading("MoA Traces", theme))
-        sections.append(_moa_table(ops, theme))
+        sections.append(_moa_table(ops, theme, now=state.collected_at))
 
     if ops.projects_db_present:
         sections.extend(_projects_sections(ops, theme))
@@ -128,6 +129,7 @@ def _has_no_artifacts(ops: OperationsState) -> bool:
         and not ops.snapshot_count
         and not ops.state_db_size_bytes
         and not ops.web_ui_build_hash
+        and not ops.blocked_script_count
     )
 
 
@@ -182,7 +184,19 @@ def _summary_table(ops: OperationsState, theme: Theme) -> Table:
             f"{ops.snapshot_count} · {_size_label(ops.snapshot_total_bytes)} · "
             f"newest {_age_span_label(ops.newest_snapshot_age_seconds)} ago",
         )
+    if ops.blocked_script_count:
+        summary.add_row("Blocked scripts", _blocked_scripts_label(ops))
     return summary
+
+
+def _blocked_scripts_label(ops: OperationsState) -> str:
+    """Refused-shell-script count, newest age and names — never their contents."""
+    names = ", ".join(escape(name) for name in ops.blocked_script_names)
+    label = (
+        f"{ops.blocked_script_count} "
+        f"(newest {_age_span_label(ops.newest_blocked_script_age_seconds)} ago)"
+    )
+    return f"{label}: {names}" if names else label
 
 
 def _delegation_summary_line(ops: OperationsState) -> str:
@@ -243,7 +257,7 @@ def _state_db_table(ops: OperationsState, theme: Theme) -> Table:
     return table
 
 
-def _model_caches_table(ops: OperationsState, theme: Theme) -> Table:
+def _model_caches_table(ops: OperationsState, theme: Theme, *, now: float) -> Table:
     cache_table = Table(box=None, show_header=True, padding=(0, 1))
     cache_table.add_column("File", style=theme.ui_accent)
     cache_table.add_column("Providers", justify="right", style=theme.banner_text)
@@ -256,7 +270,7 @@ def _model_caches_table(ops: OperationsState, theme: Theme) -> Table:
             str(cache.provider_count),
             str(cache.model_count),
             _size_label(cache.size_bytes),
-            _age_label(cache.mtime),
+            _age_label(cache.mtime, now),
         )
     return cache_table
 
@@ -269,7 +283,14 @@ def _pr_monitors_table(ops: OperationsState, theme: Theme) -> Table:
     pr_table.add_column("Monitored", justify="right", style=theme.banner_text)
     pr_table.add_column("Tracked", justify="right", style=theme.banner_text)
     pr_table.add_column("Author", justify="right", style=theme.banner_text)
+    # The PR-keyed cron/state shape is the only one carrying per-PR review
+    # state, so the two columns only widen the table when it is in play.
+    show_review = any(m.open_count or m.conflicting_count for m in ops.pr_monitors)
+    if show_review:
+        pr_table.add_column("Open", justify="right", style=theme.ui_accent)
+        pr_table.add_column("Conflict", justify="right", style=theme.ui_warn)
     for monitor in ops.pr_monitors:
+        review = [str(monitor.open_count), str(monitor.conflicting_count)] if show_review else []
         pr_table.add_row(
             escape(monitor.filename),
             escape(monitor.repo) if monitor.repo else "—",
@@ -277,6 +298,7 @@ def _pr_monitors_table(ops: OperationsState, theme: Theme) -> Table:
             str(monitor.monitored_count),
             str(monitor.tracked_count),
             str(monitor.author_pr_count),
+            *review,
         )
     return pr_table
 
@@ -352,7 +374,7 @@ def _goals_table(ops: OperationsState, theme: Theme) -> Table:
     return goal_table
 
 
-def _moa_table(ops: OperationsState, theme: Theme) -> Table:
+def _moa_table(ops: OperationsState, theme: Theme, *, now: float) -> Table:
     moa_table = Table(box=None, show_header=False, padding=(0, 2))
     moa_table.add_column("Key", style=theme.ui_label)
     moa_table.add_column("Value", style=theme.banner_text)
@@ -362,7 +384,7 @@ def _moa_table(ops: OperationsState, theme: Theme) -> Table:
         "Newest Session",
         escape(ops.moa_trace_newest_session_id) if ops.moa_trace_newest_session_id else "—",
     )
-    moa_table.add_row("Newest Age", _age_label(ops.moa_trace_newest_mtime))
+    moa_table.add_row("Newest Age", _age_label(ops.moa_trace_newest_mtime, now))
     if ops.moa_trace_latest_record_summary:
         moa_table.add_row("Latest Record", escape(ops.moa_trace_latest_record_summary))
     if ops.moa_trace_latest_record_keys:
@@ -446,11 +468,11 @@ def _size_label(size_bytes: int) -> str:
     return str(size_bytes)
 
 
-def _age_label(timestamp: float | None) -> str:
+def _age_label(timestamp: float | None, now: float) -> str:
     if timestamp is None:
         return "—"
     try:
-        age = max(0, int(time.time() - timestamp))
+        age = max(0, int(now - timestamp))
     except (OverflowError, OSError, ValueError):
         return "—"
     return fmt_age_seconds(age)

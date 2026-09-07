@@ -213,6 +213,26 @@ def test_collect_memory_files(hermes_home: Path):
     c.close()
 
 
+def test_memory_files_exclude_lock_files_and_dotfiles(hermes_home: Path):
+    """The agent's MEMORY.md.lock / USER.md.lock siblings are not memory files."""
+    memories = hermes_home / "memories"
+    (memories / "MEMORY.md").write_text("test")
+    (memories / "USER.md").write_text("test")
+    (memories / "MEMORY.md.lock").write_text("")
+    (memories / "USER.md.lock").write_text("")
+    (memories / ".DS_Store").write_text("")
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.skills_memory.memory_file_count == 2
+    assert state.memory.memory_file_count == 2
+    assert state.memory.memory_files == ["MEMORY.md", "USER.md"]
+
+
 def test_read_skill_description_parses_yaml_frontmatter(hermes_home: Path):
     skill_md = hermes_home / "skills" / "dev" / "lint" / "SKILL.md"
     skill_md.parent.mkdir(parents=True, exist_ok=True)

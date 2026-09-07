@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import time
-
 import rich.box
 from rich.console import Group, RenderableType
 from rich.panel import Panel
@@ -79,15 +77,16 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
 
     if kanban.active_tasks:
         sections.append(section_heading("Active Workers", theme))
-        sections.append(_task_table(kanban.active_tasks, theme))
+        sections.append(_task_table(kanban.active_tasks, theme, now=state.collected_at))
 
     if kanban.problem_tasks:
         sections.append(section_heading("Blocked / Failing Tasks", theme))
-        sections.append(_task_table(kanban.problem_tasks, theme))
+        sections.append(_task_table(kanban.problem_tasks, theme, now=state.collected_at))
 
     task_metadata = _task_metadata_table(
         [*kanban.active_tasks, *kanban.problem_tasks, *kanban.recent_tasks],
         theme,
+        now=state.collected_at,
     )
     if task_metadata is not None:
         sections.append(section_heading("Task Metadata", theme))
@@ -205,7 +204,7 @@ def _recent_runs_table(kanban: KanbanState, theme: Theme) -> Table:
     return runs
 
 
-def _task_table(tasks: list[KanbanTaskSummary], theme: Theme) -> Table:
+def _task_table(tasks: list[KanbanTaskSummary], theme: Theme, *, now: float) -> Table:
     table = Table(box=None, show_header=True, padding=(0, 1))
     table.add_column("Task", style=theme.ui_accent)
     table.add_column("Status", style=theme.banner_text)
@@ -221,7 +220,7 @@ def _task_table(tasks: list[KanbanTaskSummary], theme: Theme) -> Table:
             escape(task.status),
             escape(task.assignee) if task.assignee else "—",
             str(task.worker_pid) if task.worker_pid else "—",
-            _age_label(task.last_heartbeat_at),
+            _age_label(task.last_heartbeat_at, now),
             str(task.consecutive_failures),
             escape(task.branch_name) if task.branch_name else "—",
             escape(task.title),
@@ -229,7 +228,9 @@ def _task_table(tasks: list[KanbanTaskSummary], theme: Theme) -> Table:
     return table
 
 
-def _task_metadata_table(tasks: list[KanbanTaskSummary], theme: Theme) -> Table | None:
+def _task_metadata_table(
+    tasks: list[KanbanTaskSummary], theme: Theme, *, now: float
+) -> Table | None:
     # The same task can appear in more than one input list (e.g. an active task
     # that also matches the recent-tasks query); dedup by task_id, first wins.
     seen: set[str] = set()
@@ -259,7 +260,7 @@ def _task_metadata_table(tasks: list[KanbanTaskSummary], theme: Theme) -> Table 
         table.add_row(
             escape(task.task_id),
             escape(task.branch_name) if task.branch_name else "—",
-            _age_label(task.completed_at),
+            _age_label(task.completed_at, now),
             escape(task.workspace_path) if task.workspace_path else "—",
             escape(task.goal_mode) if task.goal_mode else "—",
             escape(task.current_step_key) if task.current_step_key else "—",
@@ -267,7 +268,7 @@ def _task_metadata_table(tasks: list[KanbanTaskSummary], theme: Theme) -> Table 
     return table
 
 
-def _age_label(timestamp: int) -> str:
+def _age_label(timestamp: int, now: float) -> str:
     if timestamp <= 0:
         return "—"
-    return fmt_age_seconds(max(0, int(time.time()) - timestamp))
+    return fmt_age_seconds(max(0, int(now) - timestamp))

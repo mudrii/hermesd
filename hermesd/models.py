@@ -411,19 +411,20 @@ class ConfigSummary(BaseModel):
     moa_aggregator_label: str = ""
     moa_save_traces: bool = False
     moa_trace_dir: str = ""
-    delegation_enabled: bool = False
-    delegation_compression_threshold_tokens: int = 0
-    delegation_max_parallel: int = 0
-    goals_enabled: bool = False
-    goals_turn_budget: int = 0
-    updates_channel: str = ""
-    updates_auto: bool = False
+    delegation_max_concurrent_children: int = 0
+    delegation_max_spawn_depth: int = 0
+    delegation_orchestrator_enabled: bool = False
+    goals_max_turns: int = 0
+    updates_check: bool = False
+    updates_pre_update_backup: str = ""
+    updates_backup_keep: int = 0
     # Server names only — MCP server config values may carry credentials.
     mcp_server_count: int = 0
     mcp_server_names: list[str] = Field(default_factory=list)
-    plugin_config_count: int = 0
-    tool_loop_guardrails_enabled: bool = False
-    tool_loop_max_repeats: int = 0
+    plugin_enabled_count: int = 0
+    plugin_disabled_count: int = 0
+    tool_loop_warnings_enabled: bool = False
+    tool_loop_hard_stop_enabled: bool = False
     max_live_sessions: int = 0
     streaming_enabled: bool = False
     logging_level: str = ""
@@ -493,6 +494,15 @@ class SkillsMemory(BaseModel):
     boot_md_present: bool = False
     boot_md_mtime: float | None = None
     skills: list[SkillInfo] = Field(default_factory=list)
+
+
+class ToolsetAvailability(BaseModel):
+    """Toolset availability from ``cache/banner_snapshot.json``."""
+
+    enabled_toolsets: list[str] = Field(default_factory=list)
+    unavailable_toolsets: list[str] = Field(default_factory=list)
+    lazy_tool_count: int = 0
+    disabled_tool_count: int = 0
 
 
 class MCPSchemaCache(BaseModel):
@@ -674,6 +684,8 @@ class PRMonitorSummary(BaseModel):
     monitored_count: int = 0
     tracked_count: int = 0
     author_pr_count: int = 0
+    open_count: int = 0
+    conflicting_count: int = 0
 
 
 class VerificationEventSummary(BaseModel):
@@ -793,6 +805,9 @@ class OperationsState(BaseModel):
     newest_snapshot_age_seconds: float | None = None
     web_ui_build_hash: str = ""
     web_ui_built_age_seconds: float | None = None
+    blocked_script_count: int = 0
+    newest_blocked_script_age_seconds: float | None = None
+    blocked_script_names: list[str] = Field(default_factory=list)
 
 
 class CuratorRun(BaseModel):
@@ -859,6 +874,7 @@ class DashboardState(BaseModel):
     total_tool_calls: int = 0
     available_tools: int = 0
     available_tool_names: list[str] = Field(default_factory=list)
+    toolset_availability: ToolsetAvailability = Field(default_factory=ToolsetAvailability)
     background_processes: list[BackgroundProcessInfo] = Field(default_factory=list)
     checkpoints: list[CheckpointInfo] = Field(default_factory=list)
     config: ConfigSummary = Field(default_factory=ConfigSummary)

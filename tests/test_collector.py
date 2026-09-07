@@ -1447,3 +1447,88 @@ def test_path_resolves_under_true_for_real_child(tmp_path: Path):
     child.write_text("x")
     assert _path_resolves_under(child, root) is True
     assert _path_resolves_under(tmp_path / "elsewhere", root) is False
+
+
+_LIVE_AVAILABILITY_SNAPSHOT = {
+    "enabled_toolsets": ["bfl", "browser", "clarify", "codegraph", "file"],
+    "tools": [{"type": "function", "function": {"name": "read_file"}}],
+    "availability": {
+        "unavailable_toolsets": [
+            {"name": "bfl", "env_vars": [], "tools": ["bfl_flux3_text_to_video"]},
+            {"name": "browser", "env_vars": [], "tools": ["browser_navigate"]},
+            {"name": "kanban", "env_vars": [], "tools": ["kanban_show"]},
+        ],
+        "lazy_tools": ["bfl_flux3_get_result", "browser_back"],
+        "disabled_tools": [],
+    },
+}
+
+
+def _collect_toolsets(hermes_home: Path) -> DashboardState:
+    c = Collector(hermes_home)
+    try:
+        return c.collect()
+    finally:
+        c.close()
+
+
+def test_toolset_availability_reads_live_banner_snapshot_shape(hermes_home: Path):
+    """availability.unavailable_toolsets is a list of {name, env_vars, tools} dicts."""
+    _write_banner_snapshot(hermes_home, _LIVE_AVAILABILITY_SNAPSHOT)
+
+    state = _collect_toolsets(hermes_home)
+
+    availability = state.toolset_availability
+    assert availability.enabled_toolsets == ["bfl", "browser", "clarify", "codegraph", "file"]
+    assert availability.unavailable_toolsets == ["bfl", "browser", "kanban"]
+    assert availability.lazy_tool_count == 2
+    assert availability.disabled_tool_count == 0
+    assert "toolset_availability" not in state.health.failed_sources
+
+
+def test_toolset_availability_accepts_plain_name_lists(hermes_home: Path):
+    _write_banner_snapshot(
+        hermes_home,
+        {
+            "enabled_toolsets": ["file"],
+            "availability": {
+                "unavailable_toolsets": ["kanban", "browser"],
+                "lazy_tools": ["a"],
+                "disabled_tools": ["b", "c"],
+            },
+        },
+    )
+
+    availability = _collect_toolsets(hermes_home).toolset_availability
+
+    assert availability.unavailable_toolsets == ["browser", "kanban"]
+    assert availability.lazy_tool_count == 1
+    assert availability.disabled_tool_count == 2
+
+
+def test_toolset_availability_unknown_shapes_are_empty(hermes_home: Path):
+    _write_banner_snapshot(
+        hermes_home,
+        {
+            "enabled_toolsets": "everything",
+            "availability": {
+                "unavailable_toolsets": {"kanban": True},
+                "lazy_tools": 7,
+                "disabled_tools": None,
+            },
+        },
+    )
+
+    availability = _collect_toolsets(hermes_home).toolset_availability
+
+    assert availability.enabled_toolsets == []
+    assert availability.unavailable_toolsets == []
+    assert availability.lazy_tool_count == 0
+    assert availability.disabled_tool_count == 0
+
+
+def test_toolset_availability_absent_snapshot_is_empty(hermes_home: Path):
+    availability = _collect_toolsets(hermes_home).toolset_availability
+
+    assert availability.enabled_toolsets == []
+    assert availability.unavailable_toolsets == []

@@ -36,8 +36,8 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append(f"{sanitize_terminal_text(c.tool_search_enabled) or '—'}\n", style=theme.ui_accent)
     lines.append("  Integrations: ", style=theme.ui_label)
     lines.append(
-        f"mcp {c.mcp_server_count} · plugins {c.plugin_config_count} "
-        f"· goals {'on' if c.goals_enabled else 'off'}",
+        f"mcp {c.mcp_server_count} · plugins {c.plugin_enabled_count} "
+        f"· goals {c.goals_max_turns or '—'}",
         style=theme.banner_text,
     )
 
@@ -130,24 +130,24 @@ def _kv_section(title: str, rows: list[tuple[str, str]], theme: Theme) -> list[R
 def _agent_limit_rows(c: ConfigSummary) -> list[tuple[str, str]]:
     rows: list[tuple[str, str]] = []
     delegation = [
-        f"compress ≥{c.delegation_compression_threshold_tokens} tok"
-        if c.delegation_compression_threshold_tokens
+        f"children {c.delegation_max_concurrent_children}"
+        if c.delegation_max_concurrent_children
         else "",
-        f"max parallel {c.delegation_max_parallel}" if c.delegation_max_parallel else "",
+        f"depth {c.delegation_max_spawn_depth}" if c.delegation_max_spawn_depth else "",
+        "orchestrator" if c.delegation_orchestrator_enabled else "",
     ]
-    if c.delegation_enabled or any(delegation):
-        state = "on" if c.delegation_enabled else "off"
-        rows.append(("Delegation", " · ".join([state, *(part for part in delegation if part)])))
-    if c.goals_enabled or c.goals_turn_budget:
-        goals = "on" if c.goals_enabled else "off"
-        if c.goals_turn_budget:
-            goals = f"{goals} · turn budget {c.goals_turn_budget}"
-        rows.append(("Goals", goals))
-    if c.tool_loop_guardrails_enabled or c.tool_loop_max_repeats:
-        guardrails = "on" if c.tool_loop_guardrails_enabled else "off"
-        if c.tool_loop_max_repeats:
-            guardrails = f"{guardrails} · max repeats {c.tool_loop_max_repeats}"
-        rows.append(("Tool Loop Guard", guardrails))
+    configured_delegation = [part for part in delegation if part]
+    if configured_delegation:
+        rows.append(("Delegation", " · ".join(configured_delegation)))
+    if c.goals_max_turns:
+        rows.append(("Goals", f"max turns {c.goals_max_turns}"))
+    guardrails = [
+        "warn" if c.tool_loop_warnings_enabled else "",
+        "hard-stop" if c.tool_loop_hard_stop_enabled else "",
+    ]
+    configured_guardrails = [part for part in guardrails if part]
+    if configured_guardrails:
+        rows.append(("Tool Loop Guard", " · ".join(configured_guardrails)))
     if c.max_live_sessions:
         rows.append(("Max Live Sessions", str(c.max_live_sessions)))
     if c.streaming_enabled:
@@ -164,11 +164,21 @@ def _integration_rows(c: ConfigSummary) -> list[tuple[str, str]]:
         rows.append(
             ("MCP Servers", f"{c.mcp_server_count} ({names})" if names else str(c.mcp_server_count))
         )
-    if c.plugin_config_count:
-        rows.append(("Plugin Config", str(c.plugin_config_count)))
-    if c.updates_channel or c.updates_auto:
-        updates = c.updates_channel or "—"
-        rows.append(("Updates", f"{updates} · auto" if c.updates_auto else updates))
+    if c.plugin_enabled_count or c.plugin_disabled_count:
+        rows.append(
+            (
+                "Plugins",
+                f"{c.plugin_enabled_count} enabled · {c.plugin_disabled_count} disabled",
+            )
+        )
+    updates = [
+        "check" if c.updates_check else "",
+        f"backup {c.updates_pre_update_backup}" if c.updates_pre_update_backup else "",
+        f"keep {c.updates_backup_keep}" if c.updates_backup_keep else "",
+    ]
+    configured_updates = [part for part in updates if part]
+    if configured_updates:
+        rows.append(("Updates", " · ".join(configured_updates)))
     if c.network_proxy_configured:
         rows.append(("Network Proxy", "configured"))
     return rows

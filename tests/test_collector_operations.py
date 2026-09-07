@@ -19,6 +19,7 @@ from hermesd.collector import (
     Collector,
     _git_checkpoint_summary,
 )
+from hermesd.models import PRMonitorSummary
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
 from tests.conftest import (
@@ -1007,6 +1008,85 @@ def test_pr_monitors_read_cron_state_directory(hermes_home: Path):
     assert monitors[0].tracked_count == 3
 
 
+def _write_pr_keyed_monitor(hermes_home: Path, payload: object) -> None:
+    state_dir = hermes_home / "cron" / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "pr_monitor.json").write_text(json.dumps(payload))
+
+
+def _pr_keyed_monitor(hermes_home: Path, payload: object) -> PRMonitorSummary:
+    _write_pr_keyed_monitor(hermes_home, payload)
+    c = Collector(hermes_home)
+    try:
+        monitors = c.collect().operations.pr_monitors
+    finally:
+        c.close()
+    assert len(monitors) == 1
+    return monitors[0]
+
+
+_LIVE_PR_KEYED_PAYLOAD = {
+    "25137": {
+        "number": 25137,
+        "title": "fix: persist CLI model runtime state",
+        "state": "CLOSED",
+        "mergeable": "UNKNOWN",
+        "reviewDecision": "",
+        "updatedAt": "2026-07-20T09:26:06Z",
+    },
+    "57327": {
+        "number": 57327,
+        "title": "fix(auth): shared provider alias normalization",
+        "state": "OPEN",
+        "mergeable": "CONFLICTING",
+        "reviewDecision": "",
+        "updatedAt": "2026-07-15T15:22:51Z",
+    },
+}
+
+
+def test_pr_monitor_reads_live_pr_keyed_shape(hermes_home: Path):
+    """The live cron/state/pr_monitor.json is a dict keyed by PR number."""
+    monitor = _pr_keyed_monitor(hermes_home, _LIVE_PR_KEYED_PAYLOAD)
+
+    assert monitor.monitored_count == 2
+    assert monitor.tracked_count == 2
+    assert monitor.open_count == 1
+    assert monitor.conflicting_count == 1
+    assert monitor.checked_at == "2026-07-20T09:26:06Z"
+    assert monitor.repo == ""
+
+
+def test_pr_monitor_pr_keyed_shape_tolerates_missing_fields(hermes_home: Path):
+    monitor = _pr_keyed_monitor(hermes_home, {"1": {}, "2": {"state": "open"}})
+
+    assert monitor.monitored_count == 2
+    assert monitor.tracked_count == 2
+    assert monitor.open_count == 1
+    assert monitor.conflicting_count == 0
+    assert monitor.checked_at == ""
+
+
+def test_pr_monitor_mixed_keys_are_not_treated_as_pr_keyed(hermes_home: Path):
+    """A repo/prs document keeps the legacy reading even with digit siblings."""
+    monitor = _pr_keyed_monitor(
+        hermes_home,
+        {"repo": "acme/widget", "checked_at": "2026-01-01T00:00:00Z", "prs": {"7": {}}},
+    )
+
+    assert monitor.repo == "acme/widget"
+    assert monitor.monitored_count == 1
+    assert monitor.open_count == 0
+    assert monitor.conflicting_count == 0
+
+
+def test_pr_monitor_digit_keys_with_non_dict_values_use_legacy_reading(hermes_home: Path):
+    monitor = _pr_keyed_monitor(hermes_home, {"1": "OPEN", "2": "MERGED"})
+
+    assert monitor.monitored_count == 0
+    assert monitor.open_count == 0
+
+
 def _count_sqlite_connects(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
     original = collector_module._connect_readonly_sqlite
     seen: list[Path] = []
@@ -1482,3 +1562,109 @@ def test_delegation_live_log_symlinked_file_is_ignored(
     run_dir.mkdir(parents=True)
     (run_dir / "task-0.log").symlink_to(outside)
     assert _collect_ops(hermes_home).operations.delegation_live_log_count == 0
+
+
+def _write_blocked_scripts(home: Path, names_to_age: dict[str, float]) -> Path:
+    root = home / "cache" / "blocked-scripts"
+    root.mkdir(parents=True, exist_ok=True)
+    for name, age in names_to_age.items():
+        path = root / name
+        path.write_text("#!/bin/sh\nrm -rf /  # secret payload\n")
+        os.utime(path, (_FIXED_NOW - age, _FIXED_NOW - age))
+    return root
+
+
+def test_blocked_scripts_counted_with_newest_names(hermes_home: Path, sample_db: Path):
+    _write_blocked_scripts(
+        hermes_home,
+        {
+            "blocked-1788689099-90533172.sh": 7200.0,
+            "blocked-1788794341-ed4ffaed.sh": 600.0,
+            "blocked-1788794977-dcea0931.sh": 60.0,
+            "blocked-old.sh": 90000.0,
+        },
+    )
+
+    ops = _collect_ops(hermes_home).operations
+
+    assert ops.blocked_script_count == 4
+    assert ops.newest_blocked_script_age_seconds == 60.0
+    assert ops.blocked_script_names == [
+        "blocked-1788794977-dcea0931.sh",
+        "blocked-1788794341-ed4ffaed.sh",
+        "blocked-1788689099-90533172.sh",
+    ]
+
+
+def test_blocked_scripts_never_read_file_contents(hermes_home: Path, sample_db: Path):
+    _write_blocked_scripts(hermes_home, {"blocked-a.sh": 10.0})
+
+    payload = json.dumps(_collect_ops(hermes_home).operations.model_dump(mode="json"))
+
+    assert "secret payload" not in payload
+    assert "rm -rf" not in payload
+
+
+def test_blocked_scripts_names_are_sanitized_and_capped(hermes_home: Path, sample_db: Path):
+    _write_blocked_scripts(hermes_home, {"[bold]blocked-" + "x" * 60 + ".sh": 5.0})
+
+    names = _collect_ops(hermes_home).operations.blocked_script_names
+
+    assert len(names[0]) <= 40
+    assert "\x1b" not in names[0]
+
+
+def test_blocked_scripts_absent_directory_is_zero(hermes_home: Path, sample_db: Path):
+    ops = _collect_ops(hermes_home).operations
+
+    assert ops.blocked_script_count == 0
+    assert ops.newest_blocked_script_age_seconds is None
+    assert ops.blocked_script_names == []
+
+
+def test_blocked_scripts_age_is_clamped_at_zero(hermes_home: Path, sample_db: Path):
+    _write_blocked_scripts(hermes_home, {"blocked-future.sh": -600.0})
+
+    assert _collect_ops(hermes_home).operations.newest_blocked_script_age_seconds == 0.0
+
+
+def test_blocked_scripts_scan_is_bounded(hermes_home: Path, sample_db: Path):
+    _write_blocked_scripts(hermes_home, {f"blocked-{i:04d}.sh": float(i) for i in range(260)})
+
+    assert _collect_ops(hermes_home).operations.blocked_script_count == 200
+
+
+def test_blocked_scripts_symlinked_entries_ignored(
+    hermes_home: Path, sample_db: Path, tmp_path: Path
+):
+    outside = tmp_path / "outside.sh"
+    outside.write_text("nope\n")
+    root = hermes_home / "cache" / "blocked-scripts"
+    root.mkdir(parents=True)
+    (root / "blocked-linked.sh").symlink_to(outside)
+
+    assert _collect_ops(hermes_home).operations.blocked_script_count == 0
+
+
+def test_blocked_scripts_unreadable_dir_keeps_last_good_and_names_source(
+    hermes_home: Path, sample_db: Path
+):
+    _skip_if_root()
+    root = _write_blocked_scripts(hermes_home, {"blocked-a.sh": 30.0})
+    c = Collector(hermes_home, clock=_fixed_clock)
+    try:
+        first = c.collect()
+        assert first.operations.blocked_script_count == 1
+
+        os.chmod(root, 0o000)
+        if not _unreadable(root / "blocked-a.sh"):
+            pytest.skip("filesystem ignores directory permissions")
+        second = c.collect()
+    finally:
+        os.chmod(root, 0o755)
+        c.close()
+
+    assert "blocked_scripts" in second.health.failed_sources
+    assert second.operations.blocked_script_count == 1
+    assert second.operations.blocked_script_names == ["blocked-a.sh"]
+    assert second.operations.delegation_count == 3

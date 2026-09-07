@@ -496,15 +496,20 @@ def test_config_new_sections_present(hermes_home: Path):
         hermes_home,
         {
             "delegation": {
-                "enabled": True,
-                "compression_threshold_tokens": 60000,
-                "max_parallel": 4,
+                "max_concurrent_children": 10,
+                "max_spawn_depth": 2,
+                "orchestrator_enabled": True,
             },
-            "goals": {"enabled": True, "turn_budget": 40},
-            "updates": {"auto": True, "channel": "stable"},
+            "goals": {"max_turns": 20},
+            "updates": {"check": True, "pre_update_backup": "quick", "backup_keep": 5},
             "mcp_servers": {"sheets": {"url": "https://mcp.example.com"}, "fs": {"command": "npx"}},
-            "plugins": {"disabled": ["a"], "extra": {}},
-            "tool_loop_guardrails": {"enabled": True, "max_repeats": 3},
+            "plugins": {"enabled": ["a", "b"], "disabled": ["c"]},
+            "tool_loop_guardrails": {
+                "warnings_enabled": True,
+                "hard_stop_enabled": True,
+                "warn_after": {"exact_failure": 2},
+                "hard_stop_after": {"exact_failure": 5},
+            },
             "max_live_sessions": 8,
             "streaming": {"enabled": True},
             "logging": {"level": "INFO"},
@@ -512,18 +517,19 @@ def test_config_new_sections_present(hermes_home: Path):
         },
     )
 
-    assert config.delegation_enabled is True
-    assert config.delegation_compression_threshold_tokens == 60000
-    assert config.delegation_max_parallel == 4
-    assert config.goals_enabled is True
-    assert config.goals_turn_budget == 40
-    assert config.updates_auto is True
-    assert config.updates_channel == "stable"
+    assert config.delegation_max_concurrent_children == 10
+    assert config.delegation_max_spawn_depth == 2
+    assert config.delegation_orchestrator_enabled is True
+    assert config.goals_max_turns == 20
+    assert config.updates_check is True
+    assert config.updates_pre_update_backup == "quick"
+    assert config.updates_backup_keep == 5
     assert config.mcp_server_count == 2
     assert config.mcp_server_names == ["fs", "sheets"]
-    assert config.plugin_config_count == 2
-    assert config.tool_loop_guardrails_enabled is True
-    assert config.tool_loop_max_repeats == 3
+    assert config.plugin_enabled_count == 2
+    assert config.plugin_disabled_count == 1
+    assert config.tool_loop_warnings_enabled is True
+    assert config.tool_loop_hard_stop_enabled is True
     assert config.max_live_sessions == 8
     assert config.streaming_enabled is True
     assert config.logging_level == "INFO"
@@ -533,18 +539,19 @@ def test_config_new_sections_present(hermes_home: Path):
 def test_config_new_sections_absent_use_defaults(hermes_home: Path):
     config = _agent_limits_config(hermes_home, {"model": {"default": "gpt-5.4"}})
 
-    assert config.delegation_enabled is False
-    assert config.delegation_compression_threshold_tokens == 0
-    assert config.delegation_max_parallel == 0
-    assert config.goals_enabled is False
-    assert config.goals_turn_budget == 0
-    assert config.updates_auto is False
-    assert config.updates_channel == ""
+    assert config.delegation_max_concurrent_children == 0
+    assert config.delegation_max_spawn_depth == 0
+    assert config.delegation_orchestrator_enabled is False
+    assert config.goals_max_turns == 0
+    assert config.updates_check is False
+    assert config.updates_pre_update_backup == ""
+    assert config.updates_backup_keep == 0
     assert config.mcp_server_count == 0
     assert config.mcp_server_names == []
-    assert config.plugin_config_count == 0
-    assert config.tool_loop_guardrails_enabled is False
-    assert config.tool_loop_max_repeats == 0
+    assert config.plugin_enabled_count == 0
+    assert config.plugin_disabled_count == 0
+    assert config.tool_loop_warnings_enabled is False
+    assert config.tool_loop_hard_stop_enabled is False
     assert config.max_live_sessions == 0
     assert config.streaming_enabled is False
     assert config.logging_level == ""
@@ -569,29 +576,40 @@ def test_config_new_sections_wrong_types_fall_back_to_defaults(hermes_home: Path
         },
     )
 
-    assert config.delegation_enabled is False
-    assert config.delegation_compression_threshold_tokens == 0
-    assert config.goals_turn_budget == 0
-    assert config.updates_channel == ""
+    assert config.delegation_max_concurrent_children == 0
+    assert config.delegation_orchestrator_enabled is False
+    assert config.goals_max_turns == 0
+    assert config.updates_pre_update_backup == ""
     assert config.mcp_server_count == 0
     assert config.mcp_server_names == []
-    assert config.plugin_config_count == 0
-    assert config.tool_loop_max_repeats == 0
+    assert config.plugin_enabled_count == 0
+    assert config.plugin_disabled_count == 0
+    assert config.tool_loop_hard_stop_enabled is False
     assert config.max_live_sessions == 0
     assert config.streaming_enabled is False
     assert config.logging_level == ""
     assert config.network_proxy_configured is False
 
 
-def test_config_plugins_list_shape_counts_entries(hermes_home: Path):
-    assert _agent_limits_config(hermes_home, {"plugins": ["a", "b", "c"]}).plugin_config_count == 3
+def test_config_plugin_lists_ignore_non_list_shapes(hermes_home: Path):
+    config = _agent_limits_config(
+        hermes_home, {"plugins": {"enabled": "everything", "disabled": {"a": 1}}}
+    )
+
+    assert config.plugin_enabled_count == 0
+    assert config.plugin_disabled_count == 0
 
 
-def test_config_updates_check_key_sets_auto(hermes_home: Path):
-    config = _agent_limits_config(hermes_home, {"updates": {"check": True, "channel": "beta"}})
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(True, "full"), (False, "off"), ("quick", "quick"), ("full", "full"), ("off", "off")],
+)
+def test_config_pre_update_backup_accepts_legacy_booleans(
+    hermes_home: Path, raw: object, expected: str
+):
+    config = _agent_limits_config(hermes_home, {"updates": {"pre_update_backup": raw}})
 
-    assert config.updates_auto is True
-    assert config.updates_channel == "beta"
+    assert config.updates_pre_update_backup == expected
 
 
 def test_config_mcp_server_names_capped_and_sorted(hermes_home: Path):
@@ -618,7 +636,7 @@ def test_config_new_sections_never_surface_secret_values(hermes_home: Path):
                 }
             },
             "logging": {"level": "DEBUG", "token": "sk-live-secret"},
-            "delegation": {"enabled": True, "secret": "sk-live-secret"},
+            "delegation": {"max_concurrent_children": 4, "api_key": "sk-live-secret"},
         },
     )
     payload = json.dumps(config.model_dump(mode="json"))
@@ -643,7 +661,17 @@ def test_config_fixture_home_surfaces_new_sections(populated_hermes_home: Path):
     finally:
         collector.close()
 
-    assert config.goals_enabled is True
+    assert config.goals_max_turns == 20
+    assert config.delegation_max_concurrent_children == 10
+    assert config.delegation_max_spawn_depth == 2
+    assert config.delegation_orchestrator_enabled is True
+    assert config.updates_check is True
+    assert config.updates_pre_update_backup == "quick"
+    assert config.updates_backup_keep == 5
+    assert config.tool_loop_warnings_enabled is True
+    assert config.tool_loop_hard_stop_enabled is True
+    assert config.plugin_enabled_count == 2
+    assert config.plugin_disabled_count == 1
     assert config.streaming_enabled is True
     assert config.logging_level == "INFO"
     assert config.mcp_server_names == ["playwright", "sheets"]

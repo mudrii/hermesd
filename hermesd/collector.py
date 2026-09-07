@@ -18,6 +18,7 @@ import time
 import tomllib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, Never, TypeVar
 
@@ -140,6 +141,7 @@ from hermesd.collect.skills import (
     _skill_description,
     _skill_frontmatter,
     _skills_prompt_summary,
+    _toolset_availability,
     _word_count,
 )
 from hermesd.collect.sqlite_util import (
@@ -197,6 +199,7 @@ from hermesd.models import (
     TokenAnalytics,
     TokenSummary,
     ToolGatewayRoute,
+    ToolsetAvailability,
     ToolStats,
 )
 from hermesd.paths import HermesPaths
@@ -220,6 +223,15 @@ class _StateDbReadout:
 # Fields each gateway sub-source owns, used to restore just that source's
 # values from the last good state when it fails.
 _HEARTBEAT_FIELDS = ("heartbeat_age_seconds", "loop_health")
+# cache/blocked-scripts/ scan bounds and the fields the source owns.
+_BLOCKED_SCRIPT_SCAN_LIMIT = 200
+_BLOCKED_SCRIPT_NAME_LIMIT = 3
+_MAX_FILE_LABEL_CHARS = 40
+_BLOCKED_SCRIPT_FIELDS = (
+    "blocked_script_count",
+    "newest_blocked_script_age_seconds",
+    "blocked_script_names",
+)
 _LIFECYCLE_FIELDS = (
     "lifecycle_phase",
     "last_exit_code",
@@ -291,6 +303,86 @@ def _model_usage_from_rows(rows: list[dict[str, Any]]) -> tuple[ModelUsage, ...]
         )
         for row in rows
     )
+
+
+def _read_blocked_scripts(root: Path, home: Path, *, now: float) -> dict[str, Any]:
+    """Stat ``cache/blocked-scripts/`` (bounded); contents are never read.
+
+    These are shell scripts the agent refused to run, so only the file name,
+    the count and the newest mtime are surfaced.
+    """
+    if not _safe_child_path(root, home) or not root.is_dir():
+        return {
+            "blocked_script_count": 0,
+            "newest_blocked_script_age_seconds": None,
+            "blocked_script_names": [],
+        }
+    entries: list[tuple[float, str]] = []
+    for entry in islice(sorted(root.iterdir()), _BLOCKED_SCRIPT_SCAN_LIMIT):
+        if entry.is_symlink() or not entry.is_file() or not _path_resolves_under(entry, home):
+            continue
+        entries.append((_mtime(entry) or 0.0, entry.name))
+    entries.sort(key=lambda item: (-item[0], item[1]))
+    newest = entries[0][0] if entries else None
+    return {
+        "blocked_script_count": len(entries),
+        "newest_blocked_script_age_seconds": max(0.0, now - newest) if newest else None,
+        "blocked_script_names": [
+            _sanitized_file_label(name) for _, name in entries[:_BLOCKED_SCRIPT_NAME_LIMIT]
+        ],
+    }
+
+
+def _sanitized_file_label(name: str) -> str:
+    """Printable, length-capped file name safe to hand to a panel."""
+    return "".join(char for char in name if char.isprintable())[:_MAX_FILE_LABEL_CHARS]
+
+
+def _memory_file_names(memories_dir: Path) -> list[str]:
+    """Sorted memory documents, excluding the agent's ``*.lock`` files and dotfiles."""
+    if not memories_dir.is_dir():
+        return []
+    return sorted(
+        path.name
+        for path in memories_dir.iterdir()
+        if path.is_file() and not path.name.startswith(".") and path.suffix != ".lock"
+    )
+
+
+def _pr_monitor_summary(filename: str, data: Mapping[str, Any]) -> PRMonitorSummary:
+    """One pr-monitor document, in either the repo/prs or the PR-keyed shape."""
+    entries = _pr_keyed_entries(data)
+    if entries is None:
+        return PRMonitorSummary(
+            filename=filename,
+            repo=str(data.get("repo") or ""),
+            checked_at=str(data.get("checked_at") or ""),
+            monitored_count=_len_if_sized(data.get("prs")) or _len_if_sized(data.get("monitored")),
+            tracked_count=_len_if_sized(data.get("tracked_numbers"))
+            or _len_if_sized(data.get("tracked")),
+            author_pr_count=_len_if_sized(data.get("author_prs"))
+            or _len_if_sized(data.get("author_pr_numbers")),
+        )
+    updated = [str(entry.get("updatedAt") or "") for entry in entries]
+    return PRMonitorSummary(
+        filename=filename,
+        checked_at=max(updated, default=""),
+        monitored_count=len(entries),
+        tracked_count=len(entries),
+        open_count=sum(1 for entry in entries if str(entry.get("state") or "").upper() == "OPEN"),
+        conflicting_count=sum(
+            1 for entry in entries if str(entry.get("mergeable") or "").upper() == "CONFLICTING"
+        ),
+    )
+
+
+def _pr_keyed_entries(data: Mapping[str, Any]) -> list[Mapping[str, Any]] | None:
+    """The PR entries when every top-level key is a PR number, else ``None``."""
+    if not data:
+        return None
+    if not all(str(key).isdigit() and isinstance(value, dict) for key, value in data.items()):
+        return None
+    return [value for value in data.values() if isinstance(value, dict)]
 
 
 @dataclass(slots=True)
@@ -453,6 +545,12 @@ class Collector:
                 # cannot be a plain attribute read off _last_state.
                 fallback=self._last_available_tools,
             ),
+            _SourceSpec(
+                "toolset_availability",
+                "toolset_availability",
+                self._collect_toolset_availability,
+                ToolsetAvailability,
+            ),
             _SourceSpec("gateway", "gateway", self._collect_gateway, GatewayState),
             # Four sources enrich the same `gateway` field in place: each one
             # fails (and falls back) independently, so a corrupt heartbeat file
@@ -558,6 +656,17 @@ class Collector:
                 lambda: self._with_state_snapshots(results["operations"]),
                 lambda: results["operations"],
                 fallback=lambda: results["operations"],
+            ),
+            # Third writer of `operations`: an unreadable blocked-scripts dir
+            # keeps the last-good counts rather than reporting a false zero.
+            _SourceSpec(
+                "operations",
+                "blocked_scripts",
+                lambda: self._with_blocked_scripts(results["operations"]),
+                lambda: results["operations"],
+                fallback=lambda: self._last_operations_fields(
+                    results["operations"], _BLOCKED_SCRIPT_FIELDS
+                ),
             ),
             _SourceSpec("skills_memory", "skills", self._collect_skills_memory, SkillsMemory),
             _SourceSpec("mcp_cache", "mcp_cache", self._collect_mcp_cache, MCPSchemaCache),
@@ -1142,10 +1251,16 @@ class Collector:
 
     def _banner_snapshot_tool_names(self) -> list[str]:
         """Tool names from cache/banner_snapshot.json, the live tool inventory."""
+        return sorted(_tool_names_from_entries(self._banner_snapshot().get("tools")))
+
+    def _collect_toolset_availability(self) -> ToolsetAvailability:
+        return _toolset_availability(self._banner_snapshot())
+
+    def _banner_snapshot(self) -> JsonMapping:
         path = self._paths.shared_path("cache", "banner_snapshot.json")
         if not _safe_child_path(path, self._paths.root_home):
-            return []
-        return sorted(_tool_names_from_entries(self._read_json_cached(path).get("tools")))
+            return {}
+        return self._read_json_cached(path)
 
     def _session_file_tool_names(self) -> tuple[int, list[str]]:
         sessions_root = self._paths.profile_path("sessions")
@@ -1757,6 +1872,24 @@ class Collector:
             self._state_db_cache = (mtime, readout)
         return readout
 
+    def _with_blocked_scripts(self, operations: OperationsState) -> OperationsState:
+        return operations.model_copy(
+            update=_read_blocked_scripts(
+                self._paths.shared_path("cache", "blocked-scripts"),
+                self._paths.root_home,
+                now=self._clock(),
+            )
+        )
+
+    def _last_operations_fields(
+        self, operations: OperationsState, fields: tuple[str, ...]
+    ) -> OperationsState:
+        """Restore one operations sub-source's fields from the last good state."""
+        last = self._last_state.operations if self._last_state is not None else None
+        if last is None:
+            return operations
+        return operations.model_copy(update={name: getattr(last, name) for name in fields})
+
     def _with_state_snapshots(self, operations: OperationsState) -> OperationsState:
         return operations.model_copy(
             update=_read_state_snapshots(
@@ -1890,17 +2023,7 @@ class Collector:
             data = self._read_json_cached(path)
             if not data:
                 continue
-            summary = PRMonitorSummary(
-                filename=path.name,
-                repo=str(data.get("repo") or ""),
-                checked_at=str(data.get("checked_at") or ""),
-                monitored_count=_len_if_sized(data.get("prs"))
-                or _len_if_sized(data.get("monitored")),
-                tracked_count=_len_if_sized(data.get("tracked_numbers"))
-                or _len_if_sized(data.get("tracked")),
-                author_pr_count=_len_if_sized(data.get("author_prs"))
-                or _len_if_sized(data.get("author_pr_numbers")),
-            )
+            summary = _pr_monitor_summary(path.name, data)
             key = summary.repo or f"::{path.name}"
             existing = deduped.get(key)
             if existing is None or summary.checked_at > existing.checked_at:
@@ -1926,9 +2049,7 @@ class Collector:
                     skills.append(SkillInfo(name=skill_dir.name, category=cat, description=desc))
 
         mem_dir = self._paths.profile_path("memories")
-        mem_count = 0
-        if mem_dir.is_dir():
-            mem_count = sum(1 for f in mem_dir.iterdir() if f.is_file())
+        mem_count = len(_memory_file_names(mem_dir))
 
         auth_data = self._read_json_cached(self._paths.shared_path("auth.json"))
         cfg = self._read_yaml_cached()
@@ -1974,11 +2095,7 @@ class Collector:
         soul_path = self._paths.profile_path("SOUL.md")
         root = self._paths.root_home
 
-        memory_files = (
-            sorted(path.name for path in memories_dir.iterdir() if path.is_file())
-            if memories_dir.is_dir()
-            else []
-        )
+        memory_files = _memory_file_names(memories_dir)
         memory_md = memories_dir / "MEMORY.md"
         user_md = memories_dir / "USER.md"
         learning_summary = _learning_summary(
