@@ -1410,14 +1410,120 @@ def test_delegation_live_log_scan_is_bounded(hermes_home: Path, sample_db: Path)
     assert 0 < count <= 200
 
 
+def test_delegation_live_run_dir_escaping_home_is_not_counted(
+    hermes_home: Path, sample_db: Path, tmp_path: Path, monkeypatch
+):
+    """A run directory that resolves outside the home is skipped, contained ones are not."""
+    live = hermes_home / "cache" / "delegation" / "live"
+    live.mkdir(parents=True)
+    inside = live / "deleg_inside"
+    inside.mkdir()
+    (inside / "task-0.log").write_text("kept\n")
+
+    escaped = live / "deleg_escaped"
+    escaped.mkdir()
+    (escaped / "task-0.log").write_text("dropped\n")
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+
+    real_resolve = Path.resolve
+
+    def escaping_resolve(self: Path, *args: object, **kwargs: object) -> Path:
+        # Simulate a directory swapped for an out-of-home target between the
+        # listing and the containment check.
+        if self == escaped:
+            return outside
+        return real_resolve(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "resolve", escaping_resolve)
+
+    ops = _collect_ops(hermes_home).operations
+
+    assert ops.delegation_live_log_count == 1
+
+
+def test_unknown_table_name_is_refused_by_the_allow_list():
+    """The identifier interpolation guard must reject anything off the allow-list."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE projects (id TEXT)")
+        assert sqlite_util_module._table_count(conn, "projects") == 0
+        with pytest.raises(ValueError, match="unknown table name"):
+            sqlite_util_module._table_count(conn, "projects; DROP TABLE projects")
+        with pytest.raises(ValueError, match="unknown table name"):
+            sqlite_util_module._column_exists(conn, "sessions", "id")
+    finally:
+        conn.close()
+
+
+def test_sqlite_helpers_degrade_to_defaults_on_a_dead_connection():
+    """A connection closed underneath the readers yields zeros, not an exception."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE projects (id TEXT)")
+    conn.close()
+
+    assert sqlite_util_module._table_count_or_zero(conn, "projects") == 0
+    assert sqlite_util_module._column_exists(conn, "projects", "id") is False
+    assert sqlite_util_module._count_rows_or_zero(conn, "SELECT COUNT(*) FROM projects") == 0
+
+
+def test_state_snapshots_root_symlinked_outside_home_is_ignored(
+    hermes_home: Path, sample_db: Path, tmp_path: Path
+):
+    """A state-snapshots/ symlink escaping the home must contribute no sizes."""
+    outside = tmp_path / "snaps"
+    outside.mkdir()
+    snapshot = outside / "20260907-143350-pre-update"
+    snapshot.mkdir()
+    (snapshot / "state.db").write_bytes(b"x" * 2048)
+    (hermes_home / "state-snapshots").symlink_to(outside, target_is_directory=True)
+
+    ops = _collect_ops(hermes_home).operations
+
+    assert ops.snapshot_count == 0
+    assert ops.snapshot_total_bytes == 0
+    assert ops.newest_snapshot_age_seconds is None
+
+
+def test_delegation_live_root_symlinked_outside_home_is_ignored(
+    hermes_home: Path, sample_db: Path, tmp_path: Path
+):
+    """A cache/delegation/live symlink escaping the home must count no transcripts."""
+    outside = tmp_path / "live"
+    outside.mkdir()
+    run_dir = outside / "deleg_done"
+    run_dir.mkdir()
+    (run_dir / "task-0.log").write_text("subagent transcript\n")
+    cache = hermes_home / "cache" / "delegation"
+    cache.mkdir(parents=True)
+    (cache / "live").symlink_to(outside, target_is_directory=True)
+
+    ops = _collect_ops(hermes_home).operations
+
+    assert ops.delegation_live_log_count == 0
+    # The rest of the operations source still collects.
+    assert ops.delegation_count == 3
+
+
 def test_state_db_maintenance_happy_path(hermes_home: Path, sample_db: Path):
+    # sample_db seeds state_meta from the wall clock; re-anchor the maintenance
+    # epochs to _FIXED_NOW so the ages stay positive whatever today's date is.
+    conn = _open_state_db(hermes_home)
+    conn.execute(
+        "UPDATE state_meta SET value = ? WHERE key = 'last_auto_prune'", (_FIXED_NOW - 7200,)
+    )
+    conn.execute(
+        "UPDATE state_meta SET value = ? WHERE key = 'last_auto_archive'", (_FIXED_NOW - 86400,)
+    )
+    conn.commit()
+    conn.close()
+
     ops = _collect_ops(hermes_home).operations
     assert ops.state_db_schema_version == 6
     assert ops.state_db_file_generation == "3"
     assert ops.state_db_fts_storage_version == "2"
-    assert ops.last_auto_prune_age_seconds is not None
-    assert ops.last_auto_archive_age_seconds is not None
-    assert ops.last_auto_archive_age_seconds > ops.last_auto_prune_age_seconds
+    assert ops.last_auto_prune_age_seconds == pytest.approx(7200.0)
+    assert ops.last_auto_archive_age_seconds == pytest.approx(86400.0)
     assert ops.state_db_size_bytes > 0
     assert ops.state_db_wal_size_bytes == 0
 

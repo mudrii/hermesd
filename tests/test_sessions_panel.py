@@ -186,6 +186,46 @@ def test_detail_escapes_markup_hostile_free_text() -> None:
     assert "\x1b[2J" not in rendered
 
 
+@pytest.mark.parametrize(
+    ("age_seconds", "expected"),
+    [
+        (0, "0s"),
+        (30, "30s"),
+        (59, "59s"),
+        (60, "1m"),
+        (3599, "59m"),
+        (3600, "1h"),
+        (86399, "23h"),
+        (86400, "1d"),
+        (3 * 86400, "3d"),
+    ],
+)
+def test_detail_activity_age_label_tiers(age_seconds: int, expected: str) -> None:
+    """Every `_age_label` tier, read off the Age column of the activity table."""
+    state = DashboardState(
+        collected_at=_NOW,
+        sessions=[_session(git_branch="age-probe", last_activity_at=_NOW - age_seconds)],
+    )
+
+    rendered = render_to_str(render_sessions(state, Theme(), detail=True), width=200, no_color=True)
+    row = next(line for line in rendered.splitlines() if "age-probe" in line)
+
+    # Columns are ID, Name, Branch, Profile, Chat, Age, Last Activity.
+    assert row.split()[-2] == expected
+
+
+def test_detail_activity_age_label_is_dash_without_a_timestamp() -> None:
+    state = DashboardState(
+        collected_at=_NOW,
+        sessions=[_session(git_branch="age-probe", started_at=0.0, last_activity_at=0.0)],
+    )
+
+    rendered = render_to_str(render_sessions(state, Theme(), detail=True), width=200, no_color=True)
+    row = next(line for line in rendered.splitlines() if "age-probe" in line)
+
+    assert row.split()[-2] == "—"
+
+
 def test_detail_age_uses_collected_at_not_wall_clock() -> None:
     """Ages are measured against the injected collection clock."""
     state = DashboardState(

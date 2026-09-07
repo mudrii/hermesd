@@ -109,6 +109,34 @@ def test_detail_keeps_session_model_breakdown_when_usage_source_is_sessions() ->
     assert "aux" not in rendered
 
 
+def test_compact_omits_models_line_when_every_row_is_task_tagged() -> None:
+    # Auxiliary (task-tagged) usage never earns the compact Models line.
+    state = DashboardState(
+        token_analytics=TokenAnalytics(
+            usage_source="session_model_usage",
+            model_usage_all=[
+                ModelUsage(model="gpt-5.4-mini", provider="openai", task="title", api_calls=2)
+            ],
+        )
+    )
+    rendered = render_to_str(render_tokens(state, Theme()), width=100, no_color=True)
+
+    assert "Models" not in rendered
+
+
+def test_detail_omits_aux_row_when_no_task_tagged_models() -> None:
+    state = _usage_state()
+    state.token_analytics.model_usage_all = [
+        usage for usage in state.token_analytics.model_usage_all if not usage.task
+    ]
+
+    rendered = render_to_str(render_tokens(state, Theme(), detail=True), width=140, no_color=True)
+
+    assert "By Model" in rendered
+    assert "gpt-5.4" in rendered
+    assert "aux" not in rendered
+
+
 def test_detail_escapes_markup_hostile_model_names() -> None:
     state = _usage_state()
     state.token_analytics.model_usage_all[0].model = "[/] evil [x]\x1b[2Jmodel"

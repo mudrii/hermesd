@@ -234,6 +234,10 @@ def _state_db_readout(conn: sqlite3.Connection) -> _StateDbReadout:
 # Fields each gateway sub-source owns, used to restore just that source's
 # values from the last good state when it fails.
 _HEARTBEAT_FIELDS = ("heartbeat_age_seconds", "loop_health")
+# Upper bound on runtime/active_sessions.json entries turned into surfaces. Each
+# entry costs a liveness syscall per refresh, so an oversized file must not be
+# able to stall the collector thread.
+_ACTIVE_SURFACE_LIMIT = 200
 # cache/blocked-scripts/ scan bounds and the fields the source owns.
 _BLOCKED_SCRIPT_SCAN_LIMIT = 200
 _BLOCKED_SCRIPT_NAME_LIMIT = 3
@@ -857,6 +861,18 @@ class Collector:
             return {}
         return self._read_json_cached(path)
 
+    def _read_json_reporting_stale(self, path: Path) -> JsonMapping:
+        """Read a JSON mapping, raising when the file cache had to serve last-good.
+
+        Silently reusing the cached value would leave a corrupt source invisible
+        in ``health.failed_sources``; raising names the source while the caller's
+        fallback still preserves the cached data.
+        """
+        data = self._read_json_cached(path)
+        if self._file_cache.last_read_was_stale(path):
+            raise RuntimeError(f"{path.name} is unreadable; keeping last-good values")
+        return data
+
     def _read_json_list_cached(self, path: Path) -> JsonObjectList:
         return self._file_cache.read_json_list(path)
 
@@ -876,7 +892,7 @@ class Collector:
         return rows if rows is not None else self._db.read_sessions()
 
     def _collect_gateway(self) -> GatewayState:
-        data = self._read_json_cached(self._paths.shared_path("gateway_state.json"))
+        data = self._read_json_reporting_stale(self._paths.shared_path("gateway_state.json"))
         if not data:
             return GatewayState()
         now = self._clock()
@@ -1122,7 +1138,9 @@ class Collector:
                 handoff_state=r.get("handoff_state") or "",
                 handoff_platform=r.get("handoff_platform") or "",
                 handoff_error=r.get("handoff_error") or "",
-                started_at=r.get("started_at") or 0.0,
+                # SQLite columns are untyped: a text value in an epoch column must
+                # coerce, not fail model validation and blank the whole source.
+                started_at=_coerce_float(r.get("started_at")),
                 ended_at=r.get("ended_at"),
                 title=r.get("title"),
                 is_active=r.get("ended_at") is None and not bool(r.get("archived") or 0),
@@ -1132,7 +1150,7 @@ class Collector:
                 title_source=r.get("title_source") or "",
                 profile_name=r.get("profile_name") or "",
                 pinned=bool(r.get("pinned") or 0),
-                last_activity_at=r.get("last_activity_at") or 0.0,
+                last_activity_at=_coerce_float(r.get("last_activity_at")),
                 last_activity_description=r.get("last_activity_description") or "",
                 actual_cost_usd=_coerce_float(r.get("actual_cost_usd")),
                 cost_source=r.get("cost_source") or "",
@@ -1172,6 +1190,8 @@ class Collector:
                     alive=bool(pid) and self._pid_exists(pid),
                 )
             )
+            if len(surfaces) >= _ACTIVE_SURFACE_LIMIT:
+                break
         return surfaces
 
     def _last_model_usage(self) -> _ModelUsageBundle:
@@ -2114,13 +2134,17 @@ class Collector:
         path = self._paths.shared_path("cache", "mcp_schema_cache.json")
         if not _safe_or_absent_child_path(path, self._paths.root_home):
             return MCPSchemaCache()
-        return _mcp_schema_cache_summary(self._read_json_cached(path), self._file_age_seconds(path))
+        return _mcp_schema_cache_summary(
+            self._read_json_reporting_stale(path), self._file_age_seconds(path)
+        )
 
     def _collect_skills_prompt(self) -> SkillsPromptSnapshot:
         path = self._paths.shared_path(".skills_prompt_snapshot.json")
         if not _safe_or_absent_child_path(path, self._paths.root_home):
             return SkillsPromptSnapshot()
-        return _skills_prompt_summary(self._read_json_cached(path), self._file_age_seconds(path))
+        return _skills_prompt_summary(
+            self._read_json_reporting_stale(path), self._file_age_seconds(path)
+        )
 
     def _file_age_seconds(self, path: Path) -> float | None:
         """Age of ``path`` against the injected clock, clamped at zero."""

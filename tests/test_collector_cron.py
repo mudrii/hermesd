@@ -15,6 +15,7 @@ import yaml
 from hermesd.collect.cron import (
     _EXECUTIONS_RECENT_LIMIT,
     _EXECUTIONS_SCAN_LIMIT,
+    _INCIDENTS_LIMIT,
 )
 from hermesd.collect.logs import _MAX_LOG_LINE_CHARS
 from hermesd.collector import (
@@ -104,6 +105,84 @@ def test_collect_cron_suggestions_ignores_malformed_json(hermes_home: Path):
     assert state.cron.suggestion_count == 0
     assert "cron" not in state.health.failed_sources
     c.close()
+
+
+def test_collect_cron_suggestions_from_a_directory_of_files(hermes_home: Path):
+    """A suggestions/ directory counts its recognised files and skips the rest."""
+    suggestions = hermes_home / "cron" / "suggestions"
+    suggestions.mkdir()
+    for name in ("a.json", "b.yaml", "c.yml", "d.md"):
+        (suggestions / name).write_text("{}")
+    (suggestions / "notes.txt").write_text("ignored")
+    (suggestions / "nested").mkdir()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.cron.suggestion_count == 4
+
+
+def test_collect_cron_suggestions_symlinked_file_is_skipped(hermes_home: Path, tmp_path: Path):
+    outside = tmp_path / "suggestions.json"
+    outside.write_text(json.dumps({"suggestions": [{"name": "standup"}, {"name": "review"}]}))
+    (hermes_home / "cron" / "suggestions.json").symlink_to(outside)
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.cron.suggestion_count == 0
+    assert "cron" not in state.health.failed_sources
+
+
+def test_collect_cron_suggestions_mapping_without_a_list_counts_its_keys(hermes_home: Path):
+    """A suggestions mapping with no suggestions/items/jobs list falls back to key count."""
+    (hermes_home / "cron" / "suggestions.json").write_text(
+        json.dumps({"standup": {"cron": "0 9 * * *"}, "review": {"cron": "0 18 * * *"}})
+    )
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.cron.suggestion_count == 2
+
+
+def test_cron_output_scan_skips_files_whose_stat_fails(hermes_home: Path, monkeypatch):
+    """A cron output file that disappears mid-scan must not fail the logs source."""
+    job_dir = hermes_home / "cron" / "output" / "job-1"
+    job_dir.mkdir(parents=True)
+    vanishing = job_dir / "vanishing.log"
+    vanishing.write_text("2026-04-09 15:41:58,123 - hermes - INFO - gone\n")
+    survivor = job_dir / "survivor.log"
+    survivor.write_text("2026-04-09 15:42:58,123 - hermes - INFO - cron ran\n")
+
+    real_stat = Path.stat
+
+    def flaky_stat(self: Path, *args: object, **kwargs: object):
+        if self == vanishing:
+            raise OSError("stat raced with a rotation")
+        return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "logs" not in state.health.failed_sources
+    assert [line.message for line in state.logs.cron_lines] == [
+        "2026-04-09 15:42:58,123 - hermes - INFO - cron ran"
+    ]
 
 
 def test_collect_chronos_config_health(hermes_home: Path):
@@ -1010,6 +1089,51 @@ def test_collect_cron_incidents_counts_open_and_unacked(
     assert unacked.error_excerpt == "Script exited with code 1"
     assert unacked.first_seen_age_seconds == pytest.approx(7200, abs=30)
     assert unacked.last_seen_age_seconds == pytest.approx(600, abs=30)
+
+
+def test_collect_cron_incidents_detail_list_is_capped_but_counts_stay_exact(hermes_home: Path):
+    """More open incidents than the detail cap: the list truncates, the counts do not."""
+    total_open = _INCIDENTS_LIMIT + 4
+    db_path = hermes_home / "cron" / "executions.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        create_cron_executions_tables(conn)
+        for index in range(total_open):
+            conn.execute(
+                "INSERT INTO cron_incidents VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    f"inc_{index:02d}",
+                    "job-alpha",
+                    f"sig-{index}",
+                    "detected",
+                    "timeout",
+                    iso_ago(9000 - index),
+                    iso_ago(total_open - index),
+                    None,
+                    None,
+                    f"incident {index} exploded",
+                    None,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    _write_jobs_json(hermes_home, [{"id": "job-alpha", "name": "Alpha Report"}])
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    executions = state.cron_executions
+    assert executions.open_incident_count == total_open
+    assert executions.unacked_incident_count == total_open
+    assert len(executions.open_incidents) == _INCIDENTS_LIMIT
+    # The newest last_seen_at rows win the cap.
+    assert [incident.incident_id for incident in executions.open_incidents] == [
+        f"inc_{index:02d}" for index in range(total_open - 1, total_open - 1 - _INCIDENTS_LIMIT, -1)
+    ]
 
 
 def test_collect_cron_incidents_absent_table_reports_zero(hermes_home: Path):

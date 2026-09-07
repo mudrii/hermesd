@@ -11,8 +11,10 @@ from pathlib import Path
 import pytest
 
 from hermesd.collector import (
+    _ACTIVE_SURFACE_LIMIT,
     Collector,
     _estimate_cost,
+    _pid_exists,
     _resolved_session_cost,
     _summarize_breakdown,
     _summarize_tokens,
@@ -1237,6 +1239,28 @@ def test_legacy_db_without_new_columns_keeps_session_defaults(hermes_home: Path)
     assert state.health.failed_sources == []
 
 
+def test_wrong_typed_session_columns_coerce_instead_of_raising(hermes_home: Path) -> None:
+    """SQLite is untyped: 'yes' in pinned and 'soon' in last_activity_at must not crash."""
+    conn = sqlite3.connect(str(hermes_home / "state.db"))
+    create_state_db_tables(conn, include_schema_version=False, include_v021_columns=True)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, message_count, pinned, "
+        "last_activity_at) VALUES (?,?,?,?,?,?)",
+        ("sess_typo", "cli", "yesterday", 3, "yes", "soon"),
+    )
+    conn.commit()
+    conn.close()
+
+    state = _collect_once(hermes_home)
+
+    assert state.health.failed_sources == []
+    session = state.sessions[0]
+    assert session.session_id == "sess_typo"
+    assert session.pinned is True
+    assert session.last_activity_at == 0.0
+    assert session.started_at == 0.0
+
+
 def _write_active_sessions(hermes_home: Path, payload: object) -> None:
     runtime = hermes_home / "runtime"
     runtime.mkdir(exist_ok=True)
@@ -1301,3 +1325,50 @@ def test_active_surfaces_missing_file_is_empty(hermes_home: Path) -> None:
 
     assert state.active_surfaces == []
     assert state.active_surface_count == 0
+
+
+def test_active_surfaces_are_bounded_and_cost_one_liveness_probe_each(hermes_home: Path) -> None:
+    """A 500-entry runtime file must not turn into 500 liveness syscalls per refresh."""
+    _write_v021_session_db(hermes_home, v021=True)
+    _write_active_sessions(
+        hermes_home,
+        {
+            "entries": [
+                {"session_id": f"sess_{index:04d}", "surface": "cli", "pid": 1000 + index}
+                for index in range(500)
+            ]
+        },
+    )
+    probed: list[int] = []
+
+    state = _collect_once(hermes_home, pid_exists=lambda pid: probed.append(pid) or False)
+
+    assert len(state.active_surfaces) == _ACTIVE_SURFACE_LIMIT
+    assert state.active_surface_count == _ACTIVE_SURFACE_LIMIT
+    assert len(probed) == _ACTIVE_SURFACE_LIMIT
+    # The cap keeps the head of the file, in file order.
+    assert state.active_surfaces[0].session_id == "sess_0000"
+    assert state.active_surfaces[-1].session_id == f"sess_{_ACTIVE_SURFACE_LIMIT - 1:04d}"
+
+
+@pytest.mark.parametrize(
+    ("raw_pid", "expected"),
+    [("abc", 0), (-1, -1), (2**40, 2**40), (None, 0), (3.7, 3), ("", 0)],
+    ids=["garbage-str", "negative", "huge", "null", "float", "empty-str"],
+)
+def test_active_surface_pid_coercion_never_raises(
+    hermes_home: Path, raw_pid: object, expected: int
+) -> None:
+    """Any pid shape must coerce; an implausible pid is simply never alive."""
+    _write_v021_session_db(hermes_home, v021=True)
+    _write_active_sessions(
+        hermes_home,
+        {"entries": [{"session_id": "sess_new", "surface": "cli", "pid": raw_pid}]},
+    )
+
+    state = _collect_once(hermes_home, pid_exists=_pid_exists)
+
+    surface = state.active_surfaces[0]
+    assert surface.pid == expected
+    assert surface.alive is False
+    assert "active_sessions" not in state.health.failed_sources

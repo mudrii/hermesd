@@ -13,6 +13,10 @@ from pathlib import Path
 import pytest
 import yaml
 
+from hermesd.collect.gateway import (
+    _INCARNATION_SCAN_LIMIT,
+    _OPEN_DELIVERY_LIMIT,
+)
 from hermesd.collector import (
     Collector,
     _is_dashboard_process,
@@ -1413,6 +1417,104 @@ def test_delivery_obligation_counts_and_excerpts(hermes_home: Path):
     )
 
 
+def test_open_delivery_list_is_capped_while_counts_stay_exact(hermes_home: Path):
+    """Seven open obligations: only the newest five are listed, counts cover all seven."""
+    _write_gateway_state(hermes_home)
+    conn = sqlite3.connect(str(hermes_home / "state.db"))
+    _create_ledger_tables(conn)
+    states = ["pending"] * 4 + ["attempting"] * 2 + ["failed"]
+    conn.executemany(
+        "INSERT INTO delivery_obligations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            (
+                f"o{index:02d}",
+                f"telegram:{index}",
+                f"platform-{index:02d}",
+                str(index),
+                None,
+                "SECRET-CONTENT-DO-NOT-SHOW",
+                state,
+                index,
+                NOW - 10_000 + index,
+                NOW - 1_000 + index,
+                None,
+                None,
+                None,
+                "root",
+            )
+            for index, state in enumerate(states)
+        ],
+    )
+    # A delivered row must never enter the open list or the pending counters.
+    conn.execute(
+        "INSERT INTO delivery_obligations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "o_done",
+            "telegram:99",
+            "platform-99",
+            "99",
+            None,
+            "SECRET-CONTENT-DO-NOT-SHOW",
+            "delivered",
+            1,
+            NOW - 5,
+            NOW - 1,
+            None,
+            None,
+            None,
+            "root",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.pending_delivery_count == 6
+    assert gateway.failed_delivery_count == 1
+    assert len(gateway.pending_deliveries) == _OPEN_DELIVERY_LIMIT
+    # Newest updated_at first; the two oldest open rows are dropped by the cap.
+    assert [entry.platform for entry in gateway.pending_deliveries] == [
+        f"platform-{index:02d}" for index in range(6, 6 - _OPEN_DELIVERY_LIMIT, -1)
+    ]
+    assert all(
+        "SECRET-CONTENT" not in entry.model_dump_json() for entry in gateway.pending_deliveries
+    )
+
+
+def test_incarnation_counts_stay_correct_beyond_the_scan_limit(hermes_home: Path):
+    """600 heartbeat rows: the total is exact and the 24h restarts survive the scan cap."""
+    _write_gateway_state(hermes_home)
+    total_rows = 600
+    recent_rows = 300
+    assert recent_rows < _INCARNATION_SCAN_LIMIT < total_rows
+    conn = sqlite3.connect(str(hermes_home / "state.db"))
+    _create_ledger_tables(conn)
+    conn.executemany(
+        "INSERT INTO gateway_heartbeats VALUES (?,?,?,?,?,?)",
+        [
+            (
+                f"b{index:04d}",
+                index + 1,
+                # The newest `recent_rows` started inside 24h; the rest are far older.
+                NOW - 60 - index if index < recent_rows else NOW - 400_000 - index,
+                NOW - 10,
+                "root",
+                "host",
+            )
+            for index in range(total_rows)
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.gateway_incarnation_count == total_rows
+    assert gateway.gateway_restarts_24h == recent_rows
+    assert gateway.current_incarnation_uptime_seconds == pytest.approx(60.0)
+
+
 def test_gateway_ledger_tables_absent_are_zero(hermes_home: Path):
     _write_gateway_state(hermes_home)
     conn = sqlite3.connect(str(hermes_home / "state.db"))
@@ -1615,6 +1717,60 @@ def test_huge_pids_across_runtime_files_keep_their_sources_healthy(hermes_home: 
     assert state.gateway.running is False
     assert state.active_surfaces[0].alive is False
     assert state.background_processes[0].alive is False
+
+
+def test_symlinked_lifecycle_outside_home_reads_as_absent(hermes_home: Path, tmp_path: Path):
+    """A lifecycle file pointing outside ~/.hermes must contribute nothing."""
+    outside = tmp_path / "gateway.lifecycle.json"
+    outside.write_text(
+        json.dumps(
+            {
+                "phase": "exited",
+                "pid": 4242,
+                "exit_code": 3,
+                "exit_reason": "OUTSIDE-THE-HOME",
+                "start_time": NOW - 5000,
+            }
+        )
+    )
+    state_dir = hermes_home / "state"
+    state_dir.mkdir(exist_ok=True)
+    (state_dir / "gateway.lifecycle.json").symlink_to(outside)
+    _write_gateway_state(hermes_home)
+
+    state = _collect(hermes_home)
+
+    assert state.gateway.lifecycle_phase == ""
+    assert state.gateway.last_exit_reason == ""
+    assert state.gateway.last_exit_code is None
+    assert "gateway_lifecycle" not in state.health.failed_sources
+
+
+def test_symlinked_update_receipt_outside_home_reads_as_absent(hermes_home: Path, tmp_path: Path):
+    """An update receipt pointing outside ~/.hermes must contribute nothing."""
+    outside = tmp_path / "latest.json"
+    outside.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "outcome": "OUTSIDE-THE-HOME",
+                "finished_at": _iso(NOW - 600),
+                "pre_update": {"version": "1.0.0"},
+                "post_update": {"version": "9.9.9"},
+            }
+        )
+    )
+    receipts = hermes_home / "logs" / "update_receipts"
+    receipts.mkdir(parents=True, exist_ok=True)
+    (receipts / "latest.json").symlink_to(outside)
+    _write_gateway_state(hermes_home)
+
+    state = _collect(hermes_home)
+
+    assert state.gateway.last_update_outcome == ""
+    assert state.gateway.last_update_to_version == ""
+    assert state.gateway.last_update_finished_age_seconds is None
+    assert "update_receipt" not in state.health.failed_sources
 
 
 def test_symlinked_active_sessions_outside_home_reads_as_absent(hermes_home: Path, tmp_path: Path):

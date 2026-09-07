@@ -19,6 +19,24 @@ def test_kanban_completed_at_renders_age_label() -> None:
     assert "2m" in rendered
 
 
+def test_kanban_compact_shows_current_board_suffix() -> None:
+    state = DashboardState(
+        kanban=KanbanState(db_present=True, board_count=3, current_board="ops-board")
+    )
+    text = render_to_str(render_kanban(state, Theme()), width=100, no_color=True)
+
+    assert "Boards:" in text
+    assert "current=ops-board" in text
+
+
+def test_kanban_compact_omits_current_board_suffix_when_unset() -> None:
+    state = DashboardState(kanban=KanbanState(db_present=True, board_count=3, current_board=""))
+    text = render_to_str(render_kanban(state, Theme()), width=100, no_color=True)
+
+    assert "Boards:" in text
+    assert "current=" not in text
+
+
 def test_kanban_detail_age_uses_collected_at_not_wall_clock() -> None:
     now = 1_800_000_000.0
     state = DashboardState(

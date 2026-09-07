@@ -6,16 +6,23 @@ import pytest
 from rich.console import Console
 
 from hermesd.models import (
+    ActiveSurface,
     BackgroundProcessInfo,
     ChannelDirectoryState,
     ChannelPlatformInfo,
     CheckpointInfo,
+    ConfigSourceStamp,
     ConfigSummary,
     CredentialPoolEntry,
+    CronExecution,
+    CronExecutionsState,
+    CronIncident,
     CronJob,
+    CronJobExecutionStats,
     CronState,
     CuratorRun,
     DashboardState,
+    DelegationInfo,
     DiscoveredRepoSummary,
     GatewayState,
     GoalSummary,
@@ -31,6 +38,7 @@ from hermesd.models import (
     MCPServerInfo,
     MemoryOverview,
     ModelCacheSummary,
+    ModelUsage,
     OperationsState,
     PlatformStatus,
     PluginInfo,
@@ -46,6 +54,7 @@ from hermesd.models import (
     TokenAnalytics,
     TokenBreakdown,
     ToolGatewayRoute,
+    ToolsetAvailability,
     ToolStats,
     VerificationEventSummary,
     VerificationRootSummary,
@@ -75,6 +84,19 @@ def _state_for(panel_num: int) -> DashboardState:
                 drain_active=True,
                 drain_principal=INJECT,
                 drain_requested_at=INJECT,
+                code_sha=INJECT,
+                code_version=INJECT,
+                config_fingerprint=INJECT,
+                config_generation_short=INJECT,
+                config_sources=[ConfigSourceStamp(name=INJECT, path=INJECT, exists=True)],
+                session_store_status=INJECT,
+                exit_reason=INJECT,
+                lifecycle_phase=INJECT,
+                last_exit_reason=INJECT,
+                last_update_outcome=INJECT,
+                last_update_from_version=INJECT,
+                last_update_to_version=INJECT,
+                last_update_failed_step=INJECT,
                 served_profiles=[INJECT],
                 platforms=[
                     PlatformStatus(
@@ -124,7 +146,23 @@ def _state_for(panel_num: int) -> DashboardState:
                     rewind_count=1,
                     message_count=5,
                     is_active=True,
+                    profile_name=INJECT,
+                    chat_type=INJECT,
+                    display_name=INJECT,
+                    title_source=INJECT,
+                    git_branch=INJECT,
+                    last_activity_description=INJECT,
+                    compression_failure_error=INJECT,
+                    cost_source=INJECT,
+                    end_reason=INJECT,
+                    billing_base_url=INJECT,
+                    billing_mode=INJECT,
+                    pinned=True,
                 )
+            ],
+            active_surface_count=1,
+            active_surfaces=[
+                ActiveSurface(session_id="sess_injection_001", surface=INJECT, pid=42, alive=True)
             ],
         )
     if panel_num == 3:  # Tokens / Cost
@@ -133,6 +171,16 @@ def _state_for(panel_num: int) -> DashboardState:
             token_analytics=TokenAnalytics(
                 by_model=[TokenBreakdown(label=INJECT, session_count=1)],
                 by_provider=[TokenBreakdown(label=INJECT, session_count=1)],
+                usage_source="session_model_usage",
+                model_usage_all=[
+                    ModelUsage(model=INJECT, provider=INJECT, task=INJECT, api_calls=2)
+                ],
+                model_usage_24h=[
+                    ModelUsage(model=INJECT, provider=INJECT, task=INJECT, api_calls=1)
+                ],
+                model_usage_7d=[
+                    ModelUsage(model=INJECT, provider=INJECT, task=INJECT, api_calls=2)
+                ],
             ),
         )
     if panel_num == 4:  # Tools
@@ -141,6 +189,12 @@ def _state_for(panel_num: int) -> DashboardState:
             total_tool_calls=2,
             available_tools=1,
             available_tool_names=[INJECT],
+            toolset_availability=ToolsetAvailability(
+                enabled_toolsets=[INJECT],
+                unavailable_toolsets=[INJECT],
+                lazy_tool_count=1,
+                disabled_tool_count=1,
+            ),
             background_processes=[BackgroundProcessInfo(session_id=INJECT, command=INJECT, pid=42)],
             checkpoints=[
                 CheckpointInfo(
@@ -206,6 +260,43 @@ def _state_for(panel_num: int) -> DashboardState:
                         last_status="error",
                         last_error=INJECT,
                         next_run_at="2026-06-14T00:00:00Z",
+                        paused=True,
+                        paused_reason=INJECT,
+                        last_delivery_error=INJECT,
+                        dispatch_kind=INJECT,
+                    )
+                ],
+            ),
+            cron_executions=CronExecutionsState(
+                db_present=True,
+                job_stats=[
+                    CronJobExecutionStats(
+                        job_id="job_injection",
+                        completed_24h=1,
+                        failed_24h=1,
+                        last_status=INJECT,
+                        last_error_excerpt=INJECT,
+                    )
+                ],
+                recent=[
+                    CronExecution(
+                        execution_id=INJECT,
+                        job_id="job_injection",
+                        job_name=INJECT,
+                        status=INJECT,
+                        error_excerpt=INJECT,
+                    )
+                ],
+                open_incident_count=1,
+                unacked_incident_count=1,
+                open_incidents=[
+                    CronIncident(
+                        incident_id=INJECT,
+                        job_id="job_injection",
+                        job_name=INJECT,
+                        state=INJECT,
+                        failure_type=INJECT,
+                        error_excerpt=INJECT,
                     )
                 ],
             ),
@@ -323,7 +414,37 @@ def _state_for(panel_num: int) -> DashboardState:
                 dashboard_process_count=1,
                 desktop_build_stamp=INJECT,
                 model_caches=[ModelCacheSummary(name=INJECT, provider_count=1, model_count=1)],
-                pr_monitors=[PRMonitorSummary(filename=INJECT, repo=INJECT, checked_at=INJECT)],
+                pr_monitors=[
+                    PRMonitorSummary(
+                        filename=INJECT,
+                        repo=INJECT,
+                        checked_at=INJECT,
+                        monitored_count=1,
+                        tracked_count=1,
+                        author_pr_count=1,
+                        open_count=1,
+                        conflicting_count=1,
+                    )
+                ],
+                delegation_count=1,
+                delegation_running_count=1,
+                delegations=[
+                    DelegationInfo(
+                        delegation_id=INJECT,
+                        origin_session=INJECT,
+                        state=INJECT,
+                        delivery_state=INJECT,
+                        goal=INJECT,
+                        result_status=INJECT,
+                        error_excerpt=INJECT,
+                    )
+                ],
+                state_db_schema_version=6,
+                state_db_file_generation=INJECT,
+                state_db_fts_storage_version=INJECT,
+                web_ui_build_hash=INJECT,
+                blocked_script_count=1,
+                blocked_script_names=[INJECT],
                 verification_db_present=True,
                 verification_latest_events=[
                     VerificationEventSummary(
@@ -448,5 +569,7 @@ def test_panel_strips_terminal_control_sequences(
     rendered = output.getvalue()
     assert "\x1b" not in rendered
     assert "\x9b" not in rendered
-    if detail:
+    # Stripping the escape must not eat the surrounding text: wherever a free-text
+    # field reaches the screen, the literal payload has to still be readable.
+    if detail or panel_num not in _NO_FREE_TEXT_COMPACT_PANELS:
         assert "beforeafter" in rendered

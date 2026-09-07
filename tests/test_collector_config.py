@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from hermesd.collect.config import _MAX_LISTED_NAMES
 from hermesd.collector import (
     Collector,
     _mcp_tool_filter_summary,
@@ -619,9 +620,88 @@ def test_config_mcp_server_names_capped_and_sorted(hermes_home: Path):
     )
 
     assert config.mcp_server_count == 30
-    assert len(config.mcp_server_names) == 20
+    assert len(config.mcp_server_names) == _MAX_LISTED_NAMES
     assert config.mcp_server_names == sorted(config.mcp_server_names)
     assert config.mcp_server_names[0] == "srv-00"
+    assert config.mcp_server_names[-1] == f"srv-{_MAX_LISTED_NAMES - 1:02d}"
+
+
+def test_moa_default_preset_falls_back_to_the_first_configured_preset(hermes_home: Path):
+    """With no explicit default_preset, the first preset is the default and is summarized."""
+    (hermes_home / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "moa": {
+                    "presets": {
+                        "council": {
+                            "reference_models": [
+                                {"provider": "openrouter", "model": "gpt-5.4"},
+                                {"provider": "openrouter", "model": "deepseek-v4"},
+                            ],
+                            "aggregator": {"provider": "openrouter", "model": "claude-opus"},
+                        },
+                        "duo": {"reference_models": [{"provider": "openrouter", "model": "x"}]},
+                    }
+                }
+            }
+        )
+    )
+
+    c = Collector(hermes_home)
+    try:
+        config = c.collect().config
+    finally:
+        c.close()
+
+    assert config.moa_default_preset == "council"
+    assert config.moa_active_preset == ""
+    assert config.moa_preset_count == 2
+    # The fallback preset, not the raw config mapping, supplies the summary.
+    assert config.moa_reference_model_count == 2
+    assert config.moa_aggregator_label == "openrouter/claude-opus"
+
+
+def test_symlinked_config_yaml_is_still_read(hermes_home: Path, tmp_path: Path):
+    """Dotfiles setups symlink config.yaml out of ~/.hermes; that must keep working.
+
+    config.yaml is the one shared file hermesd follows through a symlink; the
+    runtime/state files under the home are confined instead.
+    """
+    outside = tmp_path / "dotfiles" / "config.yaml"
+    outside.parent.mkdir()
+    outside.write_text(
+        yaml.dump({"model": {"default": "dotfile-model", "provider": "dotfile-provider"}})
+    )
+    (hermes_home / "config.yaml").symlink_to(outside)
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.config.model == "dotfile-model"
+    assert state.config.provider == "dotfile-provider"
+    assert "config" not in state.health.failed_sources
+
+
+def test_mcp_tool_filter_summary_truncates_long_include_lists(hermes_home: Path):
+    """A 40-entry include list must not render 40 tool names into one cell."""
+    includes = [f"tool_{index:02d}" for index in range(40)]
+    cfg = hermes_home / "config.yaml"
+    cfg.write_text(
+        yaml.dump({"mcp_servers": {"wide": {"command": "npx", "tools": {"include": includes}}}})
+    )
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    tool_filter = state.skills_memory.mcp_servers[0].tool_filter
+    assert tool_filter == "tool_00,tool_01,tool_02"
+    assert "tool_03" not in tool_filter
+    assert _mcp_tool_filter_summary({"include": includes}) == tool_filter
 
 
 def test_config_new_sections_never_surface_secret_values(hermes_home: Path):

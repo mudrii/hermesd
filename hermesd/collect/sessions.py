@@ -32,7 +32,8 @@ def _summarize_tokens(
     contributing_rows = 0
     reported_rows = 0
     for row in rows:
-        started_at = row.get("started_at") or 0.0
+        # SQLite is untyped: coerce before comparing, or a text epoch raises.
+        started_at = _coerce_float(row.get("started_at"))
         if started_at_min is not None and started_at < started_at_min:
             continue
         contributing_rows += 1
@@ -63,7 +64,7 @@ def _summarize_window(
     now: float | None = None,
 ) -> TokenWindowSummary:
     cutoff = (now if now is not None else time.time()) - days * 86400
-    filtered = [row for row in rows if (row.get("started_at") or 0.0) >= cutoff]
+    filtered = [row for row in rows if _coerce_float(row.get("started_at")) >= cutoff]
     totals = _summarize_tokens(filtered)
     prompt_tokens = totals.input_tokens + totals.cache_read_tokens
     cache_ratio = totals.cache_read_tokens / prompt_tokens if prompt_tokens > 0 else 0.0

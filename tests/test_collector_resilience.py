@@ -97,6 +97,35 @@ def test_corrupt_session_file_keeps_last_good_tool_inventory(populated_hermes_ho
         collector.close()
 
 
+def test_session_file_named_by_the_index_but_missing_contributes_no_tools(
+    hermes_home: Path,
+) -> None:
+    """A dangling index entry is normal churn, not a read fault: it has no tools."""
+    sessions = hermes_home / "sessions"
+    sessions.mkdir(exist_ok=True)
+    (sessions / "sessions.json").write_text(
+        json.dumps(
+            {
+                "cli": {"session_id": "sess_present"},
+                "telegram": {"session_id": "sess_deleted"},
+            }
+        )
+    )
+    (sessions / "session_sess_present.json").write_text(
+        json.dumps({"session_id": "sess_present", "tools": [{"name": "web_search"}]})
+    )
+
+    collector = Collector(hermes_home)
+    try:
+        state = collector.collect()
+    finally:
+        collector.close()
+
+    assert state.available_tool_names == ["web_search"]
+    assert state.available_tools == 1
+    assert "tools_index" not in state.health.failed_sources
+
+
 @pytest.mark.parametrize(
     "corrupt_payload",
     ['["not", "a", "mapping"]', '"scalar"', "null"],
@@ -503,6 +532,109 @@ def test_corrupt_state_db_keeps_last_good_delegations(hermes_home: Path, sample_
         assert degraded.operations.delegation_count == good.delegation_count
         assert degraded.operations.delegations == good.delegations
         assert degraded.operations.state_db_schema_version == good.state_db_schema_version
+    finally:
+        c.close()
+
+
+def test_corrupt_state_db_names_model_usage_and_keeps_the_last_good_rows(
+    hermes_home: Path, sample_db: Path
+):
+    """A corrupt state.db must both name `model_usage` and serve its last-good rows."""
+    c = Collector(hermes_home)
+    try:
+        good = c.collect().token_analytics
+        assert good.usage_source == "session_model_usage"
+        assert [row.model for row in good.model_usage_all] == ["gpt-5.4", "gpt-5.4-mini"]
+
+        sample_db.write_bytes(b"this is not a sqlite database" * 64)
+        degraded = c.collect()
+
+        assert "model_usage" in degraded.health.failed_sources
+        assert degraded.token_analytics.model_usage_all == good.model_usage_all
+        assert degraded.token_analytics.usage_source == good.usage_source
+    finally:
+        c.close()
+
+
+def test_corrupt_gateway_state_json_names_the_gateway_source(
+    hermes_home: Path, sample_gateway_state: Path
+):
+    """Falling back to a cached gateway_state.json must not hide the read failure."""
+    c = Collector(hermes_home)
+    try:
+        good = c.collect().gateway
+        assert good.code_version == "2026.9.1"
+
+        sample_gateway_state.write_text("{ this is not json")
+        degraded = c.collect()
+
+        assert "gateway" in degraded.health.failed_sources
+        assert "gateway" in degraded.health.errors
+        assert degraded.gateway.code_version == good.code_version
+        assert degraded.gateway.code_sha == good.code_sha
+        assert {p.name for p in degraded.gateway.platforms} == {p.name for p in good.platforms}
+    finally:
+        c.close()
+
+
+def test_corrupt_mcp_schema_cache_names_the_mcp_cache_source(
+    hermes_home: Path, sample_mcp_schema_cache: Path
+):
+    c = Collector(hermes_home)
+    try:
+        good = c.collect().mcp_cache
+        assert good.mcp_cached_server_names == ["playwright", "sheets"]
+
+        sample_mcp_schema_cache.write_text("{ this is not json")
+        degraded = c.collect()
+
+        assert "mcp_cache" in degraded.health.failed_sources
+        assert degraded.mcp_cache.mcp_cached_server_names == good.mcp_cached_server_names
+        assert degraded.mcp_cache.mcp_cached_server_count == good.mcp_cached_server_count
+    finally:
+        c.close()
+
+
+def test_corrupt_skills_prompt_snapshot_names_the_skills_prompt_source(
+    hermes_home: Path, sample_skills_prompt_snapshot: Path
+):
+    c = Collector(hermes_home)
+    try:
+        good = c.collect().skills_prompt
+        assert good.prompted_skill_count == 3
+
+        sample_skills_prompt_snapshot.write_text("{ this is not json")
+        degraded = c.collect()
+
+        assert "skills_prompt" in degraded.health.failed_sources
+        assert degraded.skills_prompt.prompted_skill_count == good.prompted_skill_count
+    finally:
+        c.close()
+
+
+def test_repaired_state_db_clears_operations_from_failed_sources(
+    hermes_home: Path, sample_db: Path
+):
+    """The recovery half of the delegations invariant: repair the DB, the source clears."""
+    original = sample_db.read_bytes()
+    c = Collector(hermes_home)
+    try:
+        good = c.collect().operations
+        assert good.delegation_count == 3
+
+        sample_db.write_bytes(b"this is not a sqlite database" * 64)
+        degraded = c.collect()
+        assert "operations" in degraded.health.failed_sources
+
+        sample_db.write_bytes(original)
+        recovered = c.collect()
+
+        assert "operations" not in recovered.health.failed_sources
+        assert "operations" not in recovered.health.errors
+        assert recovered.operations.delegation_count == 3
+        assert [d.delegation_id for d in recovered.operations.delegations] == [
+            d.delegation_id for d in good.delegations
+        ]
     finally:
         c.close()
 

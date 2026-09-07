@@ -67,6 +67,31 @@ def test_collect_curator_scheduler_preserves_last_good_on_malformed_state(
     c.close()
 
 
+def test_learned_skill_directory_that_is_a_symlink_is_skipped(hermes_home: Path, tmp_path: Path):
+    """A learned/<skill> symlink must not be counted, however it resolves."""
+    outside = tmp_path / "smuggled-skill"
+    outside.mkdir()
+    (outside / "SKILL.md").write_text("---\nname: smuggled\npinned: true\ncreated_by: agent\n---\n")
+    learned = hermes_home / "skills" / "learned"
+    learned.mkdir()
+    real = learned / "dev-lint"
+    real.mkdir()
+    (real / "SKILL.md").write_text("---\nname: dev-lint\n---\n")
+    (learned / "smuggled").symlink_to(outside, target_is_directory=True)
+    # A plain file in learned/ is not a skill directory either.
+    (learned / "README.md").write_text("notes\n")
+
+    c = Collector(hermes_home)
+    try:
+        memory = c.collect().memory
+    finally:
+        c.close()
+
+    assert memory.learned_skill_count == 1
+    assert memory.pinned_skill_count == 0
+    assert memory.agent_created_skill_count == 0
+
+
 def test_collect_memory_learning_summary(hermes_home: Path):
     (hermes_home / "skills" / ".usage.json").write_text(
         json.dumps(

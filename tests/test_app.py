@@ -320,6 +320,62 @@ def test_run_exits_cleanly_on_keyboard_interrupt(
     assert app._closed.is_set() is True
 
 
+@pytest.mark.skipif(not hasattr(signal, "SIGINT"), reason="platform has no SIGINT semantics")
+def test_run_exits_cleanly_on_a_real_sigint(
+    populated_hermes_home: Path, monkeypatch, restore_signal_handlers
+):
+    """A genuine SIGINT delivered to the process stops run() and joins both threads."""
+    import io
+    import os
+
+    from rich.console import Console
+
+    import hermesd.app as app_module
+
+    entered = threading.Event()
+
+    class SignallingLive:
+        def __init__(self, renderable, *, console, refresh_per_second, screen):
+            pass
+
+        def __enter__(self):
+            entered.set()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def update(self, renderable):
+            pass
+
+    def send_sigint() -> None:
+        # The loop is inside Live; the signal is delivered to the main thread,
+        # where run() installed the handler.
+        assert entered.wait(timeout=10.0), "run() never entered the Live loop"
+        os.kill(os.getpid(), signal.SIGINT)
+
+    app = DashboardApp(populated_hermes_home, refresh_rate=1)
+    app._console = Console(file=io.StringIO(), width=80, height=24, force_terminal=True)
+    monkeypatch.setattr(app_module, "Live", SignallingLive)
+
+    signaller = threading.Thread(target=send_sigint)
+    signaller.start()
+    try:
+        app.run()  # must return, not raise KeyboardInterrupt
+    finally:
+        signaller.join(timeout=10.0)
+        app.close()
+
+    assert signaller.is_alive() is False
+    assert app._running.is_set() is False
+    assert app._stop_requested.is_set() is True
+    assert app._closed.is_set() is True
+    for thread in (app._collector_thread, app._input_thread):
+        assert thread is not None
+        thread.join(timeout=5.0)
+        assert thread.is_alive() is False
+
+
 def test_run_reports_render_failure_and_exits_nonzero(
     populated_hermes_home: Path, monkeypatch, restore_signal_handlers, capsys
 ):

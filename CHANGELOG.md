@@ -49,6 +49,10 @@ and this project uses date-based versions in `YYYY.M.D` form.
 - A `null` or wrong-typed value in `config.yaml` (for example `max_turns: null` or `max_turns: unlimited`) or in `cron/jobs.json` (`enabled: null`) no longer fails the whole config or cron source; values are coerced and defaults applied.
 - Goal state is re-read only when `state.db` changes, and per-repo checkpoint commit counts only when the repository's refs change, removing a database snapshot copy and two git subprocesses per repository from every refresh.
 - Plain-text reads under `~/.hermes` (memory files, `SOUL.md`, skill frontmatter, hook and plugin manifests, checkpoint workdir markers, the gateway pid file, cron suggestions) now refuse symlinks that escape the Hermes home and read at most 256 KiB, so an oversized or redirected file cannot stall or mislead the dashboard.
+- A text value in the `sessions.started_at` or `last_activity_at` column (SQLite is untyped) no longer fails the whole sessions source and every token panel with it; epochs are coerced before model construction.
+- A corrupt `gateway_state.json`, `cache/mcp_schema_cache.json` or `.skills_prompt_snapshot.json` now names its source in the health footer while serving the last-good value, instead of degrading silently.
+- `runtime/active_sessions.json` is capped at 200 entries so an oversized file cannot stall the collector with one liveness probe per entry.
+- The opt-in live contract test applies the same hidden-session filter as the reader, so it passes on homes with hidden sessions.
 - On Python 3.14, an unreadable `logs/` directory is reported as a failed source (with last-good lines kept) instead of "no logs": `Path.exists()` now returns False on permission errors there, so the logs reader uses a strict existence check that only treats absence as absence.
 - Quitting no longer waits for a full collection pass: `close()` signals the in-flight pass, which stops after the current source and keeps last-good values for the rest.
 - Logs and Skills detail views clamp a negative scroll offset to the top instead of slicing from the end and rendering an empty page with a `[-4--5/30]` counter.

@@ -62,6 +62,32 @@ def test_curator_panel_detail_empty_state():
     assert "No curation runs" in text
 
 
+def test_curator_panel_compact_shows_scheduler_state_without_run():
+    # No run report yet, but scheduler state exists: compact shows it instead of
+    # the "No curation runs" placeholder.
+    run = CuratorRun(
+        scheduler_state_present=True,
+        scheduler_paused=True,
+        scheduler_run_count=7,
+    )
+    text = render_to_str(
+        render_panel(13, DashboardState(curator=run), Theme(), detail=False),
+        no_color=True,
+    )
+    assert "No curation runs" not in text
+    assert re.search(r"Scheduler:\s+paused", text)
+    assert re.search(r"Runs:\s+7\b", text)
+
+
+def test_curator_panel_compact_scheduler_active_when_not_paused():
+    run = CuratorRun(scheduler_state_present=True, scheduler_run_count=0)
+    text = render_to_str(
+        render_panel(13, DashboardState(curator=run), Theme(), detail=False),
+        no_color=True,
+    )
+    assert re.search(r"Scheduler:\s+active", text)
+
+
 def test_curator_panel_detail_shows_scheduler_state_without_run():
     run = CuratorRun(
         scheduler_state_present=True,

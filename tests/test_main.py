@@ -22,6 +22,7 @@ from hermesd.__main__ import (
     resolve_hermes_home,
     resolve_profile_name,
 )
+from hermesd.models import DashboardState
 from tests.conftest import create_kanban_db_tables
 
 
@@ -488,6 +489,24 @@ def test_main_snapshot_json_outputs_state(populated_hermes_home: Path, capsys):
     assert payload["panel_num"] is None
     assert payload["state"]["gateway"]["state"] == "running"
     assert payload["state"]["memory"]["memory_file_count"] >= 1
+
+
+def test_main_snapshot_json_serializes_every_dashboard_state_field(
+    populated_hermes_home: Path, capsys
+):
+    """A field dropped from DashboardState serialization must fail here, not silently ship."""
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-format",
+            "json",
+            "--no-color",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert set(payload["state"]) == set(DashboardState.model_fields)
 
 
 def test_main_snapshot_panel_json_file(populated_hermes_home: Path, tmp_path: Path):

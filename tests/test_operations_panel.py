@@ -5,6 +5,7 @@ from __future__ import annotations
 from hermesd.models import (
     DashboardState,
     DelegationInfo,
+    GoalSummary,
     ModelCacheSummary,
     OperationsState,
     PRMonitorSummary,
@@ -227,3 +228,55 @@ def test_operations_detail_escapes_blocked_script_names() -> None:
     text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
 
     assert "[bold red]evil.sh" in text
+
+
+def _placeholder_rows(text: str) -> list[list[str]]:
+    """Every rendered line that is nothing but seven em-dash cells."""
+    return [cells for line in text.splitlines() if (cells := line.split()) == ["—"] * 7]
+
+
+def test_operations_detail_delegations_table_placeholder_row_when_list_empty() -> None:
+    # A counted-but-unlisted delegation set still renders one all-dash row.
+    state = _ops_state(delegation_count=3)
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Delegations (3 total · 0 live logs)" in text
+    assert _placeholder_rows(text) == [["—"] * 7]
+
+
+def test_operations_detail_reports_no_verification_events_when_ledger_empty() -> None:
+    state = _ops_state(verification_db_present=True)
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Verification Evidence" in text
+    assert "No verification events recorded" in text
+    # The event table (and its Exit column) must not be drawn at all.
+    assert "Exit" not in text
+
+
+def test_operations_detail_projects_table_placeholder_row_when_list_empty() -> None:
+    state = _ops_state(projects_db_present=True)
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Projects" in text
+    assert "Slug" in text
+    assert _placeholder_rows(text) == [["—"] * 7]
+
+
+def test_operations_detail_goal_waiting_falls_back_to_session() -> None:
+    # With no waiting pid the Waiting cell names the blocking session instead.
+    state = _ops_state(
+        goal_count=1,
+        goals=[
+            GoalSummary(
+                session_id="sess_goal",
+                goal="ship the feature",
+                status="active",
+                waiting_on_session="sess_blocker",
+            )
+        ],
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "session sess_blocker" in text
+    assert "pid " not in text

@@ -963,14 +963,30 @@ def test_interrupt_does_not_wait_for_message_search_lock(tmp_path, monkeypatch):
 
 
 def test_interrupt_after_close_is_noop(tmp_path):
-    """interrupt() on a closed HermesDB must not raise."""
+    """interrupt() on a closed HermesDB must not raise or reopen the connection."""
     db_file = tmp_path / "state.db"
     seed = sqlite3.connect(db_file)
-    seed.execute("CREATE TABLE t (x INTEGER)")
+    create_state_db_tables(seed, include_schema_version=False)
+    seed.execute("INSERT INTO sessions (id, source, started_at) VALUES ('s1', 'cli', 1.0)")
+    seed.commit()
     seed.close()
 
     db = HermesDB(db_file)
+    assert db.read_session_count() == 1
+    assert [row["id"] for row in db.read_sessions()] == ["s1"]
+
     db.close()
+    db.interrupt()
+
+    # A second session lands on disk after the close. A closed HermesDB must not
+    # reconnect to pick it up; it serves the last-good cache instead.
+    seed = sqlite3.connect(db_file)
+    seed.execute("INSERT INTO sessions (id, source, started_at) VALUES ('s2', 'cli', 2.0)")
+    seed.commit()
+    seed.close()
+
+    assert db.read_session_count() == 1
+    assert [row["id"] for row in db.read_sessions()] == ["s1"]
     db.interrupt()
 
 
