@@ -95,14 +95,21 @@ from hermesd.collect.logs import (
     _latest_log_mtime,
 )
 from hermesd.collect.operations import (
+    StateDbRead,
+    _count_delegation_live_logs,
     _curator_with_scheduler_state,
-    _goal_state_update,
     _is_dashboard_process,
+    _iso_age_seconds,
     _moa_latest_record_summary,
     _model_cache_counts,
     _read_projects_state,
+    _read_state_snapshots,
     _read_verification_evidence,
+    _state_db_update,
     _state_transition_label,
+)
+from hermesd.collect.operations import (
+    _read_state_db as _read_state_db_tables,
 )
 from hermesd.collect.redaction import (
     _has_secret_material,
@@ -202,9 +209,9 @@ def _closing_source() -> Never:
 
 @dataclass(frozen=True, slots=True)
 class _StateDbReadout:
-    """One state.db pass: the goal-state update plus the raw gateway ledgers."""
+    """One state.db pass: the operations tables plus the raw gateway ledgers."""
 
-    goal_update: dict[str, Any]
+    state: StateDbRead
     ledgers: _GatewayLedgerRows
 
 
@@ -331,8 +338,9 @@ class Collector:
         ] = {}
         self._profile_count_cache: dict[str, tuple[int | None, int]] = {}
         self._kanban_board_cache: dict[str, KanbanBoardSummary] = {}
-        # One state.db readout per changed mtime, shared by the goal state and
-        # the gateway ledgers so a pass snapshots the (large, WAL) db only once.
+        # One state.db readout per changed mtime, shared by the goal/delegation
+        # state and the gateway ledgers so a pass snapshots the (large, WAL)
+        # db only once.
         self._state_db_cache: tuple[int, _StateDbReadout] | None = None
         self._checkpoint_summary_cache: dict[
             str, tuple[tuple[int, ...], tuple[int, float | None, str]]
@@ -504,6 +512,16 @@ class Collector:
                 "operations",
                 lambda: self._collect_operations(results["background_processes"]),
                 OperationsState,
+            ),
+            # Second writer of the `operations` field: state-snapshots/ can hold
+            # gigabytes, so a failed scan degrades to the operations state
+            # collected above instead of blanking the whole panel.
+            _SourceSpec(
+                "operations",
+                "state_snapshots",
+                lambda: self._with_state_snapshots(results["operations"]),
+                lambda: results["operations"],
+                fallback=lambda: results["operations"],
             ),
             _SourceSpec("skills_memory", "skills", self._collect_skills_memory, SkillsMemory),
             _SourceSpec("mcp_cache", "mcp_cache", self._collect_mcp_cache, MCPSchemaCache),
@@ -967,7 +985,7 @@ class Collector:
         ledger = self._read_json_list_cached(self._paths.shared_path("spawn-ledger.json"))
         if ledger:
             return [
-                _background_process_from_ledger(entry)
+                _background_process_from_ledger(entry, self._pid_exists)
                 for entry in ledger
                 if _coerce_int(entry.get("pid")) > 0 or str(entry.get("session_id") or "")
             ]
@@ -991,10 +1009,14 @@ class Collector:
                 watcher_message_id=str(entry.get("watcher_message_id") or ""),
                 watcher_interval=_coerce_int(entry.get("watcher_interval")),
                 watch_patterns=[str(item) for item in _as_list(entry.get("watch_patterns"))],
+                alive=self._process_alive(_coerce_int(entry.get("pid"))),
             )
             for entry in entries
             if str(entry.get("session_id") or "")
         ]
+
+    def _process_alive(self, pid: int) -> bool:
+        return bool(pid) and self._pid_exists(pid)
 
     def _collect_available_tools(self) -> tuple[int, list[str]]:
         banner_names = self._banner_snapshot_tool_names()
@@ -1457,11 +1479,16 @@ class Collector:
             or str(desktop_stamp.get("contentHash") or "")[:12]
             or ""
         )
+        web_ui_stamp = self._read_json_cached(self._paths.shared_path("web-ui-build-stamp.json"))
         operations = OperationsState(
             dashboard_process_count=dashboard_process_count,
             desktop_build_stamp=stamp_label,
             model_caches=self._collect_model_caches(),
             pr_monitors=self._collect_pr_monitors(),
+            web_ui_build_hash=str(web_ui_stamp.get("contentHash") or "")[:12],
+            web_ui_built_age_seconds=_iso_age_seconds(
+                str(web_ui_stamp.get("builtAt") or ""), self._clock()
+            ),
         )
         operations = self._with_response_store(operations)
         operations = self._with_verification_evidence(operations)
@@ -1562,19 +1589,36 @@ class Collector:
             return _read_projects_state(conn, operations, self._paths)
 
     def _with_goals(self, operations: OperationsState) -> OperationsState:
+        """Apply every state.db-backed operations source from one open.
+
+        Goals, delegations and DB-maintenance metadata all live in state.db, so
+        they share the single (mtime-cached) readout with the gateway ledgers
+        rather than taking a WAL snapshot each.
+        """
         readout = self._read_state_db()
         if readout is None:
-            if self._last_state is not None and self._last_state.operations.goal_count:
-                raise RuntimeError("state.db goal state disappeared or became unsafe")
+            last = self._last_state.operations if self._last_state is not None else None
+            if last is not None and (
+                last.goal_count or last.delegation_count or last.state_db_schema_version
+            ):
+                raise RuntimeError("state.db operations data disappeared or became unsafe")
             return operations
-        return operations.model_copy(update=readout.goal_update)
+        db_path = self._paths.profile_path("state.db")
+        update = _state_db_update(readout.state, now=self._clock(), pid_exists=self._pid_exists)
+        update["state_db_size_bytes"] = _file_size(db_path)
+        update["state_db_wal_size_bytes"] = _file_size(db_path.with_name(f"{db_path.name}-wal"))
+        update["delegation_live_log_count"] = _count_delegation_live_logs(
+            self._paths.shared_path("cache", "delegation", "live"),
+            self._paths.root_home,
+        )
+        return operations.model_copy(update=update)
 
     def _read_state_db(self) -> _StateDbReadout | None:
-        """Goal state and gateway ledgers from one state.db pass; None when absent.
+        """Operations tables and gateway ledgers from one state.db pass; None when absent.
 
         Opening state.db snapshots its WAL to a temp dir, on top of the snapshot
         HermesDB already takes, so the readout is redone only when state.db (or
-        its -wal) changes and is shared by both sources in a pass.
+        its -wal) changes and is shared by every source in a pass.
         """
         db_path = self._paths.profile_path("state.db")
         if (
@@ -1590,12 +1634,21 @@ class Collector:
         with _connect_readonly_sqlite(db_path) as conn:
             conn.row_factory = sqlite3.Row
             readout = _StateDbReadout(
-                goal_update=_goal_state_update(conn),
+                state=_read_state_db_tables(conn),
                 ledgers=_read_gateway_ledger_rows(conn),
             )
         if mtime is not None:
             self._state_db_cache = (mtime, readout)
         return readout
+
+    def _with_state_snapshots(self, operations: OperationsState) -> OperationsState:
+        return operations.model_copy(
+            update=_read_state_snapshots(
+                self._paths.shared_path("state-snapshots"),
+                self._paths.root_home,
+                now=self._clock(),
+            )
+        )
 
     def _collect_curator(self) -> CuratorRun:
         # Read the scheduler state and curator config once for the whole pass;

@@ -486,3 +486,32 @@ def test_deleted_cron_executions_db_reports_absent_without_failing_the_source(
         assert state.cron_executions.job_stats == []
     finally:
         collector.close()
+
+
+def test_corrupt_state_db_keeps_last_good_delegations(hermes_home: Path, sample_db: Path):
+    """A corrupt state.db must serve the last-good delegation table, not a blank one."""
+    c = Collector(hermes_home)
+    try:
+        good = c.collect().operations
+        assert good.delegation_count == 3
+        assert good.delegations
+
+        sample_db.write_bytes(b"this is not a sqlite database" * 64)
+
+        degraded = c.collect()
+        assert "operations" in degraded.health.failed_sources
+        assert degraded.operations.delegation_count == good.delegation_count
+        assert degraded.operations.delegations == good.delegations
+        assert degraded.operations.state_db_schema_version == good.state_db_schema_version
+    finally:
+        c.close()
+
+
+def test_removed_state_db_keeps_last_good_delegations(hermes_home: Path, sample_db: Path):
+    c = Collector(hermes_home)
+    try:
+        good = c.collect().operations
+        sample_db.unlink()
+        assert c.collect().operations.delegations == good.delegations
+    finally:
+        c.close()

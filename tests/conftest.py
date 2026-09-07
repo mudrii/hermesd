@@ -213,6 +213,76 @@ def _insert_gateway_ledger_rows(conn: sqlite3.Connection, now: float) -> None:
     )
 
 
+def create_async_delegations_table(conn: sqlite3.Connection) -> None:
+    """Create the async_delegations table shipped by newer hermes-agent builds."""
+    conn.executescript(
+        """
+        CREATE TABLE async_delegations (
+            delegation_id TEXT PRIMARY KEY,
+            origin_session TEXT,
+            origin_ui_session_id TEXT,
+            parent_session_id TEXT,
+            state TEXT NOT NULL,
+            dispatched_at REAL NOT NULL,
+            completed_at REAL,
+            updated_at REAL NOT NULL,
+            event_json TEXT,
+            result_json TEXT,
+            delivery_state TEXT NOT NULL DEFAULT 'pending',
+            delivery_attempts INTEGER,
+            delivered_at REAL,
+            owner_pid INTEGER,
+            owner_started_at INTEGER,
+            task_json TEXT,
+            delivery_claim TEXT,
+            delivery_claimed_at REAL,
+            origin_session_id TEXT
+        );
+        """
+    )
+
+
+def insert_delegation(conn: sqlite3.Connection, delegation_id: str, **overrides: object) -> None:
+    """Insert one async_delegations row, defaulting every optional column."""
+    row: dict[str, object] = {
+        "delegation_id": delegation_id,
+        "origin_session": "sess_001",
+        "origin_ui_session_id": None,
+        "parent_session_id": None,
+        "state": "completed",
+        "dispatched_at": 1775791400.0,
+        "completed_at": 1775791460.0,
+        "updated_at": 1775791460.0,
+        "event_json": None,
+        "result_json": json.dumps(
+            {"results": [{"status": "ok", "summary": "did the thing", "error": ""}]}
+        ),
+        "delivery_state": "delivered",
+        "delivery_attempts": 1,
+        "delivered_at": 1775791461.0,
+        "owner_pid": 4242,
+        "owner_started_at": 1775791399,
+        "task_json": json.dumps({"goal": "ship the feature"}),
+        "delivery_claim": None,
+        "delivery_claimed_at": None,
+        "origin_session_id": None,
+    }
+    row.update(overrides)
+    columns = ", ".join(row)
+    placeholders = ", ".join("?" for _ in row)
+    conn.execute(
+        f"INSERT INTO async_delegations ({columns}) VALUES ({placeholders})",
+        tuple(row.values()),
+    )
+
+
+def create_state_meta_table(conn: sqlite3.Connection, entries: dict[str, str]) -> None:
+    """Create state_meta if absent and seed it with the given key/value pairs."""
+    conn.execute("CREATE TABLE IF NOT EXISTS state_meta (key TEXT, value TEXT)")
+    for key, value in entries.items():
+        conn.execute("INSERT INTO state_meta VALUES (?, ?)", (key, value))
+
+
 @pytest.fixture
 def sample_db(hermes_home: Path) -> Path:
     """Create a state.db with sample sessions, messages and gateway ledgers."""
@@ -303,9 +373,92 @@ def sample_db(hermes_home: Path) -> Path:
                 None,
             ),
         )
+    create_async_delegations_table(conn)
+    insert_delegation(
+        conn,
+        "deleg_done",
+        dispatched_at=now - 300,
+        completed_at=now - 240,
+        updated_at=now - 240,
+    )
+    insert_delegation(
+        conn,
+        "deleg_failed",
+        state="error",
+        delivery_state="pending",
+        delivery_attempts=3,
+        dispatched_at=now - 200,
+        completed_at=now - 190,
+        updated_at=now - 190,
+        result_json=json.dumps(
+            {"results": [{"status": "error", "summary": "", "error": "boom in the worker"}]}
+        ),
+        task_json=json.dumps({"goal": "rebuild the index"}),
+    )
+    insert_delegation(
+        conn,
+        "deleg_running",
+        state="running",
+        delivery_state="pending",
+        completed_at=None,
+        delivered_at=None,
+        result_json=None,
+        dispatched_at=now - 60,
+        updated_at=now - 30,
+        task_json=json.dumps({"goal": "crawl the docs"}),
+    )
+    create_state_meta_table(
+        conn,
+        {
+            "last_auto_prune": str(now - 7200),
+            "last_auto_archive": str(now - 86400),
+            "db_file_generation": "3",
+            "fts_storage_version": "2",
+        },
+    )
     conn.commit()
     conn.close()
     return db_path
+
+
+@pytest.fixture
+def sample_state_snapshots(hermes_home: Path) -> Path:
+    """Create state-snapshots/ with one pre-update dir and one loose db file."""
+    root = hermes_home / "state-snapshots"
+    root.mkdir()
+    pre_update = root / "20260907-143350-pre-update"
+    pre_update.mkdir()
+    (pre_update / "state.db").write_bytes(b"x" * 2048)
+    (pre_update / "state.db-wal").write_bytes(b"y" * 512)
+    (root / "state-20260728-021943-pre-fts-opt.db").write_bytes(b"z" * 4096)
+    return root
+
+
+@pytest.fixture
+def sample_web_ui_stamp(hermes_home: Path) -> Path:
+    """Create web-ui-build-stamp.json next to the desktop build stamp."""
+    path = hermes_home / "web-ui-build-stamp.json"
+    path.write_text(
+        json.dumps(
+            {
+                "contentHash": "314422207985101a8473ac82fb0113c0565b2f04",
+                "builtAt": "2026-09-07T14:08:09.843444+00:00",
+            }
+        )
+    )
+    return path
+
+
+@pytest.fixture
+def sample_delegation_live_logs(hermes_home: Path) -> Path:
+    """Create cache/delegation/live/<id>/task-*.log subagent transcripts."""
+    live = hermes_home / "cache" / "delegation" / "live"
+    live.mkdir(parents=True)
+    for delegation_id in ("deleg_done", "deleg_running"):
+        run_dir = live / delegation_id
+        run_dir.mkdir()
+        (run_dir / "task-0.log").write_text("subagent transcript\n")
+    return live
 
 
 @pytest.fixture
@@ -684,6 +837,39 @@ def sample_processes(hermes_home: Path) -> Path:
                     "watcher_interval": 0,
                     "notify_on_complete": False,
                     "watch_patterns": [],
+                },
+            ]
+        )
+    )
+    return path
+
+
+@pytest.fixture
+def sample_spawn_ledger(hermes_home: Path) -> Path:
+    """Create a spawn-ledger.json with purpose/port/profile entries."""
+    path = hermes_home / "spawn-ledger.json"
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "pid": 4242,
+                    "create_time": 1775791440.0,
+                    "purpose": "dashboard",
+                    "install": "cc907ccae096",
+                    "argv": "hermes dashboard --port 9119 --no-open",
+                    "host": "127.0.0.1",
+                    "port": 9119,
+                    "profile": "coding",
+                },
+                {
+                    "pid": 4343,
+                    "create_time": 1775791450.0,
+                    "purpose": "mcp-helper",
+                    "install": "cc907ccae096",
+                    "argv": "node codegraph.js serve --mcp",
+                    "host": "",
+                    "port": None,
+                    "profile": None,
                 },
             ]
         )
@@ -1097,6 +1283,12 @@ def populated_hermes_home(
     sample_mcp_schema_cache,
     sample_skills_prompt_snapshot,
     sample_cron_executions_db,
+    # sample_spawn_ledger is deliberately NOT included: the ledger *replaces*
+    # processes.json in _collect_background_processes, so the two registries
+    # cannot both be exercised by one populated home.
+    sample_state_snapshots,
+    sample_web_ui_stamp,
+    sample_delegation_live_logs,
 ) -> Path:
     """A fully populated mock ~/.hermes."""
     return hermes_home
