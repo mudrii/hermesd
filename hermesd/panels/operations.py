@@ -4,12 +4,12 @@ import time
 
 import rich.box
 from rich.console import Group, RenderableType
-from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import DashboardState
+from hermesd.panels.formatting import escape_terminal_text as escape
 from hermesd.theme import Theme
 
 
@@ -287,7 +287,10 @@ def _size_label(size_bytes: int) -> str:
 def _age_label(timestamp: float | None) -> str:
     if timestamp is None:
         return "—"
-    age = max(0, int(time.time() - timestamp))
+    try:
+        age = max(0, int(time.time() - timestamp))
+    except (OverflowError, OSError, ValueError):
+        return "—"
     if age < 60:
         return f"{age}s"
     if age < 3600:

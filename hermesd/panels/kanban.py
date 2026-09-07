@@ -4,12 +4,13 @@ import time
 
 import rich.box
 from rich.console import Group, RenderableType
-from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import DashboardState, KanbanTaskSummary
+from hermesd.panels.formatting import escape_terminal_text as escape
+from hermesd.panels.formatting import sanitize_terminal_text
 from hermesd.theme import Theme
 
 
@@ -33,7 +34,10 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             lines.append("  Boards: ", style=theme.ui_label)
             lines.append(f"{kanban.board_count}", style=theme.banner_text)
             if kanban.current_board:
-                lines.append(f" current={kanban.current_board}", style=theme.banner_dim)
+                lines.append(
+                    f" current={sanitize_terminal_text(kanban.current_board)}",
+                    style=theme.banner_dim,
+                )
             lines.append("\n")
         if kanban.stale_claim_count:
             lines.append("  Stale Claims: ", style=theme.ui_label)
@@ -45,7 +49,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         )
         lines.append("\n")
         for status, count in sorted(kanban.status_counts.items())[:4]:
-            lines.append(f"  {status}: ", style=theme.ui_label)
+            lines.append(f"  {sanitize_terminal_text(status)}: ", style=theme.ui_label)
             lines.append(f"{count}", style=theme.banner_text)
     return Panel(
         lines,
@@ -238,7 +242,7 @@ def _task_metadata_table(tasks: list[KanbanTaskSummary], theme: Theme) -> Table 
         table.add_row(
             escape(task.task_id),
             escape(task.branch_name) if task.branch_name else "—",
-            str(task.completed_at) if task.completed_at else "—",
+            _age_label(task.completed_at),
             escape(task.workspace_path) if task.workspace_path else "—",
             escape(task.goal_mode) if task.goal_mode else "—",
             escape(task.current_step_key) if task.current_step_key else "—",

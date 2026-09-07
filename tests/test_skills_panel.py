@@ -229,23 +229,26 @@ def test_skills_detail_shows_integrations_sections():
 
 def test_skills_detail_scroll_offset():
     skills = [
-        SkillInfo(name=f"skill-{i}", category="cat", description=f"Desc {i}") for i in range(20)
+        SkillInfo(name=f"skill-{i}", category="cat", description=f"Desc {i}") for i in range(30)
     ]
     state = DashboardState(
         skills_memory=SkillsMemory(
-            skill_count=20,
+            skill_count=30,
             skill_categories=1,
             providers=[],
             skills=skills,
         ),
     )
-    # Scroll to offset 5
+    # Scroll to offset 5 (the window is 20 rows, so 30 skills leave room)
     panel = render_panel(7, state, Theme(), detail=True, scroll_offset=5)
     text = render_to_str(panel, width=100, no_color=True)
     # Should show "↑" indicator for scrolled content
     assert "↑" in text
-    # First visible should be skill-5
-    assert "skill-5" in text
+    # Names sort lexicographically, so offset 5 starts at "skill-13";
+    # the first rows (skill-0, skill-1, skill-10...) are scrolled off.
+    assert "skill-13" in text
+    assert "skill-0" not in text
+    assert "skill-12" not in text
 
 
 def test_skills_detail_scroll_offset_zero():

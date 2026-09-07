@@ -27,6 +27,9 @@ from hermesd.theme import Theme, load_theme
 
 _LOG_VIEWS = ("agent", "gateway", "errors", "cron")
 _DOTS_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+# Fail-safe for the input thread: transient OSError/termios errors are retried,
+# but this many consecutive failures mean the terminal is unrecoverable.
+_MAX_CONSECUTIVE_INPUT_FAILURES = 5
 _PANEL_NUMBERS = tuple(sorted(PANEL_NAMES))
 
 
@@ -200,6 +203,7 @@ class DashboardApp:
             profile_mode_label=profile_mode_label,
         )
         self._running = threading.Event()
+        self._stop_requested = threading.Event()
         self._force_refresh = threading.Event()
         # Guards collector/search -> render shared state: _state, _theme,
         # _input_error, _message_search_inflight.
@@ -217,6 +221,7 @@ class DashboardApp:
         self._console = Console(force_terminal=not no_color, no_color=no_color)
 
     def run(self) -> None:
+        self._stop_requested.clear()
         self._running.set()
 
         # Install handlers before the first collect so Ctrl+C during a slow
@@ -237,7 +242,8 @@ class DashboardApp:
                 self._build_layout(), console=self._console, refresh_per_second=2, screen=True
             ) as live:
                 while self._running.is_set():
-                    self._running.wait(0.5)
+                    if self._stop_requested.wait(0.5):
+                        break
                     if not self._running.is_set():
                         break
                     self._spinner_idx = (self._spinner_idx + 1) % len(_DOTS_FRAMES)
@@ -260,7 +266,8 @@ class DashboardApp:
         original_view = self._snapshot_view_state()
         try:
             if panel_num is not None:
-                self._view.enter_detail(panel_num)
+                with self._view_lock:
+                    self._view.enter_detail(panel_num)
             with snapshot_console.capture() as capture:
                 snapshot_console.print(self._build_layout(console=snapshot_console))
             return capture.get()
@@ -336,17 +343,29 @@ class DashboardApp:
     def close(self) -> None:
         self._closed.set()
         self._running.clear()
+        self._stop_requested.set()
         self._force_refresh.set()
         with self._lock:
             self._message_search_inflight = ""
         current_thread = threading.current_thread()
-        for thread in (self._collector_thread, self._input_thread, self._message_search_thread):
+        search_thread = self._message_search_thread
+        if (
+            search_thread is not None
+            and search_thread is not current_thread
+            and search_thread.is_alive()
+        ):
+            # Abort any in-flight SQLite search so the worker exits promptly,
+            # then join it before the connection is closed underneath it.
+            self._collector.interrupt_searches()
+            search_thread.join(timeout=5.0)
+        for thread in (self._collector_thread, self._input_thread):
             if thread is not None and thread is not current_thread and thread.is_alive():
                 thread.join(timeout=1.0)
         self._collector.close()
 
     def _signal_handler(self, sig: int, frame: FrameType | None) -> None:
         self._running.clear()
+        self._stop_requested.set()
         self._force_refresh.set()
 
     def _collector_loop(self) -> None:
@@ -372,33 +391,65 @@ class DashboardApp:
 
         fd = sys.stdin.fileno()
         old_settings: _TermiosSettings | None = None
+        failures = 0
+        pending = b""
         try:
             old_settings = termios.tcgetattr(fd)
             tty.setcbreak(fd)
             while self._running.is_set():
-                if not select.select([fd], [], [], 0.25)[0]:
-                    continue
-                data = _os.read(fd, 64)
-                if not data:
-                    break
-                action = self._handle_input_data(data)
-                if action == "quit":
-                    self._running.clear()
-                    break
+                try:
+                    if not select.select([fd], [], [], 0.25)[0]:
+                        if pending == b"\x1b":
+                            self.handle_key("\x1b")
+                            pending = b""
+                        failures = 0
+                        continue
+                    data = _os.read(fd, 64)
+                    if not data:
+                        break
+                    action, pending = self._handle_input_data(data, pending)
+                    failures = 0
+                    if action == "quit":
+                        self._running.clear()
+                        self._stop_requested.set()
+                        break
+                except Exception as exc:
+                    # Transient termios/select/read errors must not kill the
+                    # app: restore the terminal and keep polling. Only a run
+                    # of consecutive failures is treated as unrecoverable.
+                    failures += 1
+                    with self._lock:
+                        self._input_error = f"input error: {exc}"
+                    if failures >= _MAX_CONSECUTIVE_INPUT_FAILURES:
+                        self._running.clear()
+                        self._stop_requested.set()
+                        break
+                    try:
+                        if old_settings is not None:
+                            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                        tty.setcbreak(fd)
+                    except Exception as restore_exc:
+                        with self._lock:
+                            self._input_error = f"input error: {restore_exc}"
+                        self._running.clear()
+                        self._stop_requested.set()
+                        break
         except Exception as exc:
             with self._lock:
                 self._input_error = f"input error: {exc}"
             self._running.clear()
+            self._stop_requested.set()
         finally:
             if old_settings is not None:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
-    def _handle_input_data(self, data: bytes) -> str | None:
-        for key in _decode_input_keys(data):
+    def _handle_input_data(self, data: bytes, pending: bytes = b"") -> tuple[str | None, bytes]:
+        keys, remainder = _decode_input_keys_with_remainder(pending + data)
+        for key in keys:
             action = self.handle_key(key)
             if action is not None:
-                return action
-        return None
+                return action, b""
+        return None, remainder
 
     def _set_state(self, state: DashboardState) -> None:
         with self._lock:
@@ -607,6 +658,7 @@ class DashboardApp:
                 filter_query=filter_query,
                 filter_edit_mode=filter_edit_mode,
                 session_sort=session_sort,
+                log_sub_view=log_sub_view,
             )
         )
         return layout
@@ -705,6 +757,7 @@ class DashboardApp:
         filter_query: str | None = None,
         filter_edit_mode: bool | None = None,
         session_sort: str | None = None,
+        log_sub_view: str | None = None,
     ) -> Text:
         active_theme = theme or self._theme
         if input_error is None:
@@ -718,6 +771,7 @@ class DashboardApp:
             or filter_query is None
             or filter_edit_mode is None
             or session_sort is None
+            or log_sub_view is None
         ):
             with self._view_lock:
                 mode = self._view.mode if view_mode is None else view_mode
@@ -727,20 +781,21 @@ class DashboardApp:
                     self._view.filter_edit_mode if filter_edit_mode is None else filter_edit_mode
                 )
                 sort_mode = self._view.session_sort if session_sort is None else session_sort
+                sub_view = self._view.log_sub_view if log_sub_view is None else log_sub_view
         else:
             mode = view_mode
             panel = detail_panel
             query = filter_query
             editing = filter_edit_mode
             sort_mode = session_sort
+            sub_view = log_sub_view
         t = Text(style=f"on {active_theme.status_bar_bg}")
         if mode == "overview":
             self._append_overview_footer_actions(t, active_theme)
         else:
             scrollable = (
                 panel is not None
-                and _detail_max_scroll_offset(panel, state, self._view.log_sub_view, query)
-                is not None
+                and _detail_max_scroll_offset(panel, state, sub_view, query) is not None
             )
             self._append_detail_footer_actions(
                 t,
@@ -930,6 +985,19 @@ def _panel_shortcut_label() -> str:
 
 
 def _decode_input_keys(data: bytes) -> list[str]:
+    keys, remainder = _decode_input_keys_with_remainder(data)
+    if remainder:
+        keys.append(remainder.decode("utf-8", errors="replace"))
+    return keys
+
+
+def _decode_input_keys_with_remainder(data: bytes) -> tuple[list[str], bytes]:
+    """Decode raw input into keys plus any incomplete trailing CSI sequence.
+
+    A partial escape sequence (e.g. "\\x1b[" split across the 64-byte bulk
+    read boundary) is returned as the remainder so the caller can prepend it
+    to the next read instead of mangling the terminator byte into a keypress.
+    """
     text = data.decode("utf-8", errors="replace")
     keys: list[str] = []
     index = 0
@@ -942,9 +1010,7 @@ def _decode_input_keys(data: bytes) -> list[str]:
 
         next_index = index + 1
         if next_index >= len(text):
-            keys.append("\x1b")
-            index = next_index
-            continue
+            return keys, b"\x1b"
         if text[next_index] != "[":
             keys.append("\x1b")
             index = next_index
@@ -953,11 +1019,13 @@ def _decode_input_keys(data: bytes) -> list[str]:
         end = next_index + 1
         while end < len(text) and not ("@" <= text[end] <= "~"):
             end += 1
-        if end < len(text):
-            end += 1
+        if end >= len(text):
+            # Incomplete CSI sequence: hold it back for the next read.
+            return keys, text[index:].encode("utf-8", errors="replace")
+        end += 1
         keys.append(text[index:end])
         index = end
-    return keys
+    return keys, b""
 
 
 def _detail_max_scroll_offset(
@@ -976,7 +1044,9 @@ def _detail_max_scroll_offset(
 
         return max_detail_scroll_offset(state, log_sub_view, filter_query)
     if panel_num == _SKILLS_PANEL_NUM:
-        return max(0, len(state.skills_memory.skills) - 1)
+        from hermesd.panels.overview import max_skills_scroll_offset
+
+        return max_skills_scroll_offset(state)
     return None
 
 

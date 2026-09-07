@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import rich.box
 from rich.console import Group, RenderableType
-from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import CuratorRun, DashboardState
+from hermesd.panels.formatting import escape_terminal_text as escape
 from hermesd.theme import Theme
 
 _TITLE = "\\[13] Curator"
@@ -38,7 +38,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             lines.append("  No curation runs", style=theme.banner_dim)
     else:
         lines.append("  Last run: ", style=theme.ui_label)
-        lines.append(f"{escape(cur.stamp)}\n", style=theme.banner_text)
+        lines.append(f"{escape(cur.stamp) if cur.stamp else '—'}\n", style=theme.banner_text)
         lines.append("  Skills: ", style=theme.ui_label)
         lines.append(f"{_delta_label(cur)}\n", style=theme.banner_text)
         lines.append("  Archived ", style=theme.ui_label)

@@ -2,12 +2,16 @@
   description = "hermesd — TUI monitoring dashboard for Hermes AI agent";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
+    nixpkgs.url = "github:NixOS/nixpkgs/c043004d1c6985732bcc1cbc5a9c9aecbbb4e0f0";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs = { self, nixpkgs }:
+    nixpkgs.lib.genAttrs [
+      "aarch64-darwin"
+      "aarch64-linux"
+      "x86_64-darwin"
+      "x86_64-linux"
+    ] (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
         python = pkgs.python311;
@@ -32,7 +36,6 @@
             description = "TUI monitoring dashboard for Hermes AI agent";
             homepage = "https://github.com/mudrii/hermesd";
             license = licenses.mit;
-            maintainers = [ ];
             mainProgram = "hermesd";
           };
         };

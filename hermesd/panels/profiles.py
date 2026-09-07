@@ -5,12 +5,13 @@ from datetime import datetime
 
 import rich.box
 from rich.console import Group
-from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import DashboardState
+from hermesd.panels.formatting import escape_terminal_text as escape
+from hermesd.panels.formatting import sanitize_terminal_text
 from hermesd.theme import Theme
 
 
@@ -28,7 +29,7 @@ def render_profiles(
 def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines = Text()
     lines.append("  Source: ", style=theme.ui_label)
-    lines.append(state.profile_mode_label, style=theme.ui_accent)
+    lines.append(sanitize_terminal_text(state.profile_mode_label), style=theme.ui_accent)
     lines.append("\n")
     lines.append("  Profiles: ", style=theme.ui_label)
     lines.append(f"{state.profiles.profile_count} discovered", style=theme.banner_text)
@@ -60,7 +61,7 @@ def _render_detail(state: DashboardState, theme: Theme, profile_view_index: int)
 
     header = Text()
     header.append("Selected source: ", style=theme.ui_label)
-    header.append(state.profile_mode_label, style=theme.ui_accent)
+    header.append(sanitize_terminal_text(state.profile_mode_label), style=theme.ui_accent)
     header.append("  ")
     header.append("p cycle", style=theme.banner_dim)
     header.append("\n")
@@ -86,11 +87,11 @@ def _render_detail(state: DashboardState, theme: Theme, profile_view_index: int)
 
     excerpt = Text()
     excerpt.append("\nViewed profile: ", style=theme.ui_label)
-    excerpt.append(viewed_profile.name, style=theme.ui_accent)
+    excerpt.append(sanitize_terminal_text(viewed_profile.name), style=theme.ui_accent)
     excerpt.append("\n")
     if viewed_profile.soul_excerpt:
         excerpt.append("SOUL: ", style=theme.ui_label)
-        excerpt.append(viewed_profile.soul_excerpt, style=theme.banner_text)
+        excerpt.append(sanitize_terminal_text(viewed_profile.soul_excerpt), style=theme.banner_text)
     else:
         excerpt.append("SOUL: ", style=theme.ui_label)
         excerpt.append("—", style=theme.banner_dim)
@@ -108,7 +109,10 @@ def _render_detail(state: DashboardState, theme: Theme, profile_view_index: int)
 def _format_timestamp(value: float | None) -> str:
     if value is None or value <= 0:
         return "—"
-    formatted = datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M")
+    try:
+        formatted = datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return "—"
     if value > time.time() + 60:
         return f"{formatted} (future)"
     return formatted

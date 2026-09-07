@@ -4,13 +4,19 @@ from typing import TypedDict
 
 import rich.box
 from rich.console import Group, RenderableType
-from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import DashboardState, SessionInfo
-from hermesd.panels.formatting import fmt_tokens, fmt_usd
+from hermesd.panels.formatting import (
+    escape_terminal_text as escape,
+)
+from hermesd.panels.formatting import (
+    fmt_tokens,
+    fmt_usd,
+    sanitize_terminal_text,
+)
 from hermesd.theme import Theme
 
 
@@ -31,6 +37,7 @@ _EXACT_SESSION_FILTER_FIELDS = {
 }
 _ACTIVE_TRUE_VALUES = {"1", "true", "yes", "active"}
 _ACTIVE_FALSE_VALUES = {"0", "false", "no", "inactive"}
+_DETAIL_MAX_SESSION_ROWS = 50
 
 
 def render_sessions(
@@ -56,8 +63,8 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append(f"   {total_msgs} msgs  {total_tc} tools\n", style=theme.banner_text)
     for s in state.sessions[:4]:
         sid_short = s.session_id[-6:] if len(s.session_id) > 6 else s.session_id
-        lines.append(f"  #{sid_short}", style=theme.session_label)
-        lines.append(f" {s.source:<4}", style=theme.ui_label)
+        lines.append(f"  #{sanitize_terminal_text(sid_short)}", style=theme.session_label)
+        lines.append(f" {sanitize_terminal_text(s.source):<4}", style=theme.ui_label)
         if s.is_active:
             lines.append(" ● ", style=f"bold {theme.ui_ok}")
         else:
@@ -99,11 +106,11 @@ def _render_detail(
     table.add_column("Out Tok", justify="right", style=theme.banner_text)
     table.add_column("Cost", justify="right", style=theme.ui_accent)
 
-    for s in sessions:
+    for s in sessions[:_DETAIL_MAX_SESSION_ROWS]:
         active = Text("● ", style=f"bold {theme.ui_ok}") if s.is_active else Text("  ")
         sid = Text()
         sid.append_text(active)
-        sid.append(s.session_id[-8:])
+        sid.append(sanitize_terminal_text(s.session_id[-8:]))
         table.add_row(
             sid,
             escape(s.source),
@@ -122,13 +129,13 @@ def _render_detail(
     header = Text()
     if filter_query:
         header.append("Filter: ", style=theme.ui_label)
-        header.append(filter_query, style=theme.ui_accent)
+        header.append(sanitize_terminal_text(filter_query), style=theme.ui_accent)
         header.append(f"  ({len(sessions)}/{len(state.sessions)} matches)", style=theme.banner_dim)
     if filter_query or session_sort != "recent":
         header.append("  ", style=theme.banner_dim)
     if session_sort != "recent":
         header.append("Sort: ", style=theme.ui_label)
-        header.append(session_sort, style=theme.ui_accent)
+        header.append(sanitize_terminal_text(session_sort), style=theme.ui_accent)
     if filter_query or session_sort != "recent":
         header.append("\n\n", style=theme.banner_dim)
 
@@ -147,6 +154,13 @@ def _render_detail(
             table if sessions else Text("  No matching sessions\n", style=theme.banner_dim),
         ]
     )
+    if len(sessions) > _DETAIL_MAX_SESSION_ROWS:
+        sections.append(
+            Text(
+                f"  … and {len(sessions) - _DETAIL_MAX_SESSION_ROWS} more\n",
+                style=theme.banner_dim,
+            )
+        )
 
     return Panel(
         Group(*sections),

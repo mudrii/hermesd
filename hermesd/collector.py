@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import math
 import os
 import re
 import shlex
-import shutil
 import sqlite3
 import subprocess
-import tempfile
 import threading
 import time
 import tomllib
@@ -21,7 +20,7 @@ from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import yaml
 
-from hermesd.db import HermesDB
+from hermesd.db import HermesDB, snapshot_wal_database
 from hermesd.file_cache import JsonMapping, JsonObjectList, LastGoodFileCache
 from hermesd.models import (
     AUTHORITATIVE_COST_STATUSES,
@@ -120,7 +119,7 @@ class Collector:
         pid_exists: Callable[[int], bool] | None = None,
         profile_name: str | None = None,
         log_tail_bytes: int = 32768,
-        db_factory: Callable[[Path], HermesDB] = HermesDB,
+        db_factory: Callable[[Path], HermesDB] | None = None,
         file_cache: LastGoodFileCache | None = None,
         clock: Callable[[], float] = time.time,
         env: Mapping[str, str] | None = None,
@@ -131,19 +130,35 @@ class Collector:
         self._pid_exists = pid_exists or _pid_exists
         self._log_tail_bytes = max(1024, log_tail_bytes)
         self._paths = HermesPaths(hermes_home, profile_name)
+        if db_factory is None:
+            # Wire allowed_root so profile db targets are re-validated against
+            # symlink swaps on every (re)connect, not just at startup.
+            db_factory = functools.partial(HermesDB, allowed_root=self._paths.root_home)
         self._db_factory = db_factory
         self._db = db_factory(self._paths.profile_path("state.db"))
         self._env = env if env is not None else os.environ
         self._clock = clock
-        self._available_tools_cache_mtime: float | None = None
+        self._available_tools_cache_key: (
+            tuple[
+                tuple[str, int, int] | None,
+                tuple[tuple[str, int, int] | None, ...],
+            ]
+            | None
+        ) = None
         self._available_tools_cache_value: tuple[int, list[str]] = (0, [])
         self._last_state: DashboardState | None = None
         self._last_session_rows: list[dict[str, Any]] = []
         self._log_stream_cache: dict[str, tuple[float | None, int, LogStream]] = {}
         self._cron_excerpt_cache: dict[
-            str, tuple[float | None, tuple[str, bool, str, float | None]]
+            str,
+            tuple[
+                tuple[str, int, int] | tuple[str, float | None],
+                tuple[str, bool, str, float | None],
+            ],
         ] = {}
         self._profile_count_cache: dict[str, tuple[float | None, int]] = {}
+        self._kanban_board_cache: dict[str, KanbanBoardSummary] = {}
+        self._kanban_board_errors: list[str] = []
         self._derived_rows: list[dict[str, Any]] | None = None
         self._derived_date = ""
         self._derived_cache: dict[str, Any] = {}
@@ -308,12 +323,15 @@ class Collector:
             lambda: self._collect_channels(gateway),
             ChannelDirectoryState,
         )
+        self._kanban_board_errors = []
         kanban = safe_collect(
             lambda: self._last_state.kanban if self._last_state is not None else KanbanState(),
             "kanban",
             self._collect_kanban,
             KanbanState,
         )
+        if self._kanban_board_errors:
+            health.mark_failed("kanban", "; ".join(self._kanban_board_errors))
         operations = safe_collect(
             lambda: (
                 self._last_state.operations if self._last_state is not None else OperationsState()
@@ -658,8 +676,8 @@ class Collector:
         rows = self._session_rows_or_read(rows)
         return TokenAnalytics(
             windows=[
-                _summarize_window("7d", rows, days=7),
-                _summarize_window("30d", rows, days=30),
+                _summarize_window("7d", rows, days=7, now=self._clock()),
+                _summarize_window("30d", rows, days=30, now=self._clock()),
             ],
             by_model=_summarize_breakdown(rows, key_name="model"),
             by_provider=_summarize_breakdown(rows, key_name="billing_provider"),
@@ -723,31 +741,47 @@ class Collector:
         ]
 
     def _collect_available_tools(self) -> tuple[int, list[str]]:
-        sessions_index = self._paths.profile_path("sessions", "sessions.json")
-        sessions_mtime = _mtime(sessions_index)
-        if sessions_mtime is not None and self._available_tools_cache_mtime == sessions_mtime:
-            return self._available_tools_cache_value
+        sessions_root = self._paths.profile_path("sessions")
+        sessions_index = sessions_root / "sessions.json"
+        if sessions_index.is_symlink() or not _path_resolves_under(sessions_index, sessions_root):
+            raise OSError("Refusing unsafe sessions index")
+        sessions_signature = _file_signature(sessions_index)
         sessions_data = self._read_json_cached(sessions_index)
+        session_files: list[Path] = []
+        for entry in sessions_data.values():
+            if not isinstance(entry, dict) or "session_id" not in entry:
+                continue
+            session_file = sessions_root / f"session_{entry['session_id']}.json"
+            if session_file.is_symlink() or not _path_resolves_under(session_file, sessions_root):
+                raise OSError(f"Refusing unsafe session file: {session_file.name}")
+            session_files.append(session_file)
+        # Tool changes inside individual session_<sid>.json files must
+        # invalidate the cache even when the index itself is not rewritten;
+        # track each path with nanosecond mtime and size (not just the max) so
+        # equal/coarse mtimes and filename swaps still invalidate correctly.
+        session_file_signatures = tuple(
+            sorted((_file_signature(path) for path in session_files), key=str)
+        )
+        cache_key = (sessions_signature, session_file_signatures)
+        if sessions_signature is not None and self._available_tools_cache_key == cache_key:
+            return self._available_tools_cache_value
         if not sessions_data:
-            self._available_tools_cache_mtime = sessions_mtime
+            self._available_tools_cache_key = cache_key
             self._available_tools_cache_value = (0, [])
             return 0, []
         names: set[str] = set()
-        for entry in sessions_data.values():
-            if isinstance(entry, dict) and "session_id" in entry:
-                sid = entry["session_id"]
-                session_file = self._paths.profile_path("sessions", f"session_{sid}.json")
-                data = self._read_json_cached(session_file)
-                if isinstance(data, dict) and "tools" in data:
-                    for t in _as_list(data["tools"]):
-                        if isinstance(t, dict):
-                            name = t.get("function", {}).get("name") or t.get("name", "")
-                        else:
-                            name = str(t)
-                        if name:
-                            names.add(name)
+        for session_file in session_files:
+            data = self._read_json_cached(session_file)
+            if isinstance(data, dict) and "tools" in data:
+                for t in _as_list(data["tools"]):
+                    if isinstance(t, dict):
+                        name = t.get("function", {}).get("name") or t.get("name", "")
+                    else:
+                        name = str(t)
+                    if name:
+                        names.add(name)
         tool_names = sorted(names)
-        self._available_tools_cache_mtime = sessions_mtime
+        self._available_tools_cache_key = cache_key
         self._available_tools_cache_value = (len(tool_names), tool_names)
         return self._available_tools_cache_value
 
@@ -869,7 +903,7 @@ class Collector:
         if tick_path.exists():
             try:
                 mtime = tick_path.stat().st_mtime
-                last_tick = self._clock() - mtime
+                last_tick = max(0.0, self._clock() - mtime)
             except OSError:
                 pass
 
@@ -881,7 +915,7 @@ class Collector:
             for j in _as_list(data.get("jobs")):
                 if not isinstance(j, dict):
                     continue
-                state = j.get("state", "")
+                state = str(j.get("state") or "")
                 if j.get("last_status") == "error" or j.get("last_error"):
                     error_count += 1
                 (
@@ -894,11 +928,12 @@ class Collector:
                     str(j.get("id") or ""),
                     self._log_tail_bytes,
                 )
+                last_status = j.get("last_status")
                 jobs.append(
                     CronJob(
-                        job_id=j.get("id", ""),
-                        name=j.get("name", ""),
-                        schedule_display=j.get("schedule_display", ""),
+                        job_id=str(j.get("id") or ""),
+                        name=str(j.get("name") or ""),
+                        schedule_display=str(j.get("schedule_display") or ""),
                         state=state,
                         enabled=j.get("enabled", True),
                         deliver=str(j.get("deliver") or ""),
@@ -910,8 +945,8 @@ class Collector:
                         latest_output_path=output_path,
                         latest_output_mtime=output_mtime,
                         silent_run=silent_run,
-                        next_run_at=j.get("next_run_at", ""),
-                        last_status=j.get("last_status"),
+                        next_run_at=str(j.get("next_run_at") or ""),
+                        last_status=str(last_status) if last_status is not None else None,
                         last_error=str(j.get("last_error") or ""),
                     )
                 )
@@ -1059,14 +1094,27 @@ class Collector:
                     or not _path_resolves_under(db_path, self._paths.root_home)
                 ):
                     continue
-                summary = _read_kanban_board_summary(
-                    db_path,
-                    slug=board_dir.name,
-                    current=board_dir.name == state.current_board,
-                    claim_ttl_seconds=state.claim_ttl_seconds,
-                )
-                if summary is not None:
-                    boards.append(summary)
+                try:
+                    summary = _read_kanban_board_summary(
+                        db_path,
+                        slug=board_dir.name,
+                        current=board_dir.name == state.current_board,
+                        claim_ttl_seconds=state.claim_ttl_seconds,
+                    )
+                except (sqlite3.Error, OSError) as exc:
+                    self._kanban_board_errors.append(
+                        f"{board_dir.name}: {_safe_exception_text(exc)}"
+                    )
+                    cached = self._kanban_board_cache.get(board_dir.name)
+                    if cached is not None:
+                        boards.append(
+                            cached.model_copy(
+                                update={"current": board_dir.name == state.current_board}
+                            )
+                        )
+                    continue
+                self._kanban_board_cache[board_dir.name] = summary
+                boards.append(summary)
         return state.model_copy(update={"board_count": len(boards), "boards": boards})
 
     def _collect_operations(
@@ -1792,25 +1840,37 @@ class Collector:
     ) -> tuple[str, bool, str, float | None]:
         cache_key = f"{output_root}:{job_id}"
         cached = self._cron_excerpt_cache.get(cache_key)
+        latest = _latest_cron_output_file(output_root, job_id, stop_at=self._paths.root_home)
+        if latest is None:
+            if cached is not None:
+                return cached[1]
+            return "", False, "", None
+        output_signature: tuple[str, int, int] | tuple[str, float | None]
+        output_signature = _file_signature(latest) or (latest.name, _mtime(latest))
+        if cached is not None and cached[0] == output_signature:
+            return cached[1]
         excerpt = _latest_cron_output_excerpt(
             output_root,
             job_id,
             max_bytes,
             stop_at=self._paths.root_home,
         )
-        _output_excerpt, _silent_run, output_path, output_mtime = excerpt
-        if output_path and cached is not None and cached[0] == output_mtime:
-            return cached[1]
-        if not output_path and cached is not None:
-            return cached[1]
+        if not excerpt[2]:
+            if cached is not None:
+                return cached[1]
+            return "", False, "", None
         redacted = (
             _redact_secret_text(excerpt[0]),
             excerpt[1],
             excerpt[2],
             excerpt[3],
         )
-        if output_path:
-            self._cron_excerpt_cache[cache_key] = (output_mtime, redacted)
+        # Key on the mtime of the file actually read (excerpt[3]), not the
+        # earlier independent directory scan, so key and content never diverge
+        # when a newer output lands between the two scans.
+        actual_path = output_root / job_id / excerpt[2]
+        actual_signature = _file_signature(actual_path) or (excerpt[2], excerpt[3])
+        self._cron_excerpt_cache[cache_key] = (actual_signature, redacted)
         return redacted
 
     def _collect_version_behind(self) -> int:
@@ -1825,6 +1885,10 @@ class Collector:
         if not skin:
             return "default"
         return normalize_skin_name(str(skin))
+
+    def interrupt_searches(self) -> None:
+        """Abort any in-flight SQLite query (e.g. a long message search)."""
+        self._db.interrupt()
 
     def close(self) -> None:
         with self._lock:
@@ -1876,8 +1940,14 @@ def _summarize_tokens(
     )
 
 
-def _summarize_window(label: str, rows: list[dict[str, Any]], days: int) -> TokenWindowSummary:
-    cutoff = time.time() - days * 86400
+def _summarize_window(
+    label: str,
+    rows: list[dict[str, Any]],
+    days: int,
+    *,
+    now: float | None = None,
+) -> TokenWindowSummary:
+    cutoff = (now if now is not None else time.time()) - days * 86400
     filtered = [row for row in rows if (row.get("started_at") or 0.0) >= cutoff]
     totals = _summarize_tokens(filtered)
     prompt_tokens = totals.input_tokens + totals.cache_read_tokens
@@ -1932,6 +2002,7 @@ _COST_PER_M = {
     "input": 2.50,  # GPT-4o / Claude Sonnet class
     "output": 10.00,
     "cache_read": 0.30,  # typical prompt caching discount
+    "cache_write": 3.125,  # input x 1.25, typical cache write premium
     "reasoning": 10.00,
 }
 
@@ -1941,15 +2012,18 @@ def _estimate_cost(
     output_tokens: int,
     cache_read_tokens: int,
     reasoning_tokens: int,
+    cache_write_tokens: int = 0,
 ) -> float:
     input_tokens = _bounded_token_count(input_tokens)
     output_tokens = _bounded_token_count(output_tokens)
     cache_read_tokens = _bounded_token_count(cache_read_tokens)
+    cache_write_tokens = _bounded_token_count(cache_write_tokens)
     reasoning_tokens = _bounded_token_count(reasoning_tokens)
     return (
         input_tokens * _COST_PER_M["input"]
         + output_tokens * _COST_PER_M["output"]
         + cache_read_tokens * _COST_PER_M["cache_read"]
+        + cache_write_tokens * _COST_PER_M["cache_write"]
         + reasoning_tokens * _COST_PER_M["reasoning"]
     ) / 1_000_000
 
@@ -1973,6 +2047,7 @@ def _resolved_session_cost(row: dict[str, Any]) -> float:
         row.get("output_tokens") or 0,
         row.get("cache_read_tokens") or 0,
         row.get("reasoning_tokens") or 0,
+        row.get("cache_write_tokens") or 0,
     )
 
 
@@ -2146,6 +2221,14 @@ def _mtime(path: Path) -> float | None:
         return path.stat().st_mtime
     except OSError:
         return None
+
+
+def _file_signature(path: Path) -> tuple[str, int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return str(path), stat.st_mtime_ns, stat.st_size
 
 
 def _safe_mtime(path: Path) -> float:
@@ -2339,20 +2422,20 @@ def _delivery_target_label(directory: dict[str, Any], deliver: str) -> str:
     return deliver
 
 
-def _latest_cron_output_excerpt(
+def _latest_cron_output_file(
     output_root: Path,
     job_id: str,
-    max_bytes: int,
     *,
     stop_at: Path | None = None,
-) -> tuple[str, bool, str, float | None]:
+) -> Path | None:
+    """Locate the newest cron output file for job_id without reading it."""
     if not job_id:
-        return "", False, "", None
+        return None
     job_output_dir = output_root / job_id
     output_root_escaped = stop_at is not None and not _path_resolves_under(output_root, stop_at)
     job_output_dir_escaped = not _path_resolves_under(job_output_dir, output_root)
     if output_root_escaped or job_output_dir_escaped or not job_output_dir.is_dir():
-        return "", False, "", None
+        return None
     files = []
     for path in job_output_dir.iterdir():
         try:
@@ -2361,8 +2444,20 @@ def _latest_cron_output_excerpt(
         except OSError:
             continue
     if not files:
+        return None
+    return max(files, key=_safe_mtime)
+
+
+def _latest_cron_output_excerpt(
+    output_root: Path,
+    job_id: str,
+    max_bytes: int,
+    *,
+    stop_at: Path | None = None,
+) -> tuple[str, bool, str, float | None]:
+    latest = _latest_cron_output_file(output_root, job_id, stop_at=stop_at)
+    if latest is None:
         return "", False, "", None
-    latest = max(files, key=_safe_mtime)
     latest_mtime = _mtime(latest)
     try:
         lines = _read_tail_text(latest, max_bytes).splitlines()
@@ -2477,7 +2572,7 @@ def _read_kanban_board_summary(
     slug: str,
     current: bool,
     claim_ttl_seconds: int,
-) -> KanbanBoardSummary | None:
+) -> KanbanBoardSummary:
     with _connect_readonly_sqlite(db_path) as conn:
         conn.row_factory = sqlite3.Row
         return KanbanBoardSummary(
@@ -2799,17 +2894,9 @@ def _safe_or_absent_child_path(path: Path, root: Path) -> bool:
 @contextlib.contextmanager
 def _connect_readonly_sqlite(db_path: Path) -> Iterator[sqlite3.Connection]:
     conn: sqlite3.Connection | None = None
-    snapshot_dir: tempfile.TemporaryDirectory[str] | None = None
     if db_path.with_name(f"{db_path.name}-wal").exists():
-        snapshot_dir = tempfile.TemporaryDirectory(prefix="hermesd-kanban-")
-        snapshot_root = Path(snapshot_dir.name)
-        snapshot_db = snapshot_root / db_path.name
+        snapshot_dir, snapshot_db = snapshot_wal_database(db_path, prefix="hermesd-kanban-")
         try:
-            shutil.copy2(db_path, snapshot_db)
-            for suffix in ("-wal", "-shm"):
-                source = db_path.with_name(f"{db_path.name}{suffix}")
-                if source.exists() and _safe_child_path(source, db_path.parent):
-                    shutil.copy2(source, snapshot_root / source.name)
             conn = sqlite3.connect(f"{snapshot_db.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
             yield conn
             return
@@ -3043,7 +3130,7 @@ def _git_checkpoint_summary(repo_dir: Path) -> tuple[int, float | None, str]:
             check=False,
             timeout=2,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
         return 0, None, ""
 
     if count_result.returncode == 0:
@@ -3059,7 +3146,8 @@ def _git_checkpoint_summary(repo_dir: Path) -> tuple[int, float | None, str]:
             check=False,
             timeout=2,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        # A non-UTF-8 commit subject must not fail the whole checkpoints source.
         return commit_count, None, ""
 
     if log_result.returncode != 0:

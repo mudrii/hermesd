@@ -121,7 +121,7 @@ def test_db_file_deleted_marks_all_cached_reads_stale(tmp_path):
     db.close()
 
 
-def test_open_connection_serves_cached_sessions_when_source_file_disappears(tmp_path):
+def test_open_connection_marks_cached_sessions_stale_when_source_file_disappears(tmp_path):
     db_path = tmp_path / "state.db"
     _create_db(db_path)
     db = HermesDB(db_path)
@@ -130,7 +130,7 @@ def test_open_connection_serves_cached_sessions_when_source_file_disappears(tmp_
     db_path.unlink()
 
     assert db.read_sessions() == sessions
-    assert db.last_read_sessions_stale is False
+    assert db.last_read_sessions_stale is True
     db.close()
 
 
@@ -260,16 +260,15 @@ def test_message_search_reconnect_failure_resets_error_count(tmp_path):
     found = db.search_session_ids_by_message("used a tool")
     assert found == {"s1"}
 
-    # Kill the handle and remove the file so the reconnect attempt also fails.
+    # Kill the handle so search errors accumulate against the unchanged source.
     db._conn.close()
-    db_path.unlink()
 
-    # Each call serves cache while counting errors; the third hits the reconnect
-    # threshold, and because the file is gone the reconnect yields no connection,
-    # resetting the consecutive-error counter back to zero.
+    # Each call serves cache while counting errors. Remove the source before the
+    # third call so the reconnect attempt fails and resets the error count.
     for _ in range(2):
         assert db.search_session_ids_by_message("used a tool") == found
     assert db._consecutive_errors == 2
+    db_path.unlink()
     assert db.search_session_ids_by_message("used a tool") == found
     assert db._conn is None
     assert db._consecutive_errors == 0

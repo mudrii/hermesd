@@ -9,6 +9,8 @@ fail the read-only invariant.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import sqlite3
 from pathlib import Path
 
@@ -16,9 +18,9 @@ from hermesd.app import DashboardApp
 from hermesd.collector import Collector
 
 
-def _manifest(root: Path) -> dict[str, tuple[str, str, int, int]]:
-    """Map every entry's relative path to (kind, link_target, size_bytes, mtime_ns)."""
-    manifest: dict[str, tuple[str, str, int, int]] = {}
+def _manifest(root: Path) -> dict[str, tuple[str, str, int, int, str]]:
+    """Map entries to kind, link target, size, mtime, and regular-file digest."""
+    manifest: dict[str, tuple[str, str, int, int, str]] = {}
     for path in sorted(root.rglob("*")):
         stat = path.lstat()
         if path.is_symlink():
@@ -30,16 +32,32 @@ def _manifest(root: Path) -> dict[str, tuple[str, str, int, int]]:
         elif path.is_file():
             kind = "file"
             link_target = ""
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
         else:
             kind = "other"
             link_target = ""
+        if kind != "file":
+            digest = ""
         manifest[str(path.relative_to(root))] = (
             kind,
             link_target,
             stat.st_size,
             stat.st_mtime_ns,
+            digest,
         )
     return manifest
+
+
+def test_manifest_detects_same_size_content_change_with_restored_mtime(tmp_path: Path):
+    path = tmp_path / "state.txt"
+    path.write_bytes(b"before")
+    stat = path.stat()
+    before = _manifest(tmp_path)
+
+    path.write_bytes(b"after!")
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    assert _manifest(tmp_path) != before
 
 
 def test_collector_does_not_write_to_hermes_home(populated_hermes_home: Path):
@@ -51,6 +69,27 @@ def test_collector_does_not_write_to_hermes_home(populated_hermes_home: Path):
     c.close()
 
     assert _manifest(populated_hermes_home) == before
+
+
+def test_collect_does_not_mutate_hermes_home(populated_hermes_home: Path):
+    before = _file_mtimes(populated_hermes_home)
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+
+    try:
+        for _ in range(3):
+            c.collect()
+    finally:
+        c.close()
+
+    assert _file_mtimes(populated_hermes_home) == before
+
+
+def _file_mtimes(root: Path) -> dict[Path, int]:
+    return {
+        path.relative_to(root): path.stat().st_mtime_ns
+        for path in root.rglob("*")
+        if path.is_file()
+    }
 
 
 def test_snapshot_read_paths_do_not_write_to_hermes_home(populated_hermes_home: Path):

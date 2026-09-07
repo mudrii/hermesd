@@ -5,6 +5,7 @@ import os
 import threading
 from pathlib import Path
 
+import pytest
 import yaml
 
 from hermesd.file_cache import LastGoodFileCache
@@ -19,11 +20,11 @@ def test_cache_hit_reuses_value_until_mtime_changes(tmp_path):
     original = path.stat()
 
     path.write_text(json.dumps({"v": 99}))
-    os.utime(path, (original.st_atime, original.st_mtime))
+    os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
     assert cache.read_json_mapping(path) == {"v": 1}
 
     path.write_text(json.dumps({"v": 2}))
-    os.utime(path, (original.st_atime, original.st_mtime + 10))
+    os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns + 10_000_000_000))
     assert cache.read_json_mapping(path) == {"v": 2}
 
 
@@ -129,3 +130,16 @@ def test_file_cache_handles_concurrent_reads(tmp_path):
         thread.join()
 
     assert errors == []
+
+
+@pytest.mark.parametrize("kind", ["json", "yaml"])
+def test_invalid_utf8_preserves_last_good_value(tmp_path, kind):
+    cache = LastGoodFileCache()
+    path = tmp_path / f"data.{kind}"
+    path.write_text('{"value": 1}' if kind == "json" else "value: 1\n")
+    read = cache.read_json_mapping if kind == "json" else cache.read_yaml_mapping
+    assert read(path) == {"value": 1}
+
+    path.write_bytes(b"\xff")
+
+    assert read(path) == {"value": 1}

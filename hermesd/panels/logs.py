@@ -7,6 +7,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from hermesd.models import DashboardState, LogLine
+from hermesd.panels.formatting import sanitize_terminal_text
 from hermesd.theme import Theme
 
 
@@ -63,7 +64,7 @@ def render_logs(
 def _log_line_text(line: LogLine, theme: Theme) -> Text:
     t = Text()
     if line.timestamp:
-        t.append(f"  {line.timestamp} ", style=theme.banner_dim)
+        t.append(f"  {sanitize_terminal_text(line.timestamp)} ", style=theme.banner_dim)
     level_colors = {
         "INFO": theme.ui_ok,
         "WARNING": theme.ui_warn,
@@ -71,18 +72,27 @@ def _log_line_text(line: LogLine, theme: Theme) -> Text:
     }
     color = level_colors.get(line.level, theme.banner_text)
     if line.component:
-        t.append(f"{line.component} ", style=theme.ui_label)
+        t.append(f"{sanitize_terminal_text(line.component)} ", style=theme.ui_label)
     if line.level:
-        t.append(f"{line.level:<5} ", style=color)
+        t.append(f"{sanitize_terminal_text(line.level):<5} ", style=color)
     if line.session_id:
-        t.append(f"[{line.session_id}] ", style=theme.ui_accent)
-    t.append(line.message, style=theme.banner_text)
+        t.append(f"[{sanitize_terminal_text(line.session_id)}] ", style=theme.ui_accent)
+    t.append(sanitize_terminal_text(line.message), style=theme.banner_text)
     return t
+
+
+def _compact_lines(state: DashboardState) -> list[LogLine]:
+    """Recent agent-stream lines, falling back to the first non-empty stream."""
+    log_map = _log_stream_map(state)
+    lines = log_map.get("agent") or next(
+        (stream_lines for stream_lines in log_map.values() if stream_lines), []
+    )
+    return lines[-5:]
 
 
 def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines = Text()
-    recent_lines = _lines_for_stream(state, "agent")[-5:]
+    recent_lines = _compact_lines(state)
     if not recent_lines:
         lines.append("  No log lines", style=theme.banner_dim)
     for log_line in recent_lines:
@@ -125,7 +135,7 @@ def _render_detail(
     if filter_query:
         lines.append("\n")
         lines.append(" Filter: ", style=theme.ui_label)
-        lines.append(filter_query, style=theme.ui_accent)
+        lines.append(sanitize_terminal_text(filter_query), style=theme.ui_accent)
         lines.append(
             f"  ({len(log_lines)}/{len(unfiltered_lines)} matches)",
             style=theme.banner_dim,
@@ -227,7 +237,3 @@ def _log_stream_map(state: DashboardState) -> dict[str, list[LogLine]]:
         "errors": state.logs.error_lines,
         "cron": state.logs.cron_lines,
     }
-
-
-def _lines_for_stream(state: DashboardState, name: str) -> list[LogLine]:
-    return _log_stream_map(state).get(name, [])

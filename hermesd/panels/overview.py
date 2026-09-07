@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import rich.box
 from rich.console import Group, RenderableType
-from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import DashboardState
+from hermesd.panels.formatting import escape_terminal_text as escape
+from hermesd.panels.formatting import sanitize_terminal_text
 from hermesd.theme import Theme
+
+_DETAIL_VISIBLE_SKILL_ROWS = 20
+
+
+def max_skills_scroll_offset(state: DashboardState) -> int:
+    """Largest scroll offset that still shows a full skills window."""
+    return max(0, len(state.skills_memory.skills) - _DETAIL_VISIBLE_SKILL_ROWS)
 
 
 def render_overview(
@@ -36,7 +44,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         sym = "✓" if p.is_active else "✗"
         color = theme.ui_ok if p.is_active else theme.banner_dim
         lines.append(f"  {sym} ", style=color)
-        lines.append(f"{p.name} ", style=theme.banner_text)
+        lines.append(f"{sanitize_terminal_text(p.name)} ", style=theme.banner_text)
 
     return Panel(
         lines,
@@ -186,13 +194,15 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
                 rows.append((cat_label, short, desc))
 
         total = len(rows)
-        # Apply scroll — clamp offset
-        offset = min(scroll_offset, max(0, total - 1))
-        visible = rows[offset:]
+        # Apply scroll — clamp so the rendered page stays a full window
+        offset = min(scroll_offset, max(0, total - _DETAIL_VISIBLE_SKILL_ROWS))
+        visible = rows[offset : offset + _DETAIL_VISIBLE_SKILL_ROWS]
 
         skills_header = Text()
         scroll_hint = (
-            f" [{offset + 1}-{min(offset + len(visible), total)}/{total}]" if total > 20 else ""
+            f" [{offset + 1}-{min(offset + len(visible), total)}/{total}]"
+            if total > _DETAIL_VISIBLE_SKILL_ROWS
+            else ""
         )
         skills_header.append(
             f"\nSkills ({sm.skill_count} in {sm.skill_categories} categories){scroll_hint}  ",
@@ -214,9 +224,9 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
                 # First visible row is the "selected" one
                 style = f"bold {theme.ui_accent}"
                 skills_table.add_row(
-                    Text(cat_label, style=style),
-                    Text(short, style=style),
-                    Text(desc or "—", style=theme.banner_text),
+                    Text(sanitize_terminal_text(cat_label), style=style),
+                    Text(sanitize_terminal_text(short), style=style),
+                    Text(sanitize_terminal_text(desc) or "—", style=theme.banner_text),
                 )
             else:
                 skills_table.add_row(

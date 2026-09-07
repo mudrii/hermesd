@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import rich.box
 from rich.console import Group, RenderableType
-from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import DashboardState
-from hermesd.panels.formatting import fmt_iso_timestamp
+from hermesd.panels.formatting import (
+    escape_terminal_text as escape,
+)
+from hermesd.panels.formatting import (
+    fmt_iso_timestamp,
+    sanitize_terminal_text,
+)
 from hermesd.theme import Theme
 
 
@@ -32,15 +37,16 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         lines.append("Stopped", style=theme.banner_text)
 
     if gw.hermes_version:
-        lines.append(f"  v{gw.hermes_version}", style=theme.banner_dim)
-        if gw.updates_behind > 0:
-            lines.append(f" ({gw.updates_behind} behind)", style=theme.ui_warn)
+        lines.append(f"  v{sanitize_terminal_text(gw.hermes_version)}", style=theme.banner_dim)
+        behind = gw.updates_behind or state.version_behind
+        if behind > 0:
+            lines.append(f" ({behind} behind)", style=theme.ui_warn)
 
     if gw.platforms:
         lines.append("    ")
         for p in gw.platforms:
             dot_color = theme.ui_ok if p.state == "connected" else theme.ui_error
-            lines.append(f"{p.name}:", style=theme.ui_label)
+            lines.append(f"{sanitize_terminal_text(p.name)}:", style=theme.ui_label)
             lines.append(" ● ", style=f"bold {dot_color}")
             if p.error_message or p.error_code:
                 lines.append("⚠ ", style=theme.ui_warn)
@@ -72,7 +78,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         dot_color = theme.ui_ok if p.state == "connected" else theme.ui_error
         status = Text()
         status.append("● ", style=f"bold {dot_color}")
-        status.append(p.state)
+        status.append(sanitize_terminal_text(p.state))
         error_parts = [p.error_code, p.error_message]
         error = " / ".join(escape(part) for part in error_parts if part) or "—"
         table.add_row(escape(p.name), status, escape(fmt_iso_timestamp(p.updated_at)), error)
@@ -85,11 +91,13 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         header.append("● ", style=f"bold {theme.ui_error}")
         header.append("Stopped", style=theme.banner_text)
     if gw.hermes_version:
-        header.append(f"\n  Hermes v{gw.hermes_version}", style=theme.ui_accent)
-        if gw.updates_behind > 0:
-            header.append(
-                f"  ({gw.updates_behind} commits behind — run 'hermes update')", style=theme.ui_warn
-            )
+        header.append(
+            f"\n  Hermes v{sanitize_terminal_text(gw.hermes_version)}",
+            style=theme.ui_accent,
+        )
+        behind = gw.updates_behind or state.version_behind
+        if behind > 0:
+            header.append(f"  ({behind} commits behind — run 'hermes update')", style=theme.ui_warn)
         else:
             header.append("  (up to date)", style=theme.ui_ok)
     if gw.active_agents:
@@ -102,7 +110,11 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         header.append("  ⚠ restart requested", style=theme.ui_warn)
     if gw.drain_active:
         principal = f" by {escape(gw.drain_principal)}" if gw.drain_principal else ""
-        requested_at = f" at {escape(gw.drain_requested_at)}" if gw.drain_requested_at else ""
+        requested_at = (
+            f" at {escape(fmt_iso_timestamp(gw.drain_requested_at))}"
+            if gw.drain_requested_at
+            else ""
+        )
         suppress = " suppress-notify" if gw.drain_suppress_notification else ""
         header.append(
             f"\n  external drain{principal}{requested_at}{suppress}",
@@ -143,7 +155,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
                 else platform.name
             )
             name = Text(
-                name_label,
+                sanitize_terminal_text(name_label),
                 style=theme.ui_ok if platform.connected else theme.ui_label,
             )
             channel_table.add_row(

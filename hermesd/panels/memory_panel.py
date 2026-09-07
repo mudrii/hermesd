@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import rich.box
 from rich.console import Group, RenderableType
-from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import DashboardState, MemoryOverview
+from hermesd.panels.formatting import escape_terminal_text as escape
+from hermesd.panels.formatting import sanitize_terminal_text
 from hermesd.theme import Theme
 
 
@@ -21,7 +22,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     memory = state.memory
     lines = Text()
     lines.append("  Provider: ", style=theme.ui_label)
-    lines.append(memory.provider or "builtin", style=theme.banner_text)
+    lines.append(sanitize_terminal_text(memory.provider) or "builtin", style=theme.banner_text)
     lines.append("\n")
     lines.append("  Files: ", style=theme.ui_label)
     lines.append(f"{memory.memory_file_count}", style=theme.ui_accent)
@@ -84,7 +85,9 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         soul_header = Text()
         soul_header.append("\nSOUL Excerpt\n", style=f"bold {theme.ui_label}")
         sections.append(soul_header)
-        sections.append(Text(f"  {memory.soul_excerpt}\n", style=theme.banner_dim))
+        sections.append(
+            Text(f"  {sanitize_terminal_text(memory.soul_excerpt)}\n", style=theme.banner_dim)
+        )
 
     return Panel(
         Group(*sections),

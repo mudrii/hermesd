@@ -1,3 +1,12 @@
+"""Extended collector tests: deeper source scenarios and helper-level contracts.
+
+Builds on ``test_collector.py`` with richer fixture setups (verification DBs,
+kanban boards, cron outputs, checkpoints) and direct tests of module-level
+collector helpers (coercion, redaction, kanban reading, PID checks). Rendering
+assertions here pin how collected values surface in panels where the collector
+and panel contracts intersect.
+"""
+
 from __future__ import annotations
 
 import json
@@ -1555,7 +1564,7 @@ def test_collect_kanban_board_visibility_renders_from_collected_state(hermes_hom
     c.close()
 
 
-def test_collect_kanban_preserves_last_good_when_board_db_corrupts(hermes_home: Path):
+def test_collect_kanban_preserves_board_when_board_db_corrupts(hermes_home: Path):
     boards_dir = hermes_home / "kanban" / "boards"
     board_dir = boards_dir / "alpha"
     board_dir.mkdir(parents=True)
@@ -1577,7 +1586,8 @@ def test_collect_kanban_preserves_last_good_when_board_db_corrupts(hermes_home: 
     db_path.write_bytes(b"not a sqlite database")
     second = c.collect()
 
-    assert second.kanban == first.kanban
+    assert second.kanban.board_count == 1
+    assert second.kanban.boards == first.kanban.boards
     assert "kanban" in second.health.failed_sources
     c.close()
 

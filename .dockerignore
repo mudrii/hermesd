@@ -3,10 +3,17 @@ venv/
 .git/
 .github/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .claude/
+.codex/
+.codegraph/
 .remember/
 .superpowers/
 docs/
+tests/
+images/
+reports/
 dist/
 build/
 *.egg-info/

@@ -18,13 +18,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: ${{ matrix.python-version }}
-          version: "0.11.28"
+          version: "0.12.10"
           enable-cache: true
       - name: Check lockfile
         run: uv lock --check
@@ -39,7 +39,7 @@ jobs:
       - name: Compile check
         run: uv run python -m compileall hermesd
       - name: Test
-        run: uv run pytest tests/ -v -W error::ResourceWarning
+        run: uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
       - name: Audit dependencies (pip-audit)
         run: uv run pip-audit
 
@@ -49,11 +49,11 @@ jobs:
     timeout-minutes: 15
     needs: test
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: "3.11"
-          version: "0.11.28"
+          version: "0.12.10"
       - name: Check lockfile
         run: uv lock --check
       - name: Install locked dependencies
@@ -105,11 +105,11 @@ jobs:
           uv run python -m venv .wheel-smoke
           .wheel-smoke/bin/python -m pip install dist/*.whl
           .wheel-smoke/bin/hermesd --version
-          .wheel-smoke/bin/python -m hermesd --version
+          .wheel-smoke/bin/python -I -m hermesd --version
           uv run python -m venv .sdist-smoke
           .sdist-smoke/bin/python -m pip install dist/*.tar.gz
           .sdist-smoke/bin/hermesd --version
-          .sdist-smoke/bin/python -m hermesd --version
+          .sdist-smoke/bin/python -I -m hermesd --version
       - name: Check package metadata
         run: uv run twine check dist/*
       - name: Upload distributions
@@ -148,4 +148,4 @@ jobs:
           test -f "${expected_wheel}"
           test "$(find dist -type f ! -name '.*' | wc -l | tr -d ' ')" = "2"
       - name: Publish release distributions to PyPI
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

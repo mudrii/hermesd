@@ -7,6 +7,36 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ## [Unreleased]
 
+### Fixed
+
+- Config detail view no longer crashes with a Rich `MarkupError` when `code_execution_mode` or MoA preset config values contain `[`; both labels are now escaped like their siblings.
+- Every panel now strips ANSI and terminal control sequences from collected data, so crafted or corrupt input can no longer redraw the display or issue terminal clipboard commands.
+- Cron jobs with non-string JSON fields (e.g. a numeric `id`) no longer crash the whole cron source to fallback; all string fields are coerced.
+- One corrupt per-board `kanban.db` no longer discards the root board and all healthy boards; a last-good summary is preserved when available and Kanban health is marked degraded.
+- Closing the dashboard no longer risks closing the SQLite connection underneath an in-flight message search: the query is interrupted and the search thread joined first.
+- Cron output excerpt cache now stats before reading (skipping the per-refresh file read when the mtime is unchanged) and no longer returns a stale excerpt when the mtime is unavailable.
+- Session cost estimation now includes `cache_write_tokens` (billed at 1.25× the input rate), fixing systematic undercounting of cache-heavy sessions.
+- The available-tools cache now keys on path-associated nanosecond file signatures, so tool changes are visible without waiting for the sessions index to be rewritten or losing changes to coarse/equal mtimes.
+- Token analytics windows, runtime `last_tick_ago_seconds` (now clamped to zero for future mtimes), and git checkpoint collection (now tolerant of non-UTF-8 commit subjects) no longer fail or misreport in edge cases.
+- Kanban "Completed" column renders an age label instead of a raw epoch; compact Logs falls back to the first non-empty stream when `agent.log` is absent; `fmt_tokens` formats negative values by magnitude; Skills detail caps its visible window; Gateway formats `drain_requested_at` and falls back to `version_behind` when `updates_behind` is absent; Profiles/Tools/Operations survive absurd mtimes; Tokens/Sessions detail tables cap at 50 rows with an overflow footer; Cron/Curator render `—` instead of blank placeholders.
+- The input thread survives transient read/termios errors (fail-safe after 5 consecutive failures), including escape sequences split immediately after a lone Escape byte; the render loop no longer busy-spins between frames, and footer/view mutations are consistently guarded by the view lock.
+- Snapshot mode creates missing parent directories for `--snapshot-file` and handles SIGINT/SIGTERM cleanly instead of dumping a traceback; an interrupted snapshot now exits with the conventional signal exit code (130/143) and a notice, and a second signal force-kills a wedged collect.
+- `file_cache` keys on `st_mtime_ns`, so same-second fixes to malformed files are picked up; profile-scoped paths and databases re-validate symlink targets on every collection/connect; invalid UTF-8 theme config falls back safely; `RuntimeStatus.agent_running` now defaults to not-running instead of reporting a running agent when the first collect fails.
+- Follow-up hardening from a second review pass: the terminal-text sanitizer now removes OSC/DCS/APC payloads too (hyperlinks, clipboard sequences) instead of leaving them as visible garbage; kanban per-board tolerance also covers WAL-snapshot `OSError`s (e.g. a sidecar vanishing mid-copy); the cron excerpt cache keys on the mtime of the file actually read; the available-tools cache tracks every session file's mtime (not just the max); and Skills detail scrolling clamps to a full 20-row window instead of shrinking to a stub at the bottom.
+
+### Changed
+
+- Removed the dead `_cache_hits` counter and unified the duplicated WAL-snapshot-to-tempdir logic between `db.py` and `collector.py` into one shared helper.
+- Package metadata now uses a PEP 639 SPDX license expression (`License-Expression: MIT`); Hatchling 1.32 emits Core Metadata 2.5 and Twine 7 validates the resulting artifacts.
+- Dev-toolchain floor pins raised (`pip>=26.2` for PYSEC-2026-3721) and documented with an explanatory comment.
+
+### Added
+
+- Test coverage tooling: `pytest-cov` with branch coverage, enforced at 96% in CI; a PTY-based end-to-end TUI integration test; contract tests extended to panels 4, 5, 6, 8, 9, 10, and 11; Unicode/CJK rendering tests; snapshot-file symlink/traversal edge-case tests.
+- `SECURITY.md` with a vulnerability reporting policy, and a Troubleshooting/FAQ section in the README covering non-TTY usage, the AGENT OFFLINE banner, footer health indicators, SQLite WAL snapshotting, and `--log-tail-bytes` tuning.
+- CI now tests Python 3.11–3.14 on Linux plus Python 3.14 on macOS, smoke-runs the Docker image, checks the commit-pinned Nix flake, runs packaging checks in a single-version job, and tracks `uv` and Docker dependency updates with Dependabot.
+- Published wheels include `py.typed`; sdists include the repository files required by their shipped test suite; artifact module smoke tests use isolated import mode so they cannot accidentally import the source checkout.
+
 ## [2026.7.11] - 2026-07-11
 
 ### Added

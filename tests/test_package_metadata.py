@@ -6,12 +6,12 @@ from pathlib import Path
 
 import yaml
 
-CHECKOUT_REF = "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
-SETUP_UV_REF = "astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990"
-UPLOAD_ARTIFACT_REF = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
-DOWNLOAD_ARTIFACT_REF = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
-PYPI_PUBLISH_REF = "pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b"
-UV_VERSION = "0.11.28"
+CHECKOUT_ACTION = "actions/checkout"
+SETUP_UV_ACTION = "astral-sh/setup-uv"
+UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact"
+DOWNLOAD_ARTIFACT_ACTION = "actions/download-artifact"
+PYPI_PUBLISH_ACTION = "pypa/gh-action-pypi-publish"
+UV_VERSION = "0.12.10"
 
 
 def _workflow(path: str) -> dict:
@@ -40,11 +40,24 @@ def _uses_steps(workflow: dict, job_name: str) -> list[dict]:
     return [step for step in steps if "uses" in step]
 
 
-def _assert_setup_uv_is_pinned(workflow: dict, job_name: str) -> None:
-    setup_step = next(
-        step for step in _uses_steps(workflow, job_name) if step["uses"] == SETUP_UV_REF
+def _action_step(workflow: dict, job_name: str, action: str) -> dict:
+    step = next(
+        step for step in _uses_steps(workflow, job_name) if step["uses"].startswith(f"{action}@")
     )
+    assert re.fullmatch(rf"{re.escape(action)}@[0-9a-f]{{40}}", step["uses"])
+    return step
+
+
+def _assert_setup_uv_is_pinned(workflow: dict, job_name: str) -> None:
+    setup_step = _action_step(workflow, job_name, SETUP_UV_ACTION)
     assert setup_step["with"]["version"] == UV_VERSION
+
+
+def _assert_all_actions_are_sha_pinned(workflow: dict) -> None:
+    for job in workflow["jobs"].values():
+        for step in job["steps"]:
+            if "uses" in step:
+                assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", step["uses"])
 
 
 def test_flake_version_matches_project_version() -> None:
@@ -56,6 +69,7 @@ def test_flake_version_matches_project_version() -> None:
 
     assert match is not None
     assert match.group(1) == expected_version
+    assert len(re.findall(r'github:[^/]+/[^/]+/[0-9a-f]{40}"', flake_text)) == 1
 
 
 def test_readme_images_use_package_metadata_safe_urls() -> None:
@@ -82,10 +96,11 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
     assert publish["on"] == {"release": {"types": ["published"]}}
     assert publish["permissions"] == {"contents": "read"}
 
-    expected_matrix = ["3.11", "3.12", "3.13"]
+    expected_matrix = ["3.11", "3.12", "3.13", "3.14"]
     assert ci["jobs"]["test"]["strategy"]["matrix"]["python-version"] == expected_matrix
     assert publish["jobs"]["test"]["strategy"]["matrix"]["python-version"] == expected_matrix
     assert ci["jobs"]["test"]["runs-on"] == "ubuntu-24.04"
+    assert ci["jobs"]["macos"]["runs-on"] == "macos-15"
     assert publish["jobs"]["test"]["runs-on"] == "ubuntu-24.04"
     assert publish["jobs"]["release-build"]["runs-on"] == "ubuntu-24.04"
     assert publish["jobs"]["pypi-publish"]["runs-on"] == "ubuntu-24.04"
@@ -99,10 +114,16 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
         "group": "publish-${{ github.event.release.tag_name }}",
         "cancel-in-progress": False,
     }
-    assert CHECKOUT_REF in _job_uses(ci, "test")
-    assert CHECKOUT_REF in _job_uses(publish, "test")
-    assert CHECKOUT_REF in _job_uses(publish, "release-build")
+    _assert_all_actions_are_sha_pinned(ci)
+    _assert_all_actions_are_sha_pinned(publish)
+    _action_step(ci, "test", CHECKOUT_ACTION)
+    _action_step(ci, "package", CHECKOUT_ACTION)
+    _action_step(ci, "macos", CHECKOUT_ACTION)
+    _action_step(publish, "test", CHECKOUT_ACTION)
+    _action_step(publish, "release-build", CHECKOUT_ACTION)
     _assert_setup_uv_is_pinned(ci, "test")
+    _assert_setup_uv_is_pinned(ci, "package")
+    _assert_setup_uv_is_pinned(ci, "macos")
     _assert_setup_uv_is_pinned(publish, "test")
     _assert_setup_uv_is_pinned(publish, "release-build")
 
@@ -112,24 +133,30 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
         "uv run ruff format --check .",
         "uv run mypy hermesd",
         "uv run python -m compileall hermesd",
-        "uv run pytest tests/ -v -W error::ResourceWarning",
+        "uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing",
         "uv run pip-audit",
         "uv lock --check",
     }
     for workflow in (ci, publish):
         assert required_test_commands <= set(_job_run_commands(workflow, "test"))
 
-    ci_commands = "\n".join(_job_run_commands(ci, "test"))
-    assert "uv build" in ci_commands
-    assert "uv run python -m venv .wheel-smoke" in ci_commands
-    assert ".wheel-smoke/bin/python -m pip install dist/*.whl" in ci_commands
-    assert ".wheel-smoke/bin/hermesd --version" in ci_commands
-    assert ".wheel-smoke/bin/python -m hermesd --version" in ci_commands
-    assert "uv run python -m venv .sdist-smoke" in ci_commands
-    assert ".sdist-smoke/bin/python -m pip install dist/*.tar.gz" in ci_commands
-    assert ".sdist-smoke/bin/hermesd --version" in ci_commands
-    assert ".sdist-smoke/bin/python -m hermesd --version" in ci_commands
-    assert "uv run twine check dist/*" in ci_commands
+    ci_package_commands = "\n".join(_job_run_commands(ci, "package"))
+    assert "uv build" in ci_package_commands
+    assert "uv run python -m venv .wheel-smoke" in ci_package_commands
+    assert ".wheel-smoke/bin/python -m pip install dist/*.whl" in ci_package_commands
+    assert ".wheel-smoke/bin/hermesd --version" in ci_package_commands
+    assert ".wheel-smoke/bin/python -I -m hermesd --version" in ci_package_commands
+    assert "uv run python -m venv .sdist-smoke" in ci_package_commands
+    assert ".sdist-smoke/bin/python -m pip install dist/*.tar.gz" in ci_package_commands
+    assert ".sdist-smoke/bin/hermesd --version" in ci_package_commands
+    assert ".sdist-smoke/bin/python -I -m hermesd --version" in ci_package_commands
+    assert "uv run twine check dist/*" in ci_package_commands
+    assert {
+        "uv sync --locked --all-extras --dev",
+        "uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing",
+    } <= set(_job_run_commands(ci, "macos"))
+    assert "docker run --rm hermesd-ci --version" in "\n".join(_job_run_commands(ci, "docker"))
+    assert "nix flake check --no-write-lock-file" in _job_run_commands(ci, "nix")
 
     release_steps = publish["jobs"]["release-build"]["steps"]
     metadata_step = next(
@@ -144,18 +171,13 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
     assert "dist/hermesd-{version}.tar.gz" in release_commands
     assert "dist/hermesd-{version}-py3-none-any.whl" in release_commands
     assert ".wheel-smoke/bin/hermesd --version" in release_commands
-    assert ".wheel-smoke/bin/python -m hermesd --version" in release_commands
+    assert ".wheel-smoke/bin/python -I -m hermesd --version" in release_commands
     assert "uv run python -m venv .sdist-smoke" in release_commands
     assert ".sdist-smoke/bin/python -m pip install dist/*.tar.gz" in release_commands
     assert ".sdist-smoke/bin/hermesd --version" in release_commands
-    assert ".sdist-smoke/bin/python -m hermesd --version" in release_commands
+    assert ".sdist-smoke/bin/python -I -m hermesd --version" in release_commands
     assert "uv run twine check dist/*" in release_commands
-    assert UPLOAD_ARTIFACT_REF in _job_uses(publish, "release-build")
-    upload_step = next(
-        step
-        for step in publish["jobs"]["release-build"]["steps"]
-        if step.get("uses") == UPLOAD_ARTIFACT_REF
-    )
+    upload_step = _action_step(publish, "release-build", UPLOAD_ARTIFACT_ACTION)
     assert upload_step["with"] == {
         "name": "release-dists",
         "path": "dist/*",
@@ -173,8 +195,8 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
     assert "RELEASE_TAG" in publish_commands
     assert 'expected_sdist="dist/hermesd-${version}.tar.gz"' in publish_commands
     assert 'expected_wheel="dist/hermesd-${version}-py3-none-any.whl"' in publish_commands
-    assert DOWNLOAD_ARTIFACT_REF in _job_uses(publish, "pypi-publish")
-    assert PYPI_PUBLISH_REF in _job_uses(publish, "pypi-publish")
+    _action_step(publish, "pypi-publish", DOWNLOAD_ARTIFACT_ACTION)
+    _action_step(publish, "pypi-publish", PYPI_PUBLISH_ACTION)
     assert publish["jobs"]["pypi-publish"]["permissions"]["id-token"] == "write"
     assert publish["jobs"]["pypi-publish"]["environment"]["name"] == "pypi"
 
@@ -190,3 +212,17 @@ def test_dependabot_tracks_github_actions_versions() -> None:
         "schedule": {"interval": "weekly"},
         "open-pull-requests-limit": 5,
     } in updates
+    assert {
+        "package-ecosystem": "docker",
+        "directory": "/",
+        "schedule": {"interval": "weekly"},
+        "open-pull-requests-limit": 5,
+    } in updates
+
+
+def test_typed_marker_and_sdist_support_files_are_packaged() -> None:
+    project = tomllib.loads(Path("pyproject.toml").read_text())
+    assert Path("hermesd/py.typed").is_file()
+
+    includes = set(project["tool"]["hatch"]["build"]["targets"]["sdist"]["include"])
+    assert {".github/", "flake.nix"} <= includes

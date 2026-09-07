@@ -39,8 +39,12 @@ CLAUDE.md
 rules/
 skills/
 
-# Codex local instructions
-AGENTS.md
-.codex/rules/python-idioms.md
-.codex/rules/python-patterns.md
-.codex/skills/py-rig/SKILL.md
+# Repository-owned Codex guidance (the generic rules/skills ignores above
+# otherwise match these nested paths too).
+!/.codex/
+!/.codex/rules/
+!/.codex/rules/python-idioms.md
+!/.codex/rules/python-patterns.md
+!/.codex/skills/
+!/.codex/skills/py-rig/
+!/.codex/skills/py-rig/SKILL.md

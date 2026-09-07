@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sqlite3
 import time
 from pathlib import Path
@@ -26,7 +27,9 @@ def test_estimate_cost_basic():
 
 def test_estimate_cost_clamps_negative_and_huge_token_counts():
     assert _estimate_cost(-100, -100, -100, -100) == 0.0
-    assert _estimate_cost(10**400, 0, 0, 0) > 0.0
+    huge_cost = _estimate_cost(10**400, 0, 0, 0)
+    assert math.isfinite(huge_cost)
+    assert huge_cost == 2_500_000_000.0
 
 
 def test_estimate_cost_output():
@@ -57,6 +60,55 @@ def test_estimate_cost_mixed():
 def test_estimate_cost_zero():
     cost = _estimate_cost(0, 0, 0, 0)
     assert cost == 0.0
+
+
+def test_estimate_cost_cache_write():
+    # 1M cache write tokens at $3.125/M (input rate x 1.25) = $3.125
+    cost = _estimate_cost(0, 0, 0, 0, 1_000_000)
+    assert abs(cost - 3.125) < 0.01
+
+
+def test_estimate_cost_cache_write_clamps_negative_and_huge_counts():
+    assert _estimate_cost(0, 0, 0, 0, -100) == 0.0
+    huge_cost = _estimate_cost(0, 0, 0, 0, 10**400)
+    assert math.isfinite(huge_cost)
+    assert huge_cost == 3_125_000_000.0
+
+
+def test_resolved_session_cost_includes_cache_write_tokens():
+    row = {
+        "estimated_cost_usd": None,
+        "cost_status": "estimated",
+        "input_tokens": 100_000,
+        "output_tokens": 5_000,
+        "cache_read_tokens": 50_000,
+        "cache_write_tokens": 20_000,
+        "reasoning_tokens": 1_000,
+    }
+    # (100_000*2.50 + 5_000*10 + 50_000*0.30 + 1_000*10 + 20_000*3.125) / 1e6
+    expected = (100_000 * 2.50 + 5_000 * 10 + 50_000 * 0.30 + 1_000 * 10 + 20_000 * 3.125) / 1e6
+    assert _resolved_session_cost(row) == pytest.approx(expected)
+
+
+def test_collector_estimates_cache_write_tokens_when_cost_is_null(hermes_home: Path):
+    """Cache-write tokens must contribute to the estimated fallback cost."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    now = time.time()
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, cache_write_tokens, "
+        "estimated_cost_usd) VALUES (?, ?, ?, ?, NULL)",
+        ("s1", "cli", now, 1_000_000),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    # 1M cache-write tokens at $3.125/M = $3.125.
+    assert state.tokens_total.total_cost_usd == pytest.approx(3.125)
+    c.close()
 
 
 def test_resolved_session_cost_preserves_reported_zero_cost():

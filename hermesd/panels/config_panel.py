@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import rich.box
 from rich.console import Group, RenderableType
-from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import ConfigSummary, DashboardState
+from hermesd.panels.formatting import escape_terminal_text as escape
+from hermesd.panels.formatting import sanitize_terminal_text
 from hermesd.theme import Theme
 
 
@@ -22,17 +23,17 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     gateway_count = sum(1 for route in c.tool_gateway_routes if route.mode == "gateway")
     lines = Text()
     lines.append("  Model: ", style=theme.ui_label)
-    lines.append(f"{c.model or '—'}\n", style=theme.ui_accent)
+    lines.append(f"{sanitize_terminal_text(c.model) or '—'}\n", style=theme.ui_accent)
     lines.append("  Provider: ", style=theme.ui_label)
-    lines.append(f"{c.provider or '—'}\n", style=theme.ui_accent)
+    lines.append(f"{sanitize_terminal_text(c.provider) or '—'}\n", style=theme.ui_accent)
     lines.append("  Personality: ", style=theme.ui_label)
-    lines.append(f"{c.personality or '—'}\n", style=theme.ui_accent)
+    lines.append(f"{sanitize_terminal_text(c.personality) or '—'}\n", style=theme.ui_accent)
     lines.append("  Compress: ", style=theme.ui_label)
     lines.append(f"{c.compression_threshold}\n", style=theme.banner_text)
     lines.append("  Gateway Tools: ", style=theme.ui_label)
     lines.append(f"{gateway_count}/{len(c.tool_gateway_routes)}\n", style=theme.banner_text)
     lines.append("  Tool Search: ", style=theme.ui_label)
-    lines.append(c.tool_search_enabled or "—", style=theme.banner_text)
+    lines.append(sanitize_terminal_text(c.tool_search_enabled) or "—", style=theme.banner_text)
 
     return Panel(
         lines,
@@ -81,10 +82,10 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     table.add_row("Memory Provider", escape(c.memory_provider) if c.memory_provider else "—")
     table.add_row("Tool Search", escape(_tool_search_label(c)))
     table.add_row("Toolsets", escape(", ".join(c.toolsets)) if c.toolsets else "—")
-    table.add_row("Code Execution", _code_execution_label(c))
+    table.add_row("Code Execution", escape(_code_execution_label(c)))
     table.add_row("Kanban Dispatch", _kanban_config_label(c))
     table.add_row("Gateway Media", _gateway_media_label(c))
-    table.add_row("MoA", _moa_label(c))
+    table.add_row("MoA", escape(_moa_label(c)))
     table.add_row("Auxiliary Slots", str(len(c.auxiliary_slots)))
     sections.append(table)
 

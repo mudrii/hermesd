@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import signal
 import sqlite3
 import subprocess
@@ -9,6 +10,23 @@ from pathlib import Path
 
 import pytest
 from rich.console import Console
+
+_AMBIENT_RUNTIME_ENV = ("HERMES_HOME", "HERMES_PROFILE", "NO_COLOR", "FORCE_COLOR")
+
+
+@pytest.fixture(autouse=True)
+def isolate_runtime_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Keep runtime environment variables from leaking into otherwise isolated tests."""
+    preserve_live_home = (
+        request.node.name == "test_live_hermes_home_has_no_drifted_blank_fields"
+        and os.environ.get("HERMESD_CONTRACT_TEST") == "1"
+    )
+    for name in _AMBIENT_RUNTIME_ENV:
+        if name != "HERMES_HOME" or not preserve_live_home:
+            monkeypatch.delenv(name, raising=False)
 
 
 def render_to_str(panel, width: int = 120, no_color: bool = False) -> str:
@@ -127,7 +145,7 @@ def sample_db(hermes_home: Path) -> Path:
             None,
             now - 3600,
             None,
-            None,
+            "cron_complete",
             77,
             51,
             12400,
@@ -136,8 +154,8 @@ def sample_db(hermes_home: Path) -> Path:
             5000,
             0,
             "openai-codex",
-            None,
-            None,
+            "https://api.kimi.test/v1",
+            "subscription_included",
             0.42,
             None,
             "unknown",

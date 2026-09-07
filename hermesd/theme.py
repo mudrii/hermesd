@@ -173,12 +173,12 @@ def load_theme(hermes_home: Path) -> Theme:
         try:
             import yaml
 
-            with open(config_path) as f:
+            with open(config_path, encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
             if isinstance(cfg, dict):
                 display = cfg.get("display", {})
                 if isinstance(display, dict):
                     skin_name = str(display.get("skin", "default") or "default")
-        except (OSError, yaml.YAMLError):
+        except (OSError, UnicodeError, yaml.YAMLError):
             pass
     return Theme(normalize_skin_name(skin_name))

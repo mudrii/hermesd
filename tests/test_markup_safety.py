@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import io
+
 import pytest
+from rich.console import Console
 
 from hermesd.models import (
     BackgroundProcessInfo,
@@ -45,7 +48,7 @@ from hermesd.models import (
     VerificationEventSummary,
     VerificationRootSummary,
 )
-from hermesd.panels import render_panel
+from hermesd.panels import PANEL_NAMES, render_panel
 from hermesd.theme import Theme
 from tests.conftest import render_to_str
 
@@ -161,6 +164,10 @@ def _state_for(panel_num: int) -> DashboardState:
                 tool_gateway_scheme=INJECT,
                 firecrawl_gateway_url=INJECT,
                 tool_gateway_routes=[ToolGatewayRoute(tool=INJECT, mode="gateway")],
+                code_execution_mode=INJECT,
+                moa_active_preset=INJECT,
+                moa_preset_count=1,
+                moa_aggregator_label=INJECT,
             ),
         )
     if panel_num == 6:  # Cron
@@ -359,7 +366,12 @@ def test_panel_does_not_crash_on_markup_injection(panel_num: int, detail: bool) 
     # Must not raise rich.markup.MarkupError (which would crash the TUI loop).
     panel = render_panel(panel_num, state, Theme(), detail=detail)
     rendered = render_to_str(panel)
-    assert rendered  # rendered to something rather than crashing
+    # Rendering must produce the actual panel (titled), not an empty fallback.
+    assert PANEL_NAMES[panel_num] in rendered
+    # The injected markup literal must survive in the detail view, where every
+    # field is rendered (compact views show only a subset of fields).
+    if detail:
+        assert "desc" in rendered
 
 
 @pytest.mark.parametrize("panel_num", range(1, 14))
@@ -373,3 +385,32 @@ def test_panel_preserves_literal_brackets(panel_num: int, detail: bool) -> None:
     if detail:
         assert PAIR in rendered, f"panel {panel_num} detail stripped literal {PAIR!r}"
         assert CLOSER in rendered, f"panel {panel_num} detail dropped literal {CLOSER!r}"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "before\x1b[2Jafter",
+        "before\x1b]52;c;SGVsbG8=\x1b\\after",
+    ],
+    ids=["csi", "osc"],
+)
+@pytest.mark.parametrize("panel_num", range(1, 14))
+@pytest.mark.parametrize("detail", [False, True])
+def test_panel_strips_terminal_control_sequences(
+    panel_num: int,
+    detail: bool,
+    payload: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(globals(), "INJECT", payload)
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=True, color_system=None, width=160)
+
+    console.print(render_panel(panel_num, _state_for(panel_num), Theme(), detail=detail))
+
+    rendered = output.getvalue()
+    assert "\x1b" not in rendered
+    assert "\x9b" not in rendered
+    if detail:
+        assert "beforeafter" in rendered

@@ -49,7 +49,24 @@ class HermesPaths:
         return self.shared_home.joinpath(*parts)
 
     def profile_path(self, *parts: str) -> Path:
+        self._validate_profile_home()
         return self.profile_home.joinpath(*parts)
+
+    def _validate_profile_home(self) -> None:
+        """Revalidate profile confinement after construction-time symlink swaps."""
+        if self.profile_name is None:
+            return
+        profiles_path = self.root_home / "profiles"
+        profile_path = profiles_path / self.profile_name
+        root_home = self.root_home.resolve(strict=False)
+        profiles_home = profiles_path.resolve(strict=False)
+        profile_home = profile_path.resolve(strict=False)
+        if (
+            profiles_path.is_symlink()
+            or not profiles_home.is_relative_to(root_home)
+            or not profile_home.is_relative_to(profiles_home)
+        ):
+            raise ValueError(f"Profile '{self.profile_name}' escaped profiles directory")
 
 
 def _is_valid_profile_name(profile_name: str) -> bool:

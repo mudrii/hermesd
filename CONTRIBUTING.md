@@ -10,7 +10,7 @@ cd hermesd
 uv venv .venv --python 3.11
 source .venv/bin/activate
 uv sync --locked --all-extras --dev
-uv run pytest tests/ -v -W error::ResourceWarning
+uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
 ```
 
 ## Development Workflow
@@ -21,7 +21,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 2. **Write the failing test first** — acceptance-level if user-visible, unit-level otherwise
 3. **Implement the minimum change** that makes the test pass
 4. **Refactor while green** — improve naming/cohesion without changing behavior
-5. **Run the full suite** — `uv run pytest tests/ -v -W error::ResourceWarning`
+5. **Run the full suite** — `uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing`
 6. **Run lint + type + audit + lock + build + package smoke**:
 
    ```bash
@@ -92,7 +92,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 
 ```bash
 # Full suite
-uv run pytest tests/ -v -W error::ResourceWarning
+uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
 
 # Single file
 uv run pytest tests/test_collector.py -v
@@ -103,15 +103,23 @@ uv run pytest tests/ -x --tb=short
 
 Test categories:
 - `test_models.py` — Pydantic model construction
-- `test_db*.py` — SQLite reader, caching, resilience
-- `test_collector*.py` — data collection from `~/.hermes/`
-- `test_*_panel.py` — panel rendering (compact + detail)
-- `test_app*.py` — TUI key handling, layout, lifecycle
-- `test_*_resilience.py` — error handling, cache preservation
+- `test_db_extended.py` / `test_db_resilience.py` — SQLite reader, WAL snapshotting, caching, resilience
+- `test_file_cache.py` — mtime-keyed JSON/YAML cache
+- `test_collector.py` / `test_collector_extended.py` / `test_collector_coverage.py` / `test_collector_fixes.py` — data collection from `~/.hermes/`
+- `test_session_active.py` — session active/ended detection
+- `test_cost_estimation.py` — token/cost reconciliation edge cases
+- `test_theme.py` — skin loading and theme inheritance
+- `test_formatting.py` — shared panel formatting helpers
+- `test_main.py` — CLI argument parsing and snapshot modes
+- `test_app.py` / `test_app_extended.py` / `test_app_fixes.py` — TUI key handling, layout, lifecycle
+- `test_panels.py` / `test_panels_extended.py` / `test_panels_fixes.py` — cross-panel rendering (compact + detail) and panel regression fixes
+- `test_cron_panel.py` / `test_curator_panel.py` / `test_curator.py` / `test_memory_panel.py` / `test_skills_panel.py` / `test_tools_panel.py` / `test_profiles_panel.py` / `test_profiles.py` — dedicated panel rendering tests
+- `test_gateway_resilience.py` / `test_curator_resilience.py` — error handling, cache preservation
+- `test_persistence_fixes.py` — persistence-layer regression fixes
 - `test_package_metadata.py` — packaging, workflow, long-description, and wheel-smoke contracts
 - `test_import_hygiene.py` / `test_readonly_invariant.py` — standalone-package and read-only safety contracts
 - `test_markup_safety.py` — Rich markup and secret-redaction safety
-- `test_cost_estimation.py` — token/cost reconciliation edge cases
+- `test_contract.py` — opt-in contract test against a real `~/.hermes` (not part of the default suite)
 
 ## Reporting Issues
 

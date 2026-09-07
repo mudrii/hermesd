@@ -226,18 +226,56 @@ def test_run_breaks_promptly_when_stopped_during_render_wait(
 
     from rich.console import Console
 
-    class ClearsDuringWait(threading.Event):
+    class StopsDuringWait(threading.Event):
         def wait(self, timeout: float | None = None) -> bool:
-            if self.is_set():
-                self.clear()  # simulate _signal_handler firing mid-wait
-                return False
-            return super().wait(timeout)
+            app._running.clear()  # simulate _signal_handler firing mid-wait
+            self.set()
+            return True
 
     app = DashboardApp(populated_hermes_home, refresh_rate=1)
-    app._running = ClearsDuringWait()
+    app._stop_requested = StopsDuringWait()
     app._console = Console(file=io.StringIO(), width=80, height=24, force_terminal=True)
     app.run()
     assert app._closed.is_set() is True
+
+
+def test_run_waits_on_stop_event_before_rendering_next_frame(
+    populated_hermes_home: Path, monkeypatch, restore_signal_handlers
+):
+    import io
+
+    from rich.console import Console
+
+    import hermesd.app as app_module
+
+    waits: list[float | None] = []
+
+    class RecordingStopEvent(threading.Event):
+        def wait(self, timeout: float | None = None) -> bool:
+            waits.append(timeout)
+            return False
+
+    class StopsAfterUpdate:
+        def __init__(self, renderable, *, console, refresh_per_second, screen):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def update(self, renderable):
+            app._running.clear()
+
+    app = DashboardApp(populated_hermes_home, refresh_rate=1)
+    app._stop_requested = RecordingStopEvent()
+    app._console = Console(file=io.StringIO(), width=80, height=24, force_terminal=True)
+    monkeypatch.setattr(app_module, "Live", StopsAfterUpdate)
+
+    app.run()
+
+    assert waits == [0.5]
 
 
 def test_run_exits_cleanly_on_keyboard_interrupt(

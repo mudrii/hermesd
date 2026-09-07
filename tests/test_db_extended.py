@@ -9,6 +9,25 @@ from hermesd.db import HermesDB
 from tests.conftest import create_state_db_tables
 
 
+def test_read_sessions(sample_db, hermes_home):
+    db = HermesDB(hermes_home / "state.db")
+    sessions = db.read_sessions()
+    assert len(sessions) == 2
+    assert {s["id"] for s in sessions} == {"sess_001", "sess_002"}
+    db.close()
+
+
+def test_read_sessions_returns_dicts(sample_db, hermes_home):
+    db = HermesDB(hermes_home / "state.db")
+    sessions = db.read_sessions()
+    s = sessions[0]
+    assert "id" in s
+    assert "source" in s
+    assert "message_count" in s
+    assert "input_tokens" in s
+    db.close()
+
+
 def test_tool_stats_with_data(sample_db, hermes_home):
     db = HermesDB(hermes_home / "state.db")
     stats = db.read_tool_stats()

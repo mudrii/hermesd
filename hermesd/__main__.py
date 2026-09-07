@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import sys
 from pathlib import Path
+from types import FrameType
 
 from hermesd import __version__
 from hermesd.paths import default_hermes_home
@@ -152,19 +154,47 @@ def main(argv: list[str] | None = None) -> None:
         or args.snapshot_panel is not None
         or args.snapshot_format != "text"
     ):
+        # Mirror the signal handling in DashboardApp.run() so Ctrl+C/SIGTERM
+        # during a slow collect exits cleanly instead of dumping a traceback.
+        # The first signal is caught; the handler then re-arms the default
+        # disposition so a second signal can still kill a wedged collect.
+        interrupted_signal: list[int] = []
+
+        def _snapshot_signal_handler(sig: int, frame: FrameType | None) -> None:
+            interrupted_signal.append(sig)
+            signal.signal(sig, signal.SIG_DFL)
+
+        previous_sigint = signal.signal(signal.SIGINT, _snapshot_signal_handler)
+        previous_sigterm = signal.signal(signal.SIGTERM, _snapshot_signal_handler)
         try:
             if args.snapshot_format == "json":
                 snapshot_text = app.render_snapshot_json(panel_num=args.snapshot_panel)
             else:
                 snapshot_text = app.render_snapshot_text(panel_num=args.snapshot_panel)
+            if interrupted_signal:
+                sig = interrupted_signal[0]
+                print(
+                    f"Interrupted by signal {sig}; snapshot discarded.",
+                    file=sys.stderr,
+                )
+                sys.exit(128 + sig)
             if args.snapshot_file is not None:
-                args.snapshot_file.write_text(snapshot_text)
+                output_path = args.snapshot_file.expanduser().resolve(strict=False)
+                if _snapshot_file_inside_hermes_home(output_path, hermes_home):
+                    print(
+                        "Error: --snapshot-file must not write under hermes home", file=sys.stderr
+                    )
+                    sys.exit(1)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(snapshot_text)
             else:
                 if args.snapshot_format == "json":
                     print(snapshot_text)
                 else:
                     print(snapshot_text, end="")
         finally:
+            signal.signal(signal.SIGINT, previous_sigint)
+            signal.signal(signal.SIGTERM, previous_sigterm)
             app.close()
         return
     app.run()

@@ -15,11 +15,18 @@ _CONNECT_BACKOFF_READS = 2
 
 
 class HermesDB:
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, allowed_root: Path | None = None):
         self._path = db_path
+        # When set, _open_target re-validates on every (re)connect that the db
+        # path is not a symlink and still resolves under this root, closing the
+        # profile symlink TOCTOU window left by startup-only validation.
+        self._allowed_root = allowed_root
         # Guards the SQLite connection lifecycle and serializes reads against
         # the cached last-good result/version state below.
         self._lock = threading.RLock()
+        # Guards only the connection reference so interrupt() can snapshot it
+        # without waiting for a long query holding _lock.
+        self._connection_ref_lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None
         self._current_data_version: int | None = None
         self._cached_sessions: list[dict[str, Any]] = []
@@ -39,7 +46,6 @@ class HermesDB:
         self._cached_message_search_version: int | None = None
         self._cached_message_search_initialized = False
         self._last_message_search_stale = False
-        self._cache_hits = 0
         self._uri = ""
         self._consecutive_errors = 0
         self._connect_backoff_reads = 0
@@ -57,13 +63,16 @@ class HermesDB:
         self._close_connection()
         if not self._path.exists():
             self._connected_mtime_ns = None
+            self._consecutive_errors = 0
             self._mark_cached_reads_stale()
             return
         try:
             db_path, uri_params = self._open_target()
             self._uri = f"{db_path.resolve().as_uri()}?{uri_params}"
-            self._conn = sqlite3.connect(self._uri, uri=True, timeout=2, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
+            conn = sqlite3.connect(self._uri, uri=True, timeout=2, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            with self._connection_ref_lock:
+                self._conn = conn
             self._current_data_version = None
             self._cached_sessions_version = None
             self._cached_session_count_version = None
@@ -78,36 +87,32 @@ class HermesDB:
         except (OSError, sqlite3.OperationalError):
             self._close_connection()
             self._connected_mtime_ns = None
+            self._consecutive_errors = 0
             self._connect_backoff_reads = _CONNECT_BACKOFF_READS
             self._mark_cached_reads_stale()
 
     def _close_connection(self) -> None:
-        if self._conn:
-            with contextlib.suppress(sqlite3.Error):
-                self._conn.close()
+        with self._connection_ref_lock:
+            conn = self._conn
             self._conn = None
+        if conn:
+            with contextlib.suppress(sqlite3.Error):
+                conn.close()
         if self._snapshot_dir is not None:
             self._snapshot_dir.cleanup()
             self._snapshot_dir = None
 
     def _open_target(self) -> tuple[Path, str]:
+        if self._allowed_root is not None and not _safe_sidecar_path(
+            self._path, self._allowed_root
+        ):
+            raise OSError(f"Refusing to open database outside allowed root: {self._path}")
         if not self._path.with_name(f"{self._path.name}-wal").exists():
             return self._path, "mode=ro&immutable=1"
         return self._snapshot_wal_database(), "mode=ro"
 
     def _snapshot_wal_database(self) -> Path:
-        snapshot_dir = tempfile.TemporaryDirectory(prefix="hermesd-state-")
-        snapshot_root = Path(snapshot_dir.name)
-        snapshot_db = snapshot_root / self._path.name
-        try:
-            shutil.copy2(self._path, snapshot_db)
-            for suffix in ("-wal", "-shm"):
-                source = self._path.with_name(f"{self._path.name}{suffix}")
-                if source.exists() and _safe_sidecar_path(source, self._path.parent):
-                    shutil.copy2(source, snapshot_root / source.name)
-        except OSError:
-            snapshot_dir.cleanup()
-            raise
+        snapshot_dir, snapshot_db = snapshot_wal_database(self._path, prefix="hermesd-state-")
         self._snapshot_dir = snapshot_dir
         return snapshot_db
 
@@ -122,7 +127,7 @@ class HermesDB:
 
     def _source_changed(self) -> bool:
         current_mtime = self._source_mtime_ns()
-        return current_mtime is not None and current_mtime != self._connected_mtime_ns
+        return current_mtime is None or current_mtime != self._connected_mtime_ns
 
     def _mark_cached_reads_stale(self) -> None:
         if self._cached_sessions_initialized:
@@ -157,7 +162,6 @@ class HermesDB:
                 return self._current_data_version
             version = int(row[0])
             if version == self._current_data_version:
-                self._cache_hits += 1
                 return self._current_data_version
             self._current_data_version = version
             return version
@@ -180,21 +184,30 @@ class HermesDB:
             )
             return self._cached_sessions
 
+    # The last_read_*_stale properties below are advisory flags (the UI only
+    # uses them to annotate possibly-stale data). They are read outside the
+    # collector's critical sections, so snapshot them under the lock to keep
+    # cross-thread reads formally synchronized rather than relying on CPython
+    # attribute-load atomicity.
     @property
     def last_read_sessions_stale(self) -> bool:
-        return self._last_read_sessions_stale
+        with self._lock:
+            return self._last_read_sessions_stale
 
     @property
     def last_read_session_count_stale(self) -> bool:
-        return self._last_read_session_count_stale
+        with self._lock:
+            return self._last_read_session_count_stale
 
     @property
     def last_read_tool_stats_stale(self) -> bool:
-        return self._last_read_tool_stats_stale
+        with self._lock:
+            return self._last_read_tool_stats_stale
 
     @property
     def last_message_search_stale(self) -> bool:
-        return self._last_message_search_stale
+        with self._lock:
+            return self._last_message_search_stale
 
     def _read_all_sessions(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
         columns = ", ".join(self._session_columns(conn))
@@ -410,6 +423,14 @@ class HermesDB:
         )
         return {str(row[0]) for row in cur.fetchall() if row[0]}
 
+    def interrupt(self) -> None:
+        """Abort any in-flight query on the connection (safe to call cross-thread)."""
+        with self._connection_ref_lock:
+            conn = self._conn
+        if conn is not None:
+            with contextlib.suppress(sqlite3.Error):
+                conn.interrupt()
+
     def close(self) -> None:
         with self._lock:
             self._closed = True
@@ -418,6 +439,30 @@ class HermesDB:
 
 def _escape_like_pattern(query: str) -> str:
     return query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def snapshot_wal_database(
+    db_path: Path, *, prefix: str
+) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+    """Copy a WAL-mode database and its sidecars into a fresh temp dir.
+
+    Returns the TemporaryDirectory (caller owns cleanup) and the snapshot db
+    path. Sidecars are copied only when they safely resolve under db_path's
+    directory.
+    """
+    snapshot_dir = tempfile.TemporaryDirectory(prefix=prefix)
+    snapshot_root = Path(snapshot_dir.name)
+    snapshot_db = snapshot_root / db_path.name
+    try:
+        shutil.copy2(db_path, snapshot_db)
+        for suffix in ("-wal", "-shm"):
+            source = db_path.with_name(f"{db_path.name}{suffix}")
+            if source.exists() and _safe_sidecar_path(source, db_path.parent):
+                shutil.copy2(source, snapshot_root / source.name)
+    except OSError:
+        snapshot_dir.cleanup()
+        raise
+    return snapshot_dir, snapshot_db
 
 
 def _safe_sidecar_path(path: Path, root: Path) -> bool:

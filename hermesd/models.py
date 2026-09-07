@@ -585,7 +585,10 @@ class HealthSummary(BaseModel):
 
 
 class RuntimeStatus(BaseModel):
-    agent_running: bool = True
+    # Default False: before the first successful runtime collection the agent
+    # state is unknown and must read as not-running rather than running.
+    # The collector sets this explicitly on every successful collect.
+    agent_running: bool = False
     last_activity_age_seconds: float | None = None
     banner: str = ""
 

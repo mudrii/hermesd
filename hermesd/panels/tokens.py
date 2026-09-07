@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import rich.box
 from rich.console import Group, RenderableType
-from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import AUTHORITATIVE_COST_STATUSES, DashboardState, TokenBreakdown
-from hermesd.panels.formatting import fmt_tokens, fmt_usd
+from hermesd.panels.formatting import (
+    escape_terminal_text as escape,
+)
+from hermesd.panels.formatting import (
+    fmt_tokens,
+    fmt_usd,
+)
 from hermesd.theme import Theme
+
+_DETAIL_MAX_SESSION_ROWS = 50
 
 
 def _fmt_cost(value: float, *, estimated: bool) -> str:
@@ -70,7 +77,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     table.add_column("Reason", justify="right", style=theme.banner_text)
     table.add_column("Cost", justify="right", style=theme.ui_accent)
 
-    for s in state.sessions:
+    for s in state.sessions[:_DETAIL_MAX_SESSION_ROWS]:
         estimated = s.cost_status not in AUTHORITATIVE_COST_STATUSES
         table.add_row(
             escape(s.session_id[-8:]),
@@ -140,6 +147,13 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
 
     sections.append(Text("\nSessions\n", style=f"bold {theme.ui_label}"))
     sections.append(table)
+    if len(state.sessions) > _DETAIL_MAX_SESSION_ROWS:
+        sections.append(
+            Text(
+                f"  … and {len(state.sessions) - _DETAIL_MAX_SESSION_ROWS} more\n",
+                style=theme.banner_dim,
+            )
+        )
 
     return Panel(
         Group(*sections),

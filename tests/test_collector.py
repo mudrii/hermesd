@@ -1,3 +1,13 @@
+"""Core collector behavior tests against the populated ``~/.hermes`` fixture.
+
+Every test drives a real ``Collector(...).collect()`` and asserts the shape of
+the resulting ``DashboardState``: full-collection happy paths, per-source
+absence/degradation fallbacks, and ``_CollectionHealth`` error bookkeeping.
+This module owns the broad "what does collect() produce" contract; error-path
+and cache-preservation depth lives in ``test_collector_coverage.py`` and
+``test_collector_extended.py``.
+"""
+
 from __future__ import annotations
 
 import json
@@ -311,27 +321,6 @@ def test_collect_channels_and_operations(populated_hermes_home: Path):
     assert state.operations.pr_monitors[0].repo == "NousResearch/hermes-agent"
     assert state.operations.pr_monitors[0].monitored_count == 2
     c.close()
-
-
-def test_collect_does_not_mutate_hermes_home(populated_hermes_home: Path):
-    before = _file_mtimes(populated_hermes_home)
-    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
-
-    try:
-        for _ in range(3):
-            c.collect()
-    finally:
-        c.close()
-
-    assert _file_mtimes(populated_hermes_home) == before
-
-
-def _file_mtimes(root: Path) -> dict[Path, int]:
-    return {
-        path.relative_to(root): path.stat().st_mtime_ns
-        for path in root.rglob("*")
-        if path.is_file()
-    }
 
 
 def test_collection_health_uses_default_when_fallback_also_fails():

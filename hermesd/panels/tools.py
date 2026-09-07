@@ -4,12 +4,13 @@ import time
 
 import rich.box
 from rich.console import Group, RenderableType
-from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import DashboardState
+from hermesd.panels.formatting import escape_terminal_text as escape
+from hermesd.panels.formatting import sanitize_terminal_text
 from hermesd.theme import Theme
 
 
@@ -28,7 +29,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append("  Checkpoints: ", style=theme.ui_label)
     lines.append(f"{len(state.checkpoints)} repo\n", style=theme.banner_text)
     for ts in state.tool_stats[:3]:
-        lines.append(f"  {ts.name}", style=theme.ui_label)
+        lines.append(f"  {sanitize_terminal_text(ts.name)}", style=theme.ui_label)
         lines.append(f" ({ts.call_count})\n", style=theme.banner_dim)
 
     return Panel(
@@ -160,4 +161,7 @@ def _watch_summary(patterns: list[str], watcher_interval: int) -> str:
 def _started_label(started_at: float) -> str:
     if started_at <= 0:
         return "—"
-    return time.strftime("%H:%M:%S", time.localtime(started_at))
+    try:
+        return time.strftime("%H:%M:%S", time.localtime(started_at))
+    except (OverflowError, OSError, ValueError):
+        return "—"

@@ -17,15 +17,17 @@ class LastGoodFileCache:
     def __init__(self) -> None:
         # Guards the mtime/value/bad-mtime cache dicts below shared across threads.
         self._lock = threading.RLock()
-        self._json_mtimes: dict[str, float] = {}
-        self._json_list_mtimes: dict[str, float] = {}
-        self._yaml_mtimes: dict[str, float] = {}
+        # mtimes are keyed on st_mtime_ns (matching db.py): float st_mtime can
+        # collide on filesystems with coarse (1-second) mtime granularity.
+        self._json_mtimes: dict[str, int] = {}
+        self._json_list_mtimes: dict[str, int] = {}
+        self._yaml_mtimes: dict[str, int] = {}
         self._json_values: dict[str, JsonMapping] = {}
         self._json_lists: dict[str, JsonObjectList] = {}
         self._yaml_values: dict[str, JsonMapping] = {}
-        self._json_bad_mtimes: dict[str, float] = {}
-        self._json_list_bad_mtimes: dict[str, float] = {}
-        self._yaml_bad_mtimes: dict[str, float] = {}
+        self._json_bad_mtimes: dict[str, int] = {}
+        self._json_list_bad_mtimes: dict[str, int] = {}
+        self._yaml_bad_mtimes: dict[str, int] = {}
 
     def read_json_mapping(self, path: Path) -> JsonMapping:
         return self._cached_read(
@@ -34,7 +36,7 @@ class LastGoodFileCache:
             values=self._json_values,
             bad_mtimes=self._json_bad_mtimes,
             load=lambda: _load_json(path),
-            load_errors=(OSError, json.JSONDecodeError),
+            load_errors=(OSError, UnicodeError, json.JSONDecodeError),
             is_valid=lambda value: isinstance(value, dict),
             default_factory=dict,
         )
@@ -46,7 +48,7 @@ class LastGoodFileCache:
             values=self._json_lists,
             bad_mtimes=self._json_list_bad_mtimes,
             load=lambda: _load_json(path),
-            load_errors=(OSError, json.JSONDecodeError),
+            load_errors=(OSError, UnicodeError, json.JSONDecodeError),
             is_valid=lambda value: (
                 isinstance(value, list) and all(isinstance(entry, dict) for entry in value)
             ),
@@ -60,7 +62,7 @@ class LastGoodFileCache:
             values=self._yaml_values,
             bad_mtimes=self._yaml_bad_mtimes,
             load=lambda: _load_yaml(path),
-            load_errors=(OSError, yaml.YAMLError),
+            load_errors=(OSError, UnicodeError, yaml.YAMLError),
             is_valid=lambda value: isinstance(value, dict),
             default_factory=dict,
         )
@@ -68,9 +70,9 @@ class LastGoodFileCache:
     def _cached_read(
         self,
         path: Path,
-        mtimes: dict[str, float],
+        mtimes: dict[str, int],
         values: dict[str, T],
-        bad_mtimes: dict[str, float],
+        bad_mtimes: dict[str, int],
         load: Callable[[], object],
         load_errors: tuple[type[Exception], ...],
         is_valid: Callable[[object], bool],
@@ -79,7 +81,7 @@ class LastGoodFileCache:
         with self._lock:
             key = str(path)
             try:
-                mtime = path.stat().st_mtime
+                mtime = path.stat().st_mtime_ns
             except OSError:
                 return values.get(key, default_factory())
             if mtimes.get(key) == mtime and key in values:
@@ -103,10 +105,10 @@ class LastGoodFileCache:
 
 
 def _load_json(path: Path) -> object:
-    with path.open() as handle:
+    with path.open(encoding="utf-8") as handle:
         return json.load(handle)
 
 
 def _load_yaml(path: Path) -> object:
-    with path.open() as handle:
+    with path.open(encoding="utf-8") as handle:
         return yaml.safe_load(handle) or {}

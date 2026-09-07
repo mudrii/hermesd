@@ -612,7 +612,8 @@ def test_kanban_panel_detail_shows_branch_and_guarded_link_attachment_rows():
     assert "/work/repo" in text
     assert "autonomous" in text
     assert "step-3" in text
-    assert str(completed_at) in text
+    # Completed renders as an age label (e.g. "3h"), not a raw epoch.
+    assert str(completed_at) not in text
     assert "Decomposition Tree" in text
     assert "t_child" in text
     assert "Decomposition Links" in text

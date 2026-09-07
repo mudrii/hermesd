@@ -9,8 +9,14 @@ import pytest
 from hermesd.__main__ import parse_args, resolve_profile_name
 from hermesd.app import DashboardApp
 from hermesd.collector import Collector
-from hermesd.paths import HermesPaths
+from hermesd.paths import HermesPaths, default_hermes_home
 from tests.conftest import create_state_db_tables
+
+
+def test_default_hermes_home_follows_path_home(monkeypatch, tmp_path: Path):
+    fake_home = tmp_path / "fake-home"
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    assert default_hermes_home() == fake_home / ".hermes"
 
 
 def test_parse_args_profile_default_none():
@@ -55,6 +61,33 @@ def test_profiled_collector_reads_profile_scoped_runtime_data(profiled_hermes_ho
     assert state.available_tool_names == ["profile_tool"]
     assert state.logs.agent_lines[0].message == "profile agent log"
     c.close()
+
+
+def test_profiled_collector_rejects_profile_root_swapped_to_outside(
+    profiled_hermes_home: Path, tmp_path: Path
+):
+    c = Collector(profiled_hermes_home, profile_name="coding")
+    first = c.collect()
+    assert first.available_tool_names == ["profile_tool"]
+
+    profile_home = profiled_hermes_home / "profiles" / "coding"
+    original_profile = profiled_hermes_home / "profiles" / "coding-original"
+    profile_home.rename(original_profile)
+    outside = tmp_path / "outside-profile"
+    sessions = outside / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "sessions.json").write_text('{"x": {"session_id": "outside"}}')
+    (sessions / "session_outside.json").write_text('{"tools": [{"name": "outside_secret_tool"}]}')
+    profile_home.symlink_to(outside, target_is_directory=True)
+
+    try:
+        second = c.collect()
+    finally:
+        c.close()
+
+    assert second.available_tool_names == ["profile_tool"]
+    assert "outside_secret_tool" not in second.available_tool_names
+    assert "tools_index" in second.health.failed_sources
 
 
 def test_profiled_collector_keeps_shared_root_config_and_auth(profiled_hermes_home: Path):

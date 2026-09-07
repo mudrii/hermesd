@@ -86,11 +86,12 @@ def test_handle_key_help_toggle(populated_hermes_home: Path):
     app.close()
 
 
-def test_handle_key_c_copies_current_view(populated_hermes_home: Path):
+def test_handle_key_c_copies_current_view(populated_hermes_home: Path, monkeypatch):
     app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
     buffer = io.StringIO()
     app._console = Console(file=buffer, width=120, height=40, force_terminal=True, no_color=True)
-    expected = app.render_current_view_text()
+    expected = "stable current view"
+    monkeypatch.setattr(app, "render_current_view_text", lambda: expected)
     app.handle_key("c")
     copied = buffer.getvalue()
     assert "]52;c;" in copied
@@ -321,15 +322,15 @@ def test_jump_bottom_then_scroll_up_changes_logs_offset(populated_hermes_home: P
 
 def test_jump_bottom_then_scroll_up_changes_skills_offset(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    skills = [SkillInfo(name=f"skill-{i}") for i in range(5)]
+    skills = [SkillInfo(name=f"skill-{i}") for i in range(30)]
     skills_memory = app._state.skills_memory.model_copy(update={"skills": skills})
     app._set_state(app._state.model_copy(update={"skills_memory": skills_memory}))
     app.handle_key("7")
     app.handle_key("G")
     app._build_layout()
-    assert app._view.scroll_offset == 4  # 5 rows - 1
+    assert app._view.scroll_offset == 10  # 30 rows - 20-row window
     app.handle_key("k")
-    assert app._view.scroll_offset == 3
+    assert app._view.scroll_offset == 9
     app.close()
 
 
@@ -591,15 +592,19 @@ def test_collector_loop_marks_state_stale_on_collect_error(populated_hermes_home
     app._running.set()
     app._force_refresh.set()
 
+    collect_called = threading.Event()
+
     def fail_once_and_stop():
         app._running.clear()
+        collect_called.set()
         raise RuntimeError("collector failed")
 
     app._collector.collect = fail_once_and_stop
 
     thread = threading.Thread(target=app._collector_loop)
     thread.start()
-    thread.join(timeout=1)
+    assert collect_called.wait(timeout=5), "collector loop never invoked collect"
+    thread.join(timeout=5)
 
     assert app._state.is_stale is True
     assert not thread.is_alive()
@@ -1187,15 +1192,19 @@ def test_collector_loop_updates_state_on_successful_collect(populated_hermes_hom
     app._running.set()
     app._force_refresh.set()
 
+    collect_called = threading.Event()
+
     def collect_once_and_stop():
         app._running.clear()
+        collect_called.set()
         return marker_state
 
     app._collector.collect = collect_once_and_stop
 
     thread = threading.Thread(target=app._collector_loop)
     thread.start()
-    thread.join(timeout=1)
+    assert collect_called.wait(timeout=5), "collector loop never invoked collect"
+    thread.join(timeout=5)
 
     assert app._state.health.total_sources == 1
     assert app._state.health.ok_sources == 1

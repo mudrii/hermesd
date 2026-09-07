@@ -4,7 +4,7 @@ A real-time TUI monitoring dashboard for [Hermes Agent](https://github.com/NousR
 
 ![hermesd overview](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/overview.png)
 
-Screenshots are from `v2026.6.15`; the text below also documents unreleased visibility additions on the current branch.
+Screenshots are from `v2026.6.15`; panel content has grown since, but the layout and interactions are unchanged.
 
 ## Why This Exists
 
@@ -272,6 +272,31 @@ hermesd --log-tail-bytes 8192
 | `q` | Quit |
 | `?` | Toggle help overlay |
 
+## Troubleshooting / FAQ
+
+**Running hermesd without a TTY (cron, CI, pipes)**
+The interactive TUI expects a terminal: the input thread only starts when stdin is a TTY (`tty.setcbreak` mode), and the Rich `Live` display forces terminal output. Run non-interactively with `--snapshot` (overview), `--snapshot-panel N` (one panel), or `--snapshot-format json` (machine-readable full state) — these render one frame to stdout and exit, so they work from cron:
+
+```cron
+*/5 * * * * hermesd --snapshot-format json --snapshot-file /tmp/hermesd-state.json
+```
+
+**What does `AGENT OFFLINE` mean?**
+The header/footer show `AGENT OFFLINE` when Hermes Agent appears inactive: the gateway process is not running, no sessions are active, and the most recent activity is older than 5 minutes. Start the gateway or a session and the banner clears on the next refresh.
+
+**What does the footer health dot mean?**
+The green/yellow/red dot next to the polling spinner shows how many collector sources succeeded on the last refresh (`ok/total`). Green means every source read cleanly, yellow means some failed (the failed source names are listed inline), red means none did. A `(stale)` marker after the refresh interval means the last refresh failed outright and hermesd is showing cached data.
+
+**Does hermesd fight Hermes Agent for the SQLite database?**
+No. All databases are opened read-only (`mode=ro`). When `state.db` is in WAL mode, hermesd copies the database plus its `-wal`/`-shm` sidecars to a temporary snapshot and reads that, so a busy writer never blocks the dashboard. If a read does fail transiently (e.g. during a WAL checkpoint), hermesd keeps the last good data on screen and retries on the next poll instead of blanking panels.
+
+**hermesd is slow with very large log files**
+Each refresh reads only the last `--log-tail-bytes` bytes of every log file and cron output excerpt (default: 32768). Lower it to cut I/O on multi-GB logs:
+
+```bash
+hermesd --log-tail-bytes 8192
+```
+
 ## Architecture
 
 hermesd is a **read-only companion** — it reads files from `~/.hermes/` and never writes to Hermes Agent state. The only write path is the explicit `--snapshot-file PATH` export, which is rejected when the target is under the Hermes home.
@@ -340,23 +365,23 @@ source .venv/bin/activate
 uv sync --locked --all-extras --dev
 
 # Run the full local gate set for the active interpreter.
-# CI runs the same checks across Python 3.11, 3.12, and 3.13.
+# CI runs the same checks across Python 3.11, 3.12, 3.13, and 3.14.
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy hermesd
 uv run python -m compileall hermesd
-uv run pytest tests/ -v -W error::ResourceWarning
+uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
 uv run pip-audit
 uv lock --check
 uv build
 python -m venv /tmp/hermesd-wheel-smoke
 /tmp/hermesd-wheel-smoke/bin/python -m pip install dist/hermesd-*.whl
 /tmp/hermesd-wheel-smoke/bin/hermesd --version
-/tmp/hermesd-wheel-smoke/bin/python -m hermesd --version
+/tmp/hermesd-wheel-smoke/bin/python -I -m hermesd --version
 python -m venv /tmp/hermesd-sdist-smoke
 /tmp/hermesd-sdist-smoke/bin/python -m pip install dist/hermesd-*.tar.gz
 /tmp/hermesd-sdist-smoke/bin/hermesd --version
-/tmp/hermesd-sdist-smoke/bin/python -m hermesd --version
+/tmp/hermesd-sdist-smoke/bin/python -I -m hermesd --version
 uv run twine check dist/*
 
 # Run the dashboard
@@ -425,9 +450,9 @@ Only 3 runtime dependencies:
 
 | Package | Version | Purpose | In hermes-agent? |
 |---------|---------|---------|------------------|
-| `rich` | >= 14.0 | TUI rendering (Live, Layout, Panel, Table, Text) | Yes (`rich>=14.3.3`) |
-| `pyyaml` | >= 6.0 | Reading config.yaml | Yes (`pyyaml>=6.0.2`) |
-| `pydantic` | >= 2.0 | Data models and validation | Yes (`pydantic>=2.12.5`) |
+| `rich` | >= 14.0 | TUI rendering (Live, Layout, Panel, Table, Text) | Yes |
+| `pyyaml` | >= 6.0 | Reading config.yaml | Yes |
+| `pydantic` | >= 2.0 | Data models and validation | Yes |
 
 If you install hermesd into the same environment as Hermes Agent, these dependencies are usually already present, so no additional downloads may be needed.
 

@@ -1,18 +1,22 @@
-"""Critical-rule guard: hermesd must never import hermes-agent code.
+"""Critical-rule guard for hermesd production imports.
 
 Parses every hermesd/**/*.py with ast, collects all imported module names, and
-asserts none reference the forbidden hermes-agent package.
+allows only the standard library, local modules, and declared runtime imports.
 """
 
 from __future__ import annotations
 
 import ast
+import sys
 import tomllib
 from pathlib import Path
 
+import pytest
+
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent / "hermesd"
 _PROJECT_ROOT = _PACKAGE_ROOT.parent
-_FORBIDDEN_TOKENS = ("hermes_agent", "hermes-agent")
+_DECLARED_RUNTIME_IMPORT_ROOTS = {"pydantic", "rich", "yaml"}
+_ALLOWED_IMPORT_ROOTS = {*sys.stdlib_module_names, "hermesd", *_DECLARED_RUNTIME_IMPORT_ROOTS}
 
 
 def _imported_module_names(tree: ast.AST) -> set[str]:
@@ -25,22 +29,42 @@ def _imported_module_names(tree: ast.AST) -> set[str]:
     return names
 
 
-def test_no_module_imports_hermes_agent():
+def _undeclared_import_roots(tree: ast.AST) -> set[str]:
+    return {
+        module.partition(".")[0]
+        for module in _imported_module_names(tree)
+        if module.partition(".")[0] not in _ALLOWED_IMPORT_ROOTS
+    }
+
+
+def test_production_imports_are_stdlib_local_or_declared_runtime_dependencies():
     offenders: dict[str, set[str]] = {}
     source_files = sorted(_PACKAGE_ROOT.rglob("*.py"))
     assert source_files, "expected to find hermesd source files to scan"
 
     for source_file in source_files:
         tree = ast.parse(source_file.read_text(), filename=str(source_file))
-        forbidden = {
-            module
-            for module in _imported_module_names(tree)
-            if any(token in module for token in _FORBIDDEN_TOKENS)
-        }
-        if forbidden:
-            offenders[str(source_file.relative_to(_PACKAGE_ROOT.parent))] = forbidden
+        undeclared = _undeclared_import_roots(tree)
+        if undeclared:
+            offenders[str(source_file.relative_to(_PACKAGE_ROOT.parent))] = undeclared
 
-    assert offenders == {}, f"hermes-agent imports are forbidden: {offenders}"
+    assert offenders == {}, f"production imports must be stdlib, local, or declared: {offenders}"
+
+
+@pytest.mark.parametrize(
+    ("statement", "expected_root"),
+    [
+        ("from agent import Agent", "agent"),
+        ("from hermes_cli import main", "hermes_cli"),
+        ("import gateway.run", "gateway"),
+        ("import run_agent", "run_agent"),
+    ],
+)
+def test_import_guard_rejects_actual_hermes_agent_import_roots(
+    statement: str,
+    expected_root: str,
+):
+    assert _undeclared_import_roots(ast.parse(statement)) == {expected_root}
 
 
 def _normalized_dependency_name(requirement: str) -> str:

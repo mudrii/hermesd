@@ -123,7 +123,9 @@ def test_sessions_panel_detail_surfaces_billing_summary_before_long_session_tabl
     )
     assert "Billing & Context" in text
     assert "Lifetime / Limit" in text
-    assert text.index("Billing & Context") < text.index("sess_000")
+    # Detail table caps at 50 rows; sorted most-recent-first, sess_070 is the
+    # last rendered row of the main table (and is not in the billing table).
+    assert text.index("Billing & Context") < text.index("sess_070")
 
 
 def test_sessions_panel_detail_filter_query():

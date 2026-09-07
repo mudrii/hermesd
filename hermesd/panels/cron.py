@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import rich.box
 from rich.console import Group, RenderableType
-from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import DashboardState
-from hermesd.panels.formatting import fmt_iso_timestamp
+from hermesd.panels.formatting import (
+    escape_terminal_text as escape,
+)
+from hermesd.panels.formatting import (
+    fmt_iso_timestamp,
+    sanitize_terminal_text,
+)
 from hermesd.theme import Theme
 
 
@@ -42,8 +47,10 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             sym = "●" if j.enabled else "○"
             color = theme.ui_ok if j.state == "scheduled" else theme.banner_dim
             lines.append(f"  {sym} ", style=color)
-            lines.append(f"{j.name or j.job_id[:8]}", style=theme.banner_text)
-            lines.append(f" {j.schedule_display}", style=theme.banner_dim)
+            lines.append(
+                sanitize_terminal_text(j.name or j.job_id[:8] or "—"), style=theme.banner_text
+            )
+            lines.append(f" {sanitize_terminal_text(j.schedule_display)}", style=theme.banner_dim)
 
     return Panel(
         lines,
@@ -117,8 +124,8 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
                 escape(j.name or j.job_id[:8]),
                 escape(j.schedule_display),
                 escape(j.delivery_target_label or j.deliver or "—"),
-                Text(j.state, style=state_color),
-                Text(last, style=last_style),
+                Text(sanitize_terminal_text(j.state), style=state_color),
+                Text(sanitize_terminal_text(last), style=last_style),
                 escape(j.last_error[:80]) if j.last_error else "—",
             )
         sections.append(table)
@@ -127,16 +134,25 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
             sections.append(Text("\nLatest Output\n", style=f"bold {theme.ui_label}"))
             for j in c.jobs:
                 line = Text()
-                line.append(f"  {j.name or j.job_id[:8]}: ", style=theme.ui_label)
+                line.append(
+                    f"  {sanitize_terminal_text(j.name or j.job_id[:8] or '—')}: ",
+                    style=theme.ui_label,
+                )
                 if j.next_run_at:
                     line.append(
-                        f"next {fmt_iso_timestamp(j.next_run_at)}  ", style=theme.banner_dim
+                        f"next {sanitize_terminal_text(fmt_iso_timestamp(j.next_run_at))}  ",
+                        style=theme.banner_dim,
                     )
                 if j.silent_run:
                     line.append("[SILENT] ", style=theme.ui_warn)
                 if j.latest_output_path:
-                    line.append(f"{j.latest_output_path}  ", style=theme.banner_dim)
-                line.append(j.latest_output_excerpt or "—", style=theme.banner_text)
+                    line.append(
+                        f"{sanitize_terminal_text(j.latest_output_path)}  ", style=theme.banner_dim
+                    )
+                line.append(
+                    sanitize_terminal_text(j.latest_output_excerpt) or "—",
+                    style=theme.banner_text,
+                )
                 line.append("\n")
                 sections.append(line)
     else:

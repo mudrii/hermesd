@@ -11,6 +11,7 @@ import yaml
 
 from hermesd.__main__ import (
     _positive_int,
+    _snapshot_file_inside_hermes_home,
     main,
     parse_args,
     resolve_hermes_home,
@@ -238,6 +239,62 @@ def test_main_rejects_snapshot_file_under_hermes_home(populated_hermes_home: Pat
 
     assert exc.value.code == 1
     assert not output_path.exists()
+
+
+def test_snapshot_file_guard_output_equal_to_hermes_home(populated_hermes_home: Path):
+    assert _snapshot_file_inside_hermes_home(populated_hermes_home, populated_hermes_home) is True
+
+
+def test_snapshot_file_guard_dotdot_traversal_into_home(populated_hermes_home: Path):
+    sneaky = populated_hermes_home / "logs" / ".." / "snapshot.txt"
+    assert _snapshot_file_inside_hermes_home(sneaky, populated_hermes_home) is True
+
+
+def test_snapshot_file_guard_dotdot_traversal_escaping_home(populated_hermes_home: Path):
+    escaped = populated_hermes_home / ".." / "snapshot.txt"
+    assert _snapshot_file_inside_hermes_home(escaped, populated_hermes_home) is False
+
+
+def test_snapshot_file_guard_common_prefix_sibling_is_outside(populated_hermes_home: Path):
+    sibling = populated_hermes_home.with_name(populated_hermes_home.name + "-evil") / "snap.txt"
+    assert _snapshot_file_inside_hermes_home(sibling, populated_hermes_home) is False
+
+
+def test_snapshot_file_guard_symlinked_output_path_into_home(populated_hermes_home: Path):
+    outside_dir = populated_hermes_home.parent / "outside"
+    outside_dir.mkdir()
+    link = outside_dir / "tunnel"
+    link.symlink_to(populated_hermes_home, target_is_directory=True)
+    assert _snapshot_file_inside_hermes_home(link / "snapshot.txt", populated_hermes_home) is True
+
+
+def test_snapshot_file_guard_symlinked_file_into_home(populated_hermes_home: Path):
+    target = populated_hermes_home / "real-target.txt"
+    link = populated_hermes_home.parent / "linked-output.txt"
+    link.symlink_to(target)
+    assert _snapshot_file_inside_hermes_home(link, populated_hermes_home) is True
+
+
+def test_main_rejects_symlinked_snapshot_file_into_hermes_home(
+    populated_hermes_home: Path, tmp_path: Path
+):
+    tunnel = tmp_path / "tunnel"
+    tunnel.symlink_to(populated_hermes_home, target_is_directory=True)
+    output_path = tunnel / "snapshot.txt"
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "--hermes-home",
+                str(populated_hermes_home),
+                "--snapshot-file",
+                str(output_path),
+                "--no-color",
+            ]
+        )
+
+    assert exc.value.code == 1
+    assert not (populated_hermes_home / "snapshot.txt").exists()
 
 
 def test_main_closes_snapshot_app_when_file_write_fails(
