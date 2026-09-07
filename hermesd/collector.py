@@ -19,7 +19,7 @@ import tomllib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, NamedTuple, Never, TypeVar
+from typing import Any, Literal, NamedTuple, Never, TypeVar
 
 from hermesd.collect.common import (
     _MAX_TEXT_READ_BYTES,
@@ -157,6 +157,7 @@ from hermesd.db import HermesDB
 from hermesd.defaults import DEFAULT_LOG_TAIL_BYTES
 from hermesd.file_cache import JsonMapping, JsonObjectList, LastGoodFileCache
 from hermesd.models import (
+    ActiveSurface,
     BackgroundProcessInfo,
     ChannelDirectoryState,
     ChannelPlatformInfo,
@@ -181,6 +182,7 @@ from hermesd.models import (
     MCPServerInfo,
     MemoryOverview,
     ModelCacheSummary,
+    ModelUsage,
     OperationsState,
     PluginInfo,
     PRMonitorSummary,
@@ -255,6 +257,40 @@ class _SourceSpec(NamedTuple):
     collect: Callable[[], Any]
     default_factory: Callable[[], Any]
     fallback: Callable[[], Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelUsageBundle:
+    """Per-model usage rows for the all-time, 24h and 7d windows."""
+
+    usage_source: Literal["session_model_usage", "sessions"] = "sessions"
+    all_time: tuple[ModelUsage, ...] = ()
+    last_24h: tuple[ModelUsage, ...] = ()
+    last_7d: tuple[ModelUsage, ...] = ()
+
+
+_EMPTY_MODEL_USAGE_BUNDLE = _ModelUsageBundle()
+
+
+def _model_usage_from_rows(rows: list[dict[str, Any]]) -> tuple[ModelUsage, ...]:
+    return tuple(
+        ModelUsage(
+            model=row.get("model") or "",
+            provider=row.get("provider") or "",
+            task=row.get("task") or "",
+            api_calls=row.get("api_calls") or 0,
+            input_tokens=row.get("input_tokens") or 0,
+            output_tokens=row.get("output_tokens") or 0,
+            cache_read_tokens=row.get("cache_read_tokens") or 0,
+            cache_write_tokens=row.get("cache_write_tokens") or 0,
+            reasoning_tokens=row.get("reasoning_tokens") or 0,
+            estimated_cost_usd=_coerce_float(row.get("estimated_cost_usd")),
+            actual_cost_usd=_coerce_float(row.get("actual_cost_usd")),
+            has_actual_cost=_coerce_float(row.get("actual_cost_usd")) > 0,
+            last_seen=row.get("last_seen") or 0.0,
+        )
+        for row in rows
+    )
 
 
 @dataclass(slots=True)
@@ -540,6 +576,21 @@ class Collector:
             _SourceSpec("active_skin", "skin", self._collect_skin, str, fallback=self._last_skin),
             _SourceSpec("curator", "curator", self._collect_curator, CuratorRun),
             _SourceSpec(
+                "model_usage",
+                "model_usage",
+                self._collect_model_usage,
+                lambda: _EMPTY_MODEL_USAGE_BUNDLE,
+                # The bundle is merged into token_analytics below, so its
+                # last-good value is not a plain _last_state attribute read.
+                fallback=self._last_model_usage,
+            ),
+            _SourceSpec(
+                "active_surfaces",
+                "active_sessions",
+                self._collect_active_surfaces,
+                list,
+            ),
+            _SourceSpec(
                 "runtime",
                 "runtime",
                 lambda: self._collect_runtime_status(results["gateway"], results["sessions"]),
@@ -563,6 +614,15 @@ class Collector:
             health.mark_failed("kanban", "; ".join(self._kanban_board_errors))
 
         tool_count, tool_names = results.pop("available_tools")
+        model_usage = results.pop("model_usage")
+        results["token_analytics"] = results["token_analytics"].model_copy(
+            update={
+                "usage_source": model_usage.usage_source,
+                "model_usage_all": list(model_usage.all_time),
+                "model_usage_24h": list(model_usage.last_24h),
+                "model_usage_7d": list(model_usage.last_7d),
+            }
+        )
         health_summary = HealthSummary(
             total_sources=health.total_sources,
             ok_sources=health.total_sources - len(health.failed_sources),
@@ -580,6 +640,7 @@ class Collector:
             health=health_summary,
             available_tools=tool_count,
             available_tool_names=tool_names,
+            active_surface_count=len(results["active_surfaces"]),
             **results,
         )
 
@@ -922,9 +983,64 @@ class Collector:
                 ended_at=r.get("ended_at"),
                 title=r.get("title"),
                 is_active=r.get("ended_at") is None and not bool(r.get("archived") or 0),
+                git_branch=r.get("git_branch") or "",
+                chat_type=r.get("chat_type") or "",
+                display_name=r.get("display_name") or "",
+                title_source=r.get("title_source") or "",
+                profile_name=r.get("profile_name") or "",
+                pinned=bool(r.get("pinned") or 0),
+                last_activity_at=r.get("last_activity_at") or 0.0,
+                last_activity_description=r.get("last_activity_description") or "",
+                actual_cost_usd=_coerce_float(r.get("actual_cost_usd")),
+                cost_source=r.get("cost_source") or "",
+                compression_failure_error=r.get("compression_failure_error") or "",
             )
             for r in rows
         ]
+
+    def _collect_model_usage(self) -> _ModelUsageBundle:
+        usage = self._db.read_model_usage(self._clock())
+        if self._db.last_read_model_usage_stale:
+            raise RuntimeError("model usage rows are stale")
+        if not any(usage.values()):
+            return _EMPTY_MODEL_USAGE_BUNDLE
+        return _ModelUsageBundle(
+            usage_source="session_model_usage",
+            all_time=_model_usage_from_rows(usage["all"]),
+            last_24h=_model_usage_from_rows(usage["24h"]),
+            last_7d=_model_usage_from_rows(usage["7d"]),
+        )
+
+    def _collect_active_surfaces(self) -> list[ActiveSurface]:
+        """Live agent surfaces from runtime/active_sessions.json."""
+        data = self._read_json_cached(self._paths.profile_path("runtime", "active_sessions.json"))
+        surfaces = []
+        for raw_entry in _as_list(data.get("entries")):
+            entry = _as_dict(raw_entry)
+            session_id = str(entry.get("session_id") or "")
+            if not session_id:
+                continue
+            pid = _coerce_int(entry.get("pid"))
+            surfaces.append(
+                ActiveSurface(
+                    session_id=session_id,
+                    surface=str(entry.get("surface") or ""),
+                    pid=pid,
+                    alive=bool(pid) and self._pid_exists(pid),
+                )
+            )
+        return surfaces
+
+    def _last_model_usage(self) -> _ModelUsageBundle:
+        if self._last_state is None:
+            return _EMPTY_MODEL_USAGE_BUNDLE
+        analytics = self._last_state.token_analytics
+        return _ModelUsageBundle(
+            usage_source=analytics.usage_source,
+            all_time=tuple(analytics.model_usage_all),
+            last_24h=tuple(analytics.model_usage_24h),
+            last_7d=tuple(analytics.model_usage_7d),
+        )
 
     def _collect_tokens_today(self, rows: list[dict[str, Any]] | None = None) -> TokenSummary:
         rows = self._session_rows_or_read(rows)

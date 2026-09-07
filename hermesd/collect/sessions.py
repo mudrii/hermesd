@@ -146,6 +146,10 @@ def _estimate_cost(
 
 
 def _session_cost_is_reported(row: dict[str, Any]) -> bool:
+    # A non-zero actual_cost_usd (hermes-agent 0.21) is provider-billed and
+    # authoritative regardless of cost_status.
+    if _coerce_float(row.get("actual_cost_usd")) > 0:
+        return True
     return (
         str(row.get("cost_status") or "") in AUTHORITATIVE_COST_STATUSES
         and row.get("estimated_cost_usd") is not None
@@ -153,6 +157,9 @@ def _session_cost_is_reported(row: dict[str, Any]) -> bool:
 
 
 def _resolved_session_cost(row: dict[str, Any]) -> float:
+    actual_cost = _coerce_float(row.get("actual_cost_usd"))
+    if actual_cost > 0:
+        return actual_cost
     raw_cost = row.get("estimated_cost_usd")
     cost = _coerce_float(raw_cost)
     if _session_cost_is_reported(row):

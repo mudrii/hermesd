@@ -69,13 +69,108 @@ def hermes_home(tmp_path: Path) -> Path:
     return home
 
 
+SESSION_V021_COLUMNS_SQL = """,
+            git_branch TEXT,
+            chat_type TEXT,
+            display_name TEXT,
+            title_source TEXT,
+            profile_name TEXT,
+            pinned INTEGER DEFAULT 0,
+            hidden INTEGER DEFAULT 0,
+            last_activity_at REAL,
+            last_activity_description TEXT,
+            compression_failure_error TEXT"""
+
+SESSION_MODEL_USAGE_SQL = """
+        CREATE TABLE session_model_usage (
+            session_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            billing_provider TEXT NOT NULL DEFAULT '',
+            billing_base_url TEXT NOT NULL DEFAULT '',
+            billing_mode TEXT NOT NULL DEFAULT '',
+            task TEXT NOT NULL DEFAULT '',
+            api_call_count INTEGER NOT NULL DEFAULT 0,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cache_read_tokens INTEGER,
+            cache_write_tokens INTEGER,
+            reasoning_tokens INTEGER,
+            estimated_cost_usd REAL,
+            actual_cost_usd REAL,
+            cost_status TEXT,
+            cost_source TEXT,
+            first_seen REAL,
+            last_seen REAL,
+            PRIMARY KEY (
+                session_id, model, billing_provider, billing_base_url, billing_mode, task
+            )
+        );
+"""
+
+
+def insert_model_usage(
+    conn: sqlite3.Connection,
+    session_id: str,
+    model: str,
+    *,
+    provider: str = "",
+    task: str = "",
+    base_url: str = "",
+    billing_mode: str = "",
+    api_call_count: int = 0,
+    input_tokens: int | None = 0,
+    output_tokens: int | None = 0,
+    cache_read_tokens: int | None = 0,
+    cache_write_tokens: int | None = 0,
+    reasoning_tokens: int | None = 0,
+    estimated_cost_usd: float | None = 0.0,
+    actual_cost_usd: float | None = 0.0,
+    last_seen: float | None = None,
+) -> None:
+    """Insert one session_model_usage row (test helper)."""
+    seen = last_seen if last_seen is not None else time.time()
+    conn.execute(
+        "INSERT INTO session_model_usage ("
+        "session_id, model, billing_provider, billing_base_url, billing_mode, task, "
+        "api_call_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+        "reasoning_tokens, estimated_cost_usd, actual_cost_usd, cost_status, cost_source, "
+        "first_seen, last_seen"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            session_id,
+            model,
+            provider,
+            base_url,
+            billing_mode,
+            task,
+            api_call_count,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            reasoning_tokens,
+            estimated_cost_usd,
+            actual_cost_usd,
+            "exact" if actual_cost_usd else "estimated",
+            "provider" if actual_cost_usd else "pricing",
+            seen,
+            seen,
+        ),
+    )
+
+
 def create_state_db_tables(
     conn: sqlite3.Connection,
     *,
     include_schema_version: bool = True,
     source_required: bool = True,
+    include_v021_columns: bool = False,
 ) -> None:
-    """Create the session/message tables used by collector and DB tests."""
+    """Create the session/message tables used by collector and DB tests.
+
+    ``include_v021_columns`` adds the hermes-agent 0.21 session columns and the
+    ``session_model_usage`` table; legacy-schema tests keep the default.
+    """
     schema_version_sql = (
         "CREATE TABLE schema_version (version INTEGER NOT NULL);\n"
         "INSERT INTO schema_version VALUES (6);\n"
@@ -83,6 +178,8 @@ def create_state_db_tables(
         else ""
     )
     source_column = "source TEXT NOT NULL" if source_required else "source TEXT"
+    extra_session_columns = SESSION_V021_COLUMNS_SQL if include_v021_columns else ""
+    model_usage_table = SESSION_MODEL_USAGE_SQL if include_v021_columns else ""
     conn.executescript(
         f"""
         {schema_version_sql}
@@ -112,9 +209,9 @@ def create_state_db_tables(
             cost_status TEXT,
             cost_source TEXT,
             pricing_version TEXT,
-            title TEXT
+            title TEXT{extra_session_columns}
         );
-
+        {model_usage_table}
         CREATE TABLE messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -285,22 +382,29 @@ def create_state_meta_table(conn: sqlite3.Connection, entries: dict[str, str]) -
 
 @pytest.fixture
 def sample_db(hermes_home: Path) -> Path:
-    """Create a state.db with sample sessions, messages and gateway ledgers."""
+    """Create a state.db with sample sessions and messages."""
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
-    create_state_db_tables(conn)
+    create_state_db_tables(conn, include_v021_columns=True)
     create_gateway_ledger_tables(conn)
     now = time.time()
     _insert_gateway_ledger_rows(conn, now)
+    session_insert = (
+        "INSERT INTO sessions ("
+        "id, source, user_id, model, parent_session_id, started_at, ended_at, end_reason, "
+        "message_count, tool_call_count, input_tokens, output_tokens, cache_read_tokens, "
+        "cache_write_tokens, reasoning_tokens, billing_provider, billing_base_url, "
+        "billing_mode, estimated_cost_usd, cost_status, git_branch, profile_name, "
+        "last_activity_at"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    )
     conn.execute(
-        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        session_insert,
         (
             "sess_001",
             "cli",
             None,
             "gpt-5.4",
-            None,
-            None,
             None,
             now - 3600,
             None,
@@ -316,22 +420,19 @@ def sample_db(hermes_home: Path) -> Path:
             "https://api.kimi.test/v1",
             "subscription_included",
             0.42,
-            None,
             "unknown",
-            None,
-            None,
-            None,
+            "feat/dashboard",
+            "coding",
+            now - 3600,
         ),
     )
     conn.execute(
-        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        session_insert,
         (
             "sess_002",
             "telegram",
             "user1",
             "gpt-5.4",
-            None,
-            None,
             None,
             now - 1800,
             None,
@@ -347,12 +448,38 @@ def sample_db(hermes_home: Path) -> Path:
             None,
             None,
             0.31,
-            None,
             "unknown",
             None,
             None,
             None,
         ),
+    )
+    insert_model_usage(
+        conn,
+        "sess_001",
+        "gpt-5.4",
+        provider="openai-codex",
+        api_call_count=40,
+        input_tokens=12400,
+        output_tokens=8200,
+        cache_read_tokens=28300,
+        cache_write_tokens=5000,
+        estimated_cost_usd=0.42,
+        actual_cost_usd=0.37,
+        last_seen=now - 120,
+    )
+    insert_model_usage(
+        conn,
+        "sess_002",
+        "gpt-5.4-mini",
+        provider="openai-codex",
+        task="title",
+        api_call_count=4,
+        input_tokens=900,
+        output_tokens=120,
+        estimated_cost_usd=0.01,
+        actual_cost_usd=0.0,
+        last_seen=now - 1800,
     )
     for i in range(5):
         conn.execute(
@@ -459,6 +586,30 @@ def sample_delegation_live_logs(hermes_home: Path) -> Path:
         run_dir.mkdir()
         (run_dir / "task-0.log").write_text("subagent transcript\n")
     return live
+
+
+@pytest.fixture
+def sample_active_sessions(hermes_home: Path) -> Path:
+    """Create runtime/active_sessions.json with one live surface."""
+    runtime = hermes_home / "runtime"
+    runtime.mkdir(exist_ok=True)
+    path = runtime / "active_sessions.json"
+    path.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {
+                        "session_id": "sess_001",
+                        "surface": "cli",
+                        "pid": os.getpid(),
+                        "process_start_time": time.time() - 60,
+                        "started_at": "2026-09-07T10:00:00+00:00",
+                    }
+                ]
+            }
+        )
+    )
+    return path
 
 
 @pytest.fixture
@@ -1289,6 +1440,7 @@ def populated_hermes_home(
     sample_state_snapshots,
     sample_web_ui_stamp,
     sample_delegation_live_logs,
+    sample_active_sessions,
 ) -> Path:
     """A fully populated mock ~/.hermes."""
     return hermes_home

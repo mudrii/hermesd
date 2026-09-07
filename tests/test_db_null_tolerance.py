@@ -18,6 +18,7 @@ import pytest
 import hermesd
 from hermesd.collector import Collector
 from hermesd.db import HermesDB
+from tests.conftest import create_state_db_tables, insert_model_usage
 
 # A line carrying this marker is exempt from the row-get guard.
 _ALLOW_MARKER = "# row-get-ok"
@@ -162,8 +163,8 @@ def test_null_hidden_session_is_treated_as_visible(null_column_db: Path) -> None
         assert [row["id"] for row in rows] == ["sess_null"]
         # A NULL hidden flag means "not soft-deleted", so it must also be counted.
         assert db.read_session_count() == 1
-        # last_activity_at is an ordering key, not a displayed column.
-        assert "last_activity_at" not in rows[0]
+        # last_activity_at is both an ordering key and a displayed column.
+        assert rows[0]["last_activity_at"] is None
     finally:
         db.close()
 
@@ -219,3 +220,71 @@ def test_null_cost_columns_collect_as_zero(hermes_home: Path, null_column_db: Pa
         assert state.tokens_total.total_cost_usd == 0.0
     finally:
         collector.close()
+
+
+def _null_v021_db(hermes_home: Path) -> Path:
+    """A 0.21-schema state.db whose new session and usage columns are all NULL."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False, include_v021_columns=True)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+        ("sess_null", "cli", time.time() - 60),
+    )
+    insert_model_usage(
+        conn,
+        "sess_null",
+        "gpt-5.4",
+        input_tokens=None,
+        output_tokens=None,
+        cache_read_tokens=None,
+        cache_write_tokens=None,
+        reasoning_tokens=None,
+        estimated_cost_usd=None,
+        actual_cost_usd=None,
+    )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def test_null_v021_session_columns_map_to_defaults(hermes_home: Path) -> None:
+    _null_v021_db(hermes_home)
+    collector = Collector(hermes_home)
+    try:
+        session = collector.collect().sessions[0]
+    finally:
+        collector.close()
+
+    assert session.git_branch == ""
+    assert session.chat_type == ""
+    assert session.display_name == ""
+    assert session.title_source == ""
+    assert session.profile_name == ""
+    assert session.pinned is False
+    assert session.last_activity_at == 0.0
+    assert session.last_activity_description == ""
+    assert session.actual_cost_usd == 0.0
+    assert session.cost_source == ""
+    assert session.compression_failure_error == ""
+
+
+def test_null_model_usage_columns_collect_as_zero(hermes_home: Path) -> None:
+    _null_v021_db(hermes_home)
+    collector = Collector(hermes_home)
+    try:
+        state = collector.collect()
+    finally:
+        collector.close()
+
+    usage = state.token_analytics.model_usage_all[0]
+    assert usage.model == "gpt-5.4"
+    assert usage.input_tokens == 0
+    assert usage.output_tokens == 0
+    assert usage.cache_read_tokens == 0
+    assert usage.cache_write_tokens == 0
+    assert usage.reasoning_tokens == 0
+    assert usage.estimated_cost_usd == 0.0
+    assert usage.actual_cost_usd == 0.0
+    assert usage.has_actual_cost is False
+    assert state.health.failed_sources == []

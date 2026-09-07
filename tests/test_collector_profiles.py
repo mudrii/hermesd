@@ -110,6 +110,9 @@ def test_collect_profiles_preserves_last_good_when_profile_db_read_fails(hermes_
         def read_tool_stats(self) -> list[dict[str, object]]:
             return []
 
+        def read_model_usage(self, now: float) -> dict[str, list[dict[str, object]]]:
+            return {"all": [], "24h": [], "7d": []}
+
         def read_session_count(self) -> int:
             if FlakyFakeDB.fail:
                 raise RuntimeError("profile db unavailable")
@@ -121,6 +124,10 @@ def test_collect_profiles_preserves_last_good_when_profile_db_read_fails(hermes_
 
         @property
         def last_read_tool_stats_stale(self) -> bool:
+            return False
+
+        @property
+        def last_read_model_usage_stale(self) -> bool:
             return False
 
         def close(self) -> None:
