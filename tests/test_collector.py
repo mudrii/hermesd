@@ -413,12 +413,19 @@ def test_collect_reads_session_rows_once_per_cycle(hermes_home: Path):
         def read_tool_stats(self) -> list[dict[str, object]]:
             return []
 
+        def read_model_usage(self, now: float) -> dict[str, list[dict[str, object]]]:
+            return {"all": [], "24h": [], "7d": []}
+
         @property
         def last_read_sessions_stale(self) -> bool:
             return False
 
         @property
         def last_read_tool_stats_stale(self) -> bool:
+            return False
+
+        @property
+        def last_read_model_usage_stale(self) -> bool:
             return False
 
         def close(self) -> None:

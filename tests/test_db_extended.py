@@ -10,6 +10,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from hermesd.collector import Collector
 from hermesd.db import _LIKE_SEARCH_LIMIT, HermesDB
 from hermesd.models import DashboardState, RuntimeStatus
@@ -17,6 +19,7 @@ from tests.conftest import (
     _skip_if_root,
     create_state_db_tables,
     create_state_db_with_session,
+    insert_model_usage,
 )
 
 
@@ -520,33 +523,16 @@ def test_read_session_count_refreshes_after_write(sample_db, hermes_home):
 
     conn = sqlite3.connect(str(sample_db))
     conn.execute(
-        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO sessions ("
+        "id, source, model, started_at, message_count, estimated_cost_usd, title"
+        ") VALUES (?,?,?,?,?,?,?)",
         (
             "sess_003",
             "cli",
-            None,
             "gpt-5.4",
-            None,
-            None,
-            None,
             time.time(),
-            None,
-            None,
             1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            None,
-            None,
-            None,
             0.0,
-            None,
-            None,
-            None,
-            None,
             "new title",
         ),
     )
@@ -1102,3 +1088,208 @@ def test_message_search_fts_check_failure_degrades_without_crashing(tmp_path):
     assert result == set()  # no cache yet, query failed -> empty, not a crash
     assert db._messages_fts_available is False
     db.close()
+
+
+def _model_usage_db(
+    hermes_home: Path,
+    rows: list[dict[str, object]],
+    *,
+    table: bool = True,
+) -> Path:
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False, include_v021_columns=table)
+    for row in rows:
+        insert_model_usage(conn, **row)  # type: ignore[arg-type]
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def test_read_model_usage_aggregates_by_model_provider_task(hermes_home):
+    now = 1_800_000_000.0
+    _model_usage_db(
+        hermes_home,
+        [
+            {
+                "session_id": "s1",
+                "model": "gpt-5.4",
+                "provider": "openai",
+                "api_call_count": 3,
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "estimated_cost_usd": 0.5,
+                "actual_cost_usd": 0.4,
+                "last_seen": now - 10,
+            },
+            {
+                "session_id": "s2",
+                "model": "gpt-5.4",
+                "provider": "openai",
+                "api_call_count": 2,
+                "input_tokens": 50,
+                "output_tokens": 10,
+                "estimated_cost_usd": 0.25,
+                "actual_cost_usd": 0.2,
+                "last_seen": now - 5,
+            },
+            {
+                "session_id": "s3",
+                "model": "gpt-5.4",
+                "provider": "openai",
+                "task": "title",
+                "api_call_count": 1,
+                "input_tokens": 5,
+                "last_seen": now - 5,
+            },
+        ],
+    )
+    db = HermesDB(hermes_home / "state.db")
+    try:
+        usage = db.read_model_usage(now)
+
+        assert [row["model"] for row in usage["all"]] == ["gpt-5.4", "gpt-5.4"]
+        main = usage["all"][0]
+        assert main["task"] == ""
+        assert main["api_calls"] == 5
+        assert main["input_tokens"] == 150
+        assert main["output_tokens"] == 30
+        assert main["estimated_cost_usd"] == pytest.approx(0.75)
+        assert main["actual_cost_usd"] == pytest.approx(0.6)
+        assert main["last_seen"] == now - 5
+        # Auxiliary (task-tagged) work groups separately.
+        assert usage["all"][1]["task"] == "title"
+    finally:
+        db.close()
+
+
+def test_read_model_usage_tolerates_null_token_columns(hermes_home):
+    now = 1_800_000_000.0
+    _model_usage_db(
+        hermes_home,
+        [
+            {
+                "session_id": "s1",
+                "model": "m",
+                "input_tokens": None,
+                "output_tokens": None,
+                "cache_read_tokens": None,
+                "cache_write_tokens": None,
+                "reasoning_tokens": None,
+                "estimated_cost_usd": None,
+                "actual_cost_usd": None,
+                "last_seen": now,
+            }
+        ],
+    )
+    db = HermesDB(hermes_home / "state.db")
+    try:
+        row = db.read_model_usage(now)["all"][0]
+
+        # SUM() over NULL columns is NULL: readers must apply `or 0`.
+        assert row["input_tokens"] is None
+        assert (row["input_tokens"] or 0) == 0
+    finally:
+        db.close()
+
+
+def test_read_model_usage_missing_table_returns_empty(hermes_home):
+    _model_usage_db(hermes_home, [], table=False)
+    db = HermesDB(hermes_home / "state.db")
+    try:
+        usage = db.read_model_usage(1_800_000_000.0)
+
+        assert usage == {"all": [], "24h": [], "7d": []}
+        assert db.last_read_model_usage_stale is False
+    finally:
+        db.close()
+
+
+def test_read_model_usage_windows_filter_by_last_seen(hermes_home):
+    now = 1_800_000_000.0
+    _model_usage_db(
+        hermes_home,
+        [
+            {"session_id": "s1", "model": "recent", "input_tokens": 10, "last_seen": now - 3600},
+            {"session_id": "s2", "model": "mid", "input_tokens": 10, "last_seen": now - 86400 * 3},
+            {"session_id": "s3", "model": "old", "input_tokens": 10, "last_seen": now - 86400 * 30},
+        ],
+    )
+    db = HermesDB(hermes_home / "state.db")
+    try:
+        usage = db.read_model_usage(now)
+
+        assert {row["model"] for row in usage["all"]} == {"recent", "mid", "old"}
+        assert {row["model"] for row in usage["24h"]} == {"recent"}
+        assert {row["model"] for row in usage["7d"]} == {"recent", "mid"}
+    finally:
+        db.close()
+
+
+def test_read_model_usage_limits_rows(hermes_home):
+    now = 1_800_000_000.0
+    _model_usage_db(
+        hermes_home,
+        [
+            {
+                "session_id": f"s{index}",
+                "model": f"model-{index:03d}",
+                "input_tokens": index + 1,
+                "last_seen": now,
+            }
+            for index in range(60)
+        ],
+    )
+    db = HermesDB(hermes_home / "state.db")
+    try:
+        usage = db.read_model_usage(now)
+
+        assert len(usage["all"]) == 50
+        # Ordered by total tokens descending.
+        assert usage["all"][0]["model"] == "model-059"
+    finally:
+        db.close()
+
+
+def test_read_model_usage_serves_cache_on_unchanged_data_version(hermes_home, monkeypatch):
+    now = 1_800_000_000.0
+    _model_usage_db(
+        hermes_home,
+        [{"session_id": "s1", "model": "m", "input_tokens": 5, "last_seen": now}],
+    )
+    db = HermesDB(hermes_home / "state.db")
+    try:
+        first = db.read_model_usage(now)
+
+        def unexpected(conn, cutoff):
+            raise AssertionError("cached read must not re-query")
+
+        monkeypatch.setattr(db, "_aggregate_model_usage", unexpected)
+
+        assert db.read_model_usage(now) is first
+    finally:
+        db.close()
+
+
+def test_read_model_usage_error_serves_last_good(hermes_home, monkeypatch):
+    now = 1_800_000_000.0
+    _model_usage_db(
+        hermes_home,
+        [{"session_id": "s1", "model": "m", "input_tokens": 5, "last_seen": now}],
+    )
+    db = HermesDB(hermes_home / "state.db")
+    try:
+        good = db.read_model_usage(now)
+        assert good["all"]
+
+        def boom(conn, cutoff):
+            raise sqlite3.OperationalError("boom")
+
+        monkeypatch.setattr(db, "_aggregate_model_usage", boom)
+        # A later "now" moves the window cutoffs, forcing a re-read.
+        degraded = db.read_model_usage(now + 7200)
+
+        assert degraded["all"] == good["all"]
+        assert db.last_read_model_usage_stale is True
+    finally:
+        db.close()

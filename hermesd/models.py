@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -72,6 +73,46 @@ class SessionInfo(BaseModel):
     ended_at: float | None = None
     title: str | None = None
     is_active: bool = False
+    # hermes-agent 0.21 columns; absent on older databases (defaults apply).
+    git_branch: str = ""
+    chat_type: str = ""
+    display_name: str = ""
+    title_source: str = ""
+    profile_name: str = ""
+    pinned: bool = False
+    last_activity_at: float = 0.0
+    last_activity_description: str = ""
+    actual_cost_usd: float = 0.0
+    cost_source: str = ""
+    compression_failure_error: str = ""
+
+
+class ActiveSurface(BaseModel):
+    """A live agent surface attached to a session (runtime/active_sessions.json)."""
+
+    session_id: str = ""
+    surface: str = ""
+    pid: int = 0
+    alive: bool = False
+
+
+class ModelUsage(BaseModel):
+    """One aggregated `session_model_usage` group."""
+
+    model: str = ""
+    provider: str = ""
+    # Non-empty for auxiliary work (title generation, compression, ...).
+    task: str = ""
+    api_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    reasoning_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+    actual_cost_usd: float = 0.0
+    has_actual_cost: bool = False
+    last_seen: float = 0.0
 
 
 class TokenSummary(BaseModel):
@@ -111,6 +152,12 @@ class TokenAnalytics(BaseModel):
     by_provider: list[TokenBreakdown] = Field(default_factory=list)
     by_endpoint: list[TokenBreakdown] = Field(default_factory=list)
     cost_status_counts: dict[str, int] = Field(default_factory=dict)
+    # "session_model_usage" when the per-model usage table is present; otherwise
+    # the legacy per-session model breakdown ("sessions") drives the panel.
+    usage_source: Literal["session_model_usage", "sessions"] = "sessions"
+    model_usage_all: list[ModelUsage] = Field(default_factory=list)
+    model_usage_24h: list[ModelUsage] = Field(default_factory=list)
+    model_usage_7d: list[ModelUsage] = Field(default_factory=list)
 
 
 class ToolStats(BaseModel):
@@ -607,6 +654,8 @@ class DashboardState(BaseModel):
     runtime: RuntimeStatus = Field(default_factory=RuntimeStatus)
     gateway: GatewayState = Field(default_factory=GatewayState)
     sessions: list[SessionInfo] = Field(default_factory=list)
+    active_surfaces: list[ActiveSurface] = Field(default_factory=list)
+    active_surface_count: int = 0
     session_message_match_query: str = ""
     session_message_match_ids: set[str] = Field(default_factory=set)
     tokens_today: TokenSummary = Field(default_factory=TokenSummary)

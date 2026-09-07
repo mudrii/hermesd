@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import TypedDict
 
 import rich.box
@@ -39,6 +40,12 @@ _EXACT_SESSION_FILTER_FIELDS = {
 _ACTIVE_TRUE_VALUES = {"1", "true", "yes", "active"}
 _ACTIVE_FALSE_VALUES = {"0", "false", "no", "inactive"}
 _DETAIL_MAX_SESSION_ROWS = 50
+_DETAIL_MAX_SURFACE_ROWS = 20
+_PIN_MARKER = "📌"
+_MAX_NAME_CHARS = 30
+_MAX_BRANCH_CHARS = 24
+_MAX_ACTIVITY_CHARS = 40
+_MAX_ERROR_CHARS = 60
 
 
 def render_sessions(
@@ -61,6 +68,8 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines = Text()
     lines.append(f"  {len(active)} active", style=f"bold {theme.ui_ok}")
     lines.append(f" / {len(state.sessions)} total", style=theme.banner_dim)
+    if state.active_surface_count > 0:
+        lines.append(f"  {state.active_surface_count} live", style=f"bold {theme.ui_accent}")
     lines.append(f"   {total_msgs} msgs  {total_tc} tools\n", style=theme.banner_text)
     for s in state.sessions[:4]:
         sid_short = s.session_id[-6:] if len(s.session_id) > 6 else s.session_id
@@ -97,9 +106,21 @@ def _render_detail(
     sections: list[RenderableType] = [
         _detail_header(state, theme, sessions, filter_query, session_sort)
     ]
+    activity_table = _activity_table(sessions, theme)
+    if activity_table is not None:
+        sections.append(section_heading("Activity", theme, leading_blank=False))
+        sections.append(activity_table)
+    surfaces_table = _surfaces_table(state, sessions, filter_query, theme)
+    if surfaces_table is not None:
+        sections.append(section_heading("Live Surfaces", theme))
+        sections.append(surfaces_table)
+    warnings = _compression_warnings(sessions, theme)
+    if warnings is not None:
+        sections.append(section_heading("Warnings", theme))
+        sections.append(warnings)
     runtime_table = _runtime_table(sessions, theme)
     if runtime_table is not None:
-        sections.append(section_heading("Runtime", theme, leading_blank=False))
+        sections.append(section_heading("Runtime", theme, leading_blank=len(sections) > 1))
         sections.append(runtime_table)
     billing_table = _billing_table(sessions, theme)
     if billing_table is not None:
@@ -170,6 +191,8 @@ def _sessions_table(sessions: list[SessionInfo], theme: Theme) -> Table:
         active = Text("● ", style=f"bold {theme.ui_ok}") if s.is_active else Text("  ")
         sid = Text()
         sid.append_text(active)
+        if s.pinned:
+            sid.append(f"{_PIN_MARKER} ", style=theme.ui_accent)
         sid.append(sanitize_terminal_text(s.session_id[-8:]))
         table.add_row(
             sid,
@@ -183,7 +206,7 @@ def _sessions_table(sessions: list[SessionInfo], theme: Theme) -> Table:
             str(s.tool_call_count),
             fmt_tokens(s.input_tokens),
             fmt_tokens(s.output_tokens),
-            fmt_usd(s.estimated_cost_usd),
+            fmt_usd(_display_cost(s)),
         )
     return table
 
@@ -358,6 +381,125 @@ def _cwd_label(cwd: str) -> str:
     if not cwd:
         return "—"
     return cwd.rstrip("/").split("/")[-1] or cwd
+
+
+def _session_display_name(session: SessionInfo) -> str:
+    """The 0.21 display_name when set, else the stored title."""
+    return session.display_name or session.title or ""
+
+
+def _display_cost(session: SessionInfo) -> float:
+    """Provider-billed cost when known, otherwise the resolved estimate."""
+    if session.actual_cost_usd > 0:
+        return session.actual_cost_usd
+    return session.estimated_cost_usd
+
+
+def _activity_at(session: SessionInfo) -> float:
+    return session.last_activity_at or session.started_at
+
+
+def _age_label(timestamp: float) -> str:
+    if timestamp <= 0:
+        return "—"
+    age = max(0, int(time.time() - timestamp))
+    if age < 60:
+        return f"{age}s"
+    if age < 3600:
+        return f"{age // 60}m"
+    if age < 86400:
+        return f"{age // 3600}h"
+    return f"{age // 86400}d"
+
+
+def _truncate(value: str, limit: int) -> str:
+    return value if len(value) <= limit else f"{value[: limit - 1]}…"
+
+
+def _activity_table(sessions: list[SessionInfo], theme: Theme) -> Table | None:
+    """Names, branches, profiles and activity ages — hermes-agent 0.21 columns."""
+    activity_sessions = [
+        session
+        for session in sessions[:10]
+        if session.display_name
+        or session.git_branch
+        or session.profile_name
+        or session.chat_type
+        or session.pinned
+        or session.last_activity_at
+        or session.last_activity_description
+    ]
+    if not activity_sessions:
+        return None
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("ID", style=theme.session_label)
+    table.add_column("Name", style=theme.banner_text)
+    table.add_column("Branch", style=theme.banner_dim)
+    table.add_column("Profile", style=theme.banner_dim)
+    table.add_column("Chat", style=theme.banner_dim)
+    table.add_column("Age", justify="right", style=theme.ui_accent)
+    table.add_column("Last Activity", style=theme.banner_text)
+    for session in activity_sessions:
+        pin = f"{_PIN_MARKER} " if session.pinned else ""
+        name = _session_display_name(session)
+        branch = session.git_branch
+        table.add_row(
+            escape(f"{pin}{session.session_id[-8:]}"),
+            escape(_truncate(name, _MAX_NAME_CHARS)) if name else "—",
+            escape(_truncate(branch, _MAX_BRANCH_CHARS)) if branch else "—",
+            escape(session.profile_name) if session.profile_name else "—",
+            escape(session.chat_type) if session.chat_type else "—",
+            _age_label(_activity_at(session)),
+            escape(_truncate(session.last_activity_description, _MAX_ACTIVITY_CHARS))
+            if session.last_activity_description
+            else "—",
+        )
+    return table
+
+
+def _surfaces_table(
+    state: DashboardState,
+    sessions: list[SessionInfo],
+    filter_query: str,
+    theme: Theme,
+) -> Table | None:
+    """Live surfaces attached to sessions (runtime/active_sessions.json).
+
+    A filtered view lists only the surfaces of the sessions it shows; the
+    unfiltered view lists every surface, including ones whose session row is
+    not in the table.
+    """
+    surfaces = state.active_surfaces
+    if filter_query:
+        shown = {session.session_id for session in sessions}
+        surfaces = [surface for surface in surfaces if surface.session_id in shown]
+    if not surfaces:
+        return None
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("Session", style=theme.session_label)
+    table.add_column("Surface", style=theme.banner_text)
+    table.add_column("PID", justify="right", style=theme.banner_dim)
+    table.add_column("State", style=theme.banner_dim)
+    for surface in surfaces[:_DETAIL_MAX_SURFACE_ROWS]:
+        table.add_row(
+            escape(surface.session_id[-8:]),
+            escape(surface.surface) if surface.surface else "—",
+            str(surface.pid),
+            Text("live", style=f"bold {theme.ui_ok}") if surface.alive else Text("dead"),
+        )
+    return table
+
+
+def _compression_warnings(sessions: list[SessionInfo], theme: Theme) -> Text | None:
+    failing = [session for session in sessions[:10] if session.compression_failure_error]
+    if not failing:
+        return None
+    lines = Text()
+    for session in failing:
+        error = _truncate(session.compression_failure_error, _MAX_ERROR_CHARS)
+        lines.append(f"  {sanitize_terminal_text(session.session_id[-8:])}  ", style=theme.ui_label)
+        lines.append(f"{sanitize_terminal_text(error)}\n", style=theme.ui_warn)
+    return lines
 
 
 def _runtime_table(sessions: list[SessionInfo], theme: Theme) -> Table | None:

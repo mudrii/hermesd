@@ -21,6 +21,16 @@ _LIKE_SEARCH_LIMIT = 500
 # read-only viewer refreshing on a timer: fail fast and keep last-good data
 # rather than stall the render loop behind a writer.
 _SQLITE_TIMEOUT_SECONDS = 2
+_MODEL_USAGE_ROW_LIMIT = 50
+# Window cutoffs are rounded down to this bucket so repeated reads inside the
+# same bucket hit the cache instead of re-querying on every collector pass.
+_MODEL_USAGE_CUTOFF_BUCKET_SECONDS = 60
+# (window name, lookback seconds); None means "all time".
+_MODEL_USAGE_WINDOWS: tuple[tuple[str, float | None], ...] = (
+    ("all", None),
+    ("24h", 86400.0),
+    ("7d", 7 * 86400.0),
+)
 
 
 class HermesDB:
@@ -50,6 +60,11 @@ class HermesDB:
         self._last_read_sessions_stale = False
         self._last_read_session_count_stale = False
         self._last_read_tool_stats_stale = False
+        self._cached_model_usage: dict[str, list[dict[str, Any]]] = _empty_model_usage()
+        self._cached_model_usage_key: tuple[int | None, tuple[float | None, ...]] | None = None
+        self._cached_model_usage_initialized = False
+        self._last_read_model_usage_stale = False
+        self._model_usage_available: bool | None = None
         self._cached_message_search_query: str = ""
         self._cached_message_search_results: set[str] = set()
         self._cached_message_search_version: int | None = None
@@ -90,6 +105,8 @@ class HermesDB:
             self._cached_session_count_version = None
             self._cached_tool_stats_version = None
             self._cached_message_search_version = None
+            self._cached_model_usage_key = None
+            self._model_usage_available = None
             self._consecutive_errors = 0
             self._connect_backoff_reads = 0
             self._connected_mtime_ns = self._source_mtime_ns()
@@ -143,6 +160,8 @@ class HermesDB:
             self._last_read_tool_stats_stale = True
         if self._cached_message_search_initialized:
             self._last_message_search_stale = True
+        if self._cached_model_usage_initialized:
+            self._last_read_model_usage_stale = True
 
     def _ensure_connection(self) -> sqlite3.Connection | None:
         if self._closed:
@@ -269,9 +288,103 @@ class HermesDB:
             "handoff_state",
             "handoff_platform",
             "handoff_error",
+            # hermes-agent 0.21 columns; absent on older databases.
+            "git_branch",
+            "chat_type",
+            "display_name",
+            "title_source",
+            "profile_name",
+            "pinned",
+            "last_activity_at",
+            "last_activity_description",
+            "actual_cost_usd",
+            "cost_source",
+            "compression_failure_error",
         ]
         available = self._session_column_set(conn)
         return [column for column in wanted_columns if column in available]
+
+    @property
+    def last_read_model_usage_stale(self) -> bool:
+        with self._lock:
+            return self._last_read_model_usage_stale
+
+    def read_model_usage(self, now: float) -> dict[str, list[dict[str, Any]]]:
+        """Aggregated `session_model_usage` rows for the all-time, 24h and 7d windows.
+
+        Returns empty windows when the table is absent (older hermes-agent), and
+        the last-good result after a SQLite error.
+        """
+        with self._lock:
+            cutoffs = _model_usage_cutoffs(now)
+            conn = self._ensure_connection()
+            if conn is None:
+                return self._cached_model_usage
+            version = self._current_version()
+            cache_key = (version, cutoffs)
+            if version is not None and self._cached_model_usage_key == cache_key:
+                self._last_read_model_usage_stale = False
+                return self._cached_model_usage
+            try:
+                usage = self._read_model_usage(conn, cutoffs)
+            except sqlite3.Error:
+                self._last_read_model_usage_stale = True
+                self._record_read_error()
+                return self._cached_model_usage
+            self._cached_model_usage = usage
+            self._cached_model_usage_key = cache_key
+            self._cached_model_usage_initialized = True
+            self._consecutive_errors = 0
+            self._last_read_model_usage_stale = False
+            return usage
+
+    def _read_model_usage(
+        self,
+        conn: sqlite3.Connection,
+        cutoffs: tuple[float | None, ...],
+    ) -> dict[str, list[dict[str, Any]]]:
+        if not self._model_usage_table_present(conn):
+            return _empty_model_usage()
+        return {
+            window[0]: self._aggregate_model_usage(conn, cutoff)
+            for window, cutoff in zip(_MODEL_USAGE_WINDOWS, cutoffs, strict=True)
+        }
+
+    def _model_usage_table_present(self, conn: sqlite3.Connection) -> bool:
+        if self._model_usage_available is None:
+            cur = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='session_model_usage'"
+            )
+            self._model_usage_available = cur.fetchone() is not None
+        return self._model_usage_available
+
+    def _aggregate_model_usage(
+        self,
+        conn: sqlite3.Connection,
+        cutoff: float | None,
+    ) -> list[dict[str, Any]]:
+        where_clause = "" if cutoff is None else "WHERE last_seen >= ? "
+        parameters: tuple[Any, ...] = () if cutoff is None else (cutoff,)
+        cur = conn.execute(
+            "SELECT model, billing_provider AS provider, task, "
+            "SUM(api_call_count) AS api_calls, "
+            "SUM(input_tokens) AS input_tokens, "
+            "SUM(output_tokens) AS output_tokens, "
+            "SUM(cache_read_tokens) AS cache_read_tokens, "
+            "SUM(cache_write_tokens) AS cache_write_tokens, "
+            "SUM(reasoning_tokens) AS reasoning_tokens, "
+            "SUM(estimated_cost_usd) AS estimated_cost_usd, "
+            "SUM(actual_cost_usd) AS actual_cost_usd, "
+            "MAX(last_seen) AS last_seen "
+            f"FROM session_model_usage {where_clause}"
+            "GROUP BY model, billing_provider, task "
+            "ORDER BY COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) "
+            "+ COALESCE(SUM(cache_read_tokens), 0) + COALESCE(SUM(cache_write_tokens), 0) "
+            "+ COALESCE(SUM(reasoning_tokens), 0) DESC, model ASC "
+            f"LIMIT {_MODEL_USAGE_ROW_LIMIT}",
+            parameters,
+        )
+        return [dict(row) for row in cur.fetchall()]
 
     def read_session_count(self) -> int:
         with self._lock:
@@ -484,6 +597,15 @@ class HermesDB:
         with self._lock:
             self._closed = True
             self._close_connection()
+
+
+def _empty_model_usage() -> dict[str, list[dict[str, Any]]]:
+    return {window[0]: [] for window in _MODEL_USAGE_WINDOWS}
+
+
+def _model_usage_cutoffs(now: float) -> tuple[float | None, ...]:
+    bucket = (now // _MODEL_USAGE_CUTOFF_BUCKET_SECONDS) * _MODEL_USAGE_CUTOFF_BUCKET_SECONDS
+    return tuple(None if span is None else bucket - span for _, span in _MODEL_USAGE_WINDOWS)
 
 
 def _escape_like_pattern(query: str) -> str:

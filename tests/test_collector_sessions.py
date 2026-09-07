@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 import time
@@ -17,7 +18,7 @@ from hermesd.collector import (
     _summarize_tokens,
     _today_epoch,
 )
-from tests.conftest import create_state_db_tables
+from tests.conftest import create_state_db_tables, insert_model_usage
 
 
 def test_today_epoch_is_midnight():
@@ -41,18 +42,16 @@ def test_collect_tokens_today_filters_by_date(
     conn = sqlite3.connect(str(sample_db))
     yesterday = time.time() - 86400 * 2
     conn.execute(
-        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO sessions ("
+        "id, source, model, started_at, message_count, tool_call_count, input_tokens, "
+        "output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, "
+        "estimated_cost_usd"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             "sess_old",
             "cli",
-            None,
             "gpt-5.4",
-            None,
-            None,
-            None,
             yesterday,
-            None,
-            None,
             10,
             5,
             5000,
@@ -60,15 +59,7 @@ def test_collect_tokens_today_filters_by_date(
             1000,
             500,
             0,
-            None,
-            None,
-            None,
             0.10,
-            None,
-            None,
-            None,
-            None,
-            None,
         ),
     )
     conn.commit()
@@ -1108,3 +1099,205 @@ def test_collector_token_window_cache_ratio_uses_prompt_and_cache_tokens(
     assert windows["7d"].cache_ratio == pytest.approx(350 / 450)
     assert windows["30d"].cache_ratio == pytest.approx(350 / 450)
     c.close()
+
+
+def _write_v021_session_db(hermes_home: Path, *, v021: bool) -> None:
+    """A state.db with (or without) the hermes-agent 0.21 session columns."""
+    conn = sqlite3.connect(str(hermes_home / "state.db"))
+    create_state_db_tables(conn, include_schema_version=False, include_v021_columns=v021)
+    now = time.time()
+    if v021:
+        conn.execute(
+            "INSERT INTO sessions ("
+            "id, source, model, started_at, message_count, input_tokens, output_tokens, "
+            "estimated_cost_usd, actual_cost_usd, cost_status, cost_source, git_branch, "
+            "chat_type, display_name, title_source, profile_name, pinned, last_activity_at, "
+            "last_activity_description, compression_failure_error, title"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "sess_new",
+                "cli",
+                "gpt-5.4",
+                now - 7200,
+                12,
+                100,
+                50,
+                0.90,
+                0.55,
+                "exact",
+                "provider",
+                "feat/usage",
+                "direct",
+                "Usage work",
+                "llm",
+                "coding",
+                1,
+                now - 30,
+                "edited db.py",
+                "compression failed: context too large",
+                "raw title",
+            ),
+        )
+        insert_model_usage(
+            conn,
+            "sess_new",
+            "gpt-5.4",
+            provider="openai",
+            api_call_count=7,
+            input_tokens=100,
+            output_tokens=50,
+            estimated_cost_usd=0.9,
+            actual_cost_usd=0.55,
+            last_seen=now - 30,
+        )
+        insert_model_usage(
+            conn,
+            "sess_new",
+            "gpt-5.4-mini",
+            provider="openai",
+            task="title",
+            api_call_count=1,
+            input_tokens=10,
+            estimated_cost_usd=0.01,
+            actual_cost_usd=0.0,
+            last_seen=now - 86400 * 3,
+        )
+    else:
+        conn.execute(
+            "INSERT INTO sessions (id, source, model, started_at, title) VALUES (?,?,?,?,?)",
+            ("sess_legacy", "cli", "gpt-5.4", now - 7200, "raw title"),
+        )
+    conn.commit()
+    conn.close()
+
+
+def _collect_once(hermes_home: Path, **kwargs: object):
+    collector = Collector(hermes_home, **kwargs)  # type: ignore[arg-type]
+    try:
+        return collector.collect()
+    finally:
+        collector.close()
+
+
+def test_collector_maps_new_session_columns(hermes_home: Path) -> None:
+    _write_v021_session_db(hermes_home, v021=True)
+
+    state = _collect_once(hermes_home)
+
+    session = state.sessions[0]
+    assert session.git_branch == "feat/usage"
+    assert session.chat_type == "direct"
+    assert session.display_name == "Usage work"
+    assert session.title_source == "llm"
+    assert session.profile_name == "coding"
+    assert session.pinned is True
+    assert session.last_activity_at > 0
+    assert session.last_activity_description == "edited db.py"
+    assert session.actual_cost_usd == pytest.approx(0.55)
+    assert session.cost_source == "provider"
+    assert session.compression_failure_error.startswith("compression failed")
+    # The provider-billed cost wins over the estimate.
+    assert session.estimated_cost_usd == pytest.approx(0.55)
+    assert state.tokens_total.cost_is_estimated is False
+
+
+def test_collector_model_usage_windows(hermes_home: Path) -> None:
+    _write_v021_session_db(hermes_home, v021=True)
+
+    analytics = _collect_once(hermes_home).token_analytics
+
+    assert analytics.usage_source == "session_model_usage"
+    assert [row.model for row in analytics.model_usage_all] == ["gpt-5.4", "gpt-5.4-mini"]
+    assert [row.model for row in analytics.model_usage_24h] == ["gpt-5.4"]
+    assert [row.model for row in analytics.model_usage_7d] == ["gpt-5.4", "gpt-5.4-mini"]
+    main = analytics.model_usage_all[0]
+    assert main.provider == "openai"
+    assert main.api_calls == 7
+    assert main.has_actual_cost is True
+    assert main.actual_cost_usd == pytest.approx(0.55)
+    aux = analytics.model_usage_all[1]
+    assert aux.task == "title"
+    assert aux.has_actual_cost is False
+
+
+def test_legacy_db_without_new_columns_keeps_session_defaults(hermes_home: Path) -> None:
+    _write_v021_session_db(hermes_home, v021=False)
+
+    state = _collect_once(hermes_home)
+
+    session = state.sessions[0]
+    assert session.session_id == "sess_legacy"
+    assert session.git_branch == ""
+    assert session.display_name == ""
+    assert session.pinned is False
+    assert session.actual_cost_usd == 0.0
+    # No usage table: the panel keeps the per-session model breakdown.
+    assert state.token_analytics.usage_source == "sessions"
+    assert state.token_analytics.model_usage_all == []
+    assert state.health.failed_sources == []
+
+
+def _write_active_sessions(hermes_home: Path, payload: object) -> None:
+    runtime = hermes_home / "runtime"
+    runtime.mkdir(exist_ok=True)
+    path = runtime / "active_sessions.json"
+    path.write_text(payload if isinstance(payload, str) else json.dumps(payload))
+
+
+def test_active_surfaces_reported_with_liveness(hermes_home: Path) -> None:
+    _write_v021_session_db(hermes_home, v021=True)
+    _write_active_sessions(
+        hermes_home,
+        {
+            "entries": [
+                {
+                    "session_id": "sess_new",
+                    "surface": "cli",
+                    "pid": 111,
+                    "process_start_time": 1.0,
+                    "started_at": "2026-09-07T10:00:00+00:00",
+                },
+                {
+                    "session_id": "sess_new",
+                    "surface": "telegram",
+                    "pid": 222,
+                    "process_start_time": 2.0,
+                    "started_at": "2026-09-07T10:05:00+00:00",
+                },
+            ]
+        },
+    )
+
+    state = _collect_once(hermes_home, pid_exists=lambda pid: pid == 111)
+
+    assert state.active_surface_count == 2
+    surfaces = {surface.surface: surface for surface in state.active_surfaces}
+    assert surfaces["cli"].alive is True
+    assert surfaces["cli"].session_id == "sess_new"
+    assert surfaces["telegram"].alive is False
+    assert surfaces["telegram"].pid == 222
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ["not json at all", {"entries": "nope"}, {}, {"entries": [{"surface": "cli"}]}],
+    ids=["garbage", "wrong-type", "empty", "no-session-id"],
+)
+def test_active_surfaces_tolerates_bad_payloads(hermes_home: Path, payload: object) -> None:
+    _write_v021_session_db(hermes_home, v021=True)
+    _write_active_sessions(hermes_home, payload)
+
+    state = _collect_once(hermes_home)
+
+    assert state.active_surfaces == []
+    assert state.active_surface_count == 0
+    assert "active_sessions" not in state.health.failed_sources
+
+
+def test_active_surfaces_missing_file_is_empty(hermes_home: Path) -> None:
+    _write_v021_session_db(hermes_home, v021=True)
+
+    state = _collect_once(hermes_home)
+
+    assert state.active_surfaces == []
+    assert state.active_surface_count == 0

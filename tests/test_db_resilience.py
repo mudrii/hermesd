@@ -10,6 +10,7 @@ from hermesd.db import _RECONNECT_ERROR_THRESHOLD, HermesDB
 from tests.conftest import (
     create_state_db_tables,
     create_state_db_with_session,
+    insert_model_usage,
 )
 
 
@@ -202,3 +203,28 @@ def test_message_search_reconnect_failure_resets_error_count(tmp_path):
     assert db._consecutive_errors == 0
     assert db.last_message_search_stale is True
     db.close()
+
+
+def test_model_usage_corruption_after_good_read_keeps_last_good(tmp_path):
+    """A corrupt DB after a good model-usage read still serves the last-good rows."""
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False, include_v021_columns=True)
+    now = 1_800_000_000.0
+    insert_model_usage(conn, "s1", "gpt-5.4", input_tokens=100, last_seen=now)
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path)
+    try:
+        good = db.read_model_usage(now)
+        assert [row["model"] for row in good["all"]] == ["gpt-5.4"]
+
+        db_path.write_bytes(b"not a database at all")
+        # A later "now" moves the window cutoffs, so the cache cannot answer.
+        degraded = db.read_model_usage(now + 7200)
+
+        assert [row["model"] for row in degraded["all"]] == ["gpt-5.4"]
+        assert db.last_read_model_usage_stale is True
+    finally:
+        db.close()
