@@ -6,11 +6,14 @@ import signal
 import sqlite3
 import subprocess
 import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 from rich.console import Console
+
+from hermesd.collector import Collector
 
 if TYPE_CHECKING:
     from hermesd.models import DashboardState
@@ -1035,3 +1038,83 @@ def build_skills_state(
             ],
         )
     )
+
+
+_RUNNING_AS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+_skip_if_root = pytest.mark.skipif(
+    _RUNNING_AS_ROOT, reason="chmod 000 does not block reads when running as root"
+)
+
+
+def _unreadable(path: Path) -> bool:
+    """True only when the OS actually denies reads (guards root/odd FS)."""
+    try:
+        path.read_bytes()
+    except OSError:
+        return True
+    except Exception:
+        return True
+    return False
+
+
+def _count_opens(monkeypatch: pytest.MonkeyPatch, target: Path) -> list[Path]:
+    """Record every real `Path.open` call on `target` and return the growing log."""
+    opens: list[Path] = []
+    real_open = Path.open
+
+    def counting_open(self: Path, *args: object, **kwargs: object) -> object:
+        if self == target:
+            opens.append(self)
+        return real_open(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    return opens
+
+
+@pytest.fixture
+def collector(hermes_home: Path) -> Iterator[Collector]:
+    """A Collector over a bare hermes home, closed on teardown."""
+    c = Collector(hermes_home)
+    try:
+        yield c
+    finally:
+        c.close()
+
+
+def _assert_cached_until_changed(
+    collector: Collector,
+    opens: list[Path],
+    source: Path,
+    rewrite: Callable[[], None],
+) -> None:
+    """Assert `source` is read cold, skipped while unchanged, and re-read after `rewrite`."""
+    collector.collect()
+    assert opens, f"cold collect never opened {source.name}"
+
+    opens.clear()
+    collector.collect()
+    assert opens == [], f"unchanged {source.name} was re-read on the second collect"
+
+    rewrite()
+    opens.clear()
+    collector.collect()
+    assert opens, f"changed {source.name} was not re-read"
+
+
+def create_state_db_with_session(path: Path) -> None:
+    """A state.db holding one session and one tool-call message."""
+    conn = sqlite3.connect(str(path))
+    create_state_db_tables(conn, include_schema_version=False)
+    now = time.time()
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, message_count, tool_call_count, "
+        "input_tokens, output_tokens) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("s1", "cli", now, 10, 5, 5000, 3000),
+    )
+    conn.execute(
+        "INSERT INTO messages (session_id, role, content, tool_name, timestamp) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("s1", "assistant", "used a tool", "shell_exec", now),
+    )
+    conn.commit()
+    conn.close()

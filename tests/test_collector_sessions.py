@@ -1,4 +1,4 @@
-"""Tests for cost estimation when provider doesn't report costs."""
+"""Collection of session rows, token totals, cost estimation, and token analytics."""
 
 from __future__ import annotations
 
@@ -15,8 +15,532 @@ from hermesd.collector import (
     _resolved_session_cost,
     _summarize_breakdown,
     _summarize_tokens,
+    _today_epoch,
 )
 from tests.conftest import create_state_db_tables
+
+
+def test_today_epoch_is_midnight():
+    import datetime
+
+    epoch = _today_epoch(time.time())
+    dt = datetime.datetime.fromtimestamp(epoch)
+    assert dt.hour == 0
+    assert dt.minute == 0
+    assert dt.second == 0
+
+
+def test_collect_tokens_today_filters_by_date(
+    hermes_home: Path, sample_db: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Only sessions started today count toward today's tokens."""
+    # Pin the "today" cutoff to two hours ago so the assertion is deterministic
+    # regardless of wall-clock time: sample_db's sessions (≤1h old) count toward
+    # today, sess_old (2 days old) does not — with no midnight-boundary flake.
+    monkeypatch.setattr("hermesd.collector._today_epoch", lambda _now: time.time() - 7200)
+    conn = sqlite3.connect(str(sample_db))
+    yesterday = time.time() - 86400 * 2
+    conn.execute(
+        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "sess_old",
+            "cli",
+            None,
+            "gpt-5.4",
+            None,
+            None,
+            None,
+            yesterday,
+            None,
+            None,
+            10,
+            5,
+            5000,
+            3000,
+            1000,
+            500,
+            0,
+            None,
+            None,
+            None,
+            0.10,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    c = Collector(hermes_home)
+    state = c.collect()
+    # sample_db: sess_001 (12_400 in) + sess_002 (9_100 in) started today.
+    # sess_old (5_000 in) started two days ago, so it counts toward the total
+    # but not toward today.
+    assert state.tokens_today.input_tokens == 21_500
+    assert state.tokens_total.input_tokens == 26_500
+    assert state.tokens_today.input_tokens < state.tokens_total.input_tokens
+    c.close()
+
+
+def test_collect_tool_stats(hermes_home: Path, sample_db: Path):
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert isinstance(state.tool_stats, list)
+    names = [t.name for t in state.tool_stats]
+    assert "shell_exec" in names
+    c.close()
+
+
+def test_collect_total_tool_calls(hermes_home: Path, sample_db: Path):
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.total_tool_calls == 51 + 14
+    c.close()
+
+
+def _insert_session_with_endpoint(db_path: Path, model: str, base_url: str) -> None:
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, model, billing_base_url) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("ctx_sess", "cli", time.time(), model, base_url),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_collect_session_context_limit_joins_on_model_and_base_url(hermes_home: Path):
+    """SessionInfo.context_limit joins model@billing_base_url against the cache."""
+    _insert_session_with_endpoint(
+        hermes_home / "state.db", "MiniMax-M3", "https://api.minimax.io/v1"
+    )
+    (hermes_home / "context_length_cache.yaml").write_text(
+        "context_lengths:\n  MiniMax-M3@https://api.minimax.io/v1: 1048576\n"
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.sessions[0].context_limit == 1048576
+    c.close()
+
+
+def test_collect_session_context_limit_normalizes_trailing_slash(hermes_home: Path):
+    """A trailing slash on the session base_url still matches the cache key."""
+    _insert_session_with_endpoint(
+        hermes_home / "state.db", "MiniMax-M3", "https://api.minimax.io/v1/"
+    )
+    (hermes_home / "context_length_cache.yaml").write_text(
+        "context_lengths:\n  MiniMax-M3@https://api.minimax.io/v1: 1048576\n"
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.sessions[0].context_limit == 1048576
+    c.close()
+
+
+def test_collect_session_context_limit_falls_back_to_same_origin_endpoint_variant(
+    hermes_home: Path,
+):
+    _insert_session_with_endpoint(
+        hermes_home / "state.db", "MiniMax-M3", "https://api.minimax.io/anthropic"
+    )
+    (hermes_home / "context_length_cache.yaml").write_text(
+        "context_lengths:\n  MiniMax-M3@https://api.minimax.io/v1: 1048576\n"
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.sessions[0].context_limit == 1048576
+    c.close()
+
+
+def test_collect_session_context_limit_missing_cache_is_zero(hermes_home: Path):
+    _insert_session_with_endpoint(
+        hermes_home / "state.db", "MiniMax-M3", "https://api.minimax.io/v1"
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.sessions[0].context_limit == 0
+    assert "sessions" not in state.health.failed_sources
+    c.close()
+
+
+def test_collect_response_store_counts(hermes_home: Path):
+    """response_store.db conversation/response counts surface in Operations."""
+    db_path = hermes_home / "response_store.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        "CREATE TABLE conversations (id TEXT PRIMARY KEY);"
+        "CREATE TABLE responses (id TEXT PRIMARY KEY);"
+        "INSERT INTO conversations VALUES ('c1'), ('c2');"
+        "INSERT INTO responses VALUES ('r1'), ('r2'), ('r3');"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    ops = state.operations
+    assert ops.response_store_present is True
+    assert ops.conversation_count == 2
+    assert ops.response_count == 3
+    assert ops.response_store_size_bytes > 0
+    assert "operations" not in state.health.failed_sources
+    c.close()
+
+
+def test_collect_response_store_absent_is_zero(hermes_home: Path):
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.operations.response_store_present is False
+    assert state.operations.conversation_count == 0
+    c.close()
+
+
+def test_collect_response_store_preserves_last_good_on_corrupt_db(hermes_home: Path):
+    db_path = hermes_home / "response_store.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        "CREATE TABLE conversations (id TEXT PRIMARY KEY);"
+        "CREATE TABLE responses (id TEXT PRIMARY KEY);"
+        "INSERT INTO conversations VALUES ('c1'), ('c2');"
+        "INSERT INTO responses VALUES ('r1'), ('r2'), ('r3');"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    first = c.collect()
+    db_path.write_bytes(b"not a sqlite database")
+    second = c.collect()
+
+    assert second.operations.response_store_present is True
+    assert second.operations.conversation_count == first.operations.conversation_count
+    assert second.operations.response_count == first.operations.response_count
+    assert "operations" in second.health.failed_sources
+    c.close()
+
+
+def test_collect_response_store_preserves_last_good_when_db_disappears(hermes_home: Path):
+    db_path = hermes_home / "response_store.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        "CREATE TABLE conversations (id TEXT PRIMARY KEY);"
+        "CREATE TABLE responses (id TEXT PRIMARY KEY);"
+        "INSERT INTO conversations VALUES ('c1'), ('c2');"
+        "INSERT INTO responses VALUES ('r1'), ('r2'), ('r3');"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    first = c.collect()
+    db_path.unlink()
+    second = c.collect()
+
+    assert second.operations.response_store_present is True
+    assert second.operations.conversation_count == first.operations.conversation_count
+    assert second.operations.response_count == first.operations.response_count
+    assert "operations" in second.health.failed_sources
+    c.close()
+
+
+def test_collect_response_store_preserves_last_good_when_db_becomes_unsafe_symlink(
+    hermes_home: Path, tmp_path: Path
+):
+    db_path = hermes_home / "response_store.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        "CREATE TABLE conversations (id TEXT PRIMARY KEY);"
+        "CREATE TABLE responses (id TEXT PRIMARY KEY);"
+        "INSERT INTO conversations VALUES ('c1'), ('c2');"
+        "INSERT INTO responses VALUES ('r1'), ('r2'), ('r3');"
+    )
+    conn.commit()
+    conn.close()
+    outside_db = tmp_path / "response_store.db"
+    sqlite3.connect(str(outside_db)).close()
+
+    c = Collector(hermes_home)
+    first = c.collect()
+    db_path.unlink()
+    db_path.symlink_to(outside_db)
+    second = c.collect()
+
+    assert second.operations.response_store_present is True
+    assert second.operations.conversation_count == first.operations.conversation_count
+    assert second.operations.response_count == first.operations.response_count
+    assert "operations" in second.health.failed_sources
+    c.close()
+
+
+def test_collect_response_store_ignores_symlinked_db_outside_home(
+    hermes_home: Path, tmp_path: Path
+):
+    outside_db = tmp_path / "response_store.db"
+    conn = sqlite3.connect(str(outside_db))
+    conn.executescript(
+        "CREATE TABLE conversations (id TEXT PRIMARY KEY);"
+        "CREATE TABLE responses (id TEXT PRIMARY KEY);"
+        "INSERT INTO conversations VALUES ('outside');"
+        "INSERT INTO responses VALUES ('outside-response');"
+    )
+    conn.commit()
+    conn.close()
+    (hermes_home / "response_store.db").symlink_to(outside_db)
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.operations.response_store_present is False
+    assert state.operations.conversation_count == 0
+    assert "operations" not in state.health.failed_sources
+    c.close()
+
+
+def test_collect_response_store_ignores_symlinked_wal_sidecar(hermes_home: Path, tmp_path: Path):
+    db_path = hermes_home / "response_store.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        "CREATE TABLE conversations (id TEXT PRIMARY KEY);"
+        "CREATE TABLE responses (id TEXT PRIMARY KEY);"
+        "INSERT INTO conversations VALUES ('c1');"
+        "INSERT INTO responses VALUES ('r1');"
+    )
+    conn.commit()
+    conn.close()
+    outside_wal = tmp_path / "outside-response-store-wal"
+    outside_wal.write_bytes(b"not a sqlite wal")
+    (hermes_home / "response_store.db-wal").symlink_to(outside_wal)
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.operations.response_store_present is True
+    assert state.operations.conversation_count == 1
+    assert state.operations.response_count == 1
+    assert "operations" not in state.health.failed_sources
+    c.close()
+
+
+def test_session_active_detection(hermes_home: Path, sample_db: Path):
+    """Sessions with ended_at=NULL should be marked active."""
+    c = Collector(hermes_home)
+    state = c.collect()
+    # Both sample sessions have ended_at=NULL. Assert the count first so the
+    # all() below can't pass vacuously on an empty session list.
+    assert len(state.sessions) == 2
+    assert all(s.is_active for s in state.sessions)
+    c.close()
+
+
+def test_session_ended_detection(hermes_home: Path):
+    """Sessions with ended_at set should not be marked active."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn)
+    now = time.time()
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, ended_at) VALUES (?, ?, ?, ?)",
+        ("sess_ended", "cli", now - 3600, now - 1800),
+    )
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, ended_at) VALUES (?, ?, ?, NULL)",
+        ("sess_active", "cli", now - 600),
+    )
+    conn.commit()
+    conn.close()
+    c = Collector(hermes_home)
+    state = c.collect()
+    by_id = {s.session_id: s for s in state.sessions}
+    assert by_id["sess_ended"].is_active is False
+    assert by_id["sess_active"].is_active is True
+    c.close()
+
+
+def test_token_analytics_windows_use_injected_clock(hermes_home: Path):
+    fake_now = 1_000_000.0
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, input_tokens) VALUES (?, ?, ?, ?)",
+        ("s1", "cli", fake_now - 10 * 86400, 100),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: fake_now)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    windows = {window.label: window for window in state.token_analytics.windows}
+    assert windows["7d"].session_count == 0
+    assert windows["30d"].session_count == 1
+
+
+def test_context_lengths_key_without_separator_is_skipped(hermes_home: Path):
+    # context_length_cache.yaml keys are "model@base_url"; a key with no "@" is
+    # malformed and must be skipped (the partition sep check), while a valid key
+    # is normalized through. Drive it via a real collect() and assert sessions
+    # still populate (no crash from the malformed entry).
+    import yaml
+
+    (hermes_home / "context_length_cache.yaml").write_text(
+        yaml.dump(
+            {
+                "context_lengths": {
+                    "no_separator_key": 12345,
+                    "gpt-5.4@https://api.example.com/": 200000,  # normalized
+                }
+            }
+        )
+    )
+    c = Collector(hermes_home)
+    try:
+        # No exception; the malformed key is silently dropped. We exercise the
+        # private reader directly to assert the normalization contract.
+        lengths = c._read_context_lengths()
+        assert "no_separator_key" not in lengths
+        assert lengths["gpt-5.4@https://api.example.com"] == 200000
+    finally:
+        c.close()
+
+
+def _make_db(hermes_home: Path) -> None:
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    now = time.time()
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, ended_at) VALUES (?, ?, ?, NULL)",
+        ("active_cli", "cli", now - 100),
+    )
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, ended_at) VALUES (?, ?, ?, ?)",
+        ("ended_cli", "cli", now - 3600, now - 1800),
+    )
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, ended_at) VALUES (?, ?, ?, NULL)",
+        ("active_telegram", "telegram", now - 50),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_active_sessions_detected(hermes_home: Path):
+    _make_db(hermes_home)
+    c = Collector(hermes_home)
+    state = c.collect()
+    by_id = {s.session_id: s for s in state.sessions}
+    assert by_id["active_cli"].is_active is True
+    assert by_id["active_telegram"].is_active is True
+    assert by_id["ended_cli"].is_active is False
+    c.close()
+
+
+def test_active_count_in_compact_panel(hermes_home: Path):
+    _make_db(hermes_home)
+    from rich.console import Console
+
+    from hermesd.collector import Collector
+    from hermesd.panels import render_panel
+    from hermesd.theme import Theme
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    panel = render_panel(2, state, Theme(), detail=False)
+    console = Console(width=80, force_terminal=True, no_color=True)
+    with console.capture() as cap:
+        console.print(panel)
+    text = cap.get()
+    assert "2 active" in text
+    assert "3 total" in text
+    c.close()
+
+
+def test_null_columns_in_session(hermes_home: Path):
+    """All nullable columns as NULL must not crash."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False, source_required=False)
+    conn.execute(
+        "INSERT INTO sessions (id, started_at) VALUES (?, ?)",
+        ("null_sess", time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    s = state.sessions[0]
+    assert s.session_id == "null_sess"
+    assert s.source == ""
+    assert s.model == ""
+    assert s.message_count == 0
+    assert s.input_tokens == 0
+    assert s.estimated_cost_usd == 0.0
+    assert s.billing_provider == ""
+    assert s.cost_status == ""
+    assert s.pricing_version == ""
+    assert s.is_active is True  # ended_at is NULL
+    c.close()
+
+
+def test_session_schema_fields_mapped(hermes_home: Path):
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.execute(
+        "INSERT INTO sessions ("
+        "id, source, started_at, billing_provider, cost_status, pricing_version, "
+        "end_reason, billing_base_url, billing_mode"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "schema_sess",
+            "cli",
+            time.time(),
+            "openai-codex",
+            "reported",
+            "2026-04",
+            "cron_complete",
+            "https://api.kimi.test/v1",
+            "subscription_included",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    session = state.sessions[0]
+    assert session.billing_provider == "openai-codex"
+    assert session.cost_status == "reported"
+    assert session.pricing_version == "2026-04"
+    assert session.end_reason == "cron_complete"
+    assert session.billing_base_url == "https://api.kimi.test/v1"
+    assert session.billing_mode == "subscription_included"
+    c.close()
+
+
+def test_session_parent_session_id_mapped(hermes_home: Path):
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, parent_session_id) VALUES (?, ?, ?, ?)",
+        ("child_sess", "cli", time.time(), "parent_sess"),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.sessions[0].parent_session_id == "parent_sess"
+    c.close()
 
 
 def test_estimate_cost_basic():

@@ -103,19 +103,19 @@ uv run pytest tests/ -x --tb=short
 
 Test categories:
 - `test_models.py` — Pydantic model construction
-- `test_db_extended.py` / `test_db_resilience.py` — SQLite reader, WAL snapshotting, caching, resilience
+- `test_db_extended.py` / `test_db_null_tolerance.py` — SQLite reader, WAL snapshotting, caching, NULL coalescing (including a static guard against `.get(col, default)` on rows)
 - `test_file_cache.py` — mtime-keyed JSON/YAML cache
-- `test_collector.py` / `test_collector_extended.py` / `test_collector_coverage.py` / `test_collector_fixes.py` — data collection from `~/.hermes/`
-- `test_session_active.py` — session active/ended detection
-- `test_cost_estimation.py` — token/cost reconciliation edge cases
+- `test_collector.py` — `Collector` construction, `collect()` orchestration, health/fallback, available tools
+- `test_collector_<source>.py` (`sessions`, `cron`, `kanban`, `skills`, `gateway`, `operations`, `config`, `logs`, `profiles`) — one file per `hermesd/collect/*.py` reader
+- `test_paths.py` — `HermesPaths` resolution and profile scoping
 - `test_theme.py` — skin loading and theme inheritance
 - `test_formatting.py` — shared panel formatting helpers
-- `test_main.py` — CLI argument parsing and snapshot modes
-- `test_app.py` / `test_app_extended.py` / `test_app_fixes.py` — TUI key handling, layout, lifecycle
-- `test_panels.py` / `test_panels_extended.py` / `test_panels_fixes.py` — cross-panel rendering (compact + detail) and panel regression fixes
-- `test_cron_panel.py` / `test_curator_panel.py` / `test_curator.py` / `test_memory_panel.py` / `test_skills_panel.py` / `test_tools_panel.py` / `test_profiles_panel.py` / `test_profiles.py` — dedicated panel rendering tests
-- `test_gateway_resilience.py` / `test_curator_resilience.py` — error handling, cache preservation
-- `test_persistence_fixes.py` — persistence-layer regression fixes
+- `test_main.py` — CLI argument parsing, snapshot modes, signal exit codes
+- `test_app.py` / `test_app_extended.py` / `test_app_input.py` — TUI key handling, input thread, layout, lifecycle
+- `test_panels.py` / `test_panels_extended.py` — cross-panel rendering (compact + detail)
+- `test_<panel>_panel.py` — one file per panel (`gateway`, `sessions`, `tokens`, `tools`, `config`, `cron`, `skills`, `logs`, `profiles`, `memory`, `kanban`, `operations`, `curator`)
+- `test_markup_safety.py` / `test_unicode_rendering.py` — Rich markup escaping and CJK/wide-character rendering across every panel
+- `test_*_resilience.py` (`collector`, `db`, `gateway`, `curator`) — every test injects an error and asserts the next read returns last-good data
 - `test_package_metadata.py` — packaging, workflow, long-description, and wheel-smoke contracts
 - `test_import_hygiene.py` / `test_readonly_invariant.py` — standalone-package and read-only safety contracts
 - `test_markup_safety.py` — Rich markup and secret-redaction safety

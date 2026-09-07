@@ -1,9 +1,14 @@
+"""CLI entry point: argument parsing, snapshot modes, signal handling, and exit codes."""
+
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import signal
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -877,3 +882,194 @@ def test_parse_args_version(capsys):
     out = capsys.readouterr().out
     assert "hermesd" in out
     assert __version__ in out
+
+
+def test_main_snapshot_file_creates_missing_parent_dirs(
+    populated_hermes_home: Path, tmp_path: Path
+):
+    output_path = tmp_path / "nested" / "deeper" / "snapshot.txt"
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-file",
+            str(output_path),
+            "--no-color",
+        ]
+    )
+    text = output_path.read_text()
+    assert "Gateway & Platforms" in text
+
+
+def test_main_snapshot_sigint_during_collect_exits_cleanly(
+    populated_hermes_home: Path, monkeypatch, capsys
+):
+    """Ctrl+C during a slow snapshot collect must not dump a traceback."""
+    closed = False
+
+    class FakeApp:
+        def __init__(self, **kwargs):
+            pass
+
+        def render_snapshot_text(self, panel_num=None):
+            os.kill(os.getpid(), signal.SIGINT)
+            return "snapshot"
+
+        def close(self):
+            nonlocal closed
+            closed = True
+
+    monkeypatch.setattr("hermesd.app.DashboardApp", FakeApp)
+    previous_handler = signal.getsignal(signal.SIGINT)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--hermes-home", str(populated_hermes_home), "--snapshot", "--no-color"])
+
+    assert excinfo.value.code == 130  # 128 + SIGINT, conventional shell exit code
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Traceback" not in captured.err
+    assert "Interrupted" in captured.err
+    assert closed is True
+    assert signal.getsignal(signal.SIGINT) == previous_handler
+
+
+def test_main_snapshot_sigterm_during_collect_exits_cleanly(
+    populated_hermes_home: Path, monkeypatch, capsys
+):
+    closed = False
+
+    class FakeApp:
+        def __init__(self, **kwargs):
+            pass
+
+        def render_snapshot_json(self, panel_num=None):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return "{}"
+
+        def close(self):
+            nonlocal closed
+            closed = True
+
+    monkeypatch.setattr("hermesd.app.DashboardApp", FakeApp)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "--hermes-home",
+                str(populated_hermes_home),
+                "--snapshot-format",
+                "json",
+                "--no-color",
+            ]
+        )
+
+    assert excinfo.value.code == 143  # 128 + SIGTERM
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Traceback" not in captured.err
+    assert "Interrupted" in captured.err
+    assert closed is True
+
+
+def test_main_snapshot_second_signal_forces_default_disposition(
+    populated_hermes_home: Path, monkeypatch
+):
+    """A second Ctrl+C/SIGTERM must be able to kill a wedged collect: the
+    first signal is caught, but immediately re-arms the default disposition."""
+    dfl_observed = False
+
+    class FakeApp:
+        def __init__(self, **kwargs):
+            pass
+
+        def render_snapshot_text(self, panel_num=None):
+            nonlocal dfl_observed
+            os.kill(os.getpid(), signal.SIGINT)
+            dfl_observed = signal.getsignal(signal.SIGINT) == signal.SIG_DFL
+            return "snapshot"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("hermesd.app.DashboardApp", FakeApp)
+
+    with pytest.raises(SystemExit):
+        main(["--hermes-home", str(populated_hermes_home), "--snapshot", "--no-color"])
+
+    assert dfl_observed is True
+
+
+def test_main_rechecks_snapshot_path_after_render(
+    populated_hermes_home: Path, tmp_path: Path, monkeypatch
+):
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    tunnel = outside_dir / "tunnel"
+    tunnel.mkdir()
+    output_path = tunnel / "snapshot.txt"
+
+    class FakeApp:
+        def __init__(self, **kwargs):
+            pass
+
+        def render_snapshot_text(self, panel_num=None):
+            tunnel.rmdir()
+            tunnel.symlink_to(populated_hermes_home, target_is_directory=True)
+            return "snapshot"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("hermesd.app.DashboardApp", FakeApp)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "--hermes-home",
+                str(populated_hermes_home),
+                "--snapshot-file",
+                str(output_path),
+                "--no-color",
+            ]
+        )
+
+    assert excinfo.value.code == 1
+    assert not (populated_hermes_home / "snapshot.txt").exists()
+
+
+def test_main_exits_with_code_one_when_render_fails(
+    populated_hermes_home: Path, monkeypatch, capsys
+):
+    """A render failure inside run() reaches the CLI as exit code 1, not a traceback."""
+
+    class FailingApp:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self):
+            print("hermesd: render failed: RuntimeError: boom", file=sys.stderr)
+            raise SystemExit(1)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("hermesd.app.DashboardApp", FailingApp)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--hermes-home", str(populated_hermes_home), "--no-color"])
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert "render failed" in captured.err
+
+
+def test_parse_args_profile_default_none():
+    args = parse_args([])
+    assert args.profile is None
+
+
+def test_parse_args_accepts_profile_flag():
+    args = parse_args(["--profile", "coding"])
+    assert args.profile == "coding"

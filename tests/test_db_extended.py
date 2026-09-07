@@ -1,12 +1,23 @@
+"""Read-only SQLite reader: schema variants, search, WAL snapshots,
+connection lifecycle, and interrupt handling."""
+
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
+from hermesd.collector import Collector
 from hermesd.db import _LIKE_SEARCH_LIMIT, HermesDB
-from tests.conftest import create_state_db_tables
+from hermesd.models import DashboardState, RuntimeStatus
+from tests.conftest import (
+    _skip_if_root,
+    create_state_db_tables,
+    create_state_db_with_session,
+)
 
 
 def _create_hermes_agent_db(path: Path) -> None:
@@ -803,4 +814,291 @@ def test_search_session_ids_by_message_falls_back_to_like_when_fts_raises(
     monkeypatch.setattr(db, "_search_session_ids_by_fts", fail_fts)
 
     assert db.search_session_ids_by_message("response 0") == {"sess_001"}
+    db.close()
+
+
+def test_db_has_no_dead_cache_hits_counter(sample_db):
+    """The _cache_hits counter was incremented but never read; it must be gone."""
+    db = HermesDB(sample_db)
+    db.read_sessions()
+    db.read_sessions()
+    assert not hasattr(db, "_cache_hits")
+    db.close()
+
+
+def test_profile_db_rejects_symlink_swapped_target_outside_allowed_root(tmp_path, hermes_home):
+    """A profile state.db swapped for an outside symlink after startup is rejected.
+
+    The open must fall back to last-good cached data instead of reading the
+    attacker-controlled database.
+    """
+    profile_home = hermes_home / "profiles" / "coding"
+    profile_home.mkdir(parents=True)
+    db_path = profile_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.execute("INSERT INTO sessions (id, source, started_at) VALUES ('legit', 'cli', 1.0)")
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path, allowed_root=hermes_home)
+    assert [row["id"] for row in db.read_sessions()] == ["legit"]
+
+    outside = tmp_path / "outside.db"
+    conn = sqlite3.connect(str(outside))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.execute("INSERT INTO sessions (id, source, started_at) VALUES ('evil', 'cli', 2.0)")
+    conn.commit()
+    conn.close()
+
+    db_path.unlink()
+    db_path.symlink_to(outside)
+    # Guarantee the source-change check notices the swap and reconnects.
+    later = db_path.stat().st_mtime + 10
+    os.utime(outside, (later, later))
+
+    sessions = db.read_sessions()
+    assert all(row["id"] != "evil" for row in sessions)
+    assert [row["id"] for row in sessions] == ["legit"]
+    db.close()
+
+
+def test_profile_db_accepts_legitimate_path_under_allowed_root(hermes_home):
+    """The resolve-under check must not break normal profile databases."""
+    profile_home = hermes_home / "profiles" / "coding"
+    profile_home.mkdir(parents=True)
+    db_path = profile_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.execute("INSERT INTO sessions (id, source, started_at) VALUES ('ok', 'cli', 1.0)")
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path, allowed_root=hermes_home)
+    assert [row["id"] for row in db.read_sessions()] == ["ok"]
+    db.close()
+
+
+def test_runtime_status_defaults_to_not_running():
+    """An uncollected runtime status must read as unknown/offline, not running."""
+    assert RuntimeStatus().agent_running is False
+    assert DashboardState().runtime.agent_running is False
+
+
+def test_first_collect_with_failed_runtime_source_reports_agent_not_running(
+    populated_hermes_home, monkeypatch
+):
+    """First collect with a failing runtime source (no last-good state) is not 'running'."""
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+
+    def boom(*args: object, **kwargs: object) -> RuntimeStatus:
+        raise RuntimeError("runtime source down")
+
+    monkeypatch.setattr(Collector, "_collect_runtime_status", boom)
+    state = c.collect()
+    assert "runtime" in state.health.failed_sources
+    assert state.runtime.agent_running is False
+    c.close()
+
+
+def test_interrupt_aborts_long_running_query(tmp_path):
+    """HermesDB.interrupt() must abort an in-flight query from another thread."""
+    db_file = tmp_path / "state.db"
+    seed = sqlite3.connect(db_file)
+    seed.execute("CREATE TABLE t (x INTEGER)")
+    seed.close()
+
+    db = HermesDB(db_file)
+    assert db._conn is not None
+    started = threading.Event()
+    outcome: dict[str, str] = {}
+
+    # SQLite calls the progress handler from inside the running statement, so it
+    # is the earliest point at which interrupt() is guaranteed to have something
+    # to abort. Signalling before .execute() would race the query start.
+    db._conn.set_progress_handler(lambda: started.set(), 1000)
+
+    def run_query() -> None:
+        try:
+            db._conn.execute(
+                "WITH RECURSIVE cnt(x) AS ("
+                "SELECT 1 UNION ALL SELECT x + 1 FROM cnt LIMIT 1000000000"
+                ") SELECT count(*) FROM cnt"
+            ).fetchall()
+            outcome["result"] = "completed"
+        except sqlite3.OperationalError:
+            outcome["result"] = "interrupted"
+
+    thread = threading.Thread(target=run_query, daemon=True)
+    thread.start()
+    assert started.wait(5)
+    db.interrupt()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert outcome.get("result") == "interrupted"
+    db.close()
+
+
+def test_interrupt_does_not_wait_for_message_search_lock(tmp_path, monkeypatch):
+    """interrupt() must reach SQLite while message search owns the query lock."""
+    db_file = tmp_path / "state.db"
+    seed = sqlite3.connect(db_file)
+    seed.execute("CREATE TABLE messages (session_id TEXT, content TEXT)")
+    seed.close()
+
+    db = HermesDB(db_file)
+    search_started = threading.Event()
+    release_search = threading.Event()
+    interrupt_returned = threading.Event()
+
+    monkeypatch.setattr(db, "_messages_fts_enabled", lambda conn: False)
+
+    def slow_search(conn: sqlite3.Connection, query: str) -> set[str]:
+        search_started.set()
+        release_search.wait(timeout=5)
+        return set()
+
+    monkeypatch.setattr(db, "_search_session_ids_by_like", slow_search)
+    search_thread = threading.Thread(target=db.search_session_ids_by_message, args=("needle",))
+    search_thread.start()
+    assert search_started.wait(timeout=5)
+
+    interrupt_thread = threading.Thread(
+        target=lambda: (db.interrupt(), interrupt_returned.set()),
+    )
+    interrupt_thread.start()
+    try:
+        assert interrupt_returned.wait(timeout=0.5)
+    finally:
+        release_search.set()
+        search_thread.join(timeout=5)
+        interrupt_thread.join(timeout=5)
+        db.close()
+
+
+def test_interrupt_after_close_is_noop(tmp_path):
+    """interrupt() on a closed HermesDB must not raise."""
+    db_file = tmp_path / "state.db"
+    seed = sqlite3.connect(db_file)
+    seed.execute("CREATE TABLE t (x INTEGER)")
+    seed.close()
+
+    db = HermesDB(db_file)
+    db.close()
+    db.interrupt()
+
+
+def test_collector_wires_allowed_root_into_default_db(tmp_path, monkeypatch):
+    """Collector must construct HermesDB with allowed_root=root_home so profile
+    db targets are re-validated against symlink swaps on every (re)connect."""
+    seen: dict[str, object] = {}
+
+    def factory(path: Path, **kwargs: object) -> HermesDB:
+        seen.update(kwargs)
+        return HermesDB(path, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("hermesd.collector.HermesDB", factory)
+    collector = Collector(tmp_path)  # default db_factory exercises the wiring
+    try:
+        assert seen.get("allowed_root") == tmp_path
+    finally:
+        collector.close()
+
+
+def test_missing_db_returns_empty_not_crash(tmp_path):
+    db = HermesDB(tmp_path / "nonexistent.db")
+    assert db.read_sessions() == []
+    assert db.read_tool_stats() == []
+    db.close()
+
+
+def test_unopenable_db_backs_off_two_reads_before_reconnect(tmp_path, monkeypatch):
+    """A failed connect must back off for two reads before retrying, not retry every read."""
+    db_dir = tmp_path / "state.db"
+    db_dir.mkdir()  # a directory at the db path makes sqlite3.connect fail
+
+    connect_calls = 0
+    original_connect = sqlite3.connect
+
+    def counting_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        nonlocal connect_calls
+        connect_calls += 1
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", counting_connect)
+
+    db = HermesDB(db_dir)  # connect attempt #1 fails
+    assert connect_calls == 1
+    assert db.read_sessions() == []  # backoff read 1: no reconnect
+    assert db.read_sessions() == []  # backoff read 2: no reconnect
+    assert connect_calls == 1
+    assert db.read_sessions() == []  # backoff exhausted: reconnect attempt #2
+    assert connect_calls == 2
+    db.close()
+
+
+@_skip_if_root
+def test_wal_snapshot_copy_failure_then_recovery(tmp_path):
+    """If snapshotting a WAL db fails, reads stay safe and recover once readable again."""
+    db_path = tmp_path / "state.db"
+    writer = sqlite3.connect(str(db_path))
+    writer.execute("PRAGMA journal_mode=WAL")
+    create_state_db_tables(writer, include_schema_version=False)
+    writer.execute("INSERT INTO sessions (id, source, started_at) VALUES ('s1', 'cli', 1.0)")
+    writer.commit()
+    assert db_path.with_name("state.db-wal").exists()
+
+    db_path.chmod(0o000)  # snapshot copy raises PermissionError
+    try:
+        db = HermesDB(db_path)
+        assert db.read_sessions() == []  # no crash, no data yet (backoff read 1)
+        assert db.read_sessions() == []  # backoff read 2
+    finally:
+        db_path.chmod(0o644)
+
+    # Backoff exhausted; next read reconnects and sees the data.
+    assert [row["id"] for row in db.read_sessions()] == ["s1"]
+    db.close()
+    writer.close()
+
+
+def test_concurrent_writer_insert_is_visible_on_next_read(tmp_path):
+    """Simulate hermes-agent writing while we read."""
+    db_path = tmp_path / "state.db"
+    create_state_db_with_session(db_path)
+    db = HermesDB(db_path)
+
+    sessions1 = db.read_sessions()
+    assert len(sessions1) == 1
+
+    # Simulate external write (new session added)
+    writer = sqlite3.connect(str(db_path))
+    writer.execute(
+        "INSERT INTO sessions (id, source, started_at, message_count) VALUES (?, ?, ?, ?)",
+        ("s2", "telegram", time.time(), 5),
+    )
+    writer.commit()
+    writer.close()
+
+    # Next read should pick up the change (data_version changed)
+    sessions2 = db.read_sessions()
+    assert len(sessions2) == 2
+    db.close()
+
+
+def test_message_search_fts_check_failure_degrades_without_crashing(tmp_path):
+    """If probing for the FTS table raises, search degrades gracefully (no crash)."""
+    db_path = tmp_path / "state.db"
+    create_state_db_with_session(db_path)
+    db = HermesDB(db_path)
+
+    # Kill the handle before any search runs, so FTS availability is still
+    # undetermined: the sqlite_master probe inside _messages_fts_enabled raises
+    # and must be swallowed (FTS treated as unavailable) rather than crashing.
+    db._conn.close()
+
+    assert db._messages_fts_available is None
+    result = db.search_session_ids_by_message("used a tool")
+    assert result == set()  # no cache yet, query failed -> empty, not a crash
+    assert db._messages_fts_available is False
     db.close()

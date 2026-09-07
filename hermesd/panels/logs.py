@@ -121,7 +121,9 @@ def _render_detail(
     )
     total = len(log_lines)
     max_offset = _max_offset(total)
-    offset = min(scroll_offset, max_offset)
+    # Clamp both ends: a negative offset would slice from the end of the list
+    # and render an empty page with a negative line counter.
+    offset = max(0, min(scroll_offset, max_offset))
     visible_lines = log_lines[offset : offset + _DETAIL_VISIBLE_LOG_LINES]
 
     lines = Text()

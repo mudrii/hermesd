@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from rich.console import Console
+
 from hermesd.models import DashboardState, LogLine, LogState, LogStream
 from hermesd.panels.logs import render_logs
 from hermesd.theme import Theme
@@ -59,3 +61,24 @@ def test_logs_compact_still_prefers_agent_stream() -> None:
 def test_logs_compact_empty_state_still_shows_placeholder() -> None:
     rendered = render_to_str(render_logs(DashboardState(), Theme()))
     assert "No log lines" in rendered
+
+
+def _export_detail_text(state: DashboardState, scroll_offset: int) -> str:
+    """Render the logs detail view through a recording console and export it."""
+    console = Console(width=120, height=80, record=True)
+    console.print(render_logs(state, Theme(), detail=True, scroll_offset=scroll_offset))
+    return console.export_text()
+
+
+def test_logs_detail_negative_scroll_offset_renders_from_the_top() -> None:
+    state = DashboardState(
+        logs=LogState(agent_lines=[LogLine(message=f"line {index:02d}") for index in range(30)])
+    )
+
+    negative = _export_detail_text(state, -5)
+
+    # A negative offset must clamp to the top, not slice from the end.
+    assert negative == _export_detail_text(state, 0)
+    assert "line 00" in negative
+    assert "line 29" not in negative
+    assert "[1-10/30]" in negative

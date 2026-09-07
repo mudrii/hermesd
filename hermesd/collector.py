@@ -891,6 +891,12 @@ class Collector:
     def _collect_config(self) -> ConfigSummary:
         cfg = self._read_yaml_cached()
         if not cfg:
+            # A config.yaml that parses to nothing after a good read is a
+            # truncated or emptied write, not a real "no configuration": fail
+            # the source so the last-good summary survives instead of blanking
+            # the config panel (same guard shape as the kanban.db readers).
+            if self._last_state is not None and self._last_state.config != ConfigSummary():
+                raise RuntimeError("config.yaml parsed empty")
             return ConfigSummary()
         model_cfg = _as_dict(cfg.get("model"))
         agent_cfg = _as_dict(cfg.get("agent"))

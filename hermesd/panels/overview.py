@@ -251,8 +251,9 @@ def _skills_table(theme: Theme, visible: list[tuple[str, str, str]], offset: int
 def _skills_sections(sm: SkillsMemory, theme: Theme, scroll_offset: int) -> list[RenderableType]:
     rows = _skill_rows(sm)
     total = len(rows)
-    # Apply scroll — clamp so the rendered page stays a full window
-    offset = min(scroll_offset, max(0, total - _DETAIL_VISIBLE_SKILL_ROWS))
+    # Apply scroll — clamp both ends so the rendered page stays a full window;
+    # a negative offset would slice from the end and render nothing.
+    offset = max(0, min(scroll_offset, max(0, total - _DETAIL_VISIBLE_SKILL_ROWS)))
     visible = rows[offset : offset + _DETAIL_VISIBLE_SKILL_ROWS]
     return [
         _skills_header(sm, theme, offset, len(visible), total),

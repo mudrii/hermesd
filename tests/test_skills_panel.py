@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+from rich.console import Console
+
 from hermesd.models import (
     CredentialPoolEntry,
     DashboardState,
@@ -320,3 +322,21 @@ def test_skills_detail_does_not_truncate_long_descriptions():
     text = render_to_str(panel, width=200, no_color=True)
 
     assert long_description in text
+
+
+def _export_skills_detail_text(state: DashboardState, scroll_offset: int) -> str:
+    """Render the skills detail view through a recording console and export it."""
+    console = Console(width=120, height=120, record=True)
+    console.print(render_panel(7, state, Theme(), detail=True, scroll_offset=scroll_offset))
+    return console.export_text()
+
+
+def test_skills_detail_negative_scroll_offset_renders_from_the_top():
+    state = build_skills_state(40, description_template="description {i}")
+
+    negative = _export_skills_detail_text(state, -5)
+
+    # A negative offset must clamp to the top, not slice from the end.
+    assert negative == _export_skills_detail_text(state, 0)
+    assert "skill-00" in negative
+    assert "skill-39" not in negative

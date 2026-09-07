@@ -219,12 +219,21 @@ def _tool_names_from_entries(value: object, *, allow_bare_names: bool = False) -
 
 
 def _read_session_tools(path: Path) -> object:
-    """Return the raw ``tools`` value of a session file without caching it."""
+    """Return the raw ``tools`` value of a session file without caching it.
+
+    A session file the index names but that no longer exists simply has no
+    tools. A file that exists but cannot be decoded raises instead: silently
+    treating it as empty shrinks the reported tool inventory, where raising
+    fails the tools source and keeps the last-good inventory — the same
+    handling a symlinked session file already gets.
+    """
     try:
         with path.open(encoding="utf-8") as handle:
             data = json.load(handle)
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except FileNotFoundError:
         return None
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise OSError(f"Unreadable session file: {path.name}") from exc
     return data.get("tools") if isinstance(data, dict) else None
 
 

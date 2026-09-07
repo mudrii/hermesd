@@ -38,6 +38,9 @@ and this project uses date-based versions in `YYYY.M.D` form.
 - Goal state is re-read only when `state.db` changes, and per-repo checkpoint commit counts only when the repository's refs change, removing a database snapshot copy and two git subprocesses per repository from every refresh.
 - Plain-text reads under `~/.hermes` (memory files, `SOUL.md`, skill frontmatter, hook and plugin manifests, checkpoint workdir markers, the gateway pid file, cron suggestions) now refuse symlinks that escape the Hermes home and read at most 256 KiB, so an oversized or redirected file cannot stall or mislead the dashboard.
 - Quitting no longer waits for a full collection pass: `close()` signals the in-flight pass, which stops after the current source and keeps last-good values for the rest.
+- Logs and Skills detail views clamp a negative scroll offset to the top instead of slicing from the end and rendering an empty page with a `[-4--5/30]` counter.
+- A `config.yaml` truncated to zero bytes (for example mid-write) now fails the config source and keeps the last-good summary instead of blanking the Config panel to defaults.
+- A corrupt or undecodable session file in the legacy `sessions/` scan now fails the tools source and preserves the last-good tool inventory instead of silently shrinking it.
 
 ### Changed
 
@@ -46,6 +49,7 @@ and this project uses date-based versions in `YYYY.M.D` form.
 - Removed the dead `_cache_hits` counter and unified the duplicated WAL-snapshot-to-tempdir logic between `db.py` and `collector.py` into one shared helper.
 - Package metadata now uses a PEP 639 SPDX license expression (`License-Expression: MIT`); Hatchling 1.32 emits Core Metadata 2.5 and Twine 7 validates the resulting artifacts.
 - Dev-toolchain floor pins raised (`pip>=26.2` for PYSEC-2026-3721) and documented with an explanatory comment.
+- Lockfile bumps the Linux-only dev transitive `cryptography` (via twine → keyring → secretstorage) from 49.0.0 to 50.0.1 to clear the PKCS#7 Bleichenbacher-oracle advisory; the shipped package does not depend on it.
 
 ### Added
 
