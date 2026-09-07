@@ -417,6 +417,8 @@ def test_corrupt_skills_prompt_snapshot_keeps_last_good(hermes_home: Path):
         collector.close()
 
     assert second.skills_prompt.prompted_skill_count == 1
+
+
 def test_corrupt_cron_executions_db_keeps_last_good_execution_history(
     populated_hermes_home: Path,
 ) -> None:
