@@ -17,3 +17,26 @@ def test_kanban_completed_at_renders_age_label() -> None:
     rendered = render_to_str(render_kanban(state, Theme(), detail=True))
     assert str(completed) not in rendered
     assert "2m" in rendered
+
+
+def test_kanban_detail_age_uses_collected_at_not_wall_clock() -> None:
+    now = 1_800_000_000.0
+    state = DashboardState(
+        collected_at=now,
+        kanban=KanbanState(
+            db_present=True,
+            task_count=1,
+            active_tasks=[
+                KanbanTaskSummary(
+                    task_id="task-age",
+                    title="age",
+                    status="in_progress",
+                    last_heartbeat_at=int(now) - 7200,
+                )
+            ],
+        ),
+    )
+
+    text = render_to_str(render_kanban(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "2h" in text

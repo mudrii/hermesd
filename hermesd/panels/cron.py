@@ -238,9 +238,15 @@ def _jobs_table(
             Text(sanitize_terminal_text(j.state), style=state_color),
             Text(sanitize_terminal_text(last), style=last_style),
             *window,
-            escape(j.last_error[:80]) if j.last_error else "—",
+            _job_error_label(j, stats_by_job.get(j.job_id)),
         )
     return table
+
+
+def _job_error_label(job: CronJob, stats: CronJobExecutionStats | None) -> str:
+    """jobs.json ``last_error``, else the executions.db excerpt for the job."""
+    error = job.last_error or (stats.last_error_excerpt if stats is not None else "")
+    return escape(error[:80]) if error else "—"
 
 
 def _job_flags_line(j: CronJob, theme: Theme) -> Text | None:

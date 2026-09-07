@@ -10,10 +10,37 @@ from typing import Any
 import yaml
 
 from hermesd.collect.common import _EXCERPT_MAX_CHARS, _as_dict, _as_list, _read_text_capped
-from hermesd.models import MCPSchemaCache, SkillsPromptSnapshot
+from hermesd.models import MCPSchemaCache, SkillsPromptSnapshot, ToolsetAvailability
 
 # Upper bound on cached server names surfaced from the MCP schema cache.
 _MAX_LISTED_NAMES = 20
+
+
+def _toolset_availability(data: dict[str, Any]) -> ToolsetAvailability:
+    """Summarize the ``availability`` block of ``cache/banner_snapshot.json``.
+
+    ``unavailable_toolsets`` ships as ``{name, env_vars, tools}`` mappings on
+    hermes-agent 0.21; plain name strings are accepted too. Any other shape
+    contributes nothing rather than guessing.
+    """
+    availability = _as_dict(data.get("availability"))
+    return ToolsetAvailability(
+        enabled_toolsets=_name_list(data.get("enabled_toolsets")),
+        unavailable_toolsets=_name_list(availability.get("unavailable_toolsets")),
+        lazy_tool_count=len(_as_list(availability.get("lazy_tools"))),
+        disabled_tool_count=len(_as_list(availability.get("disabled_tools"))),
+    )
+
+
+def _name_list(value: object) -> list[str]:
+    """Sorted names from a list of strings or of ``{"name": ...}`` mappings."""
+    names = set()
+    for entry in _as_list(value):
+        if isinstance(entry, str) and entry:
+            names.add(entry)
+        elif isinstance(entry, dict) and isinstance(entry.get("name"), str) and entry["name"]:
+            names.add(entry["name"])
+    return sorted(names)
 
 
 def _mcp_schema_cache_summary(data: dict[str, Any], age_seconds: float | None) -> MCPSchemaCache:

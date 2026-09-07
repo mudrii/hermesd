@@ -506,3 +506,49 @@ def test_cron_detail_shows_paused_without_a_reason() -> None:
     )
     text = render_to_str(render_cron(state, Theme(), detail=True), width=140, no_color=True)
     assert "paused" in text
+
+
+def _error_column_state(last_error: str) -> DashboardState:
+    return DashboardState(
+        cron=CronState(
+            job_count=1, jobs=[CronJob(job_id="job-a", name="alpha", last_error=last_error)]
+        ),
+        cron_executions=_executions_state(
+            db_present=True,
+            job_stats=[
+                CronJobExecutionStats(
+                    job_id="job-a", last_status="failed", last_error_excerpt="executions.db boom"
+                )
+            ],
+        ),
+    )
+
+
+def test_cron_detail_falls_back_to_execution_error_excerpt() -> None:
+    """executions.db keeps the error after jobs.json clears last_error."""
+    text = render_to_str(
+        render_cron(_error_column_state(""), Theme(), detail=True), width=160, no_color=True
+    )
+
+    assert "executions.db boom" in text
+
+
+def test_cron_detail_prefers_jobs_json_last_error() -> None:
+    text = render_to_str(
+        render_cron(_error_column_state("jobs.json boom"), Theme(), detail=True),
+        width=160,
+        no_color=True,
+    )
+
+    assert "jobs.json boom" in text
+    assert "executions.db boom" not in text
+
+
+def test_cron_detail_escapes_execution_error_excerpt() -> None:
+    state = _error_column_state("")
+    state.cron_executions.job_stats[0].last_error_excerpt = "[bold red]evil\x1b[2J"
+
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "[bold red]evil" in text
+    assert "\x1b[2J" not in text

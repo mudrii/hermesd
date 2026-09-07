@@ -7,7 +7,19 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ## [Unreleased]
 
+### Added
+
+- Tools detail now reports toolset availability from the `availability` block of `cache/banner_snapshot.json` — `Toolsets: N enabled · unavailable: … · N lazy · N disabled` — and the compact view carries a `⚠ N toolsets unavailable` marker. The reader accepts both the `{name, env_vars, tools}` mappings hermes-agent 0.21 writes and plain name strings; unknown shapes read as empty.
+- Operations now surfaces `cache/blocked-scripts/` (shell scripts the agent refused to run): a `Blocked scripts: N (newest Xh ago): a.sh, b.sh` detail row and a compact count. The scan is bounded to 200 entries, symlink-safe, stat-only — script contents are never read — and is registered as its own `blocked_scripts` health source, so an unreadable directory keeps the last-good counts.
+- The Operations PR table gains **Open** and **Conflict** columns whenever a PR monitor reports per-PR review state.
+
 ### Fixed
+
+- The Config panel read hermes-agent config keys that do not exist. The **Agent limits** and **Integrations** sections now read the real 0.21 keys: `delegation.max_concurrent_children` / `max_spawn_depth` / `orchestrator_enabled`, `goals.max_turns`, `updates.check` / `pre_update_backup` (legacy booleans map to `full`/`off`) / `backup_keep`, `tool_loop_guardrails.warnings_enabled` / `hard_stop_enabled`, and `plugins.enabled` / `plugins.disabled` counts. The invented `delegation.enabled`, `delegation.compression_threshold_tokens`, `delegation.max_parallel`, `goals.enabled`, `goals.turn_budget`, `updates.channel`, `updates.auto`, `tool_loop_guardrails.max_repeats` and `plugins` entry-count readings are gone; the compact line now reads `mcp N · plugins N · goals N`.
+- `cron/state/pr_monitor.json` is a mapping keyed by PR number on hermes-agent 0.21, which the reader did not recognise — every live PR monitor reported 0 PRs. That shape is now detected and reports monitored/tracked counts, open and conflicting counts, and the newest `updatedAt` as the checked-at stamp.
+- `memory_files` / `memory_file_count` counted `MEMORY.md.lock` and `USER.md.lock`, doubling the reported memory-file count. `*.lock` files and dotfiles are now excluded.
+- Sessions, Kanban and Operations computed ages with `time.time()` instead of the collector's injected clock, so a JSON snapshot's ages drifted from its own `collected_at`. All three now measure against `state.collected_at`.
+- The Cron detail job table falls back to the executions.db `last_error_excerpt` when `jobs.json` carries no `last_error`, so a failure that has already been cleared from `jobs.json` still shows an error.
 
 - Config detail view no longer crashes with a Rich `MarkupError` when `code_execution_mode` or MoA preset config values contain `[`; both labels are now escaped like their siblings.
 - Sessions hidden by hermes-agent 0.21 (`sessions.hidden = 1`) are excluded from the session list and the header count, and sessions are ordered by `COALESCE(last_activity_at, started_at)` so revived sessions sort where the agent shows them; older schemas without those columns keep the previous behaviour.

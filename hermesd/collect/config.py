@@ -25,21 +25,23 @@ def _config_agent_limits(cfg: dict[str, Any]) -> dict[str, Any]:
     updates = _as_dict(cfg.get("updates"))
     guardrails = _as_dict(cfg.get("tool_loop_guardrails"))
     mcp_names = sorted(str(name) for name in _as_dict(cfg.get("mcp_servers")))
+    plugins = _as_dict(cfg.get("plugins"))
     return {
-        "delegation_enabled": bool(delegation.get("enabled")),
-        "delegation_compression_threshold_tokens": _coerce_int(
-            delegation.get("compression_threshold_tokens")
+        "delegation_max_concurrent_children": _coerce_int(
+            delegation.get("max_concurrent_children")
         ),
-        "delegation_max_parallel": _coerce_int(delegation.get("max_parallel")),
-        "goals_enabled": bool(goals.get("enabled")),
-        "goals_turn_budget": _coerce_int(goals.get("turn_budget")),
-        "updates_channel": _plain_str(updates.get("channel")),
-        "updates_auto": bool(updates.get("auto")) or bool(updates.get("check")),
+        "delegation_max_spawn_depth": _coerce_int(delegation.get("max_spawn_depth")),
+        "delegation_orchestrator_enabled": bool(delegation.get("orchestrator_enabled")),
+        "goals_max_turns": _coerce_int(goals.get("max_turns")),
+        "updates_check": bool(updates.get("check")),
+        "updates_pre_update_backup": _pre_update_backup_mode(updates.get("pre_update_backup")),
+        "updates_backup_keep": _coerce_int(updates.get("backup_keep")),
         "mcp_server_count": len(mcp_names),
         "mcp_server_names": mcp_names[:_MAX_LISTED_NAMES],
-        "plugin_config_count": _config_entry_count(cfg.get("plugins")),
-        "tool_loop_guardrails_enabled": bool(guardrails.get("enabled")),
-        "tool_loop_max_repeats": _coerce_int(guardrails.get("max_repeats")),
+        "plugin_enabled_count": _name_list_count(plugins.get("enabled")),
+        "plugin_disabled_count": _name_list_count(plugins.get("disabled")),
+        "tool_loop_warnings_enabled": bool(guardrails.get("warnings_enabled")),
+        "tool_loop_hard_stop_enabled": bool(guardrails.get("hard_stop_enabled")),
         "max_live_sessions": _coerce_int(cfg.get("max_live_sessions")),
         "streaming_enabled": bool(_as_dict(cfg.get("streaming")).get("enabled")),
         "logging_level": _plain_str(_as_dict(cfg.get("logging")).get("level")),
@@ -47,10 +49,16 @@ def _config_agent_limits(cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _config_entry_count(value: object) -> int:
-    if isinstance(value, dict | list):
-        return len(value)
-    return 0
+def _name_list_count(value: object) -> int:
+    """Length of a plugins.enabled/disabled name list; other shapes count as none."""
+    return len(value) if isinstance(value, list) else 0
+
+
+def _pre_update_backup_mode(value: object) -> str:
+    """``updates.pre_update_backup`` mode; legacy booleans map to full/off."""
+    if isinstance(value, bool):
+        return "full" if value else "off"
+    return _plain_str(value)
 
 
 def _plain_str(value: object) -> str:

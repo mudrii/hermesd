@@ -29,18 +29,19 @@ def test_config_detail_escapes_moa_label_values() -> None:
 
 def _agent_limits_config() -> ConfigSummary:
     return ConfigSummary(
-        delegation_enabled=True,
-        delegation_compression_threshold_tokens=60000,
-        delegation_max_parallel=4,
-        goals_enabled=True,
-        goals_turn_budget=40,
-        updates_channel="stable",
-        updates_auto=True,
+        delegation_max_concurrent_children=10,
+        delegation_max_spawn_depth=2,
+        delegation_orchestrator_enabled=True,
+        goals_max_turns=20,
+        updates_check=True,
+        updates_pre_update_backup="quick",
+        updates_backup_keep=5,
         mcp_server_count=2,
         mcp_server_names=["playwright", "sheets"],
-        plugin_config_count=3,
-        tool_loop_guardrails_enabled=True,
-        tool_loop_max_repeats=3,
+        plugin_enabled_count=3,
+        plugin_disabled_count=1,
+        tool_loop_warnings_enabled=True,
+        tool_loop_hard_stop_enabled=True,
         max_live_sessions=8,
         streaming_enabled=True,
         logging_level="INFO",
@@ -58,12 +59,18 @@ def test_config_detail_shows_agent_limits_and_integrations() -> None:
 
     assert "Agent limits" in text
     assert "Integrations" in text
-    assert "60000" in text
-    assert "turn budget 40" in text
+    assert "children 10" in text
+    assert "depth 2" in text
+    assert "max turns 20" in text
+    assert "warn" in text
+    assert "hard-stop" in text
     assert "INFO" in text
     assert "playwright" in text
     assert "sheets" in text
-    assert "stable" in text
+    assert "quick" in text
+    assert "keep 5" in text
+    assert "3 enabled" in text
+    assert "1 disabled" in text
 
 
 def test_config_detail_empty_sections_render_placeholder() -> None:
@@ -80,14 +87,14 @@ def test_config_compact_shows_integrations_line() -> None:
 
     assert "mcp 2" in text
     assert "plugins 3" in text
-    assert "goals on" in text
+    assert "goals 20" in text
 
 
-def test_config_compact_shows_goals_off_when_disabled() -> None:
+def test_config_compact_shows_goals_placeholder_when_unset() -> None:
     text = _render(ConfigSummary(), detail=False)
 
     assert "mcp 0" in text
-    assert "goals off" in text
+    assert "goals —" in text
 
 
 def test_config_detail_escapes_markup_hostile_server_names() -> None:

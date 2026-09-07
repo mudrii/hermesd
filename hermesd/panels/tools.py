@@ -28,6 +28,10 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append(f"{len(state.background_processes)} proc\n", style=theme.banner_text)
     lines.append("  Checkpoints: ", style=theme.ui_label)
     lines.append(f"{len(state.checkpoints)} repo\n", style=theme.banner_text)
+    unavailable = len(state.toolset_availability.unavailable_toolsets)
+    if unavailable:
+        plural = "" if unavailable == 1 else "s"
+        lines.append(f"  ⚠ {unavailable} toolset{plural} unavailable\n", style=theme.ui_warn)
     for ts in state.tool_stats[:3]:
         lines.append(f"  {sanitize_terminal_text(ts.name)}", style=theme.ui_label)
         lines.append(f" ({ts.call_count})\n", style=theme.banner_dim)
@@ -47,6 +51,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         *_tool_calls_section(state, theme),
         Text("\n"),
         *_available_tools_section(state, theme),
+        *_toolset_availability_lines(state, theme),
         Text("\n"),
         *_background_processes_section(state, theme),
         Text("\n"),
@@ -94,6 +99,27 @@ def _available_tools_section(state: DashboardState, theme: Theme) -> list[Render
         row.append(escape(names[i + 2]) if i + 2 < len(names) else "")
         tools_table.add_row(*row)
     return [header, tools_table]
+
+
+def _toolset_availability_lines(state: DashboardState, theme: Theme) -> list[RenderableType]:
+    """Toolset load status from the banner snapshot; empty without a snapshot."""
+    availability = state.toolset_availability
+    if not availability.enabled_toolsets and not availability.unavailable_toolsets:
+        return []
+    line = Text("\n  Toolsets: ", style=theme.ui_label)
+    line.append(f"{len(availability.enabled_toolsets)} enabled", style=theme.banner_text)
+    if availability.unavailable_toolsets:
+        names = ", ".join(sanitize_terminal_text(n) for n in availability.unavailable_toolsets)
+        line.append(f" · unavailable: {names}", style=theme.ui_warn)
+    extras = [
+        f"{availability.lazy_tool_count} lazy" if availability.lazy_tool_count else "",
+        f"{availability.disabled_tool_count} disabled" if availability.disabled_tool_count else "",
+    ]
+    configured = [part for part in extras if part]
+    if configured:
+        line.append(f" · {' · '.join(configured)}", style=theme.banner_dim)
+    line.append("\n")
+    return [line]
 
 
 def _background_processes_section(state: DashboardState, theme: Theme) -> list[RenderableType]:

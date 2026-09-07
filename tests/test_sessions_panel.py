@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
 from hermesd.models import ActiveSurface, DashboardState, SessionInfo
 from hermesd.panels.sessions import render_sessions
 from hermesd.theme import Theme
 from tests.conftest import render_to_str
+
+# Frozen collection clock: session ages are rendered against state.collected_at,
+# so tests pin both ends and never depend on wall-clock time.
+_NOW = 1_800_000_000.0
 
 
 def test_sessions_detail_caps_table_with_footer() -> None:
@@ -38,7 +40,7 @@ def _session(**overrides: object) -> SessionInfo:
         "input_tokens": 1000,
         "output_tokens": 500,
         "estimated_cost_usd": 0.9,
-        "started_at": time.time() - 7200,
+        "started_at": _NOW - 7200,
         "is_active": True,
     }
     base.update(overrides)
@@ -47,6 +49,7 @@ def _session(**overrides: object) -> SessionInfo:
 
 def _rich_state() -> DashboardState:
     return DashboardState(
+        collected_at=_NOW,
         sessions=[
             _session(
                 display_name="Dashboard work",
@@ -56,7 +59,7 @@ def _rich_state() -> DashboardState:
                 profile_name="coding",
                 pinned=True,
                 chat_type="direct",
-                last_activity_at=time.time() - 45,
+                last_activity_at=_NOW - 45,
                 last_activity_description="edited db.py",
                 actual_cost_usd=0.55,
                 cost_source="provider",
@@ -112,7 +115,9 @@ def test_detail_shows_branch_profile_activity_and_actual_cost() -> None:
 
 
 def test_detail_falls_back_to_started_at_for_age() -> None:
-    state = DashboardState(sessions=[_session(started_at=time.time() - 120, git_branch="main")])
+    state = DashboardState(
+        collected_at=_NOW, sessions=[_session(started_at=_NOW - 120, git_branch="main")]
+    )
 
     rendered = render_to_str(render_sessions(state, Theme(), detail=True), width=200)
 
@@ -179,3 +184,14 @@ def test_detail_escapes_markup_hostile_free_text() -> None:
     assert "[/]" in rendered
     assert "[x]" in rendered
     assert "\x1b[2J" not in rendered
+
+
+def test_detail_age_uses_collected_at_not_wall_clock() -> None:
+    """Ages are measured against the injected collection clock."""
+    state = DashboardState(
+        collected_at=_NOW, sessions=[_session(last_activity_at=_NOW - 3600, git_branch="main")]
+    )
+
+    rendered = render_to_str(render_sessions(state, Theme(), detail=True), width=200)
+
+    assert "1h" in rendered

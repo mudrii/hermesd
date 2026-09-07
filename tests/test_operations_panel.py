@@ -7,6 +7,7 @@ from hermesd.models import (
     DelegationInfo,
     ModelCacheSummary,
     OperationsState,
+    PRMonitorSummary,
 )
 from hermesd.panels.operations import render_operations
 from hermesd.theme import Theme
@@ -167,3 +168,62 @@ def test_detail_uses_placeholders_for_missing_delegation_fields():
     )
     text = render_to_str(render_operations(state, Theme(), detail=True), width=160)
     assert "—" in text
+
+
+def test_operations_detail_shows_pr_open_and_conflicting_counts() -> None:
+    state = _ops_state(
+        pr_monitors=[
+            PRMonitorSummary(
+                filename="pr_monitor.json",
+                monitored_count=2,
+                tracked_count=2,
+                open_count=1,
+                conflicting_count=1,
+            )
+        ]
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Open" in text
+    assert "Conflict" in text
+
+
+def test_operations_detail_hides_pr_open_columns_when_all_zero() -> None:
+    state = _ops_state(
+        pr_monitors=[
+            PRMonitorSummary(filename="pr_monitor.json", repo="acme/widget", monitored_count=3)
+        ]
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Conflict" not in text
+
+
+def test_operations_detail_shows_blocked_scripts_line() -> None:
+    state = _ops_state(
+        blocked_script_count=3,
+        newest_blocked_script_age_seconds=7200.0,
+        blocked_script_names=["a.sh", "b.sh", "c.sh"],
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Blocked scripts" in text
+    assert "3" in text
+    assert "a.sh, b.sh, c.sh" in text
+
+
+def test_operations_compact_shows_blocked_scripts_only_when_present() -> None:
+    present = render_to_str(
+        render_operations(_ops_state(blocked_script_count=2), Theme()), width=100, no_color=True
+    )
+    absent = render_to_str(render_operations(_ops_state(), Theme()), width=100, no_color=True)
+
+    assert "Blocked" in present
+    assert "Blocked" not in absent
+
+
+def test_operations_detail_escapes_blocked_script_names() -> None:
+    state = _ops_state(blocked_script_count=1, blocked_script_names=["[bold red]evil.sh"])
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "[bold red]evil.sh" in text
