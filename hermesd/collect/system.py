@@ -18,16 +18,20 @@ _GIT_SUBPROCESS_TIMEOUT_SECONDS = 2
 # gateway state within this window counts as running even with no live
 # session and no gateway process.
 _RECENT_ACTIVITY_WINDOW_SECONDS = 300.0
+# os.kill() passes the pid to the C API as a pid_t, so anything wider raises
+# OverflowError. A JSON file under ~/.hermes can hold an arbitrary integer, and
+# no such value can name a live process anyway.
+_MAX_PID = 2**31 - 1
 
 
 def _pid_exists(pid: int) -> bool:
-    if pid <= 0:
+    if pid <= 0 or pid > _MAX_PID:
         # os.kill(0, 0) targets this process group and os.kill(-1, 0) every
         # process the user owns; neither is a liveness check.
         return False
     try:
         os.kill(pid, 0)
-    except ProcessLookupError:
+    except (ProcessLookupError, OverflowError):
         return False
     except PermissionError:
         return True

@@ -11,16 +11,16 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from hermesd.collect.common import (
+    _age_seconds,
     _as_dict,
     _as_list,
     _coerce_float,
     _coerce_int,
-    _safe_child_path,
+    _iso_to_epoch,
 )
 from hermesd.collect.sqlite_util import (
     _count_by,
@@ -49,34 +49,10 @@ _DELIVERY_ERROR_EXCERPT_CHARS = 80
 # newest incarnations matter for uptime and the 24h restart count.
 _INCARNATION_SCAN_LIMIT = 500
 _OPEN_DELIVERY_LIMIT = 5
-
-
-def _parse_iso_epoch(value: object) -> float | None:
-    """Parse an ISO-8601 timestamp into epoch seconds; naive values are UTC."""
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not text:
-        return None
-    if text.endswith(("Z", "z")):
-        text = f"{text[:-1]}+00:00"
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    try:
-        return parsed.timestamp()
-    except (OverflowError, OSError, ValueError):
-        return None
-
-
-def _age_since(timestamp: float | None, now: float) -> float | None:
-    """Seconds since timestamp, clamped at zero so clock skew never goes negative."""
-    if timestamp is None:
-        return None
-    return max(0.0, now - timestamp)
+# A recorded start_time is only usable as wall-clock when it lands inside this
+# window of now. The live gateway_state.json carries a monotonic-clock value
+# (178874708938, i.e. the year 7638), which must never be read as an epoch.
+_PLAUSIBLE_EPOCH_WINDOW_SECONDS = 50 * 365 * _DAY_SECONDS
 
 
 def _optional_int(value: object) -> int | None:
@@ -94,7 +70,7 @@ def _platform_status(name: str, info: dict[str, Any], now: float) -> PlatformSta
         error_message=str(info.get("error_message") or ""),
         needs_attention=bool(info.get("needs_attention")),
         retrying_since=retrying_since,
-        retrying_since_age_seconds=_age_since(_parse_iso_epoch(retrying_since), now),
+        retrying_since_age_seconds=_age_seconds(_iso_to_epoch(retrying_since), now),
     )
 
 
@@ -106,8 +82,8 @@ def _heartbeat_liveness(
     running: bool,
 ) -> tuple[float | None, GatewayLoopHealth]:
     """Event-loop liveness from the watchdog heartbeat; file mtime is the fallback clock."""
-    stamp = _parse_iso_epoch(data.get("updated_at")) if data else None
-    age = _age_since(stamp if stamp is not None else file_mtime, now)
+    stamp = _iso_to_epoch(data.get("updated_at")) if data else None
+    age = _age_seconds(stamp if stamp is not None else file_mtime, now)
     if age is None:
         return None, GatewayLoopHealth.UNKNOWN
     if age <= _HEARTBEAT_TICKING_SECONDS:
@@ -143,52 +119,85 @@ def _lifecycle_status(data: JsonMapping, pid_exists: Callable[[int], bool]) -> _
 
 @dataclass(frozen=True, slots=True)
 class _ConfigGeneration:
+    """The gateway's recorded config fingerprint and source stamps.
+
+    Informational only: no current hermes-agent writes ``config_generation``,
+    so the recorded per-source mtimes are orphan data and are never compared
+    against the live files (see ``_config_stale``).
+    """
+
     fingerprint: str = ""
     short: str = ""
     sources: list[ConfigSourceStamp] = field(default_factory=list)
-    stale: bool = False
 
 
-def _config_generation(data: JsonMapping, root: Path) -> _ConfigGeneration:
-    """Config files the running gateway loaded, plus whether any changed since."""
+def _config_generation(data: JsonMapping) -> _ConfigGeneration:
+    """Config files the running gateway recorded that it loaded."""
     raw = _as_dict(data.get("config_generation"))
     if not raw:
         return _ConfigGeneration()
-    sources: list[ConfigSourceStamp] = []
-    stale = False
-    for entry in _as_list(raw.get("sources")):
-        info = _as_dict(entry)
-        if not info:
-            continue
-        recorded = _coerce_int(info.get("mtime_ns"))
-        source_path = str(info.get("path") or "")
-        sources.append(
-            ConfigSourceStamp(
-                name=str(info.get("name") or ""),
-                path=source_path,
-                exists=bool(info.get("exists")),
-                mtime_ns=recorded,
-                size=_coerce_int(info.get("size")),
-            )
+    sources = [
+        ConfigSourceStamp(
+            name=str(info.get("name") or ""),
+            path=str(info.get("path") or ""),
+            exists=bool(info.get("exists")),
+            mtime_ns=_coerce_int(info.get("mtime_ns")),
+            size=_coerce_int(info.get("size")),
         )
-        stale = stale or _config_source_changed(source_path, recorded, root)
+        for entry in _as_list(raw.get("sources"))
+        if (info := _as_dict(entry))
+    ]
     return _ConfigGeneration(
         fingerprint=str(raw.get("fingerprint") or ""),
         short=str(raw.get("short") or ""),
         sources=sources,
-        stale=stale,
     )
 
 
-def _config_source_changed(source_path: str, recorded_mtime_ns: int, root: Path) -> bool:
-    """True when the live config file is newer than the one the gateway loaded."""
-    if not source_path or recorded_mtime_ns <= 0:
+def _plausible_epoch(value: object, now: float) -> float | None:
+    """Wall-clock epoch for `value`, or None when it cannot be one.
+
+    Accepts an ISO-8601 string or a numeric epoch, and rejects anything more
+    than _PLAUSIBLE_EPOCH_WINDOW_SECONDS from `now` — hermes-agent records a
+    monotonic clock reading under the same ``start_time`` key.
+    """
+    epoch = _iso_to_epoch(value)
+    if epoch is None:
+        if isinstance(value, str) or value is None:
+            return None
+        epoch = _coerce_float(value)
+    if epoch <= 0 or abs(epoch - now) > _PLAUSIBLE_EPOCH_WINDOW_SECONDS:
+        return None
+    return epoch
+
+
+def _gateway_start_epoch(
+    heartbeat: JsonMapping,
+    lifecycle: JsonMapping,
+    state: JsonMapping,
+    now: float,
+) -> float | None:
+    """When the running gateway started, from the first source carrying a usable stamp."""
+    for data in (heartbeat, lifecycle, state):
+        epoch = _plausible_epoch(data.get("start_time"), now)
+        if epoch is not None:
+            return epoch
+    return None
+
+
+def _config_stale(config_path: Path, root: Path, start_epoch: float | None) -> bool:
+    """True when config.yaml was written after the running gateway started.
+
+    ``config_path`` is stat'd through symlinks on purpose: dotfiles setups link
+    ``~/.hermes/config.yaml`` at a repository copy, and that is still the file
+    the gateway loads. Only the lexical location is confined to `root`.
+    """
+    if start_epoch is None:
         return False
-    path = Path(source_path)
-    if not _safe_child_path(path, root):
+    if not config_path.is_relative_to(root):
         return False
     try:
-        return path.stat().st_mtime_ns > recorded_mtime_ns
+        return config_path.stat().st_mtime > start_epoch
     except OSError:
         return False
 
@@ -209,7 +218,7 @@ def _update_receipt_status(data: JsonMapping, now: float, code_sha: str) -> _Upd
     plan = _as_dict(data.get("plan"))
     return _UpdateReceipt(
         outcome=str(data.get("outcome") or ""),
-        finished_age_seconds=_age_since(_parse_iso_epoch(data.get("finished_at")), now),
+        finished_age_seconds=_age_seconds(_iso_to_epoch(data.get("finished_at")), now),
         from_version=str(_as_dict(data.get("pre_update")).get("version") or ""),
         to_version=str(_as_dict(data.get("post_update")).get("version") or ""),
         failed_step=_first_failed_step(data.get("steps")),
@@ -293,7 +302,7 @@ def _gateway_ledger_fields(rows: _GatewayLedgerRows, now: float) -> dict[str, An
     return {
         "gateway_incarnation_count": rows.incarnation_count,
         "gateway_restarts_24h": sum(1 for start in starts if now - start <= _DAY_SECONDS),
-        "current_incarnation_uptime_seconds": _age_since(max(starts) if starts else None, now),
+        "current_incarnation_uptime_seconds": _age_seconds(max(starts) if starts else None, now),
         "pending_delivery_count": sum(counts.get(state) or 0 for state in _PENDING_DELIVERY_STATES),
         "failed_delivery_count": counts.get("failed") or 0,
         "pending_deliveries": [_delivery_summary(row, now) for row in rows.delivery_rows],
@@ -306,7 +315,7 @@ def _delivery_summary(row: dict[str, Any], now: float) -> DeliveryObligationSumm
         platform=str(row.get("platform") or ""),
         state=str(row.get("state") or ""),
         attempts=_coerce_int(row.get("attempts") or 0),
-        age_seconds=_age_since(timestamp or None, now),
+        age_seconds=_age_seconds(timestamp or None, now),
         last_error=_error_excerpt(row.get("last_error") or ""),
     )
 

@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from hermesd.file_cache import LastGoodFileCache
+from hermesd.file_cache import _MAX_PARSED_FILE_BYTES, LastGoodFileCache
 
 
 def test_cache_hit_reuses_value_until_mtime_changes(tmp_path):
@@ -283,3 +283,42 @@ def test_valid_json_changed_within_same_second_is_reloaded(tmp_path, monkeypatch
     _pin_coarse_mtime(monkeypatch, path, reference)
 
     assert cache.read_json_mapping(path) == {"v": 2}
+
+
+def test_oversized_json_is_refused_and_keeps_the_last_good_value(tmp_path):
+    """A document over the parse cap is treated exactly like a malformed one."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "models_dev_cache.json"
+    path.write_text(json.dumps({"v": 1}))
+    assert cache.read_json_mapping(path) == {"v": 1}
+
+    padding = "p" * (_MAX_PARSED_FILE_BYTES + 1)
+    path.write_text(json.dumps({"v": 2, "pad": padding}))
+    assert path.stat().st_size > _MAX_PARSED_FILE_BYTES
+
+    assert cache.read_json_mapping(path) == {"v": 1}
+    assert cache.last_read_was_stale(path) is True
+
+
+def test_oversized_json_is_not_reparsed_on_every_read(tmp_path, monkeypatch):
+    cache = LastGoodFileCache()
+    path = tmp_path / "huge.json"
+    path.write_text(json.dumps({"pad": "p" * (_MAX_PARSED_FILE_BYTES + 1)}))
+
+    def exploding_open(*args, **kwargs):
+        raise AssertionError("an over-cap file must never be opened")
+
+    monkeypatch.setattr(Path, "open", exploding_open)
+
+    assert cache.read_json_mapping(path) == {}
+    assert cache.read_json_mapping(path) == {}
+
+
+def test_file_just_under_the_cap_still_loads(tmp_path):
+    """models_dev_cache.json is ~4.5 MB in a real ~/.hermes and must keep loading."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "big-but-ok.json"
+    path.write_text(json.dumps({"pad": "p" * (5 * 1024 * 1024)}))
+    assert path.stat().st_size < _MAX_PARSED_FILE_BYTES
+
+    assert cache.read_json_mapping(path)["pad"].startswith("p")

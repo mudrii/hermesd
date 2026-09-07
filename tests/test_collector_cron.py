@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -14,6 +16,7 @@ from hermesd.collect.cron import (
     _EXECUTIONS_RECENT_LIMIT,
     _EXECUTIONS_SCAN_LIMIT,
 )
+from hermesd.collect.logs import _MAX_LOG_LINE_CHARS
 from hermesd.collector import (
     Collector,
     _delivery_target_label,
@@ -1300,3 +1303,90 @@ def test_collect_cron_blank_paused_at_string_is_not_paused(hermes_home: Path):
         c.close()
 
     assert state.cron.jobs[0].paused is False
+
+
+# --------------------------------------------------------------------------
+# Cron path containment and output-line bounds
+# --------------------------------------------------------------------------
+
+
+def test_collect_cron_output_truncates_a_giant_line(hermes_home: Path):
+    """A single unbounded line would be redacted and scanned whole every refresh."""
+    job_dir = hermes_home / "cron" / "output" / "job-1"
+    job_dir.mkdir(parents=True)
+    (job_dir / "latest.md").write_text("z" * 20_000 + "\n")
+
+    c = Collector(hermes_home, log_tail_bytes=64 * 1024)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert len(state.logs.cron_lines) == 1
+    assert len(state.logs.cron_lines[0].message) == _MAX_LOG_LINE_CHARS
+
+
+def test_collect_cron_executions_ignores_a_symlinked_cron_directory(
+    hermes_home: Path, tmp_path: Path
+):
+    """Only checking db_path.is_symlink() misses a symlinked cron/ directory."""
+    outside_cron = tmp_path / "outside-cron"
+    outside_cron.mkdir()
+    conn = sqlite3.connect(str(outside_cron / "executions.db"))
+    create_cron_executions_tables(conn)
+    insert_cron_execution(conn, "e1", "job-1", "completed", claimed_at=iso_ago(60))
+    conn.commit()
+    conn.close()
+    cron_dir = hermes_home / "cron"
+    shutil.rmtree(cron_dir)
+    cron_dir.symlink_to(outside_cron, target_is_directory=True)
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.cron_executions.db_present is False
+    assert state.cron_executions.recent == []
+    assert "cron_executions" not in state.health.failed_sources
+
+
+def test_symlinked_executions_db_after_a_good_read_keeps_last_good(
+    hermes_home: Path, sample_cron_executions_db: Path, tmp_path: Path
+):
+    outside_db = tmp_path / "outside-executions.db"
+    conn = sqlite3.connect(str(outside_db))
+    create_cron_executions_tables(conn)
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert first.cron_executions.db_present is True
+        assert first.cron_executions.recent
+
+        sample_cron_executions_db.unlink()
+        sample_cron_executions_db.symlink_to(outside_db)
+        second = c.collect()
+    finally:
+        c.close()
+
+    assert second.cron_executions == first.cron_executions
+    assert "cron_executions" in second.health.failed_sources
+
+
+def test_cron_ticker_stamps_ignore_symlinks_outside_home(hermes_home: Path, tmp_path: Path):
+    outside = tmp_path / "ticker_heartbeat"
+    outside.write_text(str(time.time()))
+    (hermes_home / "cron" / "ticker_heartbeat").symlink_to(outside)
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.cron.ticker_heartbeat_age_seconds is None
+    assert state.cron.ticker_health is CronTickerHealth.UNKNOWN

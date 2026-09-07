@@ -8,17 +8,18 @@ import os
 import shlex
 import sqlite3
 from collections.abc import Callable
-from datetime import UTC, datetime
 from itertools import islice
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from hermesd.collect.common import (
+    _age_seconds,
     _as_dict,
     _as_list,
     _coerce_float,
     _coerce_int,
     _file_size,
+    _iso_to_epoch,
     _mtime,
     _path_resolves_under,
     _read_tail_text,
@@ -128,7 +129,10 @@ def _goal_state_update(conn: sqlite3.Connection) -> dict[str, Any]:
 
 _DELEGATION_TERMINAL_STATES = ("completed", "error", "failed", "cancelled")
 _DELEGATION_FAILED_STATES = ("error", "failed")
-_JSON_COLUMN_MAX_BYTES = 4096
+# Cap on any JSON object column decoded whole (delegation task/result payloads
+# and goal records). 64 KiB comfortably holds a real goal — which carries the
+# full contract and subgoal list — while still refusing a runaway blob.
+_JSON_COLUMN_MAX_BYTES = 64 * 1024
 _DELEGATION_TEXT_MAX_CHARS = 80
 _BOUNDED_SCAN_LIMIT = 200
 _STATE_META_MAINTENANCE_KEYS = (
@@ -231,7 +235,7 @@ def _delegation_from_row(
 ) -> DelegationInfo:
     dispatched_at = _coerce_float(row.get("dispatched_at"))
     completed_at = _coerce_float(row.get("completed_at")) or None
-    task = _json_object_capped(row.get("task_json"))
+    task = _json_object_capped(row.get("task_json")) or {}
     result = _first_delegation_result(row.get("result_json"))
     owner_pid = _coerce_int(row.get("owner_pid"))
     return DelegationInfo(
@@ -264,23 +268,27 @@ def _delegation_duration(
 
 
 def _first_delegation_result(raw: object) -> dict[str, Any]:
-    results = _as_list(_json_object_capped(raw).get("results"))
+    results = _as_list((_json_object_capped(raw) or {}).get("results"))
     if results and isinstance(results[0], dict):
         return results[0]
     return {}
 
 
-def _json_object_capped(raw: object) -> dict[str, Any]:
-    """Decode a JSON object column, refusing payloads over 4 KiB."""
+def _json_object_capped(raw: object) -> dict[str, Any] | None:
+    """Decode a JSON object column, refusing payloads over _JSON_COLUMN_MAX_BYTES.
+
+    None means "no usable object" — absent, over the cap, malformed, or not a
+    JSON object — which lets callers distinguish that from a genuine ``{}``.
+    """
     if not isinstance(raw, str) or not raw:
-        return {}
+        return None
     if len(raw.encode("utf-8", errors="replace")) > _JSON_COLUMN_MAX_BYTES:
-        return {}
+        return None
     with contextlib.suppress(json.JSONDecodeError, ValueError):
         decoded = json.loads(raw)
         if isinstance(decoded, dict):
             return decoded
-    return {}
+    return None
 
 
 def _clip_single_line(value: str) -> str:
@@ -320,21 +328,11 @@ def _read_schema_version(conn: sqlite3.Connection) -> int:
 
 def _epoch_age_seconds(raw: str, now: float) -> float | None:
     epoch = _coerce_float(raw)
-    if epoch <= 0:
-        return None
-    return max(0.0, now - epoch)
+    return _age_seconds(epoch if epoch > 0 else None, now)
 
 
 def _iso_age_seconds(raw: str, now: float) -> float | None:
-    if not raw:
-        return None
-    try:
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return max(0.0, now - parsed.timestamp())
+    return _age_seconds(_iso_to_epoch(raw), now)
 
 
 def _count_delegation_live_logs(live_root: Path, home: Path) -> int:
@@ -405,11 +403,11 @@ def _read_goal_summaries(conn: sqlite3.Connection) -> list[GoalSummary]:
     )
     goals: list[GoalSummary] = []
     for row in rows:
-        raw_value = str(row.get("value") or "")
-        with contextlib.suppress(json.JSONDecodeError):
-            data = json.loads(raw_value)
-            if isinstance(data, dict):
-                goals.append(_goal_summary_from_row(str(row.get("key") or ""), data))
+        # Same cap as the delegation payloads: a goal record is untrusted,
+        # unbounded JSON sitting in a state_meta value column.
+        data = _json_object_capped(row.get("value"))
+        if data is not None:
+            goals.append(_goal_summary_from_row(str(row.get("key") or ""), data))
     return goals
 
 

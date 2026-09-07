@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import sqlite3
+import stat
 
 import pytest
 
+from hermesd.collector import Collector
 from hermesd.db import _RECONNECT_ERROR_THRESHOLD, HermesDB
 from tests.conftest import (
+    _skip_if_root,
+    _unreadable,
     create_state_db_tables,
     create_state_db_with_session,
     insert_model_usage,
@@ -226,5 +230,68 @@ def test_model_usage_corruption_after_good_read_keeps_last_good(tmp_path):
 
         assert [row["model"] for row in degraded["all"]] == ["gpt-5.4"]
         assert db.last_read_model_usage_stale is True
+    finally:
+        db.close()
+
+
+@_skip_if_root
+def test_unreadable_state_db_directory_fails_the_source_instead_of_emptying_it(tmp_path):
+    """Python 3.14's Path.exists() returns False on EACCES; that must not read as "no db"."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    create_state_db_with_session(home / "state.db")
+
+    collector = Collector(home)
+    try:
+        first = collector.collect()
+        assert [session.session_id for session in first.sessions] == ["s1"]
+
+        original_mode = stat.S_IMODE(home.stat().st_mode)
+        home.chmod(0o000)
+        try:
+            if not _unreadable(home / "state.db"):
+                pytest.skip("filesystem does not enforce directory permissions")
+            second = collector.collect()
+        finally:
+            home.chmod(original_mode)
+    finally:
+        collector.close()
+
+    assert second.sessions == first.sessions
+    assert "sessions" in second.health.failed_sources
+    # The denial itself is reported, not a generic "cached rows" note that a
+    # silently-absent database would also produce.
+    assert "PermissionError" in second.health.errors["sessions"]
+
+
+def test_run_readout_reuses_the_shared_connection(tmp_path):
+    db_path = tmp_path / "state.db"
+    create_state_db_with_session(db_path)
+    db = HermesDB(db_path)
+    try:
+        assert db.run_readout(lambda conn: conn is db._conn) is True
+    finally:
+        db.close()
+
+
+def test_run_readout_raises_on_a_missing_database(tmp_path):
+    db_path = tmp_path / "state.db"
+    create_state_db_with_session(db_path)
+    db = HermesDB(db_path)
+    try:
+        db.close()
+        with pytest.raises(sqlite3.Error):
+            db.run_readout(lambda conn: conn.execute("SELECT 1").fetchone())
+    finally:
+        db.close()
+
+
+def test_run_readout_propagates_sqlite_errors(tmp_path):
+    db_path = tmp_path / "state.db"
+    create_state_db_with_session(db_path)
+    db = HermesDB(db_path)
+    try:
+        with pytest.raises(sqlite3.Error):
+            db.run_readout(lambda conn: conn.execute("SELECT * FROM missing_table").fetchall())
     finally:
         db.close()

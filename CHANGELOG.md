@@ -42,9 +42,18 @@ and this project uses date-based versions in `YYYY.M.D` form.
 - Logs and Skills detail views clamp a negative scroll offset to the top instead of slicing from the end and rendering an empty page with a `[-4--5/30]` counter.
 - A `config.yaml` truncated to zero bytes (for example mid-write) now fails the config source and keeps the last-good summary instead of blanking the Config panel to defaults.
 - A corrupt or undecodable session file in the legacy `sessions/` scan now fails the tools source and preserves the last-good tool inventory instead of silently shrinking it.
+- Gateway no longer reports "config stale" permanently: staleness is now derived from `config.yaml`'s mtime against the running gateway's start time (`state/gateway.heartbeat`, `state/gateway.lifecycle.json`, then `gateway_state.json`, ignoring monotonic-clock values), instead of the orphan `config_generation` mtimes that no current hermes-agent writes. A symlinked `config.yaml` (dotfiles setups) is still evaluated, and no known start time reports not-stale.
+- A process ID too large for the OS (for example `2**40` in `gateway_state.json`, `runtime/active_sessions.json` or `spawn-ledger.json`) no longer raises `OverflowError` and fails the whole source; it is simply reported as not alive.
+- `runtime/active_sessions.json`, `desktop-build-stamp.json` and `web-ui-build-stamp.json` are now confined to `~/.hermes` like every other read, and `cron/executions.db`, `cron/ticker_heartbeat` and `cron/ticker_last_success` are confined to the Hermes home rather than only checked for being symlinks themselves — a symlinked `cron/` directory no longer escapes. An `executions.db` swapped for an outside path after a good read keeps the last-good executions and names the source failed.
+- JSON/YAML files under `~/.hermes` are refused above 8 MiB instead of being parsed whole and retained forever; the 4.5 MB `models_dev_cache.json` still loads, and an over-cap file keeps the last-good value like a malformed one.
+- Goal records in `state_meta` are now decoded through the same size-capped JSON helper as delegation payloads, and that cap is raised from 4 KiB to 64 KiB so realistic delegation tasks and results are no longer blanked.
+- `state.db` is snapshotted once per change instead of twice per refresh: the goals/delegations/ledger readout now runs on the read-only connection `HermesDB` already holds, halving the WAL copy cost on non-APFS filesystems. A corrupt `state.db` still falls back to last-good data for those sources.
+- Cron output lines are truncated to 4096 characters before redaction, matching the log reader, so a single 20 000-character line cannot slow a refresh.
+- Database existence checks (`state.db`, `kanban.db`, `response_store.db`, `verification_evidence.db`, `projects.db`) use the strict existence probe, so on Python 3.14 an unreadable directory marks the source failed instead of reporting an empty database.
 
 ### Changed
 
+- Internal: the duplicated ISO-8601 parsers and age helpers across `collect/gateway.py`, `collect/cron.py`, `collect/operations.py` and `collector.py` are consolidated into `collect/common.py` (`_iso_to_epoch`, `_age_seconds`); behaviour is unchanged.
 - Internal: `collector.py` is split into a `hermesd/collect/` package of per-domain readers, with `hermesd.collector` kept as the public facade; no behaviour or import path changes.
 - Internal: long panel `_render_detail` functions are split into named per-section helpers, with the shared section heading and age formatter moved to `hermesd/panels/formatting.py`; rendered output is byte-identical.
 - Removed the dead `_cache_hits` counter and unified the duplicated WAL-snapshot-to-tempdir logic between `db.py` and `collector.py` into one shared helper.

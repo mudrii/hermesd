@@ -12,6 +12,12 @@ T = TypeVar("T")
 JsonMapping = dict[str, object]
 JsonObjectList = list[JsonMapping]
 
+# Upper bound on a single JSON/YAML document parsed whole and then retained for
+# the life of the process. ~/.hermes ships a 4.5 MB models_dev_cache.json, so
+# the cap has to clear that with headroom while still refusing a file large
+# enough to stall a refresh or exhaust memory.
+_MAX_PARSED_FILE_BYTES = 8 * 1024 * 1024
+
 
 class LastGoodFileCache:
     def __init__(self) -> None:
@@ -89,7 +95,8 @@ class LastGoodFileCache:
         with self._lock:
             key = str(path)
             try:
-                mtime = path.stat().st_mtime_ns
+                stat = path.stat()
+                mtime = stat.st_mtime_ns
             except FileNotFoundError:
                 # The source is gone, not transiently unreadable: evict rather
                 # than serve a deleted file's value forever.
@@ -104,6 +111,11 @@ class LastGoodFileCache:
                 self._stale_reads[key] = False
                 return values[key]
             if bad_mtimes.get(key) == mtime:
+                return self._stale(key, values, default_factory)
+            if stat.st_size > _MAX_PARSED_FILE_BYTES:
+                # Treated exactly like a malformed file: remembered as bad for
+                # this mtime so the size is not re-checked every refresh.
+                bad_mtimes[key] = mtime
                 return self._stale(key, values, default_factory)
             try:
                 value = load()

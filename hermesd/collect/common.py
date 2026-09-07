@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,38 @@ _MAX_TEXT_READ_BYTES = 256 * 1024
 # Width of the one-line previews shown in compact panels (SOUL.md and cron
 # output excerpts); wide enough for a headline, short enough for a cell.
 _EXCERPT_MAX_CHARS = 80
+
+
+def _iso_to_epoch(value: object) -> float | None:
+    """Epoch seconds for an ISO-8601 stamp; naive values are UTC, garbage is None.
+
+    The single ISO parser for every collector: ``~/.hermes`` writes timestamps
+    with a trailing ``Z``, with an explicit offset, and without either.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith(("Z", "z")):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    try:
+        return parsed.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _age_seconds(epoch: float | None, now: float) -> float | None:
+    """Age of `epoch` at `now`, clamped at zero so clock skew never goes negative."""
+    if epoch is None or not math.isfinite(epoch):
+        return None
+    return max(0.0, now - epoch)
 
 
 def _today_epoch(now: float) -> float:
