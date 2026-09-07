@@ -106,3 +106,75 @@ def test_tools_detail_handles_absurd_started_at() -> None:
     )
     rendered = render_to_str(render_tools(state, Theme(), detail=True))
     assert "—" in rendered
+
+
+def _process(**fields: object) -> BackgroundProcessInfo:
+    base: dict[str, object] = {
+        "session_id": "proc_alpha",
+        "command": "pytest -q",
+        "pid": 4242,
+        "purpose": "dashboard",
+        "port": 9119,
+        "profile": "coding",
+        "alive": True,
+    }
+    base.update(fields)
+    return BackgroundProcessInfo(**base)  # type: ignore[arg-type]
+
+
+def test_tools_detail_renders_purpose_port_and_profile_columns():
+    state = DashboardState(background_processes=[_process()])
+    text = render_to_str(render_tools(state, Theme(), detail=True), width=180)
+    assert "Purpose" in text
+    assert "Port" in text
+    assert "Profile" in text
+    row = next(line for line in text.splitlines() if "proc_alpha" in line)
+    assert "dashboard" in row
+    assert "9119" in row
+    assert "coding" in row
+
+
+def test_tools_detail_uses_placeholders_for_missing_process_metadata():
+    state = DashboardState(
+        background_processes=[_process(purpose="", port=0, profile="", pid=0, alive=False)]
+    )
+    text = render_to_str(render_tools(state, Theme(), detail=True), width=180)
+    row = next(line for line in text.splitlines() if "proc_alpha" in line)
+    assert row.count("—") >= 3
+
+
+def test_tools_detail_marks_dead_processes():
+    state = DashboardState(
+        background_processes=[
+            _process(session_id="proc_live", alive=True),
+            _process(session_id="proc_dead", pid=4343, alive=False),
+        ]
+    )
+    text = render_to_str(render_tools(state, Theme(), detail=True), width=180)
+    live_row = next(line for line in text.splitlines() if "proc_live" in line)
+    dead_row = next(line for line in text.splitlines() if "proc_dead" in line)
+    assert "✗" not in live_row
+    assert "4343 ✗" in dead_row
+
+
+def test_tools_detail_escapes_markup_hostile_process_metadata():
+    state = DashboardState(
+        background_processes=[
+            _process(
+                purpose="[bold]mcp\x1b[2J-helper[/bold]",
+                profile="\x1b]8;;http://evil\x07[red]p[/red]",
+                command="run [blink]x[/blink]",
+            )
+        ]
+    )
+    text = render_to_str(render_tools(state, Theme(), detail=True), width=200)
+    assert "\x1b[2J" not in text
+    assert "http://evil" not in text
+    assert "[bold]mcp" in text
+    assert "[blink]x" in text
+
+
+def test_tools_detail_empty_process_table_still_renders():
+    state = DashboardState(background_processes=[])
+    text = render_to_str(render_tools(state, Theme(), detail=True), width=180)
+    assert "No running background processes" in text

@@ -105,6 +105,9 @@ def _background_processes_section(state: DashboardState, theme: Theme) -> list[R
     process_table = Table(box=None, show_header=True, padding=(0, 1))
     process_table.add_column("Session", style=theme.ui_label, min_width=14)
     process_table.add_column("PID", justify="right", style=theme.ui_accent, min_width=5)
+    process_table.add_column("Purpose", style=theme.banner_text, min_width=8)
+    process_table.add_column("Port", justify="right", style=theme.banner_dim, min_width=5)
+    process_table.add_column("Profile", style=theme.banner_dim, min_width=7)
     process_table.add_column("Notify", style=theme.banner_text, min_width=6)
     process_table.add_column("Watch", style=theme.banner_dim, min_width=8)
     process_table.add_column("Started", style=theme.banner_dim, min_width=8)
@@ -112,7 +115,10 @@ def _background_processes_section(state: DashboardState, theme: Theme) -> list[R
     for process in state.background_processes:
         process_table.add_row(
             escape(process.session_id),
-            str(process.pid) if process.pid else "—",
+            _pid_label(process.pid, process.alive),
+            escape(process.purpose) or "—",
+            str(process.port) if process.port else "—",
+            escape(process.profile) or "—",
             "Yes" if process.notify_on_complete else "No",
             _watch_summary(process.watch_patterns, process.watcher_interval),
             _started_label(process.started_at),
@@ -138,6 +144,13 @@ def _checkpoints_section(state: DashboardState, theme: Theme) -> list[Renderable
             _started_label(checkpoint.last_checkpoint_at or 0.0),
         )
     return [header, checkpoint_table]
+
+
+def _pid_label(pid: int, alive: bool) -> str:
+    """PID cell, marked with ✗ when the recorded pid is gone."""
+    if not pid:
+        return "—"
+    return str(pid) if alive else f"{pid} ✗"
 
 
 def _watch_summary(patterns: list[str], watcher_interval: int) -> str:

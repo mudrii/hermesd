@@ -7,14 +7,22 @@ import json
 import os
 import shlex
 import sqlite3
+from collections.abc import Callable
+from datetime import UTC, datetime
+from itertools import islice
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from hermesd.collect.common import (
     _as_dict,
     _as_list,
+    _coerce_float,
     _coerce_int,
+    _file_size,
+    _mtime,
+    _path_resolves_under,
     _read_tail_text,
+    _safe_child_path,
 )
 from hermesd.collect.kanban import _kanban_board_present
 from hermesd.collect.sqlite_util import (
@@ -26,6 +34,7 @@ from hermesd.collect.sqlite_util import (
 )
 from hermesd.models import (
     CuratorRun,
+    DelegationInfo,
     DiscoveredRepoSummary,
     GoalSummary,
     OperationsState,
@@ -115,6 +124,276 @@ def _goal_state_update(conn: sqlite3.Connection) -> dict[str, Any]:
         ),
         "goals": goals,
     }
+
+
+_DELEGATION_TERMINAL_STATES = ("completed", "error", "failed", "cancelled")
+_DELEGATION_FAILED_STATES = ("error", "failed")
+_JSON_COLUMN_MAX_BYTES = 4096
+_DELEGATION_TEXT_MAX_CHARS = 80
+_BOUNDED_SCAN_LIMIT = 200
+_STATE_META_MAINTENANCE_KEYS = (
+    "last_auto_prune",
+    "last_auto_archive",
+    "db_file_generation",
+    "fts_storage_version",
+)
+
+
+class StateDbRead(NamedTuple):
+    """Everything one state.db open yields, before clock/pid enrichment.
+
+    Cached against state.db's mtime by the collector, so it must hold only
+    values that change when the database changes — never a wall-clock age or a
+    liveness check.
+    """
+
+    goal_update: dict[str, Any]
+    delegation_rows: list[dict[str, Any]]
+    delegation_counts: dict[str, int]
+    meta: dict[str, str]
+    schema_version: int
+
+
+def _read_state_db(conn: sqlite3.Connection) -> StateDbRead:
+    return StateDbRead(
+        goal_update=_goal_state_update(conn),
+        delegation_rows=_delegation_rows(conn),
+        delegation_counts=_delegation_counts(conn),
+        meta=_state_meta_entries(conn),
+        schema_version=_read_schema_version(conn),
+    )
+
+
+def _state_db_update(
+    read: StateDbRead,
+    *,
+    now: float,
+    pid_exists: Callable[[int], bool],
+) -> dict[str, Any]:
+    """Turn a cached state.db read into a fresh OperationsState update."""
+    update: dict[str, Any] = dict(read.goal_update)
+    update.update(read.delegation_counts)
+    update["delegations"] = [
+        _delegation_from_row(row, now, pid_exists) for row in read.delegation_rows
+    ]
+    update["state_db_schema_version"] = read.schema_version
+    update["state_db_file_generation"] = read.meta.get("db_file_generation", "")
+    update["state_db_fts_storage_version"] = read.meta.get("fts_storage_version", "")
+    update["last_auto_prune_age_seconds"] = _epoch_age_seconds(
+        read.meta.get("last_auto_prune", ""), now
+    )
+    update["last_auto_archive_age_seconds"] = _epoch_age_seconds(
+        read.meta.get("last_auto_archive", ""), now
+    )
+    return update
+
+
+def _delegation_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """The 10 newest async_delegations rows; the table is absent on old agents."""
+    if not _table_exists(conn, "async_delegations"):
+        return []
+    with contextlib.suppress(sqlite3.Error):
+        return _query_rows(
+            conn,
+            "SELECT * FROM async_delegations ORDER BY dispatched_at DESC LIMIT 10",
+        )
+    return []
+
+
+def _delegation_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    if not _table_exists(conn, "async_delegations"):
+        return {}
+    terminal = ", ".join(f"'{state}'" for state in _DELEGATION_TERMINAL_STATES)
+    failed = ", ".join(f"'{state}'" for state in _DELEGATION_FAILED_STATES)
+    return {
+        "delegation_count": _table_count_or_zero(conn, "async_delegations"),
+        "delegation_running_count": _count_rows_or_zero(
+            conn,
+            f"SELECT COUNT(*) FROM async_delegations WHERE COALESCE(state, '') NOT IN ({terminal})",
+        ),
+        "delegation_failed_count": _count_rows_or_zero(
+            conn,
+            f"SELECT COUNT(*) FROM async_delegations WHERE COALESCE(state, '') IN ({failed})",
+        ),
+        "delegation_undelivered_count": _count_rows_or_zero(
+            conn,
+            "SELECT COUNT(*) FROM async_delegations "
+            "WHERE COALESCE(delivery_state, '') != 'delivered' "
+            "AND COALESCE(state, '') = 'completed'",
+        ),
+    }
+
+
+def _delegation_from_row(
+    row: dict[str, Any],
+    now: float,
+    pid_exists: Callable[[int], bool],
+) -> DelegationInfo:
+    dispatched_at = _coerce_float(row.get("dispatched_at"))
+    completed_at = _coerce_float(row.get("completed_at")) or None
+    task = _json_object_capped(row.get("task_json"))
+    result = _first_delegation_result(row.get("result_json"))
+    owner_pid = _coerce_int(row.get("owner_pid"))
+    return DelegationInfo(
+        delegation_id=str(row.get("delegation_id") or ""),
+        origin_session=str(row.get("origin_session") or row.get("origin_session_id") or ""),
+        state=str(row.get("state") or ""),
+        delivery_state=str(row.get("delivery_state") or ""),
+        delivery_attempts=_coerce_int(row.get("delivery_attempts")),
+        dispatched_at=dispatched_at,
+        completed_at=completed_at,
+        duration_seconds=_delegation_duration(dispatched_at, completed_at, now),
+        goal=_clip_single_line(str(task.get("goal") or "")),
+        result_status=str(result.get("status") or ""),
+        error_excerpt=_clip_single_line(
+            str(result.get("error") or "") or str(result.get("summary") or "")
+        ),
+        owner_alive=bool(owner_pid) and pid_exists(owner_pid),
+    )
+
+
+def _delegation_duration(
+    dispatched_at: float,
+    completed_at: float | None,
+    now: float,
+) -> float | None:
+    if dispatched_at <= 0:
+        return None
+    end = completed_at if completed_at is not None else now
+    return max(0.0, end - dispatched_at)
+
+
+def _first_delegation_result(raw: object) -> dict[str, Any]:
+    results = _as_list(_json_object_capped(raw).get("results"))
+    if results and isinstance(results[0], dict):
+        return results[0]
+    return {}
+
+
+def _json_object_capped(raw: object) -> dict[str, Any]:
+    """Decode a JSON object column, refusing payloads over 4 KiB."""
+    if not isinstance(raw, str) or not raw:
+        return {}
+    if len(raw.encode("utf-8", errors="replace")) > _JSON_COLUMN_MAX_BYTES:
+        return {}
+    with contextlib.suppress(json.JSONDecodeError, ValueError):
+        decoded = json.loads(raw)
+        if isinstance(decoded, dict):
+            return decoded
+    return {}
+
+
+def _clip_single_line(value: str) -> str:
+    return " ".join(value.split())[:_DELEGATION_TEXT_MAX_CHARS]
+
+
+def _state_meta_entries(conn: sqlite3.Connection) -> dict[str, str]:
+    if not _table_exists(conn, "state_meta"):
+        return {}
+    keys = ", ".join(f"'{key}'" for key in _STATE_META_MAINTENANCE_KEYS)
+    with contextlib.suppress(sqlite3.Error):
+        rows = _query_rows(
+            conn,
+            f"SELECT key, value FROM state_meta WHERE key IN ({keys}) LIMIT 8",
+        )
+        return {str(row.get("key") or ""): str(row.get("value") or "") for row in rows}
+    return {}
+
+
+def _read_schema_version(conn: sqlite3.Connection) -> int:
+    """Max integer in schema_version's version-like column, 0 when absent."""
+    if not _table_exists(conn, "schema_version"):
+        return 0
+    best = 0
+    with contextlib.suppress(sqlite3.Error):
+        columns = [str(row[1] or "") for row in conn.execute("PRAGMA table_info(schema_version)")]
+        for column in columns:
+            if "version" not in column.lower():
+                continue
+            # Identifier comes from PRAGMA output, not from user input.
+            row = conn.execute(
+                f'SELECT MAX(CAST("{column}" AS INTEGER)) FROM schema_version'
+            ).fetchone()
+            best = max(best, int(row[0] or 0) if row is not None else 0)
+    return best
+
+
+def _epoch_age_seconds(raw: str, now: float) -> float | None:
+    epoch = _coerce_float(raw)
+    if epoch <= 0:
+        return None
+    return max(0.0, now - epoch)
+
+
+def _iso_age_seconds(raw: str, now: float) -> float | None:
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return max(0.0, now - parsed.timestamp())
+
+
+def _count_delegation_live_logs(live_root: Path, home: Path) -> int:
+    """Count live subagent transcripts, scanning at most 200 directory entries."""
+    if not _safe_child_path(live_root, home) or not live_root.is_dir():
+        return 0
+    count = 0
+    scanned = 0
+    with contextlib.suppress(OSError):
+        for run_dir in islice(live_root.iterdir(), _BOUNDED_SCAN_LIMIT):
+            scanned += 1
+            if run_dir.is_symlink() or not run_dir.is_dir():
+                continue
+            if not _path_resolves_under(run_dir, home):
+                continue
+            for log in islice(run_dir.glob("task-*.log"), _BOUNDED_SCAN_LIMIT - scanned):
+                if log.is_symlink() or not log.is_file():
+                    continue
+                count += 1
+                scanned += 1
+            if scanned >= _BOUNDED_SCAN_LIMIT:
+                break
+    return count
+
+
+def _read_state_snapshots(root: Path, home: Path, *, now: float) -> dict[str, Any]:
+    """Stat state-snapshots/ one level deep, capped at 200 entries."""
+    count = 0
+    total_bytes = 0
+    newest: float | None = None
+    if _safe_child_path(root, home) and root.is_dir():
+        with contextlib.suppress(OSError):
+            for entry in islice(root.iterdir(), _BOUNDED_SCAN_LIMIT):
+                if entry.is_symlink() or not _path_resolves_under(entry, home):
+                    continue
+                if entry.is_dir():
+                    total_bytes += _immediate_file_bytes(entry)
+                elif entry.is_file():
+                    total_bytes += _file_size(entry)
+                else:
+                    continue
+                count += 1
+                mtime = _mtime(entry)
+                if mtime is not None and (newest is None or mtime > newest):
+                    newest = mtime
+    return {
+        "snapshot_count": count,
+        "snapshot_total_bytes": total_bytes,
+        "newest_snapshot_age_seconds": max(0.0, now - newest) if newest is not None else None,
+    }
+
+
+def _immediate_file_bytes(directory: Path) -> int:
+    total = 0
+    with contextlib.suppress(OSError):
+        for child in islice(directory.iterdir(), _BOUNDED_SCAN_LIMIT):
+            if child.is_file() and not child.is_symlink():
+                total += _file_size(child)
+    return total
 
 
 def _read_goal_summaries(conn: sqlite3.Connection) -> list[GoalSummary]:

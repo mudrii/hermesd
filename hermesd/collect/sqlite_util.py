@@ -44,6 +44,7 @@ def _connect_readonly_sqlite(db_path: Path) -> Iterator[sqlite3.Connection]:
 # unlisted name is rejected instead of reaching the database.
 _KNOWN_TABLES = frozenset(
     {
+        "async_delegations",
         "conversations",
         "discovered_repos",
         "project_folders",

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -237,7 +237,10 @@ def _read_session_tools(path: Path) -> object:
     return data.get("tools") if isinstance(data, dict) else None
 
 
-def _background_process_from_ledger(entry: Mapping[str, Any]) -> BackgroundProcessInfo:
+def _background_process_from_ledger(
+    entry: Mapping[str, Any],
+    pid_exists: Callable[[int], bool],
+) -> BackgroundProcessInfo:
     pid = _coerce_int(entry.get("pid"))
     purpose = str(entry.get("purpose") or "")
     return BackgroundProcessInfo(
@@ -253,4 +256,5 @@ def _background_process_from_ledger(entry: Mapping[str, Any]) -> BackgroundProce
         purpose=purpose,
         port=_coerce_int(entry.get("port")),
         profile=str(entry.get("profile") or ""),
+        alive=bool(pid) and pid_exists(pid),
     )

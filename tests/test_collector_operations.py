@@ -25,8 +25,11 @@ from tests.conftest import (
     _init_shadow_checkpoint_repo,
     _skip_if_root,
     _unreadable,
+    create_async_delegations_table,
     create_kanban_db_tables,
     create_state_db_tables,
+    create_state_meta_table,
+    insert_delegation,
     render_to_str,
 )
 
@@ -1104,3 +1107,378 @@ def _commit(repo_dir: Path, workdir: Path, message: str) -> None:
     git = ["git", "--git-dir", str(repo_dir), "--work-tree", str(workdir)]
     subprocess.run([*git, "add", "tracked.txt"], check=True, capture_output=True, text=True)
     subprocess.run([*git, "commit", "-m", message], check=True, capture_output=True, text=True)
+
+
+# ---------------------------------------------------------------------------
+# Async delegations, state.db maintenance, snapshot backups, web UI stamp
+# ---------------------------------------------------------------------------
+
+_FIXED_NOW = 1_800_000_000.0
+
+
+def _fixed_clock() -> float:
+    return _FIXED_NOW
+
+
+def _collect_ops(home: Path, **kwargs: object):
+    """One collect pass with a fixed clock, closing the collector afterwards."""
+    c = Collector(home, clock=_fixed_clock, **kwargs)  # type: ignore[arg-type]
+    try:
+        return c.collect()
+    finally:
+        c.close()
+
+
+def _open_state_db(home: Path) -> sqlite3.Connection:
+    return sqlite3.connect(str(home / "state.db"))
+
+
+def test_delegations_happy_path(hermes_home: Path, sample_db: Path):
+    ops = _collect_ops(hermes_home, pid_exists=lambda pid: pid == 4242).operations
+    assert ops.delegation_count == 3
+    assert ops.delegation_running_count == 1
+    assert ops.delegation_failed_count == 1
+    assert ops.delegation_undelivered_count == 0
+    assert [d.delegation_id for d in ops.delegations] == [
+        "deleg_running",
+        "deleg_failed",
+        "deleg_done",
+    ]
+    running = ops.delegations[0]
+    assert running.state == "running"
+    assert running.goal == "crawl the docs"
+    assert running.owner_alive is True
+    failed = ops.delegations[1]
+    assert failed.result_status == "error"
+    assert failed.error_excerpt == "boom in the worker"
+    assert failed.delivery_attempts == 3
+    assert failed.duration_seconds is not None and failed.duration_seconds > 0
+
+
+def test_delegation_owner_alive_uses_injected_pid_exists(hermes_home: Path, sample_db: Path):
+    ops = _collect_ops(hermes_home, pid_exists=lambda pid: False).operations
+    assert all(not d.owner_alive for d in ops.delegations)
+
+
+def test_delegation_table_absent_leaves_counts_at_zero(hermes_home: Path):
+    conn = _open_state_db(hermes_home)
+    create_state_db_tables(conn)
+    conn.commit()
+    conn.close()
+    ops = _collect_ops(hermes_home).operations
+    assert ops.delegation_count == 0
+    assert ops.delegations == []
+
+
+def test_delegation_null_columns_coerce_to_defaults(hermes_home: Path):
+    conn = _open_state_db(hermes_home)
+    create_async_delegations_table(conn)
+    conn.execute(
+        "INSERT INTO async_delegations "
+        "(delegation_id, state, dispatched_at, updated_at, delivery_state) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("deleg_null", "queued", 0.0, 0.0, "pending"),
+    )
+    conn.commit()
+    conn.close()
+    entry = _collect_ops(hermes_home).operations.delegations[0]
+    assert entry.origin_session == ""
+    assert entry.delivery_attempts == 0
+    assert entry.goal == ""
+    assert entry.result_status == ""
+    assert entry.error_excerpt == ""
+    assert entry.completed_at is None
+    assert entry.duration_seconds is None
+    assert entry.owner_alive is False
+
+
+def test_delegation_garbage_json_columns_are_ignored(hermes_home: Path):
+    conn = _open_state_db(hermes_home)
+    create_async_delegations_table(conn)
+    insert_delegation(conn, "deleg_garbage", task_json="{not json", result_json="[[[")
+    conn.commit()
+    conn.close()
+    entry = _collect_ops(hermes_home).operations.delegations[0]
+    assert entry.goal == ""
+    assert entry.result_status == ""
+
+
+def test_delegation_oversized_json_columns_are_capped(hermes_home: Path):
+    conn = _open_state_db(hermes_home)
+    create_async_delegations_table(conn)
+    insert_delegation(
+        conn,
+        "deleg_big",
+        task_json=json.dumps({"goal": "x" * 8000}),
+        result_json=json.dumps({"results": [{"status": "ok", "error": "y" * 8000}]}),
+    )
+    conn.commit()
+    conn.close()
+    entry = _collect_ops(hermes_home).operations.delegations[0]
+    assert entry.goal == ""
+    assert entry.result_status == ""
+
+
+def test_delegation_text_fields_clip_to_80_chars(hermes_home: Path):
+    conn = _open_state_db(hermes_home)
+    create_async_delegations_table(conn)
+    insert_delegation(
+        conn,
+        "deleg_long",
+        task_json=json.dumps({"goal": "g" * 300}),
+        result_json=json.dumps({"results": [{"status": "error", "error": "e" * 300}]}),
+    )
+    conn.commit()
+    conn.close()
+    entry = _collect_ops(hermes_home).operations.delegations[0]
+    assert len(entry.goal) == 80
+    assert len(entry.error_excerpt) == 80
+
+
+def test_delegation_error_excerpt_falls_back_to_summary(hermes_home: Path):
+    conn = _open_state_db(hermes_home)
+    create_async_delegations_table(conn)
+    insert_delegation(
+        conn,
+        "deleg_summary",
+        result_json=json.dumps({"results": [{"status": "ok", "summary": "all\n  done"}]}),
+    )
+    conn.commit()
+    conn.close()
+    entry = _collect_ops(hermes_home).operations.delegations[0]
+    assert entry.error_excerpt == "all done"
+
+
+def test_delegation_detail_rows_capped_at_ten_newest(hermes_home: Path):
+    conn = _open_state_db(hermes_home)
+    create_async_delegations_table(conn)
+    for index in range(15):
+        insert_delegation(conn, f"deleg_{index:02d}", dispatched_at=1000.0 + index)
+    conn.commit()
+    conn.close()
+    ops = _collect_ops(hermes_home).operations
+    assert ops.delegation_count == 15
+    assert len(ops.delegations) == 10
+    assert ops.delegations[0].delegation_id == "deleg_14"
+
+
+def test_delegation_undelivered_counts_only_completed_rows(hermes_home: Path):
+    conn = _open_state_db(hermes_home)
+    create_async_delegations_table(conn)
+    insert_delegation(conn, "a", state="completed", delivery_state="pending")
+    insert_delegation(conn, "b", state="completed", delivery_state="delivered")
+    insert_delegation(conn, "c", state="error", delivery_state="pending")
+    conn.commit()
+    conn.close()
+    assert _collect_ops(hermes_home).operations.delegation_undelivered_count == 1
+
+
+def test_delegation_live_logs_counted(
+    hermes_home: Path, sample_db: Path, sample_delegation_live_logs: Path
+):
+    assert _collect_ops(hermes_home).operations.delegation_live_log_count == 2
+
+
+def test_delegation_live_log_dir_absent(hermes_home: Path, sample_db: Path):
+    assert _collect_ops(hermes_home).operations.delegation_live_log_count == 0
+
+
+def test_delegation_live_log_symlinked_dir_is_ignored(
+    hermes_home: Path, sample_db: Path, tmp_path: Path
+):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "task-0.log").write_text("nope\n")
+    live = hermes_home / "cache" / "delegation" / "live"
+    live.mkdir(parents=True)
+    (live / "deleg_evil").symlink_to(outside, target_is_directory=True)
+    assert _collect_ops(hermes_home).operations.delegation_live_log_count == 0
+
+
+def test_delegation_live_log_scan_is_bounded(hermes_home: Path, sample_db: Path):
+    live = hermes_home / "cache" / "delegation" / "live"
+    live.mkdir(parents=True)
+    for index in range(260):
+        run_dir = live / f"deleg_{index:04d}"
+        run_dir.mkdir()
+        (run_dir / "task-0.log").write_text("x\n")
+    count = _collect_ops(hermes_home).operations.delegation_live_log_count
+    assert 0 < count <= 200
+
+
+def test_state_db_maintenance_happy_path(hermes_home: Path, sample_db: Path):
+    ops = _collect_ops(hermes_home).operations
+    assert ops.state_db_schema_version == 6
+    assert ops.state_db_file_generation == "3"
+    assert ops.state_db_fts_storage_version == "2"
+    assert ops.last_auto_prune_age_seconds is not None
+    assert ops.last_auto_archive_age_seconds is not None
+    assert ops.last_auto_archive_age_seconds > ops.last_auto_prune_age_seconds
+    assert ops.state_db_size_bytes > 0
+    assert ops.state_db_wal_size_bytes == 0
+
+
+def test_state_db_maintenance_tolerates_missing_tables(hermes_home: Path):
+    conn = _open_state_db(hermes_home)
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.commit()
+    conn.close()
+    ops = _collect_ops(hermes_home).operations
+    assert ops.state_db_schema_version == 0
+    assert ops.last_auto_prune_age_seconds is None
+    assert ops.last_auto_archive_age_seconds is None
+    assert ops.state_db_file_generation == ""
+
+
+def test_state_db_maintenance_null_and_garbage_meta_values(hermes_home: Path):
+    conn = _open_state_db(hermes_home)
+    create_state_db_tables(conn, include_schema_version=False)
+    create_state_meta_table(conn, {"db_file_generation": "7"})
+    conn.execute("INSERT INTO state_meta VALUES ('last_auto_prune', NULL)")
+    conn.execute("INSERT INTO state_meta VALUES ('last_auto_archive', 'not-a-number')")
+    conn.commit()
+    conn.close()
+    ops = _collect_ops(hermes_home).operations
+    assert ops.last_auto_prune_age_seconds is None
+    assert ops.last_auto_archive_age_seconds is None
+    assert ops.state_db_file_generation == "7"
+
+
+def test_state_db_schema_version_takes_max_of_version_column(hermes_home: Path):
+    conn = _open_state_db(hermes_home)
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.executescript(
+        "CREATE TABLE schema_version (version INTEGER, applied_at TEXT);"
+        "INSERT INTO schema_version VALUES (4, 'a');"
+        "INSERT INTO schema_version VALUES (9, 'b');"
+    )
+    conn.commit()
+    conn.close()
+    assert _collect_ops(hermes_home).operations.state_db_schema_version == 9
+
+
+def test_state_db_wal_size_reported(hermes_home: Path, sample_db: Path):
+    conn = _open_state_db(hermes_home)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE wal_probe (x INTEGER)")
+    conn.commit()
+    try:
+        assert _collect_ops(hermes_home).operations.state_db_wal_size_bytes > 0
+    finally:
+        conn.close()
+
+
+def test_state_snapshots_happy_path(
+    hermes_home: Path, sample_db: Path, sample_state_snapshots: Path
+):
+    ops = _collect_ops(hermes_home).operations
+    assert ops.snapshot_count == 2
+    assert ops.snapshot_total_bytes == 2048 + 512 + 4096
+    assert ops.newest_snapshot_age_seconds is not None
+
+
+def test_state_snapshots_directory_absent(hermes_home: Path, sample_db: Path):
+    ops = _collect_ops(hermes_home).operations
+    assert ops.snapshot_count == 0
+    assert ops.snapshot_total_bytes == 0
+    assert ops.newest_snapshot_age_seconds is None
+
+
+def test_state_snapshots_symlinked_entries_ignored(
+    hermes_home: Path, sample_db: Path, tmp_path: Path
+):
+    outside = tmp_path / "outside.db"
+    outside.write_bytes(b"q" * 9999)
+    root = hermes_home / "state-snapshots"
+    root.mkdir()
+    (root / "state-linked.db").symlink_to(outside)
+    ops = _collect_ops(hermes_home).operations
+    assert ops.snapshot_count == 0
+    assert ops.snapshot_total_bytes == 0
+
+
+def test_state_snapshots_scan_is_bounded(hermes_home: Path, sample_db: Path):
+    root = hermes_home / "state-snapshots"
+    root.mkdir()
+    for index in range(260):
+        (root / f"state-{index:04d}.db").write_bytes(b"z")
+    assert _collect_ops(hermes_home).operations.snapshot_count == 200
+
+
+def test_state_snapshot_failure_is_its_own_source_and_keeps_operations(
+    hermes_home: Path, sample_db: Path, monkeypatch: pytest.MonkeyPatch
+):
+    def boom(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise OSError("snapshot scan exploded")
+
+    monkeypatch.setattr(collector_module, "_read_state_snapshots", boom)
+    state = _collect_ops(hermes_home)
+    assert "state_snapshots" in state.health.failed_sources
+    assert state.operations.delegation_count == 3
+
+
+def test_web_ui_build_stamp_read(hermes_home: Path, sample_web_ui_stamp: Path):
+    ops = _collect_ops(hermes_home).operations
+    assert ops.web_ui_build_hash == "314422207985"
+    assert ops.web_ui_built_age_seconds is not None
+
+
+def test_web_ui_build_stamp_absent(hermes_home: Path):
+    ops = _collect_ops(hermes_home).operations
+    assert ops.web_ui_build_hash == ""
+    assert ops.web_ui_built_age_seconds is None
+
+
+def test_web_ui_build_stamp_garbage_timestamp(hermes_home: Path):
+    (hermes_home / "web-ui-build-stamp.json").write_text(
+        json.dumps({"contentHash": "abcdef0123456789", "builtAt": "not-a-date"})
+    )
+    ops = _collect_ops(hermes_home).operations
+    assert ops.web_ui_build_hash == "abcdef012345"
+    assert ops.web_ui_built_age_seconds is None
+
+
+def test_background_processes_from_spawn_ledger_carry_liveness(
+    hermes_home: Path, sample_spawn_ledger: Path
+):
+    processes = _collect_ops(hermes_home, pid_exists=lambda pid: pid == 4242)
+    by_purpose = {p.purpose: p for p in processes.background_processes}
+    dashboard = by_purpose["dashboard"]
+    assert dashboard.port == 9119
+    assert dashboard.profile == "coding"
+    assert dashboard.alive is True
+    helper = by_purpose["mcp-helper"]
+    assert helper.port == 0
+    assert helper.profile == ""
+    assert helper.alive is False
+
+
+def test_background_processes_from_legacy_registry_carry_liveness(
+    hermes_home: Path, sample_processes: Path
+):
+    processes = _collect_ops(hermes_home, pid_exists=lambda pid: pid == 4242)
+    by_id = {p.session_id: p for p in processes.background_processes}
+    assert by_id["proc_alpha"].alive is True
+    assert by_id["proc_beta"].alive is False
+    assert by_id["proc_alpha"].purpose == ""
+    assert by_id["proc_alpha"].port == 0
+
+
+def test_web_ui_build_stamp_naive_timestamp_is_treated_as_utc(hermes_home: Path):
+    (hermes_home / "web-ui-build-stamp.json").write_text(
+        json.dumps({"contentHash": "0123456789abcdef", "builtAt": "2026-09-07T14:08:09"})
+    )
+    ops = _collect_ops(hermes_home).operations
+    assert ops.web_ui_built_age_seconds is not None
+    assert ops.web_ui_built_age_seconds > 0
+
+
+def test_delegation_live_log_symlinked_file_is_ignored(
+    hermes_home: Path, sample_db: Path, tmp_path: Path
+):
+    outside = tmp_path / "outside.log"
+    outside.write_text("nope\n")
+    run_dir = hermes_home / "cache" / "delegation" / "live" / "deleg_a"
+    run_dir.mkdir(parents=True)
+    (run_dir / "task-0.log").symlink_to(outside)
+    assert _collect_ops(hermes_home).operations.delegation_live_log_count == 0

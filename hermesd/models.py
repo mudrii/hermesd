@@ -140,6 +140,9 @@ class BackgroundProcessInfo(BaseModel):
     purpose: str = ""
     port: int = 0
     profile: str = ""
+    # True when the recorded pid is still live (checked via the injected
+    # pid_exists); False marks a stale ledger/registry entry.
+    alive: bool = False
 
 
 class CheckpointInfo(BaseModel):
@@ -519,6 +522,21 @@ class GoalSummary(BaseModel):
     subgoal_count: int = 0
 
 
+class DelegationInfo(BaseModel):
+    delegation_id: str = ""
+    origin_session: str = ""
+    state: str = ""
+    delivery_state: str = ""
+    delivery_attempts: int = 0
+    dispatched_at: float = 0.0
+    completed_at: float | None = None
+    duration_seconds: float | None = None
+    goal: str = ""
+    result_status: str = ""
+    error_excerpt: str = ""
+    owner_alive: bool = False
+
+
 class OperationsState(BaseModel):
     dashboard_process_count: int = 0
     desktop_build_stamp: str = ""
@@ -552,6 +570,24 @@ class OperationsState(BaseModel):
     active_goal_count: int = 0
     waiting_goal_count: int = 0
     goals: list[GoalSummary] = Field(default_factory=list)
+    delegations: list[DelegationInfo] = Field(default_factory=list)
+    delegation_count: int = 0
+    delegation_running_count: int = 0
+    delegation_failed_count: int = 0
+    delegation_undelivered_count: int = 0
+    delegation_live_log_count: int = 0
+    state_db_schema_version: int = 0
+    state_db_size_bytes: int = 0
+    state_db_wal_size_bytes: int = 0
+    state_db_file_generation: str = ""
+    state_db_fts_storage_version: str = ""
+    last_auto_prune_age_seconds: float | None = None
+    last_auto_archive_age_seconds: float | None = None
+    snapshot_count: int = 0
+    snapshot_total_bytes: int = 0
+    newest_snapshot_age_seconds: float | None = None
+    web_ui_build_hash: str = ""
+    web_ui_built_age_seconds: float | None = None
 
 
 class CuratorRun(BaseModel):

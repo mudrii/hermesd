@@ -35,6 +35,10 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append("  MoA Traces: ", style=theme.ui_label)
     lines.append(str(ops.moa_trace_count), style=theme.banner_text)
     lines.append("\n")
+    delegation_line = _delegation_summary_line(ops)
+    if delegation_line:
+        lines.append("  Delegations: ", style=theme.ui_label)
+        lines.append(f"{delegation_line}\n", style=theme.banner_text)
     lines.append("  Verify: ", style=theme.ui_label)
     if ops.verification_db_present:
         lines.append(
@@ -72,6 +76,20 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         sections.append(_heading("Goals", theme))
         sections.append(_goals_table(ops, theme))
 
+    if ops.delegation_count:
+        sections.append(
+            _heading(
+                f"Delegations ({ops.delegation_count} total · "
+                f"{ops.delegation_live_log_count} live logs)",
+                theme,
+            )
+        )
+        sections.append(_delegations_table(ops, theme))
+
+    if ops.state_db_size_bytes or ops.state_db_schema_version:
+        sections.append(_heading("State DB", theme))
+        sections.append(_state_db_table(ops, theme))
+
     if ops.moa_trace_count:
         sections.append(_heading("MoA Traces", theme))
         sections.append(_moa_table(ops, theme))
@@ -106,6 +124,10 @@ def _has_no_artifacts(ops: OperationsState) -> bool:
         and not ops.moa_trace_count
         and not ops.projects_db_present
         and not ops.goal_count
+        and not ops.delegation_count
+        and not ops.snapshot_count
+        and not ops.state_db_size_bytes
+        and not ops.web_ui_build_hash
     )
 
 
@@ -148,7 +170,77 @@ def _summary_table(ops: OperationsState, theme: Theme) -> Table:
             f"{ops.goal_count} goals  {ops.active_goal_count} active  "
             f"{ops.waiting_goal_count} waiting",
         )
+    if ops.web_ui_build_hash or ops.web_ui_built_age_seconds is not None:
+        summary.add_row(
+            "Web UI Build",
+            f"{escape(ops.web_ui_build_hash) or '—'}  "
+            f"built {_age_span_label(ops.web_ui_built_age_seconds)} ago",
+        )
+    if ops.snapshot_count:
+        summary.add_row(
+            "Snapshots",
+            f"{ops.snapshot_count} · {_size_label(ops.snapshot_total_bytes)} · "
+            f"newest {_age_span_label(ops.newest_snapshot_age_seconds)} ago",
+        )
     return summary
+
+
+def _delegation_summary_line(ops: OperationsState) -> str:
+    if not (
+        ops.delegation_running_count
+        or ops.delegation_failed_count
+        or ops.delegation_undelivered_count
+    ):
+        return ""
+    return (
+        f"{ops.delegation_running_count} running · "
+        f"{ops.delegation_failed_count} failed · "
+        f"{ops.delegation_undelivered_count} undelivered"
+    )
+
+
+def _delegations_table(ops: OperationsState, theme: Theme) -> Table:
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("ID", style=theme.ui_accent)
+    table.add_column("State", style=theme.banner_text)
+    table.add_column("Delivery", style=theme.banner_text)
+    table.add_column("Owner", style=theme.banner_dim)
+    table.add_column("Took", justify="right", style=theme.banner_dim)
+    table.add_column("Goal", style=theme.banner_text)
+    table.add_column("Result", style=theme.banner_dim)
+    for delegation in ops.delegations:
+        delivery = escape(delegation.delivery_state) or "—"
+        if delegation.delivery_attempts:
+            delivery = f"{delivery} x{delegation.delivery_attempts}"
+        table.add_row(
+            escape(delegation.delegation_id) or "—",
+            escape(delegation.state) or "—",
+            delivery,
+            "alive" if delegation.owner_alive else "—",
+            _duration_label(delegation.duration_seconds),
+            escape(delegation.goal) or "—",
+            escape(delegation.error_excerpt) or escape(delegation.result_status) or "—",
+        )
+    if not ops.delegations:
+        table.add_row("—", "—", "—", "—", "—", "—", "—")
+    return table
+
+
+def _state_db_table(ops: OperationsState, theme: Theme) -> Table:
+    table = Table(box=None, show_header=False, padding=(0, 2))
+    table.add_column("Key", style=theme.ui_label)
+    table.add_column("Value", style=theme.banner_text)
+    table.add_row("Schema Version", str(ops.state_db_schema_version))
+    table.add_row(
+        "Size",
+        f"{_size_label(ops.state_db_size_bytes)} db · "
+        f"{_size_label(ops.state_db_wal_size_bytes)} wal",
+    )
+    table.add_row("Last Auto Prune", _age_span_label(ops.last_auto_prune_age_seconds))
+    table.add_row("Last Auto Archive", _age_span_label(ops.last_auto_archive_age_seconds))
+    table.add_row("File Generation", escape(ops.state_db_file_generation) or "—")
+    table.add_row("FTS Storage", escape(ops.state_db_fts_storage_version) or "—")
+    return table
 
 
 def _model_caches_table(ops: OperationsState, theme: Theme) -> Table:
@@ -329,7 +421,24 @@ def _discovered_repos_table(ops: OperationsState, theme: Theme) -> Table:
     return repo_table
 
 
+def _duration_label(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    return fmt_age_seconds(max(0, int(seconds)))
+
+
+def _age_span_label(seconds: float | None) -> str:
+    """Compact age label with a day tier for prune/archive/snapshot ages."""
+    if seconds is None:
+        return "—"
+    if seconds < 86400:
+        return _duration_label(seconds)
+    return f"{int(seconds // 86400)}d"
+
+
 def _size_label(size_bytes: int) -> str:
+    if size_bytes >= 1_000_000_000:
+        return f"{size_bytes / 1_000_000_000:.1f}G"
     if size_bytes >= 1_000_000:
         return f"{size_bytes / 1_000_000:.1f}M"
     if size_bytes >= 1_000:
