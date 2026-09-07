@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from enum import StrEnum
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -13,12 +14,44 @@ from hermesd.paths import default_hermes_home
 AUTHORITATIVE_COST_STATUSES: frozenset[str] = frozenset({"reported", "exact", "included"})
 
 
+class GatewayLoopHealth(StrEnum):
+    """Event-loop liveness derived from the gateway watchdog heartbeat."""
+
+    TICKING = "ticking"
+    STALE = "stale"
+    WEDGED = "wedged"
+    UNKNOWN = "unknown"
+
+
 class PlatformStatus(BaseModel):
     name: str
     state: str = "unknown"
     updated_at: str = ""
     error_code: str = ""
     error_message: str = ""
+    needs_attention: bool = False
+    retrying_since: str = ""
+    retrying_since_age_seconds: float | None = None
+
+
+class ConfigSourceStamp(BaseModel):
+    """One config file as recorded in the running gateway's config generation."""
+
+    name: str = ""
+    path: str = ""
+    exists: bool = False
+    mtime_ns: int = 0
+    size: int = 0
+
+
+class DeliveryObligationSummary(BaseModel):
+    """A queued outbound delivery. Message content is deliberately never read."""
+
+    platform: str = ""
+    state: str = ""
+    attempts: int = 0
+    age_seconds: float | None = None
+    last_error: str = ""
 
 
 class GatewayState(BaseModel):
@@ -39,6 +72,37 @@ class GatewayState(BaseModel):
     served_profiles: list[str] = Field(default_factory=list)
     scale_to_zero_idle_timeout_minutes: int = 0
     scale_to_zero_relay_only: bool = False
+    # Event-loop liveness (state/gateway.heartbeat)
+    heartbeat_age_seconds: float | None = None
+    loop_health: GatewayLoopHealth = GatewayLoopHealth.UNKNOWN
+    # Lifecycle (state/gateway.lifecycle.json)
+    lifecycle_phase: str = ""
+    last_exit_code: int | None = None
+    last_exit_reason: str = ""
+    unclean_previous_exit: bool = False
+    # Code and config identity (gateway_state.json)
+    code_sha: str = ""
+    code_version: str = ""
+    config_fingerprint: str = ""
+    config_generation_short: str = ""
+    config_sources: list[ConfigSourceStamp] = Field(default_factory=list)
+    config_stale: bool = False
+    session_store_status: str = ""
+    exit_reason: str = ""
+    # Update receipts (logs/update_receipts/latest.json)
+    last_update_outcome: str = ""
+    last_update_finished_age_seconds: float | None = None
+    last_update_from_version: str = ""
+    last_update_to_version: str = ""
+    last_update_failed_step: str = ""
+    runtime_code_skew: bool = False
+    # Restart history and delivery obligations (state.db)
+    gateway_incarnation_count: int = 0
+    gateway_restarts_24h: int = 0
+    current_incarnation_uptime_seconds: float | None = None
+    pending_delivery_count: int = 0
+    failed_delivery_count: int = 0
+    pending_deliveries: list[DeliveryObligationSummary] = Field(default_factory=list)
 
 
 class SessionInfo(BaseModel):

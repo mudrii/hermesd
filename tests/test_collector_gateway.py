@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -15,9 +18,10 @@ from hermesd.collector import (
     _is_dashboard_process,
     _pid_exists,
 )
+from hermesd.models import GatewayLoopHealth
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
-from tests.conftest import render_to_str
+from tests.conftest import create_state_db_tables, render_to_str
 
 
 def test_collect_gateway_preserves_last_good_mapping_on_non_mapping_json(hermes_home: Path):
@@ -737,3 +741,787 @@ def test_gateway_version_up_to_date(hermes_home: Path):
     assert state.gateway.hermes_version == "0.8.0"
     assert state.gateway.updates_behind == 0
     c.close()
+
+
+NOW = 1_800_000_000.0
+
+
+def _iso(epoch: float, *, naive: bool = False) -> str:
+    moment = datetime.fromtimestamp(epoch, tz=UTC)
+    if naive:
+        return moment.replace(tzinfo=None).isoformat()
+    return moment.isoformat()
+
+
+def _clock() -> float:
+    return NOW
+
+
+def _write_gateway_state(home: Path, **extra: object) -> None:
+    payload: dict[str, object] = {
+        "pid": 4242,
+        "gateway_state": "running",
+        "platforms": {"telegram": {"state": "connected", "updated_at": ""}},
+    }
+    payload.update(extra)
+    (home / "gateway_state.json").write_text(json.dumps(payload))
+
+
+def _write_heartbeat(home: Path, **extra: object) -> Path:
+    state_dir = home / "state"
+    state_dir.mkdir(exist_ok=True)
+    payload: dict[str, object] = {
+        "pid": 4242,
+        "updated_at": _iso(NOW - 30),
+        "monotonic": 1234.5,
+        "start_time": NOW - 5000,
+        "loop_tick_socket": "/tmp/gw.sock",
+        "loop_tick_tcp_port": None,
+    }
+    payload.update(extra)
+    path = state_dir / "gateway.heartbeat"
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def _write_lifecycle(home: Path, **extra: object) -> Path:
+    state_dir = home / "state"
+    state_dir.mkdir(exist_ok=True)
+    payload: dict[str, object] = {
+        "phase": "exited",
+        "pid": 4242,
+        "start_time": NOW - 5000,
+        "started_at": _iso(NOW - 5000),
+        "exit_code": 3,
+        "exit_reason": "SIGTERM received",
+    }
+    payload.update(extra)
+    path = state_dir / "gateway.lifecycle.json"
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def _write_receipt(home: Path, payload: object) -> Path:
+    receipts = home / "logs" / "update_receipts"
+    receipts.mkdir(parents=True, exist_ok=True)
+    path = receipts / "latest.json"
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def _collect(home: Path, *, live_pid: int = 4242):
+    collector = Collector(home, pid_exists=lambda pid: pid == live_pid, clock=_clock)
+    try:
+        return collector.collect()
+    finally:
+        collector.close()
+
+
+# --------------------------------------------------------------------------
+# A. heartbeat liveness
+# --------------------------------------------------------------------------
+
+
+def test_heartbeat_happy_path_is_ticking(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_heartbeat(hermes_home)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.heartbeat_age_seconds == pytest.approx(30.0)
+    assert gateway.loop_health is GatewayLoopHealth.TICKING
+
+
+def test_heartbeat_missing_file_is_unknown(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.heartbeat_age_seconds is None
+    assert gateway.loop_health is GatewayLoopHealth.UNKNOWN
+
+
+def test_heartbeat_naive_timestamp_is_treated_as_utc(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_heartbeat(hermes_home, updated_at=_iso(NOW - 45, naive=True))
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.heartbeat_age_seconds == pytest.approx(45.0)
+    assert gateway.loop_health is GatewayLoopHealth.TICKING
+
+
+def test_heartbeat_garbage_timestamp_falls_back_to_file_mtime(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    path = _write_heartbeat(hermes_home, updated_at="not-a-timestamp")
+    os.utime(path, (NOW - 120, NOW - 120))
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.heartbeat_age_seconds == pytest.approx(120.0)
+    assert gateway.loop_health is GatewayLoopHealth.STALE
+
+
+def test_heartbeat_wrong_types_do_not_crash(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    path = _write_heartbeat(hermes_home, updated_at=17, pid="nope", loop_tick_tcp_port="x")
+    os.utime(path, (NOW - 10, NOW - 10))
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.heartbeat_age_seconds == pytest.approx(10.0)
+    assert gateway.loop_health is GatewayLoopHealth.TICKING
+
+
+def test_heartbeat_future_timestamp_clamps_to_zero(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_heartbeat(hermes_home, updated_at=_iso(NOW + 5000))
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.heartbeat_age_seconds == 0.0
+    assert gateway.loop_health is GatewayLoopHealth.TICKING
+
+
+@pytest.mark.parametrize(
+    ("age", "gateway_state", "expected"),
+    [
+        (90.0, "running", GatewayLoopHealth.TICKING),
+        (91.0, "running", GatewayLoopHealth.STALE),
+        (300.0, "running", GatewayLoopHealth.STALE),
+        (301.0, "running", GatewayLoopHealth.WEDGED),
+        (301.0, "stopped", GatewayLoopHealth.STALE),
+    ],
+)
+def test_heartbeat_health_thresholds(
+    hermes_home: Path,
+    age: float,
+    gateway_state: str,
+    expected: GatewayLoopHealth,
+):
+    _write_gateway_state(hermes_home, gateway_state=gateway_state)
+    _write_heartbeat(hermes_home, updated_at=_iso(NOW - age))
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.heartbeat_age_seconds == pytest.approx(age)
+    assert gateway.loop_health is expected
+
+
+def test_symlinked_heartbeat_file_is_ignored(hermes_home: Path, tmp_path: Path):
+    _write_gateway_state(hermes_home)
+    outside = tmp_path / "outside.heartbeat"
+    outside.write_text(json.dumps({"updated_at": _iso(NOW - 5)}))
+    state_dir = hermes_home / "state"
+    state_dir.mkdir(exist_ok=True)
+    (state_dir / "gateway.heartbeat").symlink_to(outside)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.heartbeat_age_seconds is None
+    assert gateway.loop_health is GatewayLoopHealth.UNKNOWN
+
+
+# --------------------------------------------------------------------------
+# B. lifecycle
+# --------------------------------------------------------------------------
+
+
+def test_lifecycle_exited_records_exit_code_and_reason(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_lifecycle(hermes_home)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.lifecycle_phase == "exited"
+    assert gateway.last_exit_code == 3
+    assert gateway.last_exit_reason == "SIGTERM received"
+    assert gateway.unclean_previous_exit is False
+
+
+def test_lifecycle_running_phase_with_dead_pid_is_unclean(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_lifecycle(
+        hermes_home, phase="running", pid=999_999_999, exit_code=None, exit_reason=None
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.lifecycle_phase == "running"
+    assert gateway.last_exit_code is None
+    assert gateway.last_exit_reason == ""
+    assert gateway.unclean_previous_exit is True
+
+
+def test_lifecycle_running_phase_with_live_pid_is_clean(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_lifecycle(hermes_home, phase="running", pid=4242, exit_code=None)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.unclean_previous_exit is False
+
+
+def test_lifecycle_missing_file_keeps_defaults(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.lifecycle_phase == ""
+    assert gateway.last_exit_code is None
+    assert gateway.unclean_previous_exit is False
+
+
+def test_lifecycle_wrong_types_do_not_crash(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_lifecycle(hermes_home, phase=7, pid="x", exit_code="not-int", exit_reason=[1, 2])
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.lifecycle_phase == "7"
+    assert gateway.last_exit_code == 0
+    assert gateway.unclean_previous_exit is False
+
+
+# --------------------------------------------------------------------------
+# C. gateway_state.json new keys
+# --------------------------------------------------------------------------
+
+
+def _config_generation(home: Path, *, mtime_ns: int) -> dict[str, object]:
+    return {
+        "fingerprint": "0123456789abcdef0123456789abcdef",
+        "short": "0123456789ab",
+        "sources": [
+            {
+                "name": "config.yaml",
+                "path": str(home / "config.yaml"),
+                "exists": True,
+                "mtime_ns": mtime_ns,
+                "size": 12,
+            }
+        ],
+    }
+
+
+def test_gateway_state_surfaces_code_and_session_store_keys(hermes_home: Path):
+    _write_gateway_state(
+        hermes_home,
+        code_sha="abcdef0123456789abcdef",
+        code_version="2026.9.1",
+        session_store={"status": "ready"},
+        exit_reason="",
+        platforms={
+            "telegram": {
+                "state": "connected",
+                "updated_at": "",
+                "needs_attention": False,
+                "retrying_since": None,
+            },
+            "discord": {
+                "state": "error",
+                "updated_at": "",
+                "error_code": "AUTH",
+                "error_message": "bad token",
+                "needs_attention": True,
+                "retrying_since": _iso(NOW - 600),
+            },
+        },
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.code_sha == "abcdef0123456789abcdef"
+    assert gateway.code_version == "2026.9.1"
+    assert gateway.session_store_status == "ready"
+    platforms = {platform.name: platform for platform in gateway.platforms}
+    assert platforms["telegram"].needs_attention is False
+    assert platforms["discord"].needs_attention is True
+    assert platforms["discord"].retrying_since_age_seconds == pytest.approx(600.0)
+    assert platforms["telegram"].retrying_since_age_seconds is None
+
+
+def test_gateway_state_exit_reason_is_surfaced(hermes_home: Path):
+    _write_gateway_state(hermes_home, gateway_state="stopped", exit_reason="crashed on boot")
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.exit_reason == "crashed on boot"
+
+
+def test_config_stale_when_live_config_is_newer_than_recorded(hermes_home: Path):
+    config = hermes_home / "config.yaml"
+    config.write_text("model: {}\n")
+    recorded = config.stat().st_mtime_ns - 1_000_000_000
+    _write_gateway_state(
+        hermes_home, config_generation=_config_generation(hermes_home, mtime_ns=recorded)
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.config_stale is True
+    assert gateway.config_fingerprint == "0123456789abcdef0123456789abcdef"
+    assert gateway.config_generation_short == "0123456789ab"
+    assert [source.name for source in gateway.config_sources] == ["config.yaml"]
+
+
+def test_config_not_stale_when_recorded_mtime_matches(hermes_home: Path):
+    config = hermes_home / "config.yaml"
+    config.write_text("model: {}\n")
+    recorded = config.stat().st_mtime_ns
+    _write_gateway_state(
+        hermes_home, config_generation=_config_generation(hermes_home, mtime_ns=recorded)
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.config_stale is False
+
+
+def test_config_stale_ignores_sources_outside_hermes_home(hermes_home: Path, tmp_path: Path):
+    outside = tmp_path / "elsewhere.yaml"
+    outside.write_text("x: 1\n")
+    _write_gateway_state(
+        hermes_home,
+        config_generation={
+            "fingerprint": "f",
+            "short": "f",
+            "sources": [{"name": "outside", "path": str(outside), "mtime_ns": 1}],
+        },
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.config_stale is False
+
+
+def test_config_generation_wrong_types_do_not_crash(hermes_home: Path):
+    _write_gateway_state(hermes_home, config_generation=["not", "a", "mapping"], session_store=7)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.config_sources == []
+    assert gateway.config_stale is False
+    assert gateway.session_store_status == ""
+
+
+# --------------------------------------------------------------------------
+# D. update receipts
+# --------------------------------------------------------------------------
+
+
+def _receipt(**extra: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema": 1,
+        "started_at": _iso(NOW - 900),
+        "finished_at": _iso(NOW - 600),
+        "argv": ["hermes", "update"],
+        "pid": 999,
+        "outcome": "ok",
+        "pre_update": {"sha": "aaaa", "short_sha": "aaaa", "version": "2026.8.1"},
+        "post_update": {"sha": "bbbb", "short_sha": "bbbb", "version": "2026.9.1"},
+        "steps": [{"name": "pull", "ok": True, "detail": "", "at": _iso(NOW - 800)}],
+        "plan": {"install_method": "uv", "runtimes": []},
+    }
+    payload.update(extra)
+    return payload
+
+
+def test_update_receipt_happy_path(hermes_home: Path):
+    _write_gateway_state(hermes_home, code_sha="bbbb")
+    _write_receipt(hermes_home, _receipt())
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.last_update_outcome == "ok"
+    assert gateway.last_update_finished_age_seconds == pytest.approx(600.0)
+    assert gateway.last_update_from_version == "2026.8.1"
+    assert gateway.last_update_to_version == "2026.9.1"
+    assert gateway.last_update_failed_step == ""
+    assert gateway.runtime_code_skew is False
+
+
+def test_update_receipt_reports_first_failed_step(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_receipt(
+        hermes_home,
+        _receipt(
+            outcome="failed",
+            steps=[
+                {"name": "pull", "ok": True},
+                {"name": "install", "ok": False, "detail": "pip exploded"},
+                {"name": "restart", "ok": False},
+            ],
+        ),
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.last_update_outcome == "failed"
+    assert gateway.last_update_failed_step == "install"
+
+
+def test_update_receipt_detects_runtime_code_skew(hermes_home: Path):
+    _write_gateway_state(hermes_home, code_sha="bbbb")
+    _write_receipt(
+        hermes_home,
+        _receipt(
+            plan={
+                "runtimes": [
+                    {"kind": "gateway", "code_sha": "bbbb"},
+                    {"kind": "worker", "code_sha": "cccc"},
+                ]
+            }
+        ),
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.runtime_code_skew is True
+
+
+def test_update_receipt_skew_ignores_blank_shas(hermes_home: Path):
+    _write_gateway_state(hermes_home, code_sha="")
+    _write_receipt(hermes_home, _receipt(plan={"runtimes": [{"code_sha": "cccc"}]}))
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.runtime_code_skew is False
+
+
+def test_update_receipt_tolerates_missing_and_wrong_typed_keys(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_receipt(hermes_home, {"outcome": 5, "steps": "nope", "plan": 12, "finished_at": "junk"})
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.last_update_outcome == "5"
+    assert gateway.last_update_finished_age_seconds is None
+    assert gateway.last_update_failed_step == ""
+    assert gateway.runtime_code_skew is False
+
+
+def test_update_receipt_missing_file_keeps_defaults(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.last_update_outcome == ""
+    assert gateway.last_update_finished_age_seconds is None
+
+
+def test_update_receipt_future_finish_clamps_to_zero(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_receipt(hermes_home, _receipt(finished_at=_iso(NOW + 3600)))
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.last_update_finished_age_seconds == 0.0
+
+
+# --------------------------------------------------------------------------
+# E/F. state.db ledgers
+# --------------------------------------------------------------------------
+
+
+def _create_ledger_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE gateway_heartbeats (
+            backend_id TEXT PRIMARY KEY,
+            pid INTEGER,
+            started_at REAL,
+            last_heartbeat REAL,
+            profile TEXT,
+            host TEXT
+        );
+        CREATE TABLE delivery_obligations (
+            obligation_id TEXT PRIMARY KEY,
+            session_key TEXT,
+            platform TEXT,
+            chat_id TEXT,
+            thread_id TEXT,
+            content TEXT,
+            state TEXT,
+            attempts INTEGER,
+            created_at REAL,
+            updated_at REAL,
+            owner_pid INTEGER,
+            owner_started_at INTEGER,
+            last_error TEXT,
+            adapter_profile TEXT
+        );
+        """
+    )
+
+
+def _write_ledgers(home: Path) -> None:
+    conn = sqlite3.connect(str(home / "state.db"))
+    _create_ledger_tables(conn)
+    conn.executemany(
+        "INSERT INTO gateway_heartbeats VALUES (?,?,?,?,?,?)",
+        [
+            ("b1", 1, NOW - 3600, NOW - 10, "root", "host"),
+            ("b2", 2, NOW - 90_000, NOW - 80_000, "root", "host"),
+            ("b3", 3, None, None, None, None),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO delivery_obligations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            (
+                "o1",
+                "telegram:1",
+                "telegram",
+                "1",
+                None,
+                "SECRET-CONTENT-DO-NOT-SHOW",
+                "pending",
+                2,
+                NOW - 400,
+                NOW - 300,
+                None,
+                None,
+                "network unreachable " + "x" * 200,
+                "root",
+            ),
+            (
+                "o2",
+                "discord:2",
+                "discord",
+                "2",
+                None,
+                "SECRET-CONTENT-DO-NOT-SHOW",
+                "failed",
+                5,
+                NOW - 900,
+                NOW - 800,
+                None,
+                None,
+                None,
+                "root",
+            ),
+            (
+                "o3",
+                "discord:3",
+                None,
+                "3",
+                None,
+                "SECRET-CONTENT-DO-NOT-SHOW",
+                "attempting",
+                1,
+                NOW - 100,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                "o4",
+                "discord:4",
+                "discord",
+                "4",
+                None,
+                "SECRET-CONTENT-DO-NOT-SHOW",
+                "delivered",
+                1,
+                NOW - 50,
+                NOW - 40,
+                None,
+                None,
+                None,
+                "root",
+            ),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_gateway_ledgers_from_state_db(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_ledgers(hermes_home)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.gateway_incarnation_count == 3
+    assert gateway.gateway_restarts_24h == 1
+    assert gateway.current_incarnation_uptime_seconds == pytest.approx(3600.0)
+
+
+def test_delivery_obligation_counts_and_excerpts(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_ledgers(hermes_home)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.pending_delivery_count == 2
+    assert gateway.failed_delivery_count == 1
+    assert len(gateway.pending_deliveries) == 3
+    by_platform = {entry.platform: entry for entry in gateway.pending_deliveries}
+    assert by_platform["telegram"].state == "pending"
+    assert by_platform["telegram"].attempts == 2
+    assert by_platform["telegram"].age_seconds == pytest.approx(300.0)
+    assert len(by_platform["telegram"].last_error) <= 80
+    assert all(
+        "SECRET-CONTENT" not in entry.model_dump_json() for entry in gateway.pending_deliveries
+    )
+
+
+def test_gateway_ledger_tables_absent_are_zero(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    conn = sqlite3.connect(str(hermes_home / "state.db"))
+    create_state_db_tables(conn)
+    conn.commit()
+    conn.close()
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.gateway_incarnation_count == 0
+    assert gateway.gateway_restarts_24h == 0
+    assert gateway.current_incarnation_uptime_seconds is None
+    assert gateway.pending_delivery_count == 0
+    assert gateway.pending_deliveries == []
+
+
+def test_gateway_ledgers_without_state_db_are_zero(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.gateway_incarnation_count == 0
+    assert gateway.pending_delivery_count == 0
+
+
+def test_gateway_ledger_uptime_clamps_future_start(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    conn = sqlite3.connect(str(hermes_home / "state.db"))
+    _create_ledger_tables(conn)
+    conn.execute(
+        "INSERT INTO gateway_heartbeats VALUES (?,?,?,?,?,?)",
+        ("b1", 1, NOW + 5000, NOW, "root", "host"),
+    )
+    conn.commit()
+    conn.close()
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.current_incarnation_uptime_seconds == 0.0
+
+
+def test_goal_state_still_collected_alongside_gateway_ledgers(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    conn = sqlite3.connect(str(hermes_home / "state.db"))
+    _create_ledger_tables(conn)
+    conn.executescript(
+        "CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+        'INSERT INTO state_meta VALUES (\'goal:s1\', \'{"goal":"ship","status":"active"}\');'
+    )
+    conn.commit()
+    conn.close()
+
+    state = _collect(hermes_home)
+
+    assert state.operations.goal_count == 1
+    assert state.gateway.gateway_incarnation_count == 0
+
+
+def test_state_db_is_read_once_per_unchanged_collect(hermes_home: Path, monkeypatch):
+    _write_gateway_state(hermes_home)
+    _write_ledgers(hermes_home)
+    from hermesd import collector as collector_module
+
+    connects: list[Path] = []
+    original = collector_module._connect_readonly_sqlite
+
+    def counting_connect(db_path: Path):
+        if db_path.name == "state.db":
+            connects.append(db_path)
+        return original(db_path)
+
+    monkeypatch.setattr(collector_module, "_connect_readonly_sqlite", counting_connect)
+
+    collector = Collector(hermes_home, pid_exists=lambda pid: True, clock=_clock)
+    try:
+        collector.collect()
+        first = len(connects)
+        collector.collect()
+    finally:
+        collector.close()
+
+    assert first == 1
+    assert len(connects) == 1
+
+
+def test_ledger_ages_use_wall_clock_after_cached_read(hermes_home: Path):
+    """A cached state.db readout must still age its rows against the live clock."""
+    _write_gateway_state(hermes_home)
+    _write_ledgers(hermes_home)
+    now = [NOW]
+
+    collector = Collector(hermes_home, pid_exists=lambda pid: True, clock=lambda: now[0])
+    try:
+        first = collector.collect()
+        now[0] = NOW + 60
+        second = collector.collect()
+    finally:
+        collector.close()
+
+    assert first.gateway.current_incarnation_uptime_seconds == pytest.approx(3600.0)
+    assert second.gateway.current_incarnation_uptime_seconds == pytest.approx(3660.0)
+
+
+def test_collect_gateway_liveness_with_real_clock(hermes_home: Path):
+    """Default (non-injected) clock path stays sane."""
+    _write_gateway_state(hermes_home)
+    _write_heartbeat(hermes_home, updated_at=_iso(time.time()))
+
+    collector = Collector(hermes_home, pid_exists=lambda pid: True)
+    try:
+        gateway = collector.collect().gateway
+    finally:
+        collector.close()
+
+    assert gateway.loop_health is GatewayLoopHealth.TICKING
+
+
+def test_heartbeat_z_suffix_timestamp_is_parsed(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_heartbeat(hermes_home, updated_at="2027-01-15T09:00:00Z")
+    stamp = datetime(2027, 1, 15, 9, 0, tzinfo=UTC).timestamp()
+    collector = Collector(hermes_home, pid_exists=lambda pid: True, clock=lambda: stamp + 45)
+    try:
+        gateway = collector.collect().gateway
+    finally:
+        collector.close()
+
+    assert gateway.heartbeat_age_seconds == pytest.approx(45.0)
+
+
+def test_config_generation_skips_non_mapping_source_entries(hermes_home: Path):
+    _write_gateway_state(
+        hermes_home,
+        config_generation={"fingerprint": "f", "short": "f", "sources": ["nope", {}]},
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.config_sources == []
+    assert gateway.config_stale is False
+
+
+def test_config_stale_ignores_unstattable_source(hermes_home: Path):
+    _write_gateway_state(
+        hermes_home,
+        config_generation={
+            "fingerprint": "f",
+            "short": "f",
+            "sources": [{"name": "gone", "path": str(hermes_home / "missing.yaml"), "mtime_ns": 5}],
+        },
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.config_stale is False
+    assert [source.name for source in gateway.config_sources] == ["gone"]

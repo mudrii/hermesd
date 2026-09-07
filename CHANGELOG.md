@@ -53,6 +53,11 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ### Added
 
+- Gateway panel: event-loop liveness from `state/gateway.heartbeat` — a `loop:` status (`ticking`/`stale`/`wedged`/`unknown`) in the compact view and the heartbeat age in detail, derived from `updated_at` (offset-aware or naive-as-UTC) and falling back to the file mtime.
+- Gateway panel: lifecycle from `state/gateway.lifecycle.json` (phase, last exit code and reason) plus an "ended without recording an exit" warning when the recorded pid of a `running` phase is no longer alive.
+- Gateway panel: new `gateway_state.json` keys — running `code_sha`/`code_version`, config generation fingerprint and sources, session-store status, `exit_reason`, and per-platform `needs_attention`/`retrying_since`. A "config changed, restart needed" line appears when any recorded config source is older than the file on disk.
+- Gateway panel: update receipts from `logs/update_receipts/latest.json` — outcome, finish age, from → to version, the first failed step, and a runtime code-skew warning when a planned runtime is pinned to a different build than the gateway.
+- Gateway panel: restart history and delivery obligations from `state.db` (`gateway_heartbeats`, `delivery_obligations`) — incarnation count, restarts in the last 24 h, current incarnation uptime, pending/failed delivery counts, and the five newest undelivered obligations with a truncated last error. Message content is never read. The goal-state and gateway-ledger readers now share one mtime-cached `state.db` pass instead of snapshotting the (large, WAL) database twice.
 - Test coverage tooling: `pytest-cov` with branch coverage, enforced at 96% in CI; a PTY-based end-to-end TUI integration test; contract tests extended to panels 4, 5, 6, 8, 9, 10, and 11; Unicode/CJK rendering tests; snapshot-file symlink/traversal edge-case tests.
 - `SECURITY.md` with a vulnerability reporting policy, and a Troubleshooting/FAQ section in the README covering non-TTY usage, the AGENT OFFLINE banner, footer health indicators, SQLite WAL snapshotting, and `--log-tail-bytes` tuning.
 - CI now tests Python 3.11–3.14 on Linux plus Python 3.14 on macOS, smoke-runs the Docker image, checks the commit-pinned Nix flake, runs packaging checks in a single-version job, and tracks `uv` and Docker dependency updates with Dependabot.
