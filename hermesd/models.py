@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from enum import StrEnum
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -166,10 +167,70 @@ class CronJob(BaseModel):
     next_run_at: str | None = None
     last_status: str | None = None
     last_error: str = ""
+    failure_streak: int = 0
+    paused_reason: str = ""
+    last_delivery_error: str = ""
+    dispatch_lateness_seconds: float | None = None
+    dispatch_kind: str = ""
+    repeat_times: int | None = None
+    repeat_completed: int = 0
+    no_agent: bool = False
+
+
+class CronTickerHealth(StrEnum):
+    """Derived health of the cron ticker from its heartbeat/last-success files."""
+
+    OK = "ok"
+    FAILING = "failing"
+    STALE = "stale"
+    UNKNOWN = "unknown"
+
+
+class CronExecution(BaseModel):
+    execution_id: str = ""
+    job_id: str = ""
+    job_name: str = ""
+    status: str = ""
+    started_age_seconds: float | None = None
+    duration_seconds: float | None = None
+    error_excerpt: str = ""
+
+
+class CronJobExecutionStats(BaseModel):
+    job_id: str = ""
+    completed_24h: int = 0
+    failed_24h: int = 0
+    running_24h: int = 0
+    last_status: str = ""
+    last_duration_seconds: float | None = None
+    last_error_excerpt: str = ""
+
+
+class CronIncident(BaseModel):
+    incident_id: str = ""
+    job_id: str = ""
+    job_name: str = ""
+    state: str = ""
+    failure_type: str = ""
+    first_seen_age_seconds: float | None = None
+    last_seen_age_seconds: float | None = None
+    error_excerpt: str = ""
+
+
+class CronExecutionsState(BaseModel):
+    db_present: bool = False
+    job_stats: list[CronJobExecutionStats] = Field(default_factory=list)
+    recent: list[CronExecution] = Field(default_factory=list)
+    open_incident_count: int = 0
+    unacked_incident_count: int = 0
+    open_incidents: list[CronIncident] = Field(default_factory=list)
 
 
 class CronState(BaseModel):
     last_tick_ago_seconds: float | None = None
+    ticker_heartbeat_age_seconds: float | None = None
+    ticker_last_success_age_seconds: float | None = None
+    ticker_health: CronTickerHealth = CronTickerHealth.UNKNOWN
     job_count: int = 0
     error_count: int = 0
     max_parallel_jobs: int = 0
@@ -620,6 +681,7 @@ class DashboardState(BaseModel):
     checkpoints: list[CheckpointInfo] = Field(default_factory=list)
     config: ConfigSummary = Field(default_factory=ConfigSummary)
     cron: CronState = Field(default_factory=CronState)
+    cron_executions: CronExecutionsState = Field(default_factory=CronExecutionsState)
     channels: ChannelDirectoryState = Field(default_factory=ChannelDirectoryState)
     kanban: KanbanState = Field(default_factory=KanbanState)
     operations: OperationsState = Field(default_factory=OperationsState)

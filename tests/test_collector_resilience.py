@@ -364,3 +364,72 @@ def test_config_yaml_scalar_then_list_then_empty_never_blanks_config(
         assert recovered.config.provider == "acme"
     finally:
         collector.close()
+
+
+def test_corrupt_cron_executions_db_keeps_last_good_execution_history(
+    populated_hermes_home: Path,
+) -> None:
+    db_path = populated_hermes_home / "cron" / "executions.db"
+    collector = Collector(populated_hermes_home)
+    try:
+        first = collector.collect()
+        assert "cron_executions" not in first.health.failed_sources
+        good_stats = {
+            stats.job_id: stats.completed_24h for stats in first.cron_executions.job_stats
+        }
+        assert good_stats["job-alpha"] == 2
+        assert first.cron_executions.open_incident_count == 2
+
+        # Overwrite the header so SQLite rejects the file as "not a database".
+        db_path.write_bytes(b"this is not a sqlite database" + b"\x00" * 4096)
+
+        second = collector.collect()
+        assert "cron_executions" in second.health.failed_sources
+        assert "cron_executions" in second.health.errors
+        # Cache preservation: the panel keeps the last-good history, not zeros.
+        assert {
+            stats.job_id: stats.completed_24h for stats in second.cron_executions.job_stats
+        } == good_stats
+        assert second.cron_executions.open_incident_count == 2
+        assert second.cron_executions.db_present is True
+        # A failing executions.db must not take jobs.json/ticker data down with it.
+        assert "cron" not in second.health.failed_sources
+    finally:
+        collector.close()
+
+
+def test_corrupt_cron_executions_db_recovers_after_the_file_is_restored(
+    populated_hermes_home: Path,
+) -> None:
+    db_path = populated_hermes_home / "cron" / "executions.db"
+    original = db_path.read_bytes()
+    collector = Collector(populated_hermes_home)
+    try:
+        collector.collect()
+        db_path.write_bytes(b"corrupt")
+        assert "cron_executions" in collector.collect().health.failed_sources
+
+        db_path.write_bytes(original)
+        recovered = collector.collect()
+        assert "cron_executions" not in recovered.health.failed_sources
+        assert recovered.cron_executions.recent[0].execution_id == "exec_alpha_running"
+    finally:
+        collector.close()
+
+
+def test_deleted_cron_executions_db_reports_absent_without_failing_the_source(
+    populated_hermes_home: Path,
+) -> None:
+    db_path = populated_hermes_home / "cron" / "executions.db"
+    collector = Collector(populated_hermes_home)
+    try:
+        assert collector.collect().cron_executions.db_present is True
+        db_path.unlink()
+
+        state = collector.collect()
+        # An absent DB is a normal state (agent never ran cron), not a failure.
+        assert "cron_executions" not in state.health.failed_sources
+        assert state.cron_executions.db_present is False
+        assert state.cron_executions.job_stats == []
+    finally:
+        collector.close()

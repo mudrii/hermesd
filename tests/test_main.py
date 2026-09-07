@@ -770,6 +770,13 @@ def test_main_snapshot_json_includes_visibility_state(populated_hermes_home: Pat
     assert state["channels"]["stale_alias_count"] == 1
     assert state["cron"]["provider"] == "chronos"
     assert state["cron"]["suggestion_count"] == 1
+    assert state["cron"]["ticker_health"] == "unknown"
+    executions = state["cron_executions"]
+    assert executions["db_present"] is True
+    assert executions["open_incident_count"] == 2
+    assert executions["unacked_incident_count"] == 1
+    assert {stats["job_id"] for stats in executions["job_stats"]} == {"job-alpha", "job-beta"}
+    assert executions["recent"][0]["execution_id"] == "exec_alpha_running"
     boards = {board["slug"]: board for board in state["kanban"]["boards"]}
     assert boards["alpha"]["block_kind_counts"] == {"needs_input": 1}
     assert state["skills_memory"]["credential_pools"][0]["expires_at"] == "2026-07-11T12:00:00Z"

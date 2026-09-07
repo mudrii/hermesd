@@ -53,6 +53,11 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ### Added
 
+- Cron panel now reads execution history from `~/.hermes/cron/executions.db`: per-job completed/failed/running counters over the last 24 hours, the last run's status, duration and first-line error excerpt, and a "Recent Executions" table of the last 10 runs in the detail view. All queries are bounded by `LIMIT`, so the table is never scanned whole; a missing database or a missing `executions` table degrades to empty summaries rather than a failed source.
+- Cron panel surfaces open incidents from `cron_incidents` in the same database — open and unacked counts in the compact view, and the latest five open incidents (job, state, failure type, first/last seen age, error excerpt) in the detail view. Older agents without the table report zero.
+- Cron ticker health derived from `cron/ticker_heartbeat` and `cron/ticker_last_success`: a one-word `ok`/`failing`/`stale`/`unknown` status in the compact view and both stamp ages in the detail view. The existing `cron/.tick.lock` age remains the fallback tick indicator.
+- Cron jobs now surface the newer `cron/jobs.json` keys — `failure_streak` (compact marker `✗3`), `paused_at`/`paused_reason` (`⏸`), `last_delivery_error`, `last_dispatch` lateness and kind, `repeat` progress, and `no_agent` — with full values in the detail view.
+- Execution history is collected as its own `cron_executions` source, so a corrupt `executions.db` falls back to the last-good history and is named in health without taking `jobs.json` and ticker data down with it.
 - Test coverage tooling: `pytest-cov` with branch coverage, enforced at 96% in CI; a PTY-based end-to-end TUI integration test; contract tests extended to panels 4, 5, 6, 8, 9, 10, and 11; Unicode/CJK rendering tests; snapshot-file symlink/traversal edge-case tests.
 - `SECURITY.md` with a vulnerability reporting policy, and a Troubleshooting/FAQ section in the README covering non-TTY usage, the AGENT OFFLINE banner, footer health indicators, SQLite WAL snapshotting, and `--log-tail-bytes` tuning.
 - CI now tests Python 3.11–3.14 on Linux plus Python 3.14 on macOS, smoke-runs the Docker image, checks the commit-pinned Nix flake, runs packaging checks in a single-version job, and tracks `uv` and Docker dependency updates with Dependabot.

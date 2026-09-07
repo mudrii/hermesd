@@ -4,22 +4,32 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
 import yaml
 
+from hermesd.collect.cron import (
+    _EXECUTIONS_RECENT_LIMIT,
+    _EXECUTIONS_SCAN_LIMIT,
+)
 from hermesd.collector import (
     Collector,
     _delivery_target_label,
     _latest_cron_output_excerpt,
 )
+from hermesd.models import CronTickerHealth
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
 from tests.conftest import (
+    CRON_EXECUTIONS_SCHEMA,
     _count_opens,
     _skip_if_root,
     _unreadable,
+    create_cron_executions_tables,
+    insert_cron_execution,
+    iso_ago,
     render_to_str,
 )
 
@@ -781,3 +791,424 @@ def test_cron_source_survives_null_enabled(hermes_home: Path):
     assert "cron" not in state.health.failed_sources
     assert [job.job_id for job in state.cron.jobs] == ["j1"]
     assert state.cron.jobs[0].enabled is True
+
+
+def _write_jobs_json(home: Path, jobs: list[dict]) -> Path:
+    path = home / "cron" / "jobs.json"
+    path.write_text(json.dumps({"jobs": jobs}))
+    return path
+
+
+def _stats_by_job(state) -> dict:
+    return {stats.job_id: stats for stats in state.cron_executions.job_stats}
+
+
+def test_collect_cron_executions_counts_the_last_24h_window(
+    hermes_home: Path, sample_cron_executions_db: Path
+):
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "cron_executions" not in state.health.failed_sources
+    assert state.cron_executions.db_present is True
+    stats = _stats_by_job(state)
+    # The 3-day-old completed run is outside the window and must not be counted.
+    assert stats["job-alpha"].completed_24h == 2
+    assert stats["job-alpha"].failed_24h == 1
+    assert stats["job-alpha"].running_24h == 1
+    assert stats["job-beta"].failed_24h == 1
+    assert stats["job-beta"].completed_24h == 0
+
+
+def test_collect_cron_executions_last_run_status_duration_and_error(
+    hermes_home: Path, sample_cron_executions_db: Path
+):
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    stats = _stats_by_job(state)
+    # Newest job-alpha row is the still-running one: no finished_at, so no duration.
+    assert stats["job-alpha"].last_status == "running"
+    assert stats["job-alpha"].last_duration_seconds is None
+    assert stats["job-alpha"].last_error_excerpt == ""
+
+    beta = stats["job-beta"]
+    assert beta.last_status == "failed"
+    assert beta.last_duration_seconds == pytest.approx(39.0, abs=1.0)
+    # First line only, never the trailing lines of a multi-line error.
+    assert beta.last_error_excerpt == "timeout waiting for the agent"
+
+
+def test_collect_cron_executions_recent_list_joins_job_names(
+    hermes_home: Path, sample_cron_executions_db: Path
+):
+    _write_jobs_json(hermes_home, [{"id": "job-alpha", "name": "Alpha Report"}])
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    recent = state.cron_executions.recent
+    assert len(recent) == 6
+    # Newest claimed_at first.
+    assert recent[0].execution_id == "exec_alpha_running"
+    assert recent[0].job_name == "Alpha Report"
+    assert recent[0].started_age_seconds == pytest.approx(29.0, abs=5.0)
+    # A job with no jobs.json entry falls back to its raw job_id.
+    beta = next(row for row in recent if row.job_id == "job-beta")
+    assert beta.job_name == "job-beta"
+    assert beta.duration_seconds == pytest.approx(39.0, abs=1.0)
+    assert beta.error_excerpt == "timeout waiting for the agent"
+
+
+def test_collect_cron_executions_missing_db_leaves_source_healthy(hermes_home: Path):
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "cron_executions" not in state.health.failed_sources
+    assert state.cron_executions.db_present is False
+    assert state.cron_executions.job_stats == []
+    assert state.cron_executions.recent == []
+    assert state.cron_executions.open_incident_count == 0
+
+
+def test_collect_cron_executions_missing_tables_leave_source_healthy(hermes_home: Path):
+    db_path = hermes_home / "cron" / "executions.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE unrelated (id TEXT)")
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "cron_executions" not in state.health.failed_sources
+    assert state.cron_executions.db_present is True
+    assert state.cron_executions.job_stats == []
+    assert state.cron_executions.open_incident_count == 0
+    assert state.cron_executions.unacked_incident_count == 0
+
+
+def test_collect_cron_executions_tolerates_null_and_garbage_timestamps(hermes_home: Path):
+    db_path = hermes_home / "cron" / "executions.db"
+    conn = sqlite3.connect(str(db_path))
+    create_cron_executions_tables(conn)
+    # claimed_at is NOT NULL but may still be empty; started/finished may be NULL or junk.
+    insert_cron_execution(
+        conn, "exec_blank", "job-null", "failed", claimed_at="", started_at=None, error=None
+    )
+    insert_cron_execution(
+        conn,
+        "exec_junk",
+        "job-null",
+        "completed",
+        claimed_at="not-a-timestamp",
+        started_at="also-junk",
+        finished_at="",
+    )
+    insert_cron_execution(
+        conn, "exec_ok", "job-null", "completed", claimed_at=iso_ago(60), started_at=iso_ago(59)
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "cron_executions" not in state.health.failed_sources
+    stats = _stats_by_job(state)
+    # Only the parseable row lands inside the 24h window.
+    assert stats["job-null"].completed_24h == 1
+    assert stats["job-null"].failed_24h == 0
+    unparsed = next(row for row in state.cron_executions.recent if row.execution_id == "exec_junk")
+    assert unparsed.started_age_seconds is None
+    assert unparsed.duration_seconds is None
+
+
+def test_collect_cron_executions_query_is_bounded(hermes_home: Path):
+    db_path = hermes_home / "cron" / "executions.db"
+    conn = sqlite3.connect(str(db_path))
+    create_cron_executions_tables(conn)
+    # More recent rows than the scan cap: the reader must not read the whole table.
+    for index in range(600):
+        insert_cron_execution(
+            conn,
+            f"exec_{index:04d}",
+            "job-bulk",
+            "completed",
+            claimed_at=iso_ago(index),
+            started_at=iso_ago(index),
+            finished_at=iso_ago(index - 1),
+        )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    stats = _stats_by_job(state)
+    assert stats["job-bulk"].completed_24h == _EXECUTIONS_SCAN_LIMIT
+    assert len(state.cron_executions.recent) == _EXECUTIONS_RECENT_LIMIT
+
+
+def test_collect_cron_incidents_counts_open_and_unacked(
+    hermes_home: Path, sample_cron_executions_db: Path
+):
+    _write_jobs_json(hermes_home, [{"id": "job-alpha", "name": "Alpha Report"}])
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    executions = state.cron_executions
+    # 'detected' and 'alerted' are open; 'closed' is not.
+    assert executions.open_incident_count == 2
+    assert executions.unacked_incident_count == 1
+    incidents = {incident.incident_id: incident for incident in executions.open_incidents}
+    assert set(incidents) == {"inc_open_unacked", "inc_open_acked"}
+    unacked = incidents["inc_open_unacked"]
+    assert unacked.job_name == "Alpha Report"
+    assert unacked.failure_type == "timeout"
+    assert unacked.state == "detected"
+    assert unacked.error_excerpt == "Script exited with code 1"
+    assert unacked.first_seen_age_seconds == pytest.approx(7200, abs=30)
+    assert unacked.last_seen_age_seconds == pytest.approx(600, abs=30)
+
+
+def test_collect_cron_incidents_absent_table_reports_zero(hermes_home: Path):
+    db_path = hermes_home / "cron" / "executions.db"
+    conn = sqlite3.connect(str(db_path))
+    # An older agent ships executions without the incidents table.
+    conn.executescript(CRON_EXECUTIONS_SCHEMA.split("CREATE TABLE cron_incidents")[0])
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "cron_executions" not in state.health.failed_sources
+    assert state.cron_executions.open_incident_count == 0
+    assert state.cron_executions.unacked_incident_count == 0
+    assert state.cron_executions.open_incidents == []
+
+
+def test_collect_cron_reads_new_jobs_json_keys(hermes_home: Path):
+    _write_jobs_json(
+        hermes_home,
+        [
+            {
+                "id": "job-alpha",
+                "name": "Alpha Report",
+                "failure_streak": "3",
+                "paused_at": 1788792024.0,
+                "paused_reason": "manual hold",
+                "last_delivery_error": "telegram 429",
+                "last_dispatch": {
+                    "scheduled_at": "2026-09-07T22:29:36+08:00",
+                    "dispatched_at": "2026-09-07T22:30:23+08:00",
+                    "lateness_seconds": "46.8",
+                    "kind": "late",
+                },
+                "repeat": {"times": 10, "completed": 4},
+                "no_agent": True,
+            }
+        ],
+    )
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    job = state.cron.jobs[0]
+    assert job.failure_streak == 3
+    assert job.paused_reason == "manual hold"
+    assert job.last_delivery_error == "telegram 429"
+    assert job.dispatch_lateness_seconds == pytest.approx(46.8)
+    assert job.dispatch_kind == "late"
+    assert job.repeat_times == 10
+    assert job.repeat_completed == 4
+    assert job.no_agent is True
+
+
+def test_collect_cron_new_jobs_json_keys_default_when_absent(hermes_home: Path):
+    _write_jobs_json(hermes_home, [{"id": "job-old", "name": "Legacy", "repeat": None}])
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    job = state.cron.jobs[0]
+    assert job.failure_streak == 0
+    assert job.paused_reason == ""
+    assert job.last_delivery_error == ""
+    assert job.dispatch_lateness_seconds is None
+    assert job.dispatch_kind == ""
+    assert job.repeat_times is None
+    assert job.repeat_completed == 0
+    assert job.no_agent is False
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_age", "last_success_age", "expected"),
+    [
+        (10.0, 30.0, CronTickerHealth.OK),
+        (119.0, 599.0, CronTickerHealth.OK),
+        (30.0, 900.0, CronTickerHealth.FAILING),
+        (300.0, 30.0, CronTickerHealth.STALE),
+    ],
+)
+def test_collect_cron_ticker_health(
+    hermes_home: Path, heartbeat_age: float, last_success_age: float, expected
+):
+    now = 1_788_792_000.0
+    (hermes_home / "cron" / "ticker_heartbeat").write_text(str(now - heartbeat_age))
+    (hermes_home / "cron" / "ticker_last_success").write_text(str(now - last_success_age))
+
+    c = Collector(hermes_home, clock=lambda: now)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.cron.ticker_health == expected
+    assert state.cron.ticker_heartbeat_age_seconds == pytest.approx(heartbeat_age)
+    assert state.cron.ticker_last_success_age_seconds == pytest.approx(last_success_age)
+
+
+def test_collect_cron_ticker_health_unknown_without_files(hermes_home: Path):
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.cron.ticker_health == CronTickerHealth.UNKNOWN
+    assert state.cron.ticker_heartbeat_age_seconds is None
+    assert state.cron.ticker_last_success_age_seconds is None
+
+
+def test_collect_cron_ticker_ages_tolerate_garbage_and_clamp_to_zero(hermes_home: Path):
+    now = 1_788_792_000.0
+    # A clock skew ahead of the reader must never yield a negative age.
+    (hermes_home / "cron" / "ticker_heartbeat").write_text(f"  {now + 45.0}\n")
+    (hermes_home / "cron" / "ticker_last_success").write_text("not-an-epoch")
+
+    c = Collector(hermes_home, clock=lambda: now)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.cron.ticker_heartbeat_age_seconds == 0.0
+    assert state.cron.ticker_last_success_age_seconds is None
+    # Heartbeat fresh, last success unreadable: the ticker is running but not succeeding.
+    assert state.cron.ticker_health == CronTickerHealth.FAILING
+
+
+def test_collect_cron_executions_treats_naive_timestamps_as_utc(hermes_home: Path):
+    """Older agents wrote claimed_at without an offset; those rows still count."""
+    import datetime
+
+    now = 1_788_792_000.0
+    naive = datetime.datetime.fromtimestamp(now - 120, tz=datetime.UTC).replace(tzinfo=None)
+    db_path = hermes_home / "cron" / "executions.db"
+    conn = sqlite3.connect(str(db_path))
+    create_cron_executions_tables(conn)
+    insert_cron_execution(
+        conn,
+        "exec_naive",
+        "job-naive",
+        "completed",
+        claimed_at=naive.isoformat(),
+        started_at=naive.isoformat(),
+        finished_at=(naive + datetime.timedelta(seconds=7)).isoformat(),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: now)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    stats = _stats_by_job(state)
+    assert stats["job-naive"].completed_24h == 1
+    assert stats["job-naive"].last_duration_seconds == pytest.approx(7.0)
+    assert state.cron_executions.recent[0].started_age_seconds == pytest.approx(120.0)
+
+
+def test_collect_cron_executions_incompatible_table_schema_is_not_a_failure(hermes_home: Path):
+    """A future/older `executions` table without our columns degrades to empty."""
+    db_path = hermes_home / "cron" / "executions.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE executions (id TEXT PRIMARY KEY, something_else TEXT)")
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "cron_executions" not in state.health.failed_sources
+    assert state.cron_executions.db_present is True
+    assert state.cron_executions.job_stats == []
+    assert state.cron_executions.recent == []
+
+
+def test_collect_cron_executions_blank_error_yields_no_excerpt(hermes_home: Path):
+    db_path = hermes_home / "cron" / "executions.db"
+    conn = sqlite3.connect(str(db_path))
+    create_cron_executions_tables(conn)
+    insert_cron_execution(
+        conn,
+        "exec_blank_error",
+        "job-blank",
+        "failed",
+        claimed_at=iso_ago(30),
+        started_at=iso_ago(29),
+        finished_at=iso_ago(28),
+        error="   \n\n\t\n",
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert _stats_by_job(state)["job-blank"].last_error_excerpt == ""
+    assert state.cron_executions.recent[0].error_excerpt == ""
