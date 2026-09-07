@@ -6,18 +6,21 @@
   };
 
   outputs = { self, nixpkgs }:
-    nixpkgs.lib.genAttrs [
-      "aarch64-darwin"
-      "aarch64-linux"
-      "x86_64-darwin"
-      "x86_64-linux"
-    ] (system:
-      let
-        pkgs = nixpkgs.legacyPackages.${system};
-        python = pkgs.python311;
-        hermesd = python.pkgs.buildPythonApplication {
+    let
+      systems = [
+        "aarch64-darwin"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "x86_64-linux"
+      ];
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      mkHermesd = pkgs:
+        let
+          python = pkgs.python311;
+        in
+        python.pkgs.buildPythonApplication {
           pname = "hermesd";
-          version = "2026.7.11";
+          version = "2026.9.8";
           pyproject = true;
 
           src = ./.;
@@ -39,25 +42,35 @@
             mainProgram = "hermesd";
           };
         };
-      in
-      {
-        packages.default = hermesd;
-        packages.hermesd = hermesd;
+    in
+    {
+      packages = forAllSystems (pkgs:
+        let hermesd = mkHermesd pkgs;
+        in {
+          default = hermesd;
+          inherit hermesd;
+        });
 
-        apps.default = flake-utils.lib.mkApp {
-          drv = hermesd;
+      apps = forAllSystems (pkgs: {
+        default = {
+          type = "app";
+          program = "${mkHermesd pkgs}/bin/hermesd";
         };
+      });
 
-        devShells.default = pkgs.mkShell {
-          packages = [
-            python
-            python.pkgs.rich
-            python.pkgs.pyyaml
-            python.pkgs.pydantic
-            python.pkgs.pytest
-            pkgs.uv
-          ];
-        };
-      }
-    );
+      devShells = forAllSystems (pkgs:
+        let python = pkgs.python311;
+        in {
+          default = pkgs.mkShell {
+            packages = [
+              python
+              python.pkgs.rich
+              python.pkgs.pyyaml
+              python.pkgs.pydantic
+              python.pkgs.pytest
+              pkgs.uv
+            ];
+          };
+        });
+    };
 }
