@@ -71,6 +71,16 @@ from hermesd.collect.cron import (
     _read_cron_executions_state,
     _tail_latest_cron_output,
 )
+from hermesd.collect.gateway import (
+    _config_generation,
+    _gateway_ledger_fields,
+    _GatewayLedgerRows,
+    _heartbeat_liveness,
+    _lifecycle_status,
+    _platform_status,
+    _read_gateway_ledger_rows,
+    _update_receipt_status,
+)
 from hermesd.collect.kanban import (
     _kanban_claim_ttl_seconds,
     _read_kanban_board_summary,
@@ -151,6 +161,7 @@ from hermesd.models import (
     CronState,
     CuratorRun,
     DashboardState,
+    GatewayLoopHealth,
     GatewayState,
     HealthSummary,
     HookInfo,
@@ -164,7 +175,6 @@ from hermesd.models import (
     MemoryOverview,
     ModelCacheSummary,
     OperationsState,
-    PlatformStatus,
     PluginInfo,
     PRMonitorSummary,
     ProfilesState,
@@ -188,6 +198,41 @@ T = TypeVar("T")
 
 def _closing_source() -> Never:
     raise RuntimeError("collector is closing")
+
+
+@dataclass(frozen=True, slots=True)
+class _StateDbReadout:
+    """One state.db pass: the goal-state update plus the raw gateway ledgers."""
+
+    goal_update: dict[str, Any]
+    ledgers: _GatewayLedgerRows
+
+
+# Fields each gateway sub-source owns, used to restore just that source's
+# values from the last good state when it fails.
+_HEARTBEAT_FIELDS = ("heartbeat_age_seconds", "loop_health")
+_LIFECYCLE_FIELDS = (
+    "lifecycle_phase",
+    "last_exit_code",
+    "last_exit_reason",
+    "unclean_previous_exit",
+)
+_UPDATE_RECEIPT_FIELDS = (
+    "last_update_outcome",
+    "last_update_finished_age_seconds",
+    "last_update_from_version",
+    "last_update_to_version",
+    "last_update_failed_step",
+    "runtime_code_skew",
+)
+_LEDGER_FIELDS = (
+    "gateway_incarnation_count",
+    "gateway_restarts_24h",
+    "current_incarnation_uptime_seconds",
+    "pending_delivery_count",
+    "failed_delivery_count",
+    "pending_deliveries",
+)
 
 
 class _SourceSpec(NamedTuple):
@@ -286,7 +331,9 @@ class Collector:
         ] = {}
         self._profile_count_cache: dict[str, tuple[int | None, int]] = {}
         self._kanban_board_cache: dict[str, KanbanBoardSummary] = {}
-        self._goal_state_cache: tuple[int | None, dict[str, Any]] | None = None
+        # One state.db readout per changed mtime, shared by the goal state and
+        # the gateway ledgers so a pass snapshots the (large, WAL) db only once.
+        self._state_db_cache: tuple[int, _StateDbReadout] | None = None
         self._checkpoint_summary_cache: dict[
             str, tuple[tuple[int, ...], tuple[int, float | None, str]]
         ] = {}
@@ -363,6 +410,39 @@ class Collector:
                 fallback=self._last_available_tools,
             ),
             _SourceSpec("gateway", "gateway", self._collect_gateway, GatewayState),
+            # Four sources enrich the same `gateway` field in place: each one
+            # fails (and falls back) independently, so a corrupt heartbeat file
+            # cannot discard the freshly read gateway_state.json.
+            _SourceSpec(
+                "gateway",
+                "gateway_heartbeat",
+                lambda: self._with_heartbeat(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_gateway_fields(results["gateway"], _HEARTBEAT_FIELDS),
+            ),
+            _SourceSpec(
+                "gateway",
+                "gateway_lifecycle",
+                lambda: self._with_lifecycle(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_gateway_fields(results["gateway"], _LIFECYCLE_FIELDS),
+            ),
+            _SourceSpec(
+                "gateway",
+                "update_receipt",
+                lambda: self._with_update_receipt(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_gateway_fields(
+                    results["gateway"], _UPDATE_RECEIPT_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "gateway",
+                "gateway_ledgers",
+                lambda: self._with_gateway_ledgers(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_gateway_fields(results["gateway"], _LEDGER_FIELDS),
+            ),
             _SourceSpec(
                 "tokens_today",
                 "tokens_today",
@@ -594,20 +674,12 @@ class Collector:
         data = self._read_json_cached(self._paths.shared_path("gateway_state.json"))
         if not data:
             return GatewayState()
-        platforms = []
-        for name, raw_info in _as_dict(data.get("platforms")).items():
-            info = _as_dict(raw_info)
-            if not info:
-                continue
-            platforms.append(
-                PlatformStatus(
-                    name=str(name),
-                    state=str(info.get("state") or "unknown"),
-                    updated_at=str(info.get("updated_at") or ""),
-                    error_code=str(info.get("error_code") or ""),
-                    error_message=str(info.get("error_message") or ""),
-                )
-            )
+        now = self._clock()
+        platforms = [
+            _platform_status(str(name), info, now)
+            for name, raw_info in _as_dict(data.get("platforms")).items()
+            if (info := _as_dict(raw_info))
+        ]
         # A non-positive PID is absent, never a target: os.kill(0)/os.kill(-1)
         # would signal a process group or every process the user owns.
         pid = max(0, _coerce_int(data.get("pid")))
@@ -635,7 +707,16 @@ class Collector:
         scale_cfg = _as_dict(cfg.get("scale_to_zero")) or _as_dict(gateway_cfg.get("scale_to_zero"))
         active_agents = _coerce_int(data.get("active_agents"))
         drain_request = self._read_json_cached(self._paths.shared_path(".drain_request.json"))
+        config_generation = _config_generation(data, self._paths.root_home)
         return GatewayState(
+            code_sha=str(data.get("code_sha") or ""),
+            code_version=str(data.get("code_version") or ""),
+            config_fingerprint=config_generation.fingerprint,
+            config_generation_short=config_generation.short,
+            config_sources=config_generation.sources,
+            config_stale=config_generation.stale,
+            session_store_status=str(_as_dict(data.get("session_store")).get("status") or ""),
+            exit_reason=str(data.get("exit_reason") or ""),
             pid=pid,
             running=running,
             state=str(data.get("gateway_state") or "unknown"),
@@ -658,6 +739,76 @@ class Collector:
             scale_to_zero_idle_timeout_minutes=_coerce_int(scale_cfg.get("idle_timeout_minutes")),
             scale_to_zero_relay_only=_scale_to_zero_relay_only(scale_cfg, platforms),
         )
+
+    def _last_gateway_fields(self, gateway: GatewayState, fields: tuple[str, ...]) -> GatewayState:
+        """Restore one source's fields from the last good state (cache preservation)."""
+        last = self._last_state.gateway if self._last_state is not None else None
+        if last is None:
+            return gateway
+        return gateway.model_copy(update={name: getattr(last, name) for name in fields})
+
+    def _read_liveness_json(self, path: Path, had_last_good: bool) -> JsonMapping:
+        """Read a gateway liveness file, failing the source on a last-good fallback."""
+        if not _safe_child_path(path, self._paths.root_home):
+            if had_last_good:
+                raise RuntimeError(f"{path.name} became unsafe")
+            return {}
+        data = self._read_json_cached(path)
+        if self._file_cache.last_read_was_stale(path):
+            raise RuntimeError(f"{path.name} is unreadable; keeping last-good values")
+        return data
+
+    def _with_heartbeat(self, gateway: GatewayState) -> GatewayState:
+        path = self._paths.shared_path("state", "gateway.heartbeat")
+        last = self._last_state.gateway if self._last_state is not None else None
+        had_last_good = last is not None and last.loop_health is not GatewayLoopHealth.UNKNOWN
+        data = self._read_liveness_json(path, had_last_good)
+        file_mtime = _mtime(path) if _safe_child_path(path, self._paths.root_home) else None
+        age, health = _heartbeat_liveness(
+            data,
+            file_mtime,
+            self._clock(),
+            running=gateway.state == "running",
+        )
+        return gateway.model_copy(update={"heartbeat_age_seconds": age, "loop_health": health})
+
+    def _with_lifecycle(self, gateway: GatewayState) -> GatewayState:
+        path = self._paths.shared_path("state", "gateway.lifecycle.json")
+        last = self._last_state.gateway if self._last_state is not None else None
+        data = self._read_liveness_json(path, bool(last is not None and last.lifecycle_phase))
+        status = _lifecycle_status(data, self._pid_exists)
+        return gateway.model_copy(
+            update={
+                "lifecycle_phase": status.phase,
+                "last_exit_code": status.last_exit_code,
+                "last_exit_reason": status.last_exit_reason,
+                "unclean_previous_exit": status.unclean_previous_exit,
+            }
+        )
+
+    def _with_update_receipt(self, gateway: GatewayState) -> GatewayState:
+        path = self._paths.shared_path("logs", "update_receipts", "latest.json")
+        last = self._last_state.gateway if self._last_state is not None else None
+        data = self._read_liveness_json(path, bool(last is not None and last.last_update_outcome))
+        receipt = _update_receipt_status(data, self._clock(), gateway.code_sha)
+        return gateway.model_copy(
+            update={
+                "last_update_outcome": receipt.outcome,
+                "last_update_finished_age_seconds": receipt.finished_age_seconds,
+                "last_update_from_version": receipt.from_version,
+                "last_update_to_version": receipt.to_version,
+                "last_update_failed_step": receipt.failed_step,
+                "runtime_code_skew": receipt.runtime_code_skew,
+            }
+        )
+
+    def _with_gateway_ledgers(self, gateway: GatewayState) -> GatewayState:
+        readout = self._read_state_db()
+        if readout is None:
+            if self._last_state is not None and self._last_state.gateway.gateway_incarnation_count:
+                raise RuntimeError("state.db gateway ledgers disappeared or became unsafe")
+            return gateway
+        return gateway.model_copy(update=_gateway_ledger_fields(readout.ledgers, self._clock()))
 
     def _find_gateway_launchd_pid(self) -> int | None:
         """Check if launchd has a live hermes gateway process."""
@@ -1411,27 +1562,40 @@ class Collector:
             return _read_projects_state(conn, operations, self._paths)
 
     def _with_goals(self, operations: OperationsState) -> OperationsState:
+        readout = self._read_state_db()
+        if readout is None:
+            if self._last_state is not None and self._last_state.operations.goal_count:
+                raise RuntimeError("state.db goal state disappeared or became unsafe")
+            return operations
+        return operations.model_copy(update=readout.goal_update)
+
+    def _read_state_db(self) -> _StateDbReadout | None:
+        """Goal state and gateway ledgers from one state.db pass; None when absent.
+
+        Opening state.db snapshots its WAL to a temp dir, on top of the snapshot
+        HermesDB already takes, so the readout is redone only when state.db (or
+        its -wal) changes and is shared by both sources in a pass.
+        """
         db_path = self._paths.profile_path("state.db")
         if (
             not db_path.exists()
             or db_path.is_symlink()
             or not _path_resolves_under(db_path, self._paths.root_home)
         ):
-            if self._last_state is not None and self._last_state.operations.goal_count:
-                raise RuntimeError("state.db goal state disappeared or became unsafe")
-            return operations
-        # Opening state.db snapshots its WAL to a temp dir on every tick, on top
-        # of the snapshot HermesDB already takes; only redo it when state.db
-        # (or its -wal) changes.
+            return None
         mtime = _db_source_mtime_ns(db_path)
-        cached = self._goal_state_cache
+        cached = self._state_db_cache
         if cached is not None and mtime is not None and cached[0] == mtime:
-            return operations.model_copy(update=cached[1])
+            return cached[1]
         with _connect_readonly_sqlite(db_path) as conn:
             conn.row_factory = sqlite3.Row
-            update = _goal_state_update(conn)
-        self._goal_state_cache = (mtime, update)
-        return operations.model_copy(update=update)
+            readout = _StateDbReadout(
+                goal_update=_goal_state_update(conn),
+                ledgers=_read_gateway_ledger_rows(conn),
+            )
+        if mtime is not None:
+            self._state_db_cache = (mtime, readout)
+        return readout
 
     def _collect_curator(self) -> CuratorRun:
         # Read the scheduler state and curator config once for the whole pass;

@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import time
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -133,13 +134,94 @@ def create_state_db_tables(
     )
 
 
+def create_gateway_ledger_tables(conn: sqlite3.Connection) -> None:
+    """Create the gateway restart-history and delivery-obligation tables."""
+    conn.executescript(
+        """
+        CREATE TABLE gateway_heartbeats (
+            backend_id TEXT PRIMARY KEY,
+            pid INTEGER,
+            started_at REAL,
+            last_heartbeat REAL,
+            profile TEXT,
+            host TEXT
+        );
+        CREATE TABLE delivery_obligations (
+            obligation_id TEXT PRIMARY KEY,
+            session_key TEXT,
+            platform TEXT,
+            chat_id TEXT,
+            thread_id TEXT,
+            content TEXT,
+            state TEXT,
+            attempts INTEGER,
+            created_at REAL,
+            updated_at REAL,
+            owner_pid INTEGER,
+            owner_started_at INTEGER,
+            last_error TEXT,
+            adapter_profile TEXT
+        );
+        """
+    )
+
+
+def _insert_gateway_ledger_rows(conn: sqlite3.Connection, now: float) -> None:
+    conn.executemany(
+        "INSERT INTO gateway_heartbeats VALUES (?,?,?,?,?,?)",
+        [
+            ("backend-current", 12345, now - 7200, now - 15, "root", "localhost"),
+            ("backend-previous", 12000, now - 100_000, now - 99_000, "root", "localhost"),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO delivery_obligations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            (
+                "obl_pending",
+                "telegram:123",
+                "telegram",
+                "123",
+                None,
+                "outbound message body",
+                "pending",
+                2,
+                now - 400,
+                now - 300,
+                12345,
+                None,
+                "network unreachable",
+                "root",
+            ),
+            (
+                "obl_failed",
+                "discord:456",
+                "discord",
+                "456",
+                None,
+                "outbound message body",
+                "failed",
+                5,
+                now - 900,
+                now - 800,
+                12345,
+                None,
+                "adapter rejected message",
+                "root",
+            ),
+        ],
+    )
+
+
 @pytest.fixture
 def sample_db(hermes_home: Path) -> Path:
-    """Create a state.db with sample sessions and messages."""
+    """Create a state.db with sample sessions, messages and gateway ledgers."""
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
     create_state_db_tables(conn)
+    create_gateway_ledger_tables(conn)
     now = time.time()
+    _insert_gateway_ledger_rows(conn, now)
     conn.execute(
         "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
@@ -239,11 +321,110 @@ def sample_gateway_state(hermes_home: Path) -> Path:
                 "start_time": None,
                 "gateway_state": "running",
                 "exit_reason": None,
+                "code_sha": "abcdef0123456789abcdef0123456789abcdef01",
+                "code_version": "2026.9.1",
+                "session_store": {"status": "ready"},
                 "platforms": {
                     "telegram": {"state": "connected", "updated_at": "2026-04-08T17:42:57+00:00"},
                     "discord": {"state": "disconnected", "updated_at": "2026-04-08T10:00:00+00:00"},
                 },
                 "updated_at": "2026-04-08T17:42:57+00:00",
+            }
+        )
+    )
+    return path
+
+
+@pytest.fixture
+def sample_gateway_heartbeat(hermes_home: Path) -> Path:
+    """Create state/gateway.heartbeat (watchdog event-loop liveness) and its lifecycle file."""
+    state_dir = hermes_home / "state"
+    state_dir.mkdir(exist_ok=True)
+    now = time.time()
+    path = state_dir / "gateway.heartbeat"
+    path.write_text(
+        json.dumps(
+            {
+                "pid": 12345,
+                "updated_at": datetime.fromtimestamp(now - 15, tz=UTC).isoformat(),
+                "monotonic": 8123.5,
+                "start_time": now - 7200,
+                "loop_tick_socket": "/tmp/hermes-gateway.sock",
+                "loop_tick_tcp_port": None,
+            }
+        )
+    )
+    (state_dir / "gateway.lifecycle.json").write_text(
+        json.dumps(
+            {
+                "phase": "running",
+                "pid": 12345,
+                "start_time": now - 7200,
+                "started_at": datetime.fromtimestamp(now - 7200, tz=UTC).isoformat(),
+                "exit_code": None,
+                "exit_reason": None,
+            }
+        )
+    )
+    return path
+
+
+@pytest.fixture
+def sample_update_receipt(hermes_home: Path) -> Path:
+    """Create logs/update_receipts/latest.json for the Updates detail section."""
+    receipts = hermes_home / "logs" / "update_receipts"
+    receipts.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    path = receipts / "latest.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "started_at": datetime.fromtimestamp(now - 900, tz=UTC).isoformat(),
+                "finished_at": datetime.fromtimestamp(now - 600, tz=UTC).isoformat(),
+                "argv": ["hermes", "update"],
+                "pid": 4242,
+                "outcome": "ok",
+                "pre_update": {
+                    "sha": "0" * 40,
+                    "short_sha": "000000000000",
+                    "version": "2026.8.1",
+                    "source": "git",
+                },
+                "post_update": {
+                    "sha": "abcdef0123456789abcdef0123456789abcdef01",
+                    "short_sha": "abcdef012345",
+                    "version": "2026.9.1",
+                    "source": "git",
+                },
+                "steps": [
+                    {
+                        "name": "pull",
+                        "ok": True,
+                        "detail": "",
+                        "at": datetime.fromtimestamp(now - 800, tz=UTC).isoformat(),
+                    }
+                ],
+                "skips": [],
+                "gateway_restart": {"requested": True},
+                "plan": {
+                    "install_method": "uv",
+                    "expected_sha": "abcdef0123456789abcdef0123456789abcdef01",
+                    "expected_version": "2026.9.1",
+                    "profiles": ["root"],
+                    "runtimes": [
+                        {
+                            "kind": "gateway",
+                            "profile": "root",
+                            "pid": 12345,
+                            "supervisor": "launchd",
+                            "code_sha": "abcdef0123456789abcdef0123456789abcdef01",
+                            "code_version": "2026.9.1",
+                            "restart_via": "launchctl",
+                            "detail": "",
+                        }
+                    ],
+                },
             }
         )
     )
@@ -896,6 +1077,8 @@ def populated_hermes_home(
     hermes_home,
     sample_db,
     sample_gateway_state,
+    sample_gateway_heartbeat,
+    sample_update_receipt,
     sample_config,
     sample_auth,
     sample_skills_manifest,

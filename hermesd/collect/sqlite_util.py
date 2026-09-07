@@ -45,7 +45,9 @@ def _connect_readonly_sqlite(db_path: Path) -> Iterator[sqlite3.Connection]:
 _KNOWN_TABLES = frozenset(
     {
         "conversations",
+        "delivery_obligations",
         "discovered_repos",
+        "gateway_heartbeats",
         "project_folders",
         "projects",
         "responses",

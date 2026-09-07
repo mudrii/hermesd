@@ -80,6 +80,12 @@ The main dashboard shows all 13 panels at a glance. The header starts with the i
 
 Press `1` to expand. Shows whether the gateway process is alive (with correct PID even after launchd restarts), Hermes version with update status, served profiles, busy/drainable state, external drain markers, scale-to-zero idle timeout and relay-only intent, channel-alias inventory/staleness, platform family labels, and a per-platform table with connection state, last-seen timestamps, and an **Error** column surfacing per-platform connection failures (e.g. discord "failed to reconnect"), plus the active-agent count and a restart-requested marker. Catches the "gateway says running but the PID is dead" case.
 
+**Liveness, lifecycle and updates.** The compact view adds a `loop:` indicator next to the running dot — `ticking` (heartbeat ≤ 90 s), `stale` (≤ 300 s), `wedged` (older while the gateway still claims to be running), or `unknown` — plus one-line warnings for "config changed, restart needed", "update failed", "code skew", and any pending/failed deliveries. Platforms flagged `needs_attention` get a `!` marker.
+
+The detail view adds a **Liveness** section (heartbeat age, incarnation count, restarts in the last 24 h, current incarnation uptime, running code version/short sha, config generation, session-store status), the gateway lifecycle (phase, last exit code/reason, and a warning when the previous life ended without recording an exit), an **Updates** section (outcome, finish age, from → to version, first failed step, runtime code skew), and a **Delivery Obligations** table with the five newest undelivered messages (platform, state, attempts, age, truncated last error — message content is never read). The platform table gains a **Retrying** age column and a `! needs attention` status marker.
+
+Sources: `state/gateway.heartbeat`, `state/gateway.lifecycle.json`, the `code_sha`/`code_version`/`config_generation`/`session_store`/`exit_reason` keys of `gateway_state.json`, `logs/update_receipts/latest.json`, and the `gateway_heartbeats` / `delivery_obligations` tables of `state.db` (all optional; anything missing renders as `—`).
+
 ![Gateway Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-01-gateway.png)
 
 ### [2] Sessions — What’s Active and Where Did It Fork?
@@ -419,6 +425,7 @@ hermesd/
     config.py     config.yaml and auth.json summaries
     cron.py       Cron output discovery, excerpts, suggestions,
                   executions.db history/incidents, ticker health
+    gateway.py    Gateway heartbeat, lifecycle, updates, ledgers
     kanban.py     Kanban board SQL readers and board discovery
     logs.py       Log line parsing constants and helpers
     operations.py Verification, goals, projects, MoA, curator

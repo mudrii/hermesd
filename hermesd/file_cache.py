@@ -28,6 +28,16 @@ class LastGoodFileCache:
         self._json_bad_mtimes: dict[str, int] = {}
         self._json_list_bad_mtimes: dict[str, int] = {}
         self._yaml_bad_mtimes: dict[str, int] = {}
+        # True when the most recent read of a path served a previously cached
+        # value because the file could not be read or parsed. Callers use it to
+        # mark their source degraded while still showing last-good data
+        # (mirrors HermesDB.last_read_sessions_stale).
+        self._stale_reads: dict[str, bool] = {}
+
+    def last_read_was_stale(self, path: Path) -> bool:
+        """Whether the last read of path fell back to a cached value."""
+        with self._lock:
+            return self._stale_reads.get(str(path), False)
 
     def read_json_mapping(self, path: Path) -> JsonMapping:
         return self._cached_read(
@@ -86,27 +96,41 @@ class LastGoodFileCache:
                 mtimes.pop(key, None)
                 bad_mtimes.pop(key, None)
                 values.pop(key, None)
+                self._stale_reads[key] = False
                 return default_factory()
             except OSError:
-                return values.get(key, default_factory())
+                return self._stale(key, values, default_factory)
             if mtimes.get(key) == mtime and key in values:
+                self._stale_reads[key] = False
                 return values[key]
             if bad_mtimes.get(key) == mtime:
-                return values.get(key, default_factory())
+                return self._stale(key, values, default_factory)
             try:
                 value = load()
             except load_errors:
                 bad_mtimes[key] = mtime
-                return values.get(key, default_factory())
+                return self._stale(key, values, default_factory)
             if not is_valid(value):
                 bad_mtimes[key] = mtime
-                return values.get(key, default_factory())
+                return self._stale(key, values, default_factory)
+            self._stale_reads[key] = False
             mtimes[key] = mtime
             bad_mtimes.pop(key, None)
             # is_valid is a TypeGuard, so `value` is narrowed to T here: the
             # runtime shape check and the static type stay in lock step.
             values[key] = value
             return values[key]
+
+    def _stale(
+        self,
+        key: str,
+        values: dict[str, T],
+        default_factory: Callable[[], T],
+    ) -> T:
+        # Only a fallback onto a previously good value counts as stale; a file
+        # that was never readable yields the default and is simply absent.
+        self._stale_reads[key] = key in values
+        return values.get(key, default_factory())
 
 
 def _is_json_mapping(value: object) -> TypeGuard[JsonMapping]:
