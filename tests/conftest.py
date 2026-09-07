@@ -317,12 +317,64 @@ def sample_config(hermes_home: Path) -> Path:
                         "enabled": False,
                     },
                 },
+                "delegation": {
+                    "enabled": True,
+                    "compression_threshold_tokens": 60000,
+                    "max_parallel": 4,
+                },
+                "goals": {"enabled": True, "turn_budget": 40},
+                "updates": {"auto": True, "channel": "stable"},
+                "tool_loop_guardrails": {"enabled": True, "max_repeats": 3},
+                "max_live_sessions": 8,
+                "streaming": {"enabled": True},
+                "logging": {"level": "INFO"},
+                "network": {"proxy": "http://user:pass@proxy.example.com:8080"},
                 "web": {"use_gateway": True},
                 "image_gen": {"use_gateway": False},
                 "tts": {"use_gateway": True},
                 "browser": {"use_gateway": False},
                 "display": {"skin": "default"},
                 "_config_version": 12,
+            }
+        )
+    )
+    return path
+
+
+@pytest.fixture
+def sample_mcp_schema_cache(hermes_home: Path) -> Path:
+    """Create a cache/mcp_schema_cache.json with opaque per-server payloads."""
+    path = hermes_home / "cache" / "mcp_schema_cache.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "playwright": {
+                    "tools": [{"name": "browser_navigate"}],
+                    "cached_at": "2026-09-06T12:00:00Z",
+                },
+                "sheets": {"tools": [], "api_key": "sk-should-never-render"},
+            }
+        )
+    )
+    return path
+
+
+@pytest.fixture
+def sample_skills_prompt_snapshot(hermes_home: Path) -> Path:
+    """Create a .skills_prompt_snapshot.json describing prompted skills."""
+    path = hermes_home / ".skills_prompt_snapshot.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "manifest": {"generated_at": "2026-09-06T12:00:00Z"},
+                "skills": [
+                    {"name": "dev-lint", "category": "dev"},
+                    {"name": "research-arxiv", "category": "research"},
+                    {"name": "ops-deploy", "category": "ops"},
+                ],
+                "category_descriptions": {"dev": "development", "ops": "operations"},
             }
         )
     )
@@ -859,6 +911,8 @@ def populated_hermes_home(
     sample_model_caches,
     sample_pr_monitor,
     sample_kanban_db,
+    sample_mcp_schema_cache,
+    sample_skills_prompt_snapshot,
 ) -> Path:
     """A fully populated mock ~/.hermes."""
     return hermes_home

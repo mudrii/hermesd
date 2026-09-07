@@ -480,3 +480,172 @@ def test_config_max_turns_null_falls_back_to_default(hermes_home: Path):
     assert "config" not in state.health.failed_sources
     assert state.config.model == "gpt-5.4"
     assert state.config.max_turns == 0
+
+
+def _agent_limits_config(home: Path, payload: object):
+    (home / "config.yaml").write_text(yaml.dump(payload))
+    collector = Collector(home)
+    try:
+        return collector.collect().config
+    finally:
+        collector.close()
+
+
+def test_config_new_sections_present(hermes_home: Path):
+    config = _agent_limits_config(
+        hermes_home,
+        {
+            "delegation": {
+                "enabled": True,
+                "compression_threshold_tokens": 60000,
+                "max_parallel": 4,
+            },
+            "goals": {"enabled": True, "turn_budget": 40},
+            "updates": {"auto": True, "channel": "stable"},
+            "mcp_servers": {"sheets": {"url": "https://mcp.example.com"}, "fs": {"command": "npx"}},
+            "plugins": {"disabled": ["a"], "extra": {}},
+            "tool_loop_guardrails": {"enabled": True, "max_repeats": 3},
+            "max_live_sessions": 8,
+            "streaming": {"enabled": True},
+            "logging": {"level": "INFO"},
+            "network": {"proxy": "http://proxy.example.com:8080"},
+        },
+    )
+
+    assert config.delegation_enabled is True
+    assert config.delegation_compression_threshold_tokens == 60000
+    assert config.delegation_max_parallel == 4
+    assert config.goals_enabled is True
+    assert config.goals_turn_budget == 40
+    assert config.updates_auto is True
+    assert config.updates_channel == "stable"
+    assert config.mcp_server_count == 2
+    assert config.mcp_server_names == ["fs", "sheets"]
+    assert config.plugin_config_count == 2
+    assert config.tool_loop_guardrails_enabled is True
+    assert config.tool_loop_max_repeats == 3
+    assert config.max_live_sessions == 8
+    assert config.streaming_enabled is True
+    assert config.logging_level == "INFO"
+    assert config.network_proxy_configured is True
+
+
+def test_config_new_sections_absent_use_defaults(hermes_home: Path):
+    config = _agent_limits_config(hermes_home, {"model": {"default": "gpt-5.4"}})
+
+    assert config.delegation_enabled is False
+    assert config.delegation_compression_threshold_tokens == 0
+    assert config.delegation_max_parallel == 0
+    assert config.goals_enabled is False
+    assert config.goals_turn_budget == 0
+    assert config.updates_auto is False
+    assert config.updates_channel == ""
+    assert config.mcp_server_count == 0
+    assert config.mcp_server_names == []
+    assert config.plugin_config_count == 0
+    assert config.tool_loop_guardrails_enabled is False
+    assert config.tool_loop_max_repeats == 0
+    assert config.max_live_sessions == 0
+    assert config.streaming_enabled is False
+    assert config.logging_level == ""
+    assert config.network_proxy_configured is False
+
+
+def test_config_new_sections_wrong_types_fall_back_to_defaults(hermes_home: Path):
+    config = _agent_limits_config(
+        hermes_home,
+        {
+            "model": {"default": "gpt-5.4"},
+            "delegation": ["not", "a", "mapping"],
+            "goals": "on",
+            "updates": 7,
+            "mcp_servers": ["sheets"],
+            "plugins": "all",
+            "tool_loop_guardrails": [],
+            "max_live_sessions": "not-a-number",
+            "streaming": None,
+            "logging": {"level": {"nested": "bad"}},
+            "network": 12,
+        },
+    )
+
+    assert config.delegation_enabled is False
+    assert config.delegation_compression_threshold_tokens == 0
+    assert config.goals_turn_budget == 0
+    assert config.updates_channel == ""
+    assert config.mcp_server_count == 0
+    assert config.mcp_server_names == []
+    assert config.plugin_config_count == 0
+    assert config.tool_loop_max_repeats == 0
+    assert config.max_live_sessions == 0
+    assert config.streaming_enabled is False
+    assert config.logging_level == ""
+    assert config.network_proxy_configured is False
+
+
+def test_config_plugins_list_shape_counts_entries(hermes_home: Path):
+    assert _agent_limits_config(hermes_home, {"plugins": ["a", "b", "c"]}).plugin_config_count == 3
+
+
+def test_config_updates_check_key_sets_auto(hermes_home: Path):
+    config = _agent_limits_config(hermes_home, {"updates": {"check": True, "channel": "beta"}})
+
+    assert config.updates_auto is True
+    assert config.updates_channel == "beta"
+
+
+def test_config_mcp_server_names_capped_and_sorted(hermes_home: Path):
+    config = _agent_limits_config(
+        hermes_home,
+        {"mcp_servers": {f"srv-{index:02d}": {"command": "npx"} for index in range(30)}},
+    )
+
+    assert config.mcp_server_count == 30
+    assert len(config.mcp_server_names) == 20
+    assert config.mcp_server_names == sorted(config.mcp_server_names)
+    assert config.mcp_server_names[0] == "srv-00"
+
+
+def test_config_new_sections_never_surface_secret_values(hermes_home: Path):
+    config = _agent_limits_config(
+        hermes_home,
+        {
+            "network": {"proxy": "https://admin:hunter2@proxy.example.com:8080"},
+            "mcp_servers": {
+                "sheets": {
+                    "url": "https://mcp.example.com/sheets?api_key=sk-live-secret",
+                    "api_key": "sk-live-secret",
+                }
+            },
+            "logging": {"level": "DEBUG", "token": "sk-live-secret"},
+            "delegation": {"enabled": True, "secret": "sk-live-secret"},
+        },
+    )
+    payload = json.dumps(config.model_dump(mode="json"))
+
+    assert "hunter2" not in payload
+    assert "sk-live-secret" not in payload
+    assert config.network_proxy_configured is True
+    assert config.mcp_server_names == ["sheets"]
+
+
+@pytest.mark.parametrize("key", ["http_proxy", "https_proxy"])
+def test_config_network_proxy_alternate_keys(hermes_home: Path, key: str):
+    config = _agent_limits_config(hermes_home, {"network": {key: "http://proxy.example.com"}})
+
+    assert config.network_proxy_configured is True
+
+
+def test_config_fixture_home_surfaces_new_sections(populated_hermes_home: Path):
+    collector = Collector(populated_hermes_home)
+    try:
+        config = collector.collect().config
+    finally:
+        collector.close()
+
+    assert config.goals_enabled is True
+    assert config.streaming_enabled is True
+    assert config.logging_level == "INFO"
+    assert config.mcp_server_names == ["playwright", "sheets"]
+    assert config.network_proxy_configured is True
+    assert "hunter2" not in json.dumps(config.model_dump(mode="json"))

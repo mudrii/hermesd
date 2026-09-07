@@ -7,14 +7,17 @@ import re
 from rich.console import Console
 
 from hermesd.models import (
+    ConfigSummary,
     CredentialPoolEntry,
     DashboardState,
     HookInfo,
+    MCPSchemaCache,
     MCPServerInfo,
     PluginInfo,
     ProviderInfo,
     SkillInfo,
     SkillsMemory,
+    SkillsPromptSnapshot,
 )
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
@@ -340,3 +343,103 @@ def test_skills_detail_negative_scroll_offset_renders_from_the_top():
     assert negative == _export_skills_detail_text(state, 0)
     assert "skill-00" in negative
     assert "skill-39" not in negative
+
+
+def _mcp_state(**kwargs) -> DashboardState:
+    return DashboardState(
+        config=ConfigSummary(
+            mcp_server_count=kwargs.pop("configured_count", 0),
+            mcp_server_names=kwargs.pop("configured_names", []),
+        ),
+        mcp_cache=MCPSchemaCache(**kwargs.pop("cache", {})),
+        skills_prompt=SkillsPromptSnapshot(**kwargs.pop("prompt", {})),
+        skills_memory=SkillsMemory(**kwargs),
+    )
+
+
+def test_skills_detail_shows_mcp_cache_section():
+    state = _mcp_state(
+        configured_count=3,
+        configured_names=["notion", "playwright", "sheets"],
+        cache={
+            "mcp_cached_server_count": 2,
+            "mcp_cached_server_names": ["playwright", "sheets"],
+            "mcp_schema_cache_age_seconds": 300.0,
+        },
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "MCP" in text
+    assert "playwright" in text
+    assert "sheets" in text
+    assert "5m" in text
+    assert "notion" in text
+
+
+def test_skills_detail_shows_dash_when_cache_age_is_unknown():
+    state = _mcp_state(
+        cache={
+            "mcp_cached_server_count": 1,
+            "mcp_cached_server_names": ["playwright"],
+            "mcp_schema_cache_age_seconds": None,
+        },
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Cache age" in text
+    assert "—" in text
+
+
+def test_skills_detail_shows_prompted_skill_line():
+    state = _mcp_state(prompt={"prompted_skill_count": 3, "prompt_snapshot_age_seconds": 7200.0})
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Prompted skills: 3 (snapshot 2h ago)" in text
+
+
+def test_skills_detail_without_cache_or_snapshot_renders_placeholder():
+    text = render_to_str(
+        render_panel(7, _mcp_state(), Theme(), detail=True), width=200, no_color=True
+    )
+
+    assert "MCP" in text
+    assert "—" in text
+    assert "Prompted skills" not in text
+
+
+def test_skills_compact_shows_cached_mcp_count_when_present():
+    state = _mcp_state(cache={"mcp_cached_server_count": 2})
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=False), width=200, no_color=True)
+
+    assert "mcp 2 cached" in text
+
+
+def test_skills_compact_hides_cached_mcp_count_when_zero():
+    text = render_to_str(
+        render_panel(7, _mcp_state(), Theme(), detail=False), width=200, no_color=True
+    )
+
+    assert "cached" not in text
+
+
+def test_skills_detail_escapes_markup_hostile_cached_names():
+    state = _mcp_state(
+        configured_count=1,
+        configured_names=["[bold]never-cached\x1b[2J"],
+        cache={
+            "mcp_cached_server_count": 1,
+            "mcp_cached_server_names": ["[red]evil\x1b]0;pwn\x07"],
+            "mcp_schema_cache_age_seconds": 60.0,
+        },
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "[red]evil" in text
+    assert "[bold]never-cached" in text
+    assert "\x1b]0;pwn" not in text
+    assert "\x1b[2J" not in text
