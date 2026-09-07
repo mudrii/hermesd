@@ -426,6 +426,14 @@ def _cron_job_dispatch(job: dict[str, Any]) -> tuple[float | None, str]:
     return lateness, str(dispatch.get("kind") or "")
 
 
+def _cron_job_paused(job: dict[str, Any]) -> tuple[bool, str]:
+    """Paused flag and reason; a `paused_at` stamp alone is enough to be paused."""
+    reason = str(job.get("paused_reason") or "").strip()
+    raw_paused_at = job.get("paused_at")
+    paused_at_set = raw_paused_at is not None and str(raw_paused_at).strip() != ""
+    return paused_at_set or bool(reason), reason
+
+
 def _cron_job_repeat(job: dict[str, Any]) -> tuple[int | None, int]:
     """`repeat` times (None means unlimited) and completed count."""
     repeat = _as_dict(job.get("repeat"))

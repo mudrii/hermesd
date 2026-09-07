@@ -1212,3 +1212,79 @@ def test_collect_cron_executions_blank_error_yields_no_excerpt(hermes_home: Path
 
     assert _stats_by_job(state)["job-blank"].last_error_excerpt == ""
     assert state.cron_executions.recent[0].error_excerpt == ""
+
+
+def test_collect_cron_paused_at_without_reason_marks_job_paused(hermes_home: Path):
+    """paused_at alone is authoritative: hermes-agent may pause with a null reason."""
+    _write_jobs_json(
+        hermes_home,
+        [{"id": "job-a", "name": "held", "paused_at": 1788792024.0, "paused_reason": None}],
+    )
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    job = state.cron.jobs[0]
+    assert job.paused is True
+    assert job.paused_reason == ""
+
+
+def test_collect_cron_paused_at_iso_string_marks_job_paused(hermes_home: Path):
+    _write_jobs_json(
+        hermes_home, [{"id": "job-a", "name": "held", "paused_at": "2026-09-07T22:00:00+08:00"}]
+    )
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.cron.jobs[0].paused is True
+
+
+def test_collect_cron_paused_reason_without_paused_at_marks_job_paused(hermes_home: Path):
+    _write_jobs_json(
+        hermes_home,
+        [{"id": "job-a", "name": "held", "paused_at": None, "paused_reason": "operator hold"}],
+    )
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    job = state.cron.jobs[0]
+    assert job.paused is True
+    assert job.paused_reason == "operator hold"
+
+
+def test_collect_cron_running_job_is_not_paused(hermes_home: Path):
+    _write_jobs_json(
+        hermes_home,
+        [{"id": "job-a", "name": "live", "paused_at": None, "paused_reason": None}],
+    )
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.cron.jobs[0].paused is False
+
+
+def test_collect_cron_blank_paused_at_string_is_not_paused(hermes_home: Path):
+    _write_jobs_json(hermes_home, [{"id": "job-a", "name": "live", "paused_at": "  "}])
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.cron.jobs[0].paused is False

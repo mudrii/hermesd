@@ -193,7 +193,11 @@ def test_cron_compact_shows_failure_streak_and_paused_markers() -> None:
             jobs=[
                 CronJob(job_id="a", name="flaky", schedule_display="every 5m", failure_streak=3),
                 CronJob(
-                    job_id="b", name="held", schedule_display="every 1h", paused_reason="manual"
+                    job_id="b",
+                    name="held",
+                    schedule_display="every 1h",
+                    paused=True,
+                    paused_reason="manual",
                 ),
             ],
         )
@@ -361,6 +365,7 @@ def test_cron_detail_shows_job_flag_fields() -> None:
                     job_id="job-a",
                     name="alpha",
                     failure_streak=4,
+                    paused=True,
                     paused_reason="operator hold",
                     last_delivery_error="telegram 429",
                     dispatch_lateness_seconds=46.8,
@@ -424,6 +429,7 @@ def test_cron_compact_escapes_markup_in_paused_and_streak_row() -> None:
                     name=f"{MARKUP_BOMB}{CLEAR_SCREEN}",
                     schedule_display=MARKUP_BOMB,
                     failure_streak=2,
+                    paused=True,
                     paused_reason="hold",
                 )
             ],
@@ -468,3 +474,35 @@ def test_cron_detail_job_with_only_stale_history_shows_dash_counters() -> None:
     text = render_to_str(render_cron(state, Theme(), detail=True), width=140, no_color=True)
     assert "✓" not in text
     assert "—" in text
+
+
+def test_cron_compact_paused_glyph_shows_without_a_reason() -> None:
+    """A job paused with a null reason still earns the ⏸ marker."""
+    state = DashboardState(
+        cron=CronState(
+            job_count=1,
+            jobs=[CronJob(job_id="a", name="held", schedule_display="every 1h", paused=True)],
+        )
+    )
+    text = render_to_str(render_cron(state, Theme()), width=100, no_color=True)
+    assert "⏸" in text
+
+
+def test_cron_compact_paused_reason_without_flag_shows_no_glyph() -> None:
+    """The marker keys off `paused`, which the collector derives; not the reason text."""
+    state = DashboardState(
+        cron=CronState(
+            job_count=1,
+            jobs=[CronJob(job_id="a", name="held", schedule_display="1h", paused_reason="hold")],
+        )
+    )
+    text = render_to_str(render_cron(state, Theme()), width=100, no_color=True)
+    assert "⏸" not in text
+
+
+def test_cron_detail_shows_paused_without_a_reason() -> None:
+    state = DashboardState(
+        cron=CronState(job_count=1, jobs=[CronJob(job_id="a", name="held", paused=True)])
+    )
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=140, no_color=True)
+    assert "paused" in text

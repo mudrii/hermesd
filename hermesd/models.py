@@ -168,6 +168,7 @@ class CronJob(BaseModel):
     last_status: str | None = None
     last_error: str = ""
     failure_streak: int = 0
+    paused: bool = False
     paused_reason: str = ""
     last_delivery_error: str = ""
     dispatch_lateness_seconds: float | None = None

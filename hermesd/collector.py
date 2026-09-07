@@ -58,6 +58,7 @@ from hermesd.collect.config import (
 from hermesd.collect.cron import (
     _chronos_configured,
     _cron_job_dispatch,
+    _cron_job_paused,
     _cron_job_repeat,
     _cron_suggestion_count,
     _cron_ticker_ages,
@@ -1058,6 +1059,7 @@ class Collector:
                 enabled = True if raw_enabled is None else bool(raw_enabled)
                 dispatch_lateness, dispatch_kind = _cron_job_dispatch(j)
                 repeat_times, repeat_completed = _cron_job_repeat(j)
+                paused, paused_reason = _cron_job_paused(j)
                 jobs.append(
                     CronJob(
                         job_id=str(j.get("id") or ""),
@@ -1078,7 +1080,8 @@ class Collector:
                         last_status=str(last_status) if last_status is not None else None,
                         last_error=str(j.get("last_error") or ""),
                         failure_streak=_coerce_int(j.get("failure_streak")),
-                        paused_reason=str(j.get("paused_reason") or ""),
+                        paused=paused,
+                        paused_reason=paused_reason,
                         last_delivery_error=str(j.get("last_delivery_error") or ""),
                         dispatch_lateness_seconds=dispatch_lateness,
                         dispatch_kind=dispatch_kind,

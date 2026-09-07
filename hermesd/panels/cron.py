@@ -45,7 +45,7 @@ def _job_markers(job: CronJob) -> str:
     markers = []
     if job.failure_streak > 0:
         markers.append(f"✗{job.failure_streak}")
-    if job.paused_reason:
+    if job.paused:
         markers.append("⏸")
     return " ".join(markers)
 
@@ -248,8 +248,9 @@ def _job_flags_line(j: CronJob, theme: Theme) -> Text | None:
     parts = []
     if j.failure_streak:
         parts.append(f"streak {j.failure_streak}")
-    if j.paused_reason:
-        parts.append(f"paused: {sanitize_terminal_text(j.paused_reason)}")
+    if j.paused:
+        reason = sanitize_terminal_text(j.paused_reason)
+        parts.append(f"paused: {reason}" if reason else "paused")
     if j.last_delivery_error:
         parts.append(f"delivery: {sanitize_terminal_text(j.last_delivery_error[:80])}")
     if j.dispatch_lateness_seconds is not None:

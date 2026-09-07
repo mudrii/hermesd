@@ -114,7 +114,7 @@ Press `6` to see cron scheduler state, provider, Chronos managed-cron config pre
 
 **Execution history** comes from `~/.hermes/cron/executions.db` (read-only, bounded queries — never a full table scan). Each job shows its last-24-hour counters (`7✓ 2✗ 1▶` for completed / failed / running) alongside the last run's status, duration (`finished_at − started_at`), and first-line error excerpt. The detail view adds a **Recent Executions** table (the last 10 runs with job name, status, start age, duration, and error excerpt) and an **Open Incidents** table from `cron_incidents` (job, state, failure type, first/last seen age, error excerpt) with open and unacked counts. Both degrade to empty summaries — never an error — when the database or either table is missing, as on older agents.
 
-The job rows also surface the newer `cron/jobs.json` keys: `failure_streak` (shown as `✗3` in the compact row), `paused_at`/`paused_reason` (`⏸`), `last_delivery_error`, `last_dispatch` lateness and kind, `repeat` progress, and `no_agent` script-only jobs.
+The job rows also surface the newer `cron/jobs.json` keys: `failure_streak` (shown as `✗3` in the compact row), `paused_at`/`paused_reason` (`⏸` — either one alone is enough to mark a job paused), `last_delivery_error`, `last_dispatch` lateness and kind, `repeat` progress, and `no_agent` script-only jobs.
 
 ![Cron Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-06-cron.png)
 
