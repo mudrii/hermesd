@@ -8,7 +8,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from hermesd.models import DashboardState, SessionInfo
+from hermesd.models import DashboardState, ProcessLiveness, SessionInfo
 from hermesd.panels.formatting import (
     escape_terminal_text as escape,
 )
@@ -78,7 +78,17 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append(f"  {len(active)} active", style=f"bold {theme.ui_ok}")
     lines.append(f" / {len(state.sessions)} total", style=theme.banner_dim)
     if state.active_surface_count > 0:
-        lines.append(f"  {state.active_surface_count} live", style=f"bold {theme.ui_accent}")
+        # The registry count is entries, not running turns: only an identity check
+        # makes a surface live, and an unverifiable one is reported as such.
+        lines.append(f"  {state.active_surface_count} surface(s)", style=f"bold {theme.ui_accent}")
+        live = sum(1 for s in state.active_surfaces if s.liveness is ProcessLiveness.LIVE)
+        unverified = sum(
+            1 for s in state.active_surfaces if s.liveness is ProcessLiveness.UNVERIFIABLE
+        )
+        if live:
+            lines.append(f" {live} live", style=f"bold {theme.ui_ok}")
+        if unverified:
+            lines.append(f" {unverified} unverified", style=theme.ui_warn)
     lines.append(f"   {total_msgs} msgs  {total_tc} tools\n", style=theme.banner_text)
     for s in state.sessions[:4]:
         sid_short = s.session_id[-6:] if len(s.session_id) > 6 else s.session_id
@@ -517,9 +527,22 @@ def _surfaces_table(
             escape(surface.session_id[-8:]),
             escape(surface.surface) if surface.surface else "—",
             str(surface.pid),
-            Text("live", style=f"bold {theme.ui_ok}") if surface.alive else Text("dead"),
+            _liveness_label(surface.liveness, theme),
         )
     return table
+
+
+def _liveness_label(liveness: ProcessLiveness, theme: Theme) -> Text:
+    """Identity-verified liveness; an unverified pid is never shown as live.
+
+    "unverified" means the pid exists but its start time was never recorded or
+    could not be observed here, so hermesd cannot tell it from a reused pid.
+    """
+    if liveness is ProcessLiveness.LIVE:
+        return Text("live", style=f"bold {theme.ui_ok}")
+    if liveness is ProcessLiveness.DEAD:
+        return Text("dead", style=theme.ui_error)
+    return Text("unverified", style=theme.ui_warn)
 
 
 def _compression_warnings(sessions: list[SessionInfo], theme: Theme) -> Text | None:

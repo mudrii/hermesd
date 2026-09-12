@@ -178,13 +178,36 @@ class SessionInfo(BaseModel):
     compression_failure_error: str = ""
 
 
+class ProcessLiveness(StrEnum):
+    """Whether a registry entry is still backed by the process it names.
+
+    ``UNVERIFIABLE`` is a first-class answer, not a fallback: an existing pid
+    proves nothing about identity once pids are reused, and a start time is not
+    always observable (no psutil dependency, an unreadable ``/proc``, or a
+    registry that recorded none).
+    """
+
+    LIVE = "live"
+    DEAD = "dead"
+    UNVERIFIABLE = "unverifiable"
+
+
 class ActiveSurface(BaseModel):
     """A live agent surface attached to a session (runtime/active_sessions.json)."""
 
     session_id: str = ""
     surface: str = ""
     pid: int = 0
-    alive: bool = False
+    # Epoch seconds, as this registry records them. gateway_state.json stores
+    # centiseconds instead; the two must never be compared directly.
+    process_start_time: float | None = None
+    liveness: ProcessLiveness = ProcessLiveness.UNVERIFIABLE
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def alive(self) -> bool:
+        """Derived: not proven dead, which includes an unverifiable identity."""
+        return self.liveness is not ProcessLiveness.DEAD
 
 
 class ModelUsage(BaseModel):

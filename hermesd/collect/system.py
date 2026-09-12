@@ -5,9 +5,12 @@ from __future__ import annotations
 import contextlib
 import os
 import subprocess
+import time
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 from hermesd.collect.common import _coerce_float, _coerce_int, _mtime, _mtime_ns
+from hermesd.models import ProcessLiveness
 from hermesd.paths import HermesPaths
 
 # Seconds a `git` call may run before it is abandoned. Two git subprocesses
@@ -22,6 +25,13 @@ _RECENT_ACTIVITY_WINDOW_SECONDS = 300.0
 # OverflowError. A JSON file under ~/.hermes can hold an arbitrary integer, and
 # no such value can name a live process anyway.
 _MAX_PID = 2**31 - 1
+# Seconds a `ps` start-time probe may run. Like git, it is on the collect tick.
+_PS_START_TIMEOUT_SECONDS = 2
+# `ps -o lstart=` reports whole seconds while the registry records fractional
+# epoch seconds, so identity is compared within this window. Two seconds is far
+# tighter than the pid wraparound a genuine reuse would require.
+_PROCESS_START_TOLERANCE_SECONDS = 2.0
+_LSTART_FORMAT = "%a %b %d %H:%M:%S %Y"
 
 
 def _pid_exists(pid: int) -> bool:
@@ -36,6 +46,118 @@ def _pid_exists(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _proc_boot_epoch() -> float | None:
+    """Boot time from ``/proc/stat``, or None off Linux / on a read failure."""
+    with contextlib.suppress(OSError, ValueError, IndexError):
+        for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines():
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    return None
+
+
+def _proc_start_times(pids: Sequence[int]) -> dict[int, float]:
+    """Linux start times as epoch seconds, from ``/proc/<pid>/stat`` field 22."""
+    boot = _proc_boot_epoch()
+    if boot is None:
+        return {}
+    try:
+        tick = os.sysconf("SC_CLK_TCK")
+    except (AttributeError, OSError, ValueError):
+        return {}
+    if tick <= 0:
+        return {}
+    observed: dict[int, float] = {}
+    for pid in pids:
+        with contextlib.suppress(OSError, ValueError, IndexError):
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            # Field 2 (comm) may contain spaces and parentheses, so anchor on the
+            # final ')' and count from field 3: starttime is field 22 → index 19.
+            fields = stat[stat.rindex(")") + 1 :].split()
+            observed[pid] = boot + int(fields[19]) / tick
+    return observed
+
+
+def _parse_lstart(value: str) -> float | None:
+    """Parse ``ps -o lstart=``, which prints local time; mktime keeps it consistent."""
+    try:
+        return time.mktime(time.strptime(value, _LSTART_FORMAT))
+    except ValueError:
+        return None
+
+
+def _ps_start_times(pids: Sequence[int]) -> dict[int, float]:
+    """Start times for every pid from a single bounded ``ps`` call.
+
+    One subprocess per surface per refresh tick would be far too expensive, so the
+    whole pid set is asked at once. A non-zero exit is normal once some pids have
+    already exited, so stdout is parsed regardless and absent pids just drop out.
+    """
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", ",".join(str(pid) for pid in pids), "-o", "pid=,lstart="],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_PS_START_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return {}
+    observed: dict[int, float] = {}
+    for line in completed.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        pid = _coerce_int(parts[0])
+        epoch = _parse_lstart(parts[1].strip())
+        if pid > 0 and epoch is not None:
+            observed[pid] = epoch
+    return observed
+
+
+def _observed_process_start_times(pids: Sequence[int]) -> dict[int, float]:
+    """Observed start time per pid as epoch seconds, best effort.
+
+    A pid that cannot be observed is absent from the result, which callers must
+    read as *unverifiable* — never as dead. hermesd has no psutil dependency, so
+    outside Linux this relies on ``ps`` being present and its ``lstart`` format.
+    """
+    unique = sorted({pid for pid in pids if pid > 0})
+    if not unique:
+        return {}
+    observed = _proc_start_times(unique)
+    missing = [pid for pid in unique if pid not in observed]
+    if missing:
+        observed.update(_ps_start_times(missing))
+    return observed
+
+
+def _surface_liveness(
+    pid: int,
+    recorded_start: float | None,
+    observed: Mapping[int, float],
+    pid_exists: Callable[[int], bool],
+) -> ProcessLiveness:
+    """Three-state liveness for one active-session registry entry.
+
+    A pid that merely exists is not the recorded process, because pids are reused:
+    only a matching start time proves identity. A start time that was never
+    recorded, or that this host cannot observe, leaves the entry unverifiable
+    rather than silently counting it as live.
+    """
+    if pid <= 0 or not pid_exists(pid):
+        return ProcessLiveness.DEAD
+    if recorded_start is None:
+        return ProcessLiveness.UNVERIFIABLE
+    seen = observed.get(pid)
+    if seen is None:
+        return ProcessLiveness.UNVERIFIABLE
+    if abs(seen - recorded_start) <= _PROCESS_START_TOLERANCE_SECONDS:
+        return ProcessLiveness.LIVE
+    # The pid exists but belongs to a different process: the recorded one is gone.
+    return ProcessLiveness.DEAD
 
 
 def _git_ref_signature(repo_dir: Path) -> tuple[int, ...]:

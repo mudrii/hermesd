@@ -16,7 +16,7 @@ import subprocess  # noqa: F401  # re-exported: tests patch hermesd.collector.su
 import threading
 import time
 import tomllib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
 from pathlib import Path
@@ -164,7 +164,9 @@ from hermesd.collect.system import (
     _git_checkpoint_summary,
     _git_ref_signature,
     _latest_runtime_activity_age,
+    _observed_process_start_times,
     _pid_exists,
+    _surface_liveness,
 )
 from hermesd.db import HermesDB
 from hermesd.defaults import DEFAULT_LOG_TAIL_BYTES
@@ -469,6 +471,7 @@ class Collector:
         self,
         hermes_home: Path,
         pid_exists: Callable[[int], bool] | None = None,
+        process_start_times: Callable[[Sequence[int]], dict[int, float]] | None = None,
         profile_name: str | None = None,
         log_tail_bytes: int = DEFAULT_LOG_TAIL_BYTES,
         db_factory: Callable[[Path], HermesDB] | None = None,
@@ -480,6 +483,7 @@ class Collector:
         self._file_cache = file_cache if file_cache is not None else LastGoodFileCache()
         self._log_cache: dict[str, list[LogLine]] = {}
         self._pid_exists = pid_exists or _pid_exists
+        self._process_start_times = process_start_times or _observed_process_start_times
         self._log_tail_bytes = max(1, log_tail_bytes)
         self._paths = HermesPaths(hermes_home, profile_name)
         if db_factory is None:
@@ -1305,25 +1309,42 @@ class Collector:
         )
 
     def _collect_active_surfaces(self) -> list[ActiveSurface]:
-        """Live agent surfaces from runtime/active_sessions.json."""
+        """Live agent surfaces from runtime/active_sessions.json.
+
+        An existing pid is not the recorded process: pids get reused, so liveness
+        compares the registry's ``process_start_time`` (epoch seconds — unlike
+        gateway_state.json, which records centiseconds) against the start time
+        observed for that pid on this host. Every pid is probed in one call rather
+        than one per surface per tick.
+        """
         data = self._read_json_confined(self._paths.profile_path("runtime", "active_sessions.json"))
-        surfaces = []
+        entries: list[dict[str, Any]] = []
         for raw_entry in _as_list(data.get("entries")):
             entry = _as_dict(raw_entry)
-            session_id = str(entry.get("session_id") or "")
-            if not session_id:
-                continue
+            if str(entry.get("session_id") or ""):
+                entries.append(entry)
+            if len(entries) >= _ACTIVE_SURFACE_LIMIT:
+                break
+        pids = sorted({_coerce_int(entry.get("pid")) for entry in entries} - {0})
+        observed = self._process_start_times(pids) if pids else {}
+        surfaces = []
+        for entry in entries:
             pid = _coerce_int(entry.get("pid"))
+            raw_start = entry.get("process_start_time")
+            recorded = _coerce_float(raw_start) if raw_start is not None else 0.0
             surfaces.append(
                 ActiveSurface(
-                    session_id=session_id,
+                    session_id=str(entry.get("session_id") or ""),
                     surface=str(entry.get("surface") or ""),
                     pid=pid,
-                    alive=bool(pid) and self._pid_exists(pid),
+                    # A non-positive stamp was never recorded; treating 0 as a real
+                    # epoch would compare against every observed start time.
+                    process_start_time=recorded if recorded > 0 else None,
+                    liveness=_surface_liveness(
+                        pid, recorded if recorded > 0 else None, observed, self._pid_exists
+                    ),
                 )
             )
-            if len(surfaces) >= _ACTIVE_SURFACE_LIMIT:
-                break
         return surfaces
 
     def _last_model_usage(self) -> _ModelUsageBundle:

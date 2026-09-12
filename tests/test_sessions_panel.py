@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 import hermesd.panels.sessions as sessions_module
-from hermesd.models import ActiveSurface, DashboardState, SessionInfo
+from hermesd.models import ActiveSurface, DashboardState, ProcessLiveness, SessionInfo
 from hermesd.panels.sessions import render_sessions
 from hermesd.theme import Theme
 from tests.conftest import render_to_str
@@ -70,10 +70,28 @@ def _rich_state() -> DashboardState:
             )
         ],
         active_surfaces=[
-            ActiveSurface(session_id="sess_abcdef12", surface="cli", pid=111, alive=True),
-            ActiveSurface(session_id="sess_abcdef12", surface="telegram", pid=222, alive=False),
+            ActiveSurface(
+                session_id="sess_abcdef12",
+                surface="cli",
+                pid=111,
+                process_start_time=1000.0,
+                liveness=ProcessLiveness.LIVE,
+            ),
+            ActiveSurface(
+                session_id="sess_abcdef12",
+                surface="telegram",
+                pid=222,
+                process_start_time=1000.0,
+                liveness=ProcessLiveness.DEAD,
+            ),
+            ActiveSurface(
+                session_id="sess_abcdef34",
+                surface="cli",
+                pid=333,
+                liveness=ProcessLiveness.UNVERIFIABLE,
+            ),
         ],
-        active_surface_count=2,
+        active_surface_count=3,
     )
 
 
@@ -84,9 +102,36 @@ def test_sessions_panel_renders_empty_state(detail: bool) -> None:
 
 
 def test_compact_shows_live_surface_count() -> None:
+    """The registry count is entries; only identity-verified surfaces count as live."""
     rendered = render_to_str(render_sessions(_rich_state(), Theme()), width=100)
 
-    assert "2 live" in rendered
+    assert "3 surface(s)" in rendered
+    assert "1 live" in rendered
+    assert "1 unverified" in rendered
+
+
+def test_compact_does_not_call_unverified_surfaces_live() -> None:
+    state = DashboardState(
+        active_surfaces=[
+            ActiveSurface(session_id="s1", surface="cli", pid=111),
+            ActiveSurface(session_id="s2", surface="cli", pid=222),
+        ],
+        active_surface_count=2,
+    )
+
+    rendered = render_to_str(render_sessions(state, Theme()), width=100)
+
+    assert "2 surface(s)" in rendered
+    assert "2 unverified" in rendered
+    assert "live" not in rendered
+
+
+def test_detail_shows_the_three_liveness_states() -> None:
+    rendered = render_to_str(render_sessions(_rich_state(), Theme(), detail=True), width=140)
+
+    assert "live" in rendered
+    assert "dead" in rendered
+    assert "unverified" in rendered
 
 
 def test_compact_omits_live_marker_without_surfaces() -> None:
