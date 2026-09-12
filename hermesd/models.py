@@ -24,6 +24,21 @@ class GatewayLoopHealth(StrEnum):
     UNKNOWN = "unknown"
 
 
+class PlatformOwnership(StrEnum):
+    """Whether a platform record still belongs to the gateway that writes the file.
+
+    ``gateway_state.json`` re-stamps its top-level ``pid``/``start_time`` on every
+    write, so those describe the most recent writer, while each platform entry
+    keeps the identity of the process that recorded it. Ownership is therefore
+    independent of heartbeat freshness: a ticking loop can still be serving a
+    platform entry preserved from an earlier life.
+    """
+
+    CURRENT = "current"
+    PRESERVED = "preserved"
+    UNVERIFIABLE = "unverifiable"
+
+
 class PlatformStatus(BaseModel):
     name: str
     state: str = "unknown"
@@ -33,6 +48,11 @@ class PlatformStatus(BaseModel):
     needs_attention: bool = False
     retrying_since: str = ""
     retrying_since_age_seconds: float | None = None
+    # Per-entry writer provenance. Absent on a gateway that predates the stamps,
+    # which is why ownership defaults to unverifiable rather than current.
+    writer_pid: int | None = None
+    writer_start_time: int | None = None
+    ownership: PlatformOwnership = PlatformOwnership.UNVERIFIABLE
 
 
 class ConfigSourceStamp(BaseModel):

@@ -6,7 +6,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from hermesd.models import DashboardState, GatewayLoopHealth, GatewayState
+from hermesd.models import DashboardState, GatewayLoopHealth, GatewayState, PlatformOwnership
 from hermesd.panels.formatting import (
     escape_terminal_text as escape,
 )
@@ -101,6 +101,7 @@ def _platforms_table(gw: GatewayState, theme: Theme) -> Table:
     table = Table(box=None, show_header=True, padding=(0, 2))
     table.add_column("Platform", style=theme.ui_label)
     table.add_column("Status", style=theme.banner_text)
+    table.add_column("Owner", style=theme.banner_dim)
     table.add_column("Updated", style=theme.banner_dim)
     table.add_column("Retrying", style=theme.ui_warn)
     table.add_column("Error", style=theme.ui_error)
@@ -117,11 +118,30 @@ def _platforms_table(gw: GatewayState, theme: Theme) -> Table:
         table.add_row(
             escape(p.name),
             status,
+            _ownership_label(p.ownership, theme),
             escape(fmt_iso_timestamp(p.updated_at)),
             _duration_label(p.retrying_since_age_seconds),
             error,
         )
     return table
+
+
+def _ownership_label(ownership: PlatformOwnership, theme: Theme) -> Text:
+    """Who wrote this platform record, independent of how fresh it looks.
+
+    A preserved entry outlived the gateway life that recorded it, so its state
+    may describe a process that is gone; unverifiable means the record carries no
+    writer identity to check (an older gateway, or a host that could not resolve a
+    process start time), which is not the same as being current.
+    """
+    label = Text()
+    if ownership is PlatformOwnership.PRESERVED:
+        label.append("⚠ preserved", style=f"bold {theme.ui_warn}")
+    elif ownership is PlatformOwnership.CURRENT:
+        label.append("current", style=theme.banner_dim)
+    else:
+        label.append("—", style=theme.banner_dim)
+    return label
 
 
 def _status_header(state: DashboardState, theme: Theme) -> Text:
@@ -199,6 +219,9 @@ def _append_compact_warnings(lines: Text, gw: GatewayState, theme: Theme) -> Non
         warnings.append("⚠ update unfinished")
     if gw.runtime_code_skew:
         warnings.append("⚠ code skew")
+    preserved = sum(1 for p in gw.platforms if p.ownership is PlatformOwnership.PRESERVED)
+    if preserved:
+        warnings.append(f"⚠ {preserved} platform record(s) outlived their writer")
     if warnings:
         lines.append("\n  " + escape("  ".join(warnings)), style=theme.ui_warn)
     if gw.pending_delivery_count or gw.failed_delivery_count:

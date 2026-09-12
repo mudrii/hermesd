@@ -9,6 +9,7 @@ from hermesd.models import (
     DeliveryObligationSummary,
     GatewayLoopHealth,
     GatewayState,
+    PlatformOwnership,
     PlatformStatus,
 )
 from hermesd.panels.gateway import render_gateway
@@ -288,3 +289,62 @@ def test_gateway_detail_renders_day_scale_durations() -> None:
     rendered = render_to_str(render_gateway(state, Theme(), detail=True), width=160, no_color=True)
 
     assert "uptime 2d" in rendered
+
+
+# F05 — writer ownership is rendered separately from freshness.
+
+
+def _ownership_state(*ownerships: PlatformOwnership) -> DashboardState:
+    return DashboardState(
+        gateway=GatewayState(
+            running=True,
+            pid=4242,
+            platforms=[
+                PlatformStatus(name=f"platform-{index}", state="connected", ownership=ownership)
+                for index, ownership in enumerate(ownerships)
+            ],
+        )
+    )
+
+
+def test_gateway_detail_marks_a_preserved_platform_record() -> None:
+    state = _ownership_state(PlatformOwnership.PRESERVED)
+
+    rendered = render_to_str(render_gateway(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "Owner" in rendered
+    assert "preserved" in rendered
+
+
+def test_gateway_detail_labels_a_current_platform_record() -> None:
+    state = _ownership_state(PlatformOwnership.CURRENT)
+
+    rendered = render_to_str(render_gateway(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "current" in rendered
+    assert "preserved" not in rendered
+
+
+def test_gateway_detail_does_not_claim_ownership_it_cannot_verify() -> None:
+    state = _ownership_state(PlatformOwnership.UNVERIFIABLE)
+
+    rendered = render_to_str(render_gateway(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "current" not in rendered
+    assert "preserved" not in rendered
+
+
+def test_gateway_compact_warns_about_preserved_platform_records() -> None:
+    state = _ownership_state(PlatformOwnership.CURRENT, PlatformOwnership.PRESERVED)
+
+    rendered = render_to_str(render_gateway(state, Theme()), no_color=True)
+
+    assert "1 platform record(s) outlived their writer" in rendered
+
+
+def test_gateway_compact_stays_quiet_when_ownership_is_current_or_unknown() -> None:
+    state = _ownership_state(PlatformOwnership.CURRENT, PlatformOwnership.UNVERIFIABLE)
+
+    rendered = render_to_str(render_gateway(state, Theme()), no_color=True)
+
+    assert "outlived their writer" not in rendered

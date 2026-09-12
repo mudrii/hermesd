@@ -85,6 +85,7 @@ from hermesd.collect.gateway import (
     _lifecycle_status,
     _platform_status,
     _read_gateway_ledger_rows,
+    _record_writer,
     _update_receipt_status,
 )
 from hermesd.collect.kanban import (
@@ -1025,8 +1026,9 @@ class Collector:
         if not data:
             return GatewayState()
         now = self._clock()
+        writer = _record_writer(data)
         platforms = [
-            _platform_status(str(name), info, now)
+            _platform_status(str(name), info, now, writer)
             for name, raw_info in _as_dict(data.get("platforms")).items()
             if (info := _as_dict(raw_info))
         ]

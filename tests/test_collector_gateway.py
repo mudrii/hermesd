@@ -22,7 +22,7 @@ from hermesd.collector import (
     _is_dashboard_process,
     _pid_exists,
 )
-from hermesd.models import GatewayLoopHealth
+from hermesd.models import GatewayLoopHealth, PlatformOwnership, PlatformStatus
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
 from tests.conftest import create_state_db_tables, render_to_str
@@ -1977,3 +1977,186 @@ def test_symlinked_active_sessions_outside_home_reads_as_absent(hermes_home: Pat
 
     assert state.active_surfaces == []
     assert "active_sessions" not in state.health.failed_sources
+
+
+# --------------------------------------------------------------------------
+# K. F05 — per-platform writer ownership
+#
+# gateway_state.json re-stamps top-level pid/start_time on every write, so those
+# identify the *most recent* writer. Each platform entry carries the identity of
+# the process that wrote it, and ownership is exact (pid, start_time) equality:
+# a preserved entry outlived the gateway life that recorded it.
+# --------------------------------------------------------------------------
+
+
+def _platform_entry(**extra: object) -> dict[str, object]:
+    entry: dict[str, object] = {"state": "connected", "updated_at": ""}
+    entry.update(extra)
+    return entry
+
+
+def _platforms_by_name(state) -> dict[str, object]:
+    return {platform.name: platform for platform in state.gateway.platforms}
+
+
+def test_platform_written_by_the_current_gateway_is_current_owner(hermes_home: Path):
+    _write_gateway_state(
+        hermes_home,
+        pid=4242,
+        start_time=111,
+        platforms={
+            "telegram": _platform_entry(writer_pid=4242, writer_start_time=111),
+        },
+    )
+
+    platform = _platforms_by_name(_collect(hermes_home))["telegram"]
+
+    assert platform.ownership is PlatformOwnership.CURRENT
+    assert platform.writer_pid == 4242
+    assert platform.writer_start_time == 111
+
+
+def test_platform_surviving_a_gateway_restart_is_preserved(hermes_home: Path):
+    _write_gateway_state(
+        hermes_home,
+        pid=4242,
+        start_time=222,
+        platforms={
+            "telegram": _platform_entry(writer_pid=4242, writer_start_time=111),
+        },
+    )
+
+    platform = _platforms_by_name(_collect(hermes_home))["telegram"]
+
+    assert platform.ownership is PlatformOwnership.PRESERVED
+
+
+def test_reused_pid_with_a_different_start_time_is_preserved_not_current(hermes_home: Path):
+    """PID equality alone is not identity: the start-time stamp is what separates them."""
+    _write_gateway_state(
+        hermes_home,
+        pid=4242,
+        start_time=999,
+        platforms={
+            "telegram": _platform_entry(writer_pid=4242, writer_start_time=111),
+        },
+    )
+
+    assert (
+        _platforms_by_name(_collect(hermes_home))["telegram"].ownership
+        is PlatformOwnership.PRESERVED
+    )
+
+
+def test_platform_from_a_different_process_is_preserved(hermes_home: Path):
+    _write_gateway_state(
+        hermes_home,
+        pid=4242,
+        start_time=111,
+        platforms={
+            "telegram": _platform_entry(writer_pid=999, writer_start_time=111),
+        },
+    )
+
+    assert (
+        _platforms_by_name(_collect(hermes_home))["telegram"].ownership
+        is PlatformOwnership.PRESERVED
+    )
+
+
+def test_platform_without_writer_provenance_is_unverifiable(hermes_home: Path):
+    """A gateway predating writer stamps records no provenance; that is not ownership."""
+    _write_gateway_state(
+        hermes_home,
+        pid=4242,
+        start_time=111,
+        platforms={"telegram": _platform_entry()},
+    )
+
+    platform = _platforms_by_name(_collect(hermes_home))["telegram"]
+
+    assert platform.ownership is PlatformOwnership.UNVERIFIABLE
+    assert platform.writer_pid is None
+    assert platform.writer_start_time is None
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        _platform_entry(writer_pid=4242),
+        _platform_entry(writer_start_time=111),
+        _platform_entry(writer_pid=4242, writer_start_time=None),
+        _platform_entry(writer_pid=None, writer_start_time=111),
+    ],
+)
+def test_partial_writer_provenance_is_unverifiable(hermes_home: Path, entry: dict[str, object]):
+    _write_gateway_state(hermes_home, pid=4242, start_time=111, platforms={"telegram": entry})
+
+    assert (
+        _platforms_by_name(_collect(hermes_home))["telegram"].ownership
+        is PlatformOwnership.UNVERIFIABLE
+    )
+
+
+@pytest.mark.parametrize(
+    "top_level",
+    [{"pid": 4242}, {"pid": None, "start_time": 111}, {"pid": None}, {"start_time": None}],
+)
+def test_missing_record_identity_leaves_platforms_unverifiable(
+    hermes_home: Path, top_level: dict[str, object]
+):
+    _write_gateway_state(
+        hermes_home,
+        **top_level,
+        platforms={"telegram": _platform_entry(writer_pid=4242, writer_start_time=111)},
+    )
+
+    assert (
+        _platforms_by_name(_collect(hermes_home))["telegram"].ownership
+        is PlatformOwnership.UNVERIFIABLE
+    )
+
+
+def test_ownership_is_evaluated_separately_from_heartbeat_freshness(hermes_home: Path):
+    """A ticking loop says nothing about whether a platform record is still owned."""
+    _write_gateway_state(
+        hermes_home,
+        pid=4242,
+        start_time=222,
+        platforms={
+            "telegram": _platform_entry(writer_pid=4242, writer_start_time=111),
+            "discord": _platform_entry(writer_pid=4242, writer_start_time=222),
+        },
+    )
+    _write_heartbeat(hermes_home, pid=4242)
+
+    state = _collect(hermes_home)
+    platforms = _platforms_by_name(state)
+
+    assert state.gateway.loop_health is GatewayLoopHealth.TICKING
+    assert platforms["telegram"].ownership is PlatformOwnership.PRESERVED
+    assert platforms["discord"].ownership is PlatformOwnership.CURRENT
+
+
+def test_mixed_owner_platforms_are_reported_per_entry(hermes_home: Path):
+    _write_gateway_state(
+        hermes_home,
+        pid=4242,
+        start_time=222,
+        platforms={
+            "telegram": _platform_entry(writer_pid=4242, writer_start_time=222),
+            "discord": _platform_entry(writer_pid=4242, writer_start_time=111),
+            "slack": _platform_entry(),
+        },
+    )
+
+    platforms = _platforms_by_name(_collect(hermes_home))
+
+    assert platforms["telegram"].ownership is PlatformOwnership.CURRENT
+    assert platforms["discord"].ownership is PlatformOwnership.PRESERVED
+    assert platforms["slack"].ownership is PlatformOwnership.UNVERIFIABLE
+
+
+def test_platform_ownership_defaults_to_unverifiable():
+    """A PlatformStatus built without provenance must not claim ownership."""
+    assert PlatformStatus(name="telegram").ownership is PlatformOwnership.UNVERIFIABLE

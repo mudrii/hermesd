@@ -33,6 +33,7 @@ from hermesd.models import (
     ConfigSourceStamp,
     DeliveryObligationSummary,
     GatewayLoopHealth,
+    PlatformOwnership,
     PlatformStatus,
 )
 
@@ -67,7 +68,59 @@ def _optional_int(value: object) -> int | None:
     return None if value is None else _coerce_int(value)
 
 
-def _platform_status(name: str, info: dict[str, Any], now: float) -> PlatformStatus:
+@dataclass(frozen=True, slots=True)
+class _RecordWriter:
+    """Identity of the process that most recently wrote ``gateway_state.json``.
+
+    Upstream re-stamps the top-level ``pid``/``start_time`` on every write, so
+    this describes the current writer and nothing older.
+    """
+
+    pid: int | None = None
+    start_time: int | None = None
+
+
+def _record_writer(data: JsonMapping) -> _RecordWriter:
+    return _RecordWriter(
+        pid=_identity_stamp(data.get("pid")),
+        start_time=_identity_stamp(data.get("start_time")),
+    )
+
+
+def _identity_stamp(value: object) -> int | None:
+    """A writer-identity stamp, or None when it cannot be compared.
+
+    Zero and absent both collapse to None: coercing a missing stamp to 0 would
+    make two records that carry no identity compare equal and read as owned.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    coerced = _coerce_int(value)
+    return coerced if coerced > 0 else None
+
+
+def _platform_ownership(info: dict[str, Any], writer: _RecordWriter) -> PlatformOwnership:
+    """Classify a platform entry by exact ``(pid, start_time)`` equality.
+
+    All four values must be present. A gateway that predates writer provenance —
+    or one whose host could not resolve a process start time — records no usable
+    identity, and guessing "current" there would present a preserved record as
+    live. Ownership is deliberately independent of heartbeat freshness.
+    """
+    entry_pid = _identity_stamp(info.get("writer_pid"))
+    entry_start = _identity_stamp(info.get("writer_start_time"))
+    if entry_pid is None or entry_start is None:
+        return PlatformOwnership.UNVERIFIABLE
+    if writer.pid is None or writer.start_time is None:
+        return PlatformOwnership.UNVERIFIABLE
+    if entry_pid == writer.pid and entry_start == writer.start_time:
+        return PlatformOwnership.CURRENT
+    return PlatformOwnership.PRESERVED
+
+
+def _platform_status(
+    name: str, info: dict[str, Any], now: float, writer: _RecordWriter
+) -> PlatformStatus:
     retrying_since = str(info.get("retrying_since") or "")
     return PlatformStatus(
         name=name,
@@ -78,6 +131,9 @@ def _platform_status(name: str, info: dict[str, Any], now: float) -> PlatformSta
         needs_attention=bool(info.get("needs_attention")),
         retrying_since=retrying_since,
         retrying_since_age_seconds=_age_seconds(_iso_to_epoch(retrying_since), now),
+        writer_pid=_identity_stamp(info.get("writer_pid")),
+        writer_start_time=_identity_stamp(info.get("writer_start_time")),
+        ownership=_platform_ownership(info, writer),
     )
 
 
