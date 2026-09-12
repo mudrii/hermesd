@@ -80,7 +80,13 @@ def _proc_start_times(pids: Sequence[int]) -> dict[int, float]:
 
 
 def _parse_lstart(value: str) -> float | None:
-    """Parse ``ps -o lstart=``, which prints local time; mktime keeps it consistent."""
+    """Parse ``ps -o lstart=``, which prints local time without a zone.
+
+    ``mktime`` resolves it in the current local zone, so a process started inside a
+    DST-ambiguous hour can resolve an hour off and read as a different process.
+    That is a one-hour window once a year, and it fails toward a false ``dead`` on
+    a single entry — never toward a false ``live``.
+    """
     try:
         return time.mktime(time.strptime(value, _LSTART_FORMAT))
     except ValueError:

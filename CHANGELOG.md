@@ -51,6 +51,11 @@ and this project uses date-based versions in `YYYY.M.D` form.
 - WAL databases always use private temporary copies, preserving the zero-write guarantee even with a same-process writer. The shared `state.db` connection reuses its copy until the source changes, avoiding duplicate copies across unchanged refreshes and consumers. The `-wal` probe uses strict existence checking so an unreadable sidecar fails the source instead of silently serving checkpoint-lagging data via `immutable=1`.
 - Contributor tooling alignment: coverage reporting no longer excludes real function bodies whose signatures contain `...` (variadic annotations) — the exclusion now matches stub-only lines; contributor docs reflect the full Python 3.11–3.14 CI matrix; the PR checklist uses the coverage-enabled test command that CI enforces; and the documented `Any`-type policy now matches what mypy actually enforces.
 
+### Developer tooling
+
+- The test suite no longer probes the host process table. Adding the identity check for active-session liveness meant a `Collector` built without an injected `process_start_times` seam shelled out to `ps`, so any test using `populated_hermes_home` spawned a subprocess per collect pass and its outcome depended on which processes happened to be running — the shared `sample_active_sessions` fixture records `process_start_time = time.time() - 60` for the live pytest PID, which a real probe contradicts by about 60 s. An autouse `no_host_process_probing` fixture now defaults the probe to "nothing observable", which reads as unverifiable rather than dead and so preserves the pre-existing `alive` expectations; tests that exercise identity matching inject their own probe.
+- Platform writer-identity stamps (`writer_pid` / `writer_start_time`) are retained in `PlatformStatus` because the ownership verdict is computed from them, but upstream classifies them as private process recon and strips them from its public status endpoint. A parametrized test now pins that neither value reaches a rendered panel in compact or detail view — only the derived verdict does.
+
 ## [2026.9.8] - 2026-09-08
 
 ### Added

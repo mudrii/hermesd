@@ -348,3 +348,36 @@ def test_gateway_compact_stays_quiet_when_ownership_is_current_or_unknown() -> N
     rendered = render_to_str(render_gateway(state, Theme()), no_color=True)
 
     assert "outlived their writer" not in rendered
+
+
+@pytest.mark.parametrize("detail", [False, True])
+def test_gateway_never_renders_raw_writer_identity_stamps(detail: bool) -> None:
+    """Upstream strips writer_pid/writer_start_time from its public status endpoint
+    as process recon. hermesd keeps them in state because the ownership verdict is
+    computed from them, but only the verdict is ever rendered."""
+    state = DashboardState(
+        gateway=GatewayState(
+            running=True,
+            pid=4242,
+            platforms=[
+                PlatformStatus(
+                    name="telegram",
+                    state="connected",
+                    writer_pid=987654,
+                    writer_start_time=178921152673,
+                    ownership=PlatformOwnership.PRESERVED,
+                )
+            ],
+        )
+    )
+
+    rendered = render_to_str(
+        render_gateway(state, Theme(), detail=detail), width=200, no_color=True
+    )
+
+    assert "987654" not in rendered
+    assert "178921152673" not in rendered
+    if detail:
+        assert "preserved" in rendered
+    else:
+        assert "outlived their writer" in rendered

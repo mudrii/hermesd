@@ -37,6 +37,19 @@ def isolate_runtime_environment(
             monkeypatch.delenv(name, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def no_host_process_probing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the suite off the host process table.
+
+    The default start-time probe shells out to ``ps``, so a Collector built
+    without an injected ``process_start_times`` would make results depend on which
+    processes happen to be running — and would spawn a subprocess per pass. Tests
+    that exercise identity matching inject their own probe; everything else
+    observes no start time, which reads as unverifiable rather than dead.
+    """
+    monkeypatch.setattr("hermesd.collector._observed_process_start_times", lambda pids: {})
+
+
 def render_to_str(panel, width: int = 120, no_color: bool = False) -> str:
     """Render a Rich renderable to a string for assertion."""
     console = Console(width=width, height=80, force_terminal=True, no_color=no_color)
