@@ -46,6 +46,16 @@ _MAX_BRANCH_CHARS = 24
 _MAX_ACTIVITY_CHARS = 40
 _MAX_ERROR_CHARS = 60
 
+# The render loop rebuilds the detail layout at 2 Hz while the collector
+# replaces state.sessions only once per collect, so the filter+sort result is
+# memoized on input identity. The single entry holds strong references: a key
+# match is always the same objects (ids cannot be recycled into a false hit),
+# and a new app instance or collect always misses. Message-search results
+# arrive as a new set object, so identity tracks content there too.
+_detail_sessions_cache: (
+    tuple[list[SessionInfo], str, str, set[str] | None, list[SessionInfo]] | None
+) = None
+
 
 def render_sessions(
     state: DashboardState,
@@ -98,8 +108,8 @@ def _render_detail(
     session_sort: str,
     message_match_ids: set[str] | None,
 ) -> Panel:
-    sessions = _sort_sessions(
-        _filter_sessions(state.sessions, filter_query, message_match_ids), session_sort
+    sessions = _filtered_sorted_sessions(
+        state.sessions, filter_query, session_sort, message_match_ids
     )
 
     sections: list[RenderableType] = [
@@ -208,6 +218,29 @@ def _sessions_table(sessions: list[SessionInfo], theme: Theme) -> Table:
             fmt_usd(_display_cost(s)),
         )
     return table
+
+
+def _filtered_sorted_sessions(
+    sessions: list[SessionInfo],
+    filter_query: str,
+    session_sort: str,
+    message_match_ids: set[str] | None,
+) -> list[SessionInfo]:
+    global _detail_sessions_cache
+    cached = _detail_sessions_cache
+    if (
+        cached is not None
+        and cached[0] is sessions
+        and cached[1] == filter_query
+        and cached[2] == session_sort
+        and cached[3] is message_match_ids
+    ):
+        return cached[4]
+    result = _sort_sessions(
+        _filter_sessions(sessions, filter_query, message_match_ids), session_sort
+    )
+    _detail_sessions_cache = (sessions, filter_query, session_sort, message_match_ids, result)
+    return result
 
 
 def _filter_sessions(

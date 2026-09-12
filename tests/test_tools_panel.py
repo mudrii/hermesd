@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+from rich.table import Table
+
+import hermesd.panels.tools as tools_module
 from hermesd.models import (
     BackgroundProcessInfo,
     DashboardState,
@@ -246,3 +250,57 @@ def test_tools_detail_escapes_markup_hostile_toolset_names():
     assert "[bold red]evil" in text
     assert "[/]x" in text
     assert "\x1b[2J" not in text
+
+
+def _counting_build_spy(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    calls = [0]
+    real_build = tools_module._build_tool_calls_table
+
+    def counting_build(tool_stats: list[ToolStats], theme: Theme) -> Table:
+        calls[0] += 1
+        return real_build(tool_stats, theme)
+
+    monkeypatch.setattr(tools_module, "_build_tool_calls_table", counting_build)
+    return calls
+
+
+def test_tools_detail_memoizes_calls_table_for_unchanged_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 2 Hz render loop must not rebuild the calls table between collects."""
+    state = DashboardState(
+        tool_stats=[ToolStats(name="terminal", call_count=5)],
+        total_tool_calls=5,
+    )
+    theme = Theme()
+    build_calls = _counting_build_spy(monkeypatch)
+
+    render_tools(state, theme, detail=True)
+    render_tools(state, theme, detail=True)
+
+    assert build_calls[0] == 1
+
+
+def test_tools_detail_rebuilds_calls_table_for_new_state_or_theme(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = DashboardState(
+        tool_stats=[ToolStats(name="terminal", call_count=5)],
+        total_tool_calls=5,
+    )
+    theme = Theme()
+    build_calls = _counting_build_spy(monkeypatch)
+
+    render_tools(state, theme, detail=True)
+    # A fresh collect yields a new tool_stats list, even with equal contents.
+    render_tools(
+        DashboardState(
+            tool_stats=[ToolStats(name="terminal", call_count=5)],
+            total_tool_calls=5,
+        ),
+        theme,
+        detail=True,
+    )
+    render_tools(state, Theme(), detail=True)
+
+    assert build_calls[0] == 3

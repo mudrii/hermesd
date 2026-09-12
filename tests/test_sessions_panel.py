@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+import hermesd.panels.sessions as sessions_module
 from hermesd.models import ActiveSurface, DashboardState, SessionInfo
 from hermesd.panels.sessions import render_sessions
 from hermesd.theme import Theme
@@ -235,3 +236,58 @@ def test_detail_age_uses_collected_at_not_wall_clock() -> None:
     rendered = render_to_str(render_sessions(state, Theme(), detail=True), width=200)
 
     assert "1h" in rendered
+
+
+def _counting_sort_spy(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    calls = [0]
+    real_sort = sessions_module._sort_sessions
+
+    def counting_sort(sessions: list[SessionInfo], session_sort: str) -> list[SessionInfo]:
+        calls[0] += 1
+        return real_sort(sessions, session_sort)
+
+    monkeypatch.setattr(sessions_module, "_sort_sessions", counting_sort)
+    return calls
+
+
+def test_detail_memoizes_filter_and_sort_for_unchanged_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 2 Hz render loop must not re-filter/re-sort between collects."""
+    state = DashboardState(sessions=[_session(session_id="sess_a"), _session(session_id="sess_b")])
+    sort_calls = _counting_sort_spy(monkeypatch)
+
+    render_sessions(state, Theme(), detail=True, filter_query="source:cli", session_sort="cost")
+    render_sessions(state, Theme(), detail=True, filter_query="source:cli", session_sort="cost")
+
+    assert sort_calls[0] == 1
+
+
+def test_detail_recomputes_when_state_filter_or_sort_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = DashboardState(sessions=[_session(session_id="sess_a")])
+    sort_calls = _counting_sort_spy(monkeypatch)
+
+    render_sessions(state, Theme(), detail=True)
+    render_sessions(state, Theme(), detail=True, filter_query="cli")
+    render_sessions(state, Theme(), detail=True, filter_query="cli", session_sort="cost")
+    # Same content in a new state object (a fresh collect) must recompute.
+    render_sessions(DashboardState(sessions=[_session(session_id="sess_a")]), Theme(), detail=True)
+
+    assert sort_calls[0] == 4
+
+
+def test_detail_recomputes_when_message_match_ids_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = DashboardState(sessions=[_session(session_id="sess_a")])
+    sort_calls = _counting_sort_spy(monkeypatch)
+    match_ids = {"sess_a"}
+
+    render_sessions(state, Theme(), detail=True, message_match_ids=match_ids)
+    render_sessions(state, Theme(), detail=True, message_match_ids=match_ids)
+    # A new set object signals a completed message search, even with equal contents.
+    render_sessions(state, Theme(), detail=True, message_match_ids=set(match_ids))
+
+    assert sort_calls[0] == 2
