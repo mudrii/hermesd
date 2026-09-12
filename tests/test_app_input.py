@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import select
+import termios
 from pathlib import Path
 
 from hermesd.app import (
@@ -60,6 +61,37 @@ def test_input_loop_quits_after_max_consecutive_failures(
     assert app._running.is_set() is False
     assert app._input_error == "input error: stdin failed"
     assert fake_terminal == {"fd": 123, "settings": ["old-settings"]}
+    app.close()
+
+
+def test_input_loop_stops_when_terminal_restore_fails(
+    populated_hermes_home: Path, fake_terminal, monkeypatch
+):
+    """A failing tcsetattr while recovering from a read error stops the app."""
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._running.set()
+
+    def fail_read(fd: int, size: int) -> bytes:
+        raise OSError("stdin failed")
+
+    monkeypatch.setattr(os, "read", fail_read)
+    tcsetattr_calls = 0
+
+    def flaky_tcsetattr(fd, when, settings):
+        nonlocal tcsetattr_calls
+        tcsetattr_calls += 1
+        if tcsetattr_calls == 1:
+            raise OSError("restore failed")
+
+    monkeypatch.setattr(termios, "tcsetattr", flaky_tcsetattr)
+
+    app._input_loop()
+
+    # First call is the failed mid-loop restore; second is the finally cleanup.
+    assert tcsetattr_calls == 2
+    assert app._running.is_set() is False
+    assert app._stop_requested.is_set()
+    assert app._input_error == "input error: restore failed"
     app.close()
 
 

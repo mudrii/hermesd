@@ -1643,8 +1643,6 @@ def _unreadable(path: Path) -> bool:
     """True only when the OS actually denies reads (guards root/odd FS)."""
     try:
         path.read_bytes()
-    except OSError:
-        return True
     except Exception:
         return True
     return False

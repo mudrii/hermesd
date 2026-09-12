@@ -1235,8 +1235,9 @@ def test_close_returns_promptly_and_skips_remaining_sources(hermes_home: Path, s
         assert started.wait(10)
         closer = threading.Thread(target=lambda: (c.close(), closed.set()))
         closer.start()
-        # Give close() time to reach the collect lock it cannot take yet.
-        time.sleep(0.1)
+        # close() sets _closing before queuing for the collect lock, so this
+        # handshake proves the closer is blocked on the lock before release.
+        assert c._closing.wait(10)
         release.set()
         start = time.perf_counter()
         assert closed.wait(10)

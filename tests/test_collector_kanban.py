@@ -110,6 +110,86 @@ def test_collect_kanban_stale_claim_counts_use_configured_ttl(hermes_home: Path)
     c.close()
 
 
+def test_collect_kanban_stale_claims_zero_when_schema_has_no_claim_columns(hermes_home: Path):
+    """A pre-claims tasks schema has no stale-claim signal: count is 0."""
+    board_dir = hermes_home / "kanban" / "boards" / "alpha"
+    board_dir.mkdir(parents=True)
+    conn = sqlite3.connect(str(board_dir / "kanban.db"))
+    conn.execute(
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, "
+        "status TEXT NOT NULL, created_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES (?, ?, ?, ?)",
+        ("alpha-task", "Alpha task", "done", 1),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.kanban.stale_claim_count == 0
+    assert state.kanban.boards[0].task_count == 1
+    assert state.kanban.boards[0].stale_claim_count == 0
+    c.close()
+
+
+def test_collect_kanban_stale_claims_counted_with_only_claim_expires_column(hermes_home: Path):
+    board_dir = hermes_home / "kanban" / "boards" / "alpha"
+    board_dir.mkdir(parents=True)
+    conn = sqlite3.connect(str(board_dir / "kanban.db"))
+    conn.execute(
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, "
+        "status TEXT NOT NULL, created_at INTEGER NOT NULL, claim_expires INTEGER)"
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, claim_expires) VALUES (?, ?, ?, ?, ?)",
+        ("stale-task", "Stale task", "done", 1, 1),
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, claim_expires) VALUES (?, ?, ?, ?, ?)",
+        ("live-task", "Live task", "done", 1, int(time.time()) + 3600),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.kanban.boards[0].stale_claim_count == 1
+    c.close()
+
+
+def test_collect_kanban_stale_claims_counted_with_only_heartbeat_column(hermes_home: Path):
+    board_dir = hermes_home / "kanban" / "boards" / "alpha"
+    board_dir.mkdir(parents=True)
+    now = int(time.time())
+    conn = sqlite3.connect(str(board_dir / "kanban.db"))
+    conn.execute(
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, "
+        "status TEXT NOT NULL, created_at INTEGER NOT NULL, last_heartbeat_at INTEGER)"
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, last_heartbeat_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("stale-task", "Stale task", "done", 1, now - 600),
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, last_heartbeat_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("live-task", "Live task", "done", 1, now - 10),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.kanban.boards[0].stale_claim_count == 1
+    c.close()
+
+
 def test_collect_kanban_board_visibility_renders_from_collected_state(hermes_home: Path):
     (hermes_home / "config.yaml").write_text(yaml.dump({"kanban": {"claim_ttl_seconds": 120}}))
     board_dir = hermes_home / "kanban" / "boards" / "alpha"

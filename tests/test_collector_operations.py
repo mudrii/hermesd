@@ -1845,10 +1845,10 @@ def test_blocked_scripts_symlinked_entries_ignored(
     assert _collect_ops(hermes_home).operations.blocked_script_count == 0
 
 
+@_skip_if_root
 def test_blocked_scripts_unreadable_dir_keeps_last_good_and_names_source(
     hermes_home: Path, sample_db: Path
 ):
-    _skip_if_root()
     root = _write_blocked_scripts(hermes_home, {"blocked-a.sh": 30.0})
     c = Collector(hermes_home, clock=_fixed_clock)
     try:

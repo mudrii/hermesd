@@ -253,7 +253,10 @@ def test_gateway_state_with_wrong_types_falls_back_to_safe_defaults(
         collector.close()
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permission bits")
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores directory permission bits",
+)
 def test_unreadable_logs_directory_keeps_last_good_log_lines(populated_hermes_home: Path) -> None:
     collector = Collector(populated_hermes_home)
     try:
@@ -273,7 +276,10 @@ def test_unreadable_logs_directory_keeps_last_good_log_lines(populated_hermes_ho
         collector.close()
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permission bits")
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores directory permission bits",
+)
 def test_unreadable_sessions_directory_keeps_last_good_tool_inventory(
     populated_hermes_home: Path,
 ) -> None:
@@ -293,7 +299,10 @@ def test_unreadable_sessions_directory_keeps_last_good_tool_inventory(
         collector.close()
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permission bits")
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores directory permission bits",
+)
 def test_unreadable_skills_directory_keeps_last_good_skills(populated_hermes_home: Path) -> None:
     collector = Collector(populated_hermes_home)
     try:
