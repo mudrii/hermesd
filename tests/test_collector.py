@@ -24,6 +24,7 @@ from hermesd.collector import (
     _redact_secret_args,
     _redact_secret_text,
     _redact_secret_url,
+    _safe_exception_text,
 )
 from hermesd.models import DashboardState
 from tests.conftest import create_kanban_db_tables, create_state_db_tables
@@ -384,6 +385,65 @@ def test_collection_health_redacts_secret_material_from_errors():
     assert health.collect(lambda: "cached", "source", fail, lambda: "default") == "cached"
     assert "[REDACTED]" in health.errors["source"]
     assert "secret-value" not in health.errors["source"]
+
+
+def test_safe_exception_text_tolerates_invalid_ipv6_url():
+    text = _safe_exception_text(ValueError("bad value 'https://[broken' in field"))
+
+    assert text.startswith("ValueError: ")
+    assert "https://[broken" in text
+
+
+def test_safe_exception_text_strips_credentials_from_malformed_url():
+    text = _safe_exception_text(
+        RuntimeError("connect https://user:glpat-abc123@[broken/v1?token=sk-secret-123 failed")
+    )
+
+    assert "glpat-abc123" not in text
+    assert "sk-secret-123" not in text
+    assert "[REDACTED]" in text
+
+
+def test_safe_exception_text_tolerates_invalid_port():
+    text = _safe_exception_text(
+        RuntimeError("dial https://user:glpat-abc123@example.com:bad/v1?token=sk-secret-123")
+    )
+
+    assert "glpat-abc123" not in text
+    assert "sk-secret-123" not in text
+
+
+def test_safe_exception_text_degrades_when_stringification_raises():
+    class Hostile(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError("no str for you")
+
+    assert _safe_exception_text(Hostile()) == "Hostile"
+
+
+def test_redact_secret_url_never_raises_on_malformed_urls():
+    assert _redact_secret_url("https://[broken") == "https://[broken"
+
+    redacted = _redact_secret_url("https://user:glpat-abc123@[broken/v1?token=sk-secret-123")
+    assert "glpat-abc123" not in redacted
+    assert "sk-secret-123" not in redacted
+    assert "https://[REDACTED]@[broken" in redacted
+
+
+def test_collect_survives_malformed_url_in_source_error(populated_hermes_home: Path, monkeypatch):
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+
+    def boom(*args: object, **kwargs: object) -> list:
+        raise RuntimeError("request to https://user:glpat-abc123@[broken failed")
+
+    monkeypatch.setattr(c, "_collect_tool_stats", boom)
+    state = c.collect()
+
+    assert "tool_stats" in state.health.failed_sources
+    assert "glpat-abc123" not in state.health.errors["tool_stats"]
+    assert len(state.sessions) == 2
+    assert state.health.ok_sources == state.health.total_sources - 1
+    c.close()
 
 
 def test_collect_recent_activity_suppresses_offline_banner(hermes_home: Path, sample_db: Path):

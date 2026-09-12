@@ -103,7 +103,10 @@ def _is_secret_option(option: str) -> bool:
 def _redact_secret_url(value: str) -> str:
     if not value:
         return ""
-    parts = urlsplit(value)
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return _redact_malformed_url(value)
     if not parts.scheme or not parts.netloc:
         return value
     netloc = parts.netloc
@@ -126,6 +129,36 @@ def _redact_secret_url(value: str) -> str:
         for key, item_value in query_pairs
     )
     return urlunsplit(parts._replace(netloc=netloc, query=redacted_query))
+
+
+def _redact_malformed_query_pair(pair: str) -> str:
+    key, sep, _value = pair.partition("=")
+    if sep and _is_secret_url_query_key(key):
+        return f"{key}=[REDACTED]"
+    return pair
+
+
+def _redact_malformed_url(value: str) -> str:
+    # urlsplit failed (e.g. an unmatched IPv6 bracket); strip credentials with
+    # bounded string ops so userinfo and secret query params never pass through.
+    scheme_end = value.find("://")
+    if scheme_end < 0:
+        return "[REDACTED]"
+    authority_start = scheme_end + 3
+    path_start = value.find("/", authority_start)
+    if path_start < 0:
+        path_start = len(value)
+    authority = value[authority_start:path_start]
+    if "@" in authority:
+        authority = f"[REDACTED]@{authority.rsplit('@', 1)[1]}"
+    rest = value[path_start:]
+    query_start = rest.find("?")
+    if query_start >= 0:
+        redacted_pairs = [
+            _redact_malformed_query_pair(p) for p in rest[query_start + 1 :].split("&")
+        ]
+        rest = f"{rest[: query_start + 1]}{'&'.join(redacted_pairs)}"
+    return f"{value[:authority_start]}{authority}{rest}"
 
 
 def _redact_secret_args(args: object) -> list[str]:
@@ -234,7 +267,12 @@ def _redact_secret_text(value: str) -> str:
 
 
 def _safe_exception_text(exc: Exception) -> str:
-    return f"{type(exc).__name__}: {_redact_secret_text(str(exc))[:200]}"
+    try:
+        return f"{type(exc).__name__}: {_redact_secret_text(str(exc))[:200]}"
+    except Exception:
+        # Sanitization must never raise: it runs inside error handling at the
+        # collection boundary, where a secondary exception would escape.
+        return type(exc).__name__
 
 
 def _redact_command_string(command: str) -> str:
