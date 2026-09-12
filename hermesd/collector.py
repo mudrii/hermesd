@@ -333,7 +333,7 @@ def _read_blocked_scripts(root: Path, home: Path, *, now: float) -> dict[str, An
             "blocked_script_names": [],
         }
     entries: list[tuple[float, str]] = []
-    for entry in islice(sorted(root.iterdir()), _BLOCKED_SCRIPT_SCAN_LIMIT):
+    for entry in sorted(islice(root.iterdir(), _BLOCKED_SCRIPT_SCAN_LIMIT)):
         if entry.is_symlink() or not entry.is_file() or not _path_resolves_under(entry, home):
             continue
         entries.append((_mtime(entry) or 0.0, entry.name))
@@ -351,6 +351,14 @@ def _read_blocked_scripts(root: Path, home: Path, *, now: float) -> dict[str, An
 def _sanitized_file_label(name: str) -> str:
     """Printable, length-capped file name safe to hand to a panel."""
     return "".join(char for char in name if char.isprintable())[:_MAX_FILE_LABEL_CHARS]
+
+
+def _path_confirmed_gone(path: Path) -> bool:
+    """True only when the path is verifiably absent; stat errors keep the entry."""
+    try:
+        return not path.exists()
+    except OSError:
+        return False
 
 
 def _memory_file_names(memories_dir: Path) -> list[str]:
@@ -513,12 +521,32 @@ class Collector:
         with self._lock:
             if self._closed:
                 raise RuntimeError("collector is closed")
+            self._prune_stale_caches()
             health = _CollectionHealth()
             session_rows = self._collect_session_rows(health)
             state = self._build_dashboard_state(health, session_rows)
             if not health.failed_sources:
                 self._last_state = state
             return state
+
+    def _prune_stale_caches(self) -> None:
+        """Evict path-keyed cache entries whose backing file or board is gone."""
+        boards_dir = self._paths.shared_path("kanban", "boards")
+        self._kanban_board_cache = {
+            slug: summary
+            for slug, summary in self._kanban_board_cache.items()
+            if not _path_confirmed_gone(boards_dir / slug)
+        }
+        self._derived_file_cache = {
+            key: entry
+            for key, entry in self._derived_file_cache.items()
+            if not _path_confirmed_gone(Path(key.split(":", 1)[1]))
+        }
+        self._cron_excerpt_cache = {
+            key: entry
+            for key, entry in self._cron_excerpt_cache.items()
+            if not _path_confirmed_gone(Path(key.rsplit(":", 1)[0]) / key.rsplit(":", 1)[1])
+        }
 
     def _build_dashboard_state(
         self,
@@ -837,7 +865,8 @@ class Collector:
             # call site pins T via its compute callable.
             return cached[1]  # type: ignore[no-any-return]
         value = compute()
-        self._derived_file_cache[key] = (signature, value)
+        if signature is not None:
+            self._derived_file_cache[key] = (signature, value)
         return value
 
     def _cached_word_count(self, path: Path, root: Path) -> int:
@@ -892,7 +921,12 @@ class Collector:
         return rows if rows is not None else self._db.read_sessions()
 
     def _collect_gateway(self) -> GatewayState:
-        data = self._read_json_reporting_stale(self._paths.shared_path("gateway_state.json"))
+        path = self._paths.shared_path("gateway_state.json")
+        if not _safe_child_path(path, self._paths.root_home):
+            if self._last_state is not None:
+                raise RuntimeError(f"{path.name} became unsafe")
+            return GatewayState()
+        data = self._read_json_reporting_stale(path)
         if not data:
             return GatewayState()
         now = self._clock()
@@ -1108,7 +1142,9 @@ class Collector:
         context_lengths = self._read_context_lengths()
         return [
             SessionInfo(
-                session_id=r["id"],
+                # NULL id must stay None so the row fails validation and the
+                # source falls back to last-good; only a missing column defaults.
+                session_id=r.get("id", ""),  # row-get-ok
                 source=r.get("source") or "",
                 model=r.get("model") or "",
                 parent_session_id=r.get("parent_session_id") or "",

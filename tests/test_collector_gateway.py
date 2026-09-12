@@ -926,6 +926,18 @@ def test_symlinked_heartbeat_file_is_ignored(hermes_home: Path, tmp_path: Path):
     assert gateway.loop_health is GatewayLoopHealth.UNKNOWN
 
 
+def test_symlinked_gateway_state_outside_home_is_not_followed(hermes_home: Path, tmp_path: Path):
+    outside = tmp_path / "gateway_state.json"
+    outside.write_text(json.dumps({"pid": 4242, "gateway_state": "running", "platforms": {}}))
+    (hermes_home / "gateway_state.json").symlink_to(outside)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.state == "unknown"
+    assert gateway.running is False
+    assert gateway.pid == 0
+
+
 # --------------------------------------------------------------------------
 # B. lifecycle
 # --------------------------------------------------------------------------

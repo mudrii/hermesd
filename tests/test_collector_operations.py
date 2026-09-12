@@ -1811,6 +1811,28 @@ def test_blocked_scripts_scan_is_bounded(hermes_home: Path, sample_db: Path):
     assert _collect_ops(hermes_home).operations.blocked_script_count == 200
 
 
+def test_blocked_scripts_scan_cap_applies_before_sort(
+    hermes_home: Path, sample_db: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _write_blocked_scripts(hermes_home, {f"blocked-{i:04d}.sh": float(i) for i in range(260)})
+
+    sorted_sizes: list[int] = []
+    real_sorted = sorted
+
+    def _spy_sorted(iterable, *args: object, **kwargs: object) -> list:
+        items = list(iterable)
+        sorted_sizes.append(len(items))
+        return real_sorted(items, *args, **kwargs)
+
+    monkeypatch.setattr(collector_module, "sorted", _spy_sorted, raising=False)
+
+    ops = _collect_ops(hermes_home).operations
+
+    assert ops.blocked_script_count == 200
+    assert sorted_sizes
+    assert max(sorted_sizes) <= 200
+
+
 def test_blocked_scripts_symlinked_entries_ignored(
     hermes_home: Path, sample_db: Path, tmp_path: Path
 ):

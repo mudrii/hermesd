@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -24,7 +25,7 @@ from hermesd.collector import (
     _redact_secret_url,
 )
 from hermesd.models import DashboardState
-from tests.conftest import create_state_db_tables
+from tests.conftest import create_kanban_db_tables, create_state_db_tables
 
 
 def test_collect_full(populated_hermes_home: Path):
@@ -64,6 +65,41 @@ def test_collect_missing_files(hermes_home: Path):
     assert state.sessions == []
     assert state.config.model == ""
     c.close()
+
+
+def test_stale_path_caches_are_evicted_when_targets_disappear(hermes_home: Path):
+    board_dir = hermes_home / "kanban" / "boards" / "alpha"
+    board_dir.mkdir(parents=True)
+    conn = sqlite3.connect(str(board_dir / "kanban.db"))
+    create_kanban_db_tables(conn)
+    conn.commit()
+    conn.close()
+    (hermes_home / "cron" / "jobs.json").write_text(
+        json.dumps({"jobs": [{"id": "job-1", "name": "Job 1"}]})
+    )
+    job_dir = hermes_home / "cron" / "output" / "job-1"
+    job_dir.mkdir(parents=True)
+    (job_dir / "latest.md").write_text("cron line\n")
+    memory_md = hermes_home / "memories" / "MEMORY.md"
+    memory_md.write_text("one two three\n")
+
+    c = Collector(hermes_home)
+    try:
+        c.collect()
+        assert "alpha" in c._kanban_board_cache
+        assert any(key.endswith(":job-1") for key in c._cron_excerpt_cache)
+        assert any(str(memory_md) in key for key in c._derived_file_cache)
+
+        shutil.rmtree(board_dir)
+        shutil.rmtree(job_dir)
+        memory_md.unlink()
+        c.collect()
+
+        assert "alpha" not in c._kanban_board_cache
+        assert not any(key.endswith(":job-1") for key in c._cron_excerpt_cache)
+        assert not any(str(memory_md) in key for key in c._derived_file_cache)
+    finally:
+        c.close()
 
 
 def test_collect_gateway_not_running(hermes_home: Path):

@@ -1346,6 +1346,19 @@ def test_wrong_typed_session_columns_coerce_instead_of_raising(hermes_home: Path
     assert session.started_at == 0.0
 
 
+def test_sessions_table_without_id_column_keeps_source_alive(hermes_home: Path) -> None:
+    conn = sqlite3.connect(str(hermes_home / "state.db"))
+    conn.execute("CREATE TABLE sessions (source TEXT, model TEXT, started_at REAL)")
+    conn.execute("INSERT INTO sessions (source, model, started_at) VALUES ('cli', 'gpt-5.4', 1)")
+    conn.commit()
+    conn.close()
+
+    state = _collect_once(hermes_home)
+
+    assert "sessions" not in state.health.failed_sources
+    assert [session.session_id for session in state.sessions] == [""]
+
+
 def _write_active_sessions(hermes_home: Path, payload: object) -> None:
     runtime = hermes_home / "runtime"
     runtime.mkdir(exist_ok=True)
