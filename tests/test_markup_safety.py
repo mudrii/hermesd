@@ -320,7 +320,29 @@ def _state_for(panel_num: int) -> DashboardState:
                     )
                 ],
                 hooks=[HookInfo(name=INJECT, description=INJECT, events=[INJECT])],
-                plugins=[PluginInfo(name=INJECT, version=INJECT, description=INJECT)],
+                plugins=[
+                    PluginInfo(
+                        name=INJECT,
+                        version=INJECT,
+                        description=INJECT,
+                        activation_reason=INJECT,
+                        kind=INJECT,
+                        manifest_key=INJECT,
+                        manifest_file=INJECT,
+                        manifest_shadowed=[INJECT],
+                        requires_hermes=INJECT,
+                        declared_capabilities=[INJECT],
+                        declared_capability_count=1,
+                        installed_revision=INJECT,
+                        pinned_revision=INJECT,
+                        install_source=INJECT,
+                        catalog_name=INJECT,
+                        catalog_repo=INJECT,
+                        catalog_sha=INJECT,
+                        catalog_tier=INJECT,
+                        catalog_installed_at=INJECT,
+                    )
+                ],
                 mcp_servers=[
                     MCPServerInfo(name=INJECT, transport=INJECT, target=INJECT, tool_filter=INJECT)
                 ],

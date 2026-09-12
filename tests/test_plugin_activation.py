@@ -278,9 +278,29 @@ def test_collector_applies_deny_list_precedence(hermes_home: Path):
     assert plugin.enabled is False
 
 
-def test_collector_matches_a_canonical_manifest_key(hermes_home: Path):
+def test_collector_ignores_a_declared_key_field_upstream_never_reads(hermes_home: Path):
+    """A manifest ``key:`` is not a spelling the plugin can be opted in under.
+
+    ``parse_manifest_file`` derives the key from the path and the manifest name and
+    never reads a ``key:`` field, so ``plugins.enabled`` cannot contain one.
+    Honouring it would report a plugin as enabled that hermes-agent refuses to
+    load — the exact false positive the activation gate exists to prevent.
+    """
     _write_config(hermes_home, {"enabled": ["observability/tracer"]})
     _write_plugin(hermes_home, "tracer", "name: tracer\nkey: observability/tracer\n")
+
+    plugin = _by_name(_collect(hermes_home))["tracer"]
+
+    assert plugin.manifest_key == "tracer"
+    assert plugin.activation == ACTIVATION_NOT_ENABLED
+
+
+def test_collector_matches_a_canonical_key_derived_from_a_category_path(hermes_home: Path):
+    """The canonical ``<category>/<name>`` spelling comes from the path, not a manifest."""
+    _write_config(hermes_home, {"enabled": ["observability/tracer"]})
+    category = hermes_home / "plugins" / "observability" / "tracer"
+    category.mkdir(parents=True, exist_ok=True)
+    (category / "plugin.yaml").write_text("name: tracer\n")
 
     plugin = _by_name(_collect(hermes_home))["tracer"]
 

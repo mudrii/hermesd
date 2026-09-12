@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from enum import StrEnum
 from pathlib import Path
@@ -13,6 +14,20 @@ from hermesd.paths import default_hermes_home
 # billed/known cost, not a token-based estimate): "reported" (legacy), "exact",
 # and "included" (subscription-covered, genuinely $0.00).
 AUTHORITATIVE_COST_STATUSES: frozenset[str] = frozenset({"reported", "exact", "included"})
+
+# Plugin manifest filenames hermesd recognises, in upstream's precedence order:
+# a native YAML manifest wins over a portable one, and plugin.yaml wins over
+# plugin.yml (hermes_cli/plugins_discovery.py:115, hermes_cli/plugin_dev.py:154,
+# hermes_cli/plugins_cmd.py:265-271).
+YAML_MANIFEST_NAMES: tuple[str, ...] = ("plugin.yaml", "plugin.yml")
+PORTABLE_MANIFEST_NAME: str = "plugin.json"
+MANIFEST_NAMES: tuple[str, ...] = (*YAML_MANIFEST_NAMES, PORTABLE_MANIFEST_NAME)
+
+# A git commit SHA the way hermes-agent records one: `git rev-parse HEAD`,
+# stripped and lowercased (hermes_cli/plugins_cmd.py:489-494). A provenance value
+# that does not match is never rendered as a revision — a corrupt sidecar is not
+# a pin, and comparing garbage against a real SHA would fabricate drift.
+_FULL_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
 class GatewayLoopHealth(StrEnum):
@@ -795,6 +810,25 @@ class PluginActivation(StrEnum):
 
 
 class PluginInfo(BaseModel):
+    """One discovered plugin: its manifest, its configured activation, its provenance.
+
+    Everything here is *read*, never executed. hermesd never imports plugin code,
+    so no field is evidence that a plugin loaded: ``activation`` says what
+    ``config.yaml`` and the manifest tell hermes-agent to do, ``declared_*`` and
+    ``requires_hermes`` say what the manifest claims, and the provenance fields
+    say which commit the install tooling recorded.
+
+    Two field names deliberately differ from the on-disk keys they come from,
+    because both would otherwise collide with an existing field:
+
+    * ``install_source`` is ``source`` in ``plugins/.install-metadata.json`` (a
+      credential-scrubbed git URL), while ``PluginInfo.source`` is upstream's
+      discovery root (``user``/``bundled``/``project``/``entrypoint``);
+    * ``catalog_*`` prefixes every key of ``<plugin_dir>/.hermes-catalog.json``,
+      whose ``sha`` and ``repo`` would otherwise be indistinguishable from the
+      installed revision and the install source.
+    """
+
     name: str
     version: str = ""
     description: str = ""
@@ -803,15 +837,78 @@ class PluginInfo(BaseModel):
     activation_reason: str = ""
     kind: str = ""
     manifest_key: str = ""
+    # Which manifest file won, and which lost to it. Upstream accepts plugin.yaml,
+    # plugin.yml and a portable plugin.json in that precedence and says nothing
+    # about the losers; hermesd records them so a conflicting pair is observable.
+    manifest_file: str = ""
+    manifest_shadowed: list[str] = Field(default_factory=list)
     tool_count: int = 0
     hook_count: int = 0
     dashboard_enabled: bool = False
+    # Declarations, not capabilities: a manifest asserting `tools.override` is
+    # consent metadata upstream still gates behind plugins.entries.<id>
+    # .granted_capabilities (hermes_cli/plugin_capabilities.py:44-46).
+    requires_hermes: str = ""
+    declared_capabilities: list[str] = Field(default_factory=list)
+    declared_capability_count: int = 0
+    # plugins/.install-metadata.json — the actually-installed HEAD, and the SHA an
+    # explicit `--ref` pinned it to ("" when the install was not pinned).
+    installed_revision: str = ""
+    pinned_revision: str = ""
+    install_source: str = ""
+    # <plugin_dir>/.hermes-catalog.json — the catalog entry that was reviewed,
+    # which is not necessarily the commit that was installed.
+    catalog_name: str = ""
+    catalog_repo: str = ""
+    catalog_sha: str = ""
+    catalog_tier: str = ""
+    catalog_installed_at: str = ""
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def enabled(self) -> bool:
         """Derived, never stored: activation is the single source of truth."""
         return self.activation is PluginActivation.ENABLED
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def manifest_format(self) -> str:
+        """``yaml`` or ``portable`` — which reader the winning filename needs.
+
+        Derived from ``manifest_file`` so the two cannot disagree: a portable
+        Agent Plugin is parsed and validated differently from a native manifest.
+        """
+        if self.manifest_file in YAML_MANIFEST_NAMES:
+            return "yaml"
+        if self.manifest_file == PORTABLE_MANIFEST_NAME:
+            return "portable"
+        return ""
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def pinned(self) -> bool:
+        """Derived: upstream records a pin only beside the revision it pins."""
+        return bool(self.pinned_revision)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def provenance_drift(self) -> bool:
+        """True when the catalog's reviewed SHA and the installed HEAD disagree.
+
+        ``install_catalog_entry`` installs at ``ref or entry.sha`` and then writes
+        the sidecar from ``entry`` (hermes_cli/plugins_cmd_catalog.py:108-118), so
+        an explicit ``--ref`` leaves the two apart by design — and the sidecar
+        alone is then not evidence of what code is on disk. Both sides must be
+        full 40-hex revisions: a malformed SHA is a corrupt sidecar, not a move,
+        and claiming drift from it would invent a comparison hermesd cannot make.
+        """
+        catalog = self.catalog_sha.lower()
+        installed = self.installed_revision.lower()
+        if not _FULL_REVISION_PATTERN.fullmatch(catalog):
+            return False
+        if not _FULL_REVISION_PATTERN.fullmatch(installed):
+            return False
+        return catalog != installed
 
 
 class MCPServerInfo(BaseModel):
@@ -830,6 +927,10 @@ class SkillsMemory(BaseModel):
     credential_pools: list[CredentialPoolEntry] = Field(default_factory=list)
     hooks: list[HookInfo] = Field(default_factory=list)
     plugins: list[PluginInfo] = Field(default_factory=list)
+    # ~/.hermes is untrusted, so the plugins walk has a budget. `plugins` is
+    # therefore a capped list, and this says when the cap cut it short — a
+    # truncated scan must never read as a complete inventory.
+    plugin_scan_truncated: bool = False
     mcp_servers: list[MCPServerInfo] = Field(default_factory=list)
     boot_md_present: bool = False
     boot_md_mtime: float | None = None

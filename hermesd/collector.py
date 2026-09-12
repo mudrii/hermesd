@@ -126,8 +126,23 @@ from hermesd.collect.operations import (
     _read_state_db as _read_state_db_tables,
 )
 from hermesd.collect.plugins import (
+    CATALOG_SIDECAR_NAME,
+    INSTALL_METADATA_NAME,
+    MANIFEST_NAMES,
+    MAX_PLUGIN_SCAN_DEPTH,
+    PLUGIN_KIND_STANDALONE,
+    CatalogProvenance,
+    ManifestChoice,
+    catalog_provenance,
+    category_prefix,
+    choose_manifest,
+    declared_capabilities,
     gate_plugin,
+    install_provenance,
+    parse_portable_manifest,
+    plugin_key,
     plugin_name_set,
+    requires_hermes_spec,
     resolve_plugin_kind,
 )
 from hermesd.collect.redaction import (
@@ -179,6 +194,7 @@ from hermesd.db import HermesDB
 from hermesd.defaults import DEFAULT_LOG_TAIL_BYTES
 from hermesd.file_cache import JsonMapping, JsonObjectList, LastGoodFileCache
 from hermesd.models import (
+    PORTABLE_MANIFEST_NAME,
     ActiveSurface,
     BackgroundProcessInfo,
     ChannelDirectoryState,
@@ -259,6 +275,13 @@ _HEARTBEAT_FIELDS = ("heartbeat_age_seconds", "loop_health")
 # entry costs a liveness syscall per refresh, so an oversized file must not be
 # able to stall the collector thread.
 _ACTIVE_SURFACE_LIMIT = 200
+# plugins/ scan bounds. The tree is walked at most two levels deep (one level of
+# category recursion, matching upstream), and both the per-directory listing and
+# the retained plugin list are capped because ~/.hermes is untrusted input read
+# every refresh. Hitting either cap sets SkillsMemory.plugin_scan_truncated, so a
+# bounded inventory never presents itself as a complete one.
+_PLUGIN_DIR_ENTRY_LIMIT = 200
+_PLUGIN_LIMIT = 200
 # cache/blocked-scripts/ scan bounds and the fields the source owns.
 _BLOCKED_SCRIPT_SCAN_LIMIT = 200
 _BLOCKED_SCRIPT_NAME_LIMIT = 3
@@ -2343,6 +2366,7 @@ class Collector:
         cfg = self._read_yaml_reporting_stale()
         boot_md = self._paths.shared_path("BOOT.md")
         providers = self._collect_providers(auth_data)
+        plugins, plugin_scan_truncated = self._collect_plugins(cfg)
         return SkillsMemory(
             skill_count=len(skills),
             skill_categories=len(categories),
@@ -2350,7 +2374,8 @@ class Collector:
             providers=providers,
             credential_pools=self._collect_credential_pools(auth_data),
             hooks=self._collect_hooks(),
-            plugins=self._collect_plugins(cfg),
+            plugins=plugins,
+            plugin_scan_truncated=plugin_scan_truncated,
             mcp_servers=self._collect_mcp_servers(cfg),
             boot_md_present=boot_md.exists(),
             boot_md_mtime=_mtime(boot_md),
@@ -2450,61 +2475,214 @@ class Collector:
             )
         return hooks
 
-    def _collect_plugins(self, cfg: dict[str, Any]) -> list[PluginInfo]:
+    def _collect_plugins(self, cfg: dict[str, Any]) -> tuple[list[PluginInfo], bool]:
+        """Discovered plugins, plus whether the directory walk was cut short.
+
+        Both directory shapes upstream scans (``plugins_discovery.py:102-131``): a
+        flat ``<root>/<name>/`` keyed by its manifest name, and a category
+        ``<root>/<cat>/<name>/`` keyed by the path ``<cat>/<name>``. A directory
+        with no manifest is a *category*, not a plugin, and is recursed into once;
+        it is never reported on its own account.
+
+        Three manifest filenames are accepted, in upstream's precedence order, and
+        the losers are recorded rather than silently dropped. Every read is
+        confined to the plugins root and byte-capped, so — unlike upstream, which
+        accepts a symlinked ``plugin.json`` — a symlinked manifest is refused.
+        """
         plugins_dir = self._paths.shared_path("plugins")
         if not plugins_dir.is_dir():
-            return []
+            return [], False
 
         plugins_cfg = _as_dict(cfg.get("plugins"))
         enabled = plugin_name_set(plugins_cfg.get("enabled"))
         disabled = plugin_name_set(plugins_cfg.get("disabled"))
+        # One file keyed by manifest name: read once per pass however many plugins
+        # were found, because a per-plugin read would be N opens of the same bytes.
+        install_metadata = self._read_install_metadata(plugins_dir)
 
-        plugins: list[PluginInfo] = []
-        for plugin_dir in sorted(plugins_dir.iterdir()):
-            if not plugin_dir.is_dir():
-                continue
-            manifest_path = plugin_dir / "plugin.yaml"
-            if not _safe_capped_file(manifest_path, plugins_dir):
-                continue
-            if not manifest_path.exists():
-                # No manifest at all: upstream reads this as a *category*
-                # directory and recurses into it, not as a plugin.
-                continue
-            manifest = self._file_cache.read_yaml_mapping(manifest_path)
-            if not manifest:
-                # A manifest file is present but did not parse. Report it as
-                # unknown rather than dropping the directory or guessing.
-                plugins.append(
-                    PluginInfo(
-                        name=plugin_dir.name,
-                        activation=PluginActivation.UNKNOWN,
-                        activation_reason="manifest missing or unreadable",
-                    )
-                )
-                continue
-            dashboard_manifest = self._read_json_cached(plugin_dir / "dashboard" / "manifest.json")
-            tools = manifest.get("provides_tools") or []
-            hooks = manifest.get("provides_hooks") or manifest.get("hooks") or []
-            name = str(manifest.get("name") or plugin_dir.name)
-            key = str(manifest.get("key") or "") or name
-            kind = resolve_plugin_kind(manifest.get("kind"), self._plugin_init_source(plugin_dir))
-            gate = gate_plugin(key=key, name=name, kind=kind, enabled=enabled, disabled=disabled)
-            plugins.append(
-                PluginInfo(
-                    name=name,
-                    version=str(manifest.get("version") or ""),
-                    description=str(manifest.get("description") or ""),
-                    source="user",
-                    activation=gate.activation,
-                    activation_reason=gate.reason,
-                    kind=kind,
-                    manifest_key=key,
-                    tool_count=len(tools) if isinstance(tools, list) else 0,
-                    hook_count=len(hooks) if isinstance(hooks, list) else 0,
-                    dashboard_enabled=bool(dashboard_manifest),
-                )
+        found, truncated = self._scan_plugin_dirs(plugins_dir)
+        plugins = [
+            self._read_plugin(
+                plugin_dir,
+                prefix,
+                choice,
+                plugins_dir,
+                enabled=enabled,
+                disabled=disabled,
+                install_metadata=install_metadata,
             )
-        return plugins
+            for plugin_dir, prefix, choice in found
+        ]
+        return plugins, truncated
+
+    def _scan_plugin_dirs(self, base: Path) -> tuple[list[tuple[Path, str, ManifestChoice]], bool]:
+        """``(plugin_dir, key prefix, winning manifest)`` triples under ``base``.
+
+        Bounded twice over, because ``~/.hermes`` is untrusted: at most
+        ``_PLUGIN_DIR_ENTRY_LIMIT`` entries of any one directory are examined, and
+        at most ``_PLUGIN_LIMIT`` plugin directories are retained. Either cap
+        firing sets the truncation flag the panel reports — a capped list must
+        never read as a complete inventory.
+        """
+        found: list[tuple[Path, str, ManifestChoice]] = []
+        truncated = False
+
+        def walk(scan: Path, prefix: str, depth: int) -> None:
+            nonlocal truncated
+            entries = sorted(islice(scan.iterdir(), _PLUGIN_DIR_ENTRY_LIMIT + 1))
+            if len(entries) > _PLUGIN_DIR_ENTRY_LIMIT:
+                truncated = True
+            for child in entries[:_PLUGIN_DIR_ENTRY_LIMIT]:
+                if not child.is_dir():
+                    continue
+                choice = choose_manifest(self._plugin_manifest_names(child, base))
+                if choice is not None:
+                    if len(found) >= _PLUGIN_LIMIT:
+                        truncated = True
+                        return
+                    found.append((child, prefix, choice))
+                elif depth < MAX_PLUGIN_SCAN_DEPTH and _path_resolves_under(child, base):
+                    # No manifest: a category, recursed into once. Past the cap
+                    # upstream logs "no plugin.yaml, depth cap reached" and stops.
+                    walk(child, category_prefix(prefix, child.name), depth + 1)
+
+        walk(base, "", 0)
+        return found, truncated
+
+    def _plugin_manifest_names(self, plugin_dir: Path, base: Path) -> tuple[str, ...]:
+        """Manifest filenames present in one plugin directory.
+
+        Returned in ``MANIFEST_NAMES`` order rather than in the order they were
+        stat'd, so :func:`choose_manifest` cannot be fed a readdir-order-dependent
+        candidate list. A symlink is refused outright and an oversized manifest is
+        refused by the byte cap: upstream accepts a symlinked ``plugin.json``,
+        hermesd does not, because this check is what stops a plugin tree from
+        steering a read outside ``~/.hermes``.
+        """
+        present: list[str] = []
+        for name in MANIFEST_NAMES:
+            path = plugin_dir / name
+            if _exists_strict(path) and _safe_capped_file(path, base):
+                present.append(name)
+        return tuple(present)
+
+    def _read_plugin(
+        self,
+        plugin_dir: Path,
+        prefix: str,
+        choice: ManifestChoice,
+        base: Path,
+        *,
+        enabled: frozenset[str],
+        disabled: frozenset[str],
+        install_metadata: JsonMapping,
+    ) -> PluginInfo:
+        """Build one plugin's record from its winning manifest and its sidecars."""
+        portable = choice.filename == PORTABLE_MANIFEST_NAME
+        manifest_path = plugin_dir / choice.filename
+        raw = (
+            self._read_json_cached(manifest_path)
+            if portable
+            else self._file_cache.read_yaml_mapping(manifest_path)
+        )
+        if not raw:
+            # Present but did not parse (or parsed to nothing). Reported rather
+            # than dropped: this directory is a plugin, and the manifest that
+            # would have named it is the thing that failed.
+            return self._unusable_plugin(plugin_dir, choice, f"{choice.filename} is unreadable")
+
+        caps: list[str] = []
+        cap_count = 0
+        tools: object = []
+        hooks: object = []
+        if portable:
+            parsed, error = parse_portable_manifest(raw)
+            if parsed is None:
+                return self._unusable_plugin(plugin_dir, choice, error)
+            name, version, description = parsed.name, parsed.version, parsed.description
+            # portable_plugin_manifest maps only name/version/description, and
+            # never sets kind — so there is no __init__.py scan and no capability
+            # or version-gate declaration to read here, however plausible the
+            # plugin.json looks.
+            kind = PLUGIN_KIND_STANDALONE
+            key = plugin_key(prefix=prefix, dirname=plugin_dir.name, name=name)
+            requires = ""
+        else:
+            name = str(raw.get("name") or plugin_dir.name)
+            version = str(raw.get("version") or "")
+            description = str(raw.get("description") or "")
+            kind = resolve_plugin_kind(raw.get("kind"), self._plugin_init_source(plugin_dir))
+            key = plugin_key(prefix=prefix, dirname=plugin_dir.name, name=name)
+            requires = requires_hermes_spec(raw.get("requires_hermes"))
+            caps, cap_count = declared_capabilities(raw.get("capabilities"))
+            tools = raw.get("provides_tools") or []
+            hooks = raw.get("provides_hooks") or raw.get("hooks") or []
+
+        gate = gate_plugin(key=key, name=name, kind=kind, enabled=enabled, disabled=disabled)
+        install = install_provenance(install_metadata.get(name))
+        catalog = self._read_catalog_sidecar(plugin_dir, base)
+        dashboard_manifest = self._read_json_cached(plugin_dir / "dashboard" / "manifest.json")
+        return PluginInfo(
+            name=name,
+            version=version,
+            description=description,
+            source="user",
+            activation=gate.activation,
+            activation_reason=gate.reason,
+            kind=kind,
+            manifest_key=key,
+            manifest_file=choice.filename,
+            manifest_shadowed=list(choice.shadowed),
+            tool_count=len(tools) if isinstance(tools, list) else 0,
+            hook_count=len(hooks) if isinstance(hooks, list) else 0,
+            dashboard_enabled=bool(dashboard_manifest),
+            requires_hermes=requires,
+            declared_capabilities=caps,
+            declared_capability_count=cap_count,
+            installed_revision=install.revision,
+            pinned_revision=install.pinned_revision,
+            install_source=install.source,
+            catalog_name=catalog.name if catalog else "",
+            catalog_repo=catalog.repo if catalog else "",
+            catalog_sha=catalog.sha if catalog else "",
+            catalog_tier=catalog.tier if catalog else "",
+            catalog_installed_at=catalog.installed_at if catalog else "",
+        )
+
+    def _unusable_plugin(self, plugin_dir: Path, choice: ManifestChoice, reason: str) -> PluginInfo:
+        """A manifest that is present but unusable: reported, never dropped.
+
+        The directory name is all hermesd can state with evidence, because the
+        manifest that would have named the plugin is the thing that failed.
+        """
+        return PluginInfo(
+            name=plugin_dir.name,
+            activation=PluginActivation.UNKNOWN,
+            activation_reason=reason,
+            manifest_file=choice.filename,
+            manifest_shadowed=list(choice.shadowed),
+        )
+
+    def _read_install_metadata(self, plugins_dir: Path) -> JsonMapping:
+        """``plugins/.install-metadata.json`` — one read per pass, keyed by name.
+
+        Upstream raises ``PluginOperationError`` on a copy it cannot parse
+        (``plugins_cmd.py:434-441``). hermesd treats it as no provenance instead:
+        a read-only viewer must not fail a whole panel over a sidecar it reads
+        only to annotate that panel, and "no provenance recorded" is the truthful
+        reading of a file hermesd cannot parse.
+        """
+        path = plugins_dir / INSTALL_METADATA_NAME
+        if not _exists_strict(path) or not _safe_capped_file(path, plugins_dir):
+            return {}
+        return self._read_json_confined(path)
+
+    def _read_catalog_sidecar(self, plugin_dir: Path, base: Path) -> CatalogProvenance | None:
+        """``<plugin_dir>/.hermes-catalog.json``, or None for a non-catalog install."""
+        path = plugin_dir / CATALOG_SIDECAR_NAME
+        if not _exists_strict(path) or not _safe_capped_file(path, base):
+            return None
+        return catalog_provenance(self._read_json_confined(path))
 
     def _plugin_init_source(self, plugin_dir: Path) -> str:
         """Text of a plugin's ``__init__.py``, for import-free kind detection.

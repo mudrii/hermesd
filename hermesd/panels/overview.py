@@ -6,7 +6,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from hermesd.models import DashboardState, PluginActivation, SkillsMemory
+from hermesd.models import DashboardState, PluginActivation, PluginInfo, SkillsMemory
 from hermesd.panels.formatting import escape_terminal_text as escape
 from hermesd.panels.formatting import fmt_age_seconds, sanitize_terminal_text, section_heading
 from hermesd.theme import Theme
@@ -39,7 +39,10 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append("  Creds: ", style=theme.ui_label)
     lines.append(f"{len(sm.credential_pools)} pools\n", style=theme.banner_text)
     lines.append("  Integrations: ", style=theme.ui_label)
-    lines.append(f"{len(sm.plugins)} plug  {len(sm.mcp_servers)} mcp\n", style=theme.banner_text)
+    # A trailing "+" marks a walk that hit its directory budget: the number is
+    # what hermesd retained, not what is on disk.
+    plugin_count = f"{len(sm.plugins)}+" if sm.plugin_scan_truncated else f"{len(sm.plugins)}"
+    lines.append(f"{plugin_count} plug  {len(sm.mcp_servers)} mcp\n", style=theme.banner_text)
     if state.mcp_cache.mcp_cached_server_count:
         lines.append("  Schema cache: ", style=theme.ui_label)
         lines.append(
@@ -79,6 +82,7 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
     if sm.plugins:
         sections.append(section_heading("Plugins", theme))
         sections.append(_plugins_table(sm, theme))
+        sections.append(_plugins_note(sm, theme))
 
     if sm.mcp_servers:
         sections.append(section_heading("MCP Servers", theme))
@@ -222,6 +226,8 @@ def _plugins_table(sm: SkillsMemory, theme: Theme) -> Table:
     plugins_table.add_column("Name", style=theme.ui_accent, min_width=16)
     plugins_table.add_column("Version", style=theme.banner_text, min_width=8)
     plugins_table.add_column("Activation", style=theme.banner_text, min_width=11)
+    plugins_table.add_column("Declares", style=theme.banner_text, min_width=8)
+    plugins_table.add_column("Provenance", style=theme.banner_text, min_width=18)
     plugins_table.add_column("Dashboard", style=theme.banner_text, min_width=9)
     plugins_table.add_column("Hooks", justify="right", min_width=5)
     plugins_table.add_column("Tools", justify="right", min_width=5)
@@ -231,6 +237,8 @@ def _plugins_table(sm: SkillsMemory, theme: Theme) -> Table:
             escape(plugin.name),
             escape(plugin.version),
             _activation_label(plugin.activation),
+            _declares_label(plugin),
+            _provenance_label(plugin),
             "Yes" if plugin.dashboard_enabled else "No",
             str(plugin.hook_count),
             str(plugin.tool_count),
@@ -253,6 +261,99 @@ _ACTIVATION_LABELS = {
 
 def _activation_label(activation: PluginActivation) -> str:
     return escape(_ACTIVATION_LABELS.get(activation, str(activation)))
+
+
+def _declares_label(plugin: PluginInfo) -> str:
+    """What the manifest *claims* — never what hermesd observed.
+
+    The capability count is the full declared one, not the length of the
+    display-bounded list, so capping that list can never change what the panel
+    reports. Upstream still gates every declared capability behind an explicit
+    grant, and evaluates ``requires_hermes`` against the running version at load
+    time; neither is something hermesd can see.
+    """
+    tokens: list[str] = []
+    if plugin.requires_hermes:
+        tokens.append(plugin.requires_hermes)
+    if plugin.declared_capability_count:
+        tokens.append(f"caps:{plugin.declared_capability_count}")
+    return escape(" ".join(tokens)) if tokens else "—"
+
+
+def _provenance_label(plugin: PluginInfo) -> str:
+    """Upstream's own annotation shapes, with a disagreement made visible.
+
+    ``catalog:<tier>@<sha8>`` is ``plugins_cmd_catalog.catalog_annotation``
+    (``:88-93``) and ``git pinned@<sha8>`` is ``plugins_cmd._pin_annotation``
+    (``:457-459``). They stay separate tokens because they are separate claims:
+    the catalog sha is the commit that was *reviewed*, the git sha the commit that
+    was *installed*, and ``install_catalog_entry`` writes the sidecar from the
+    catalog entry even when ``--ref`` installed something else (``:108-118``).
+
+    When the two agree the second token adds nothing and is dropped; when they
+    differ both are shown, because that difference is the only evidence available
+    that the code on disk is not the code that was reviewed. Picking one would
+    hide exactly the case worth seeing.
+    """
+    tokens: list[str] = []
+    if plugin.catalog_name or plugin.catalog_sha:
+        tier = plugin.catalog_tier or "community"
+        tokens.append(
+            f"catalog:{tier}@{plugin.catalog_sha[:8]}" if plugin.catalog_sha else f"catalog:{tier}"
+        )
+    if plugin.installed_revision and (plugin.provenance_drift or not tokens):
+        verb = "git pinned@" if plugin.pinned else "git@"
+        tokens.append(f"{verb}{plugin.installed_revision[:8]}")
+    if plugin.provenance_drift:
+        tokens.append("⚠ drift")
+    return escape(" ".join(tokens)) if tokens else "—"
+
+
+# Provenance and activation are both records read off disk, so this is rendered on
+# every pass rather than only when something looks wrong: the strongest claim
+# hermesd can make about a plugin is what its files say.
+_PROVENANCE_NOTE = (
+    "Activation, provenance and declarations are read from files — hermesd never "
+    "imports plugin code, so none of them proves a plugin loads."
+)
+# Bound on the conflicting-manifest list only. The plugins themselves are all in
+# the table above; this note names a few and states the true count.
+_CONFLICT_NOTE_LIMIT = 3
+
+
+def _plugins_note(sm: SkillsMemory, theme: Theme) -> Text:
+    """What the plugins table cannot fit in a cell."""
+    note = Text()
+    note.append(f"\n{_PROVENANCE_NOTE}\n", style=theme.banner_dim)
+    if sm.plugin_scan_truncated:
+        note.append(
+            "  ⚠ plugin list truncated: the directory scan hit its budget, so the"
+            " table above is bounded, not a complete inventory\n",
+            style=theme.banner_dim,
+        )
+    conflicts = [plugin for plugin in sm.plugins if plugin.manifest_shadowed]
+    if conflicts:
+        subject = (
+            "1 plugin carries a conflicting manifest"
+            if len(conflicts) == 1
+            else f"{len(conflicts)} plugins carry conflicting manifests"
+        )
+        note.append(
+            f"  ⚠ {subject} (plugin.yaml outranks plugin.yml outranks plugin.json):\n",
+            style=theme.banner_dim,
+        )
+        for plugin in conflicts[:_CONFLICT_NOTE_LIMIT]:
+            ignored = ", ".join(plugin.manifest_shadowed)
+            note.append(
+                f"    {escape(plugin.name)}: {escape(plugin.manifest_file)} used;"
+                f" {escape(ignored)} ignored\n",
+                style=theme.banner_dim,
+            )
+        if len(conflicts) > _CONFLICT_NOTE_LIMIT:
+            note.append(
+                f"    (+{len(conflicts) - _CONFLICT_NOTE_LIMIT} more)\n", style=theme.banner_dim
+            )
+    return note
 
 
 def _mcp_servers_table(sm: SkillsMemory, theme: Theme) -> Table:

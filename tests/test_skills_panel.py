@@ -233,7 +233,7 @@ def test_skills_detail_shows_integrations_sections():
         ),
     )
     panel = render_panel(7, state, Theme(), detail=True)
-    text = render_to_str(panel, width=100, no_color=True)
+    text = render_to_str(panel, width=200, no_color=True)
     assert "Hooks" in text
     assert "startup-check" in text
     assert "Plugins" in text
@@ -537,3 +537,257 @@ def test_skills_detail_escapes_markup_hostile_cached_names():
     assert "[bold]never-cached" in text
     assert "\x1b]0;pwn" not in text
     assert "\x1b[2J" not in text
+
+
+# --------------------------------------------------------------------------
+# plugin provenance and declarations
+# --------------------------------------------------------------------------
+
+CATALOG_SHA = "a" * 40
+INSTALLED_SHA = "b" * 40
+
+
+def _plugins_state(*plugins: PluginInfo, **skills_memory: object) -> DashboardState:
+    return DashboardState(skills_memory=SkillsMemory(plugins=list(plugins), **skills_memory))
+
+
+def _plugins_text(*plugins: PluginInfo, **skills_memory: object) -> str:
+    return render_to_str(
+        render_panel(7, _plugins_state(*plugins, **skills_memory), Theme(), detail=True),
+        width=200,
+        no_color=True,
+    )
+
+
+def _section(text: str) -> str:
+    """The Plugins table only, so an assertion cannot be satisfied by another section."""
+    return text.split("Plugins", 1)[1].split("MCP Servers", 1)[0]
+
+
+def test_skills_detail_has_a_provenance_column():
+    text = _plugins_text(PluginInfo(name="weather", catalog_sha=CATALOG_SHA))
+
+    assert "Provenance" in text
+
+
+def test_a_catalog_install_renders_upstreams_own_annotation():
+    text = _section(
+        _plugins_text(PluginInfo(name="weather", catalog_sha=CATALOG_SHA, catalog_tier="official"))
+    )
+
+    assert f"catalog:official@{CATALOG_SHA[:8]}" in text
+
+
+def test_a_catalog_tier_is_defaulted_at_render_time_not_in_the_data():
+    """catalog_annotation falls back to 'community'; the model keeps what was written."""
+    text = _section(_plugins_text(PluginInfo(name="weather", catalog_sha=CATALOG_SHA)))
+
+    assert f"catalog:community@{CATALOG_SHA[:8]}" in text
+
+
+def test_a_catalog_sidecar_with_no_usable_sha_still_names_the_install():
+    text = _section(
+        _plugins_text(PluginInfo(name="weather", catalog_name="weather", catalog_tier="official"))
+    )
+
+    assert "catalog:official" in text
+    assert "catalog:official@" not in text
+
+
+def test_an_unpinned_git_install_renders_its_installed_head():
+    text = _section(_plugins_text(PluginInfo(name="weather", installed_revision=INSTALLED_SHA)))
+
+    assert f"git@{INSTALLED_SHA[:8]}" in text
+    assert "pinned" not in text
+
+
+def test_a_ref_install_renders_as_pinned():
+    text = _section(
+        _plugins_text(
+            PluginInfo(
+                name="weather",
+                installed_revision=INSTALLED_SHA,
+                pinned_revision=INSTALLED_SHA,
+            )
+        )
+    )
+
+    assert f"git pinned@{INSTALLED_SHA[:8]}" in text
+
+
+def test_agreeing_catalog_and_installed_revisions_are_not_rendered_twice():
+    text = _section(
+        _plugins_text(
+            PluginInfo(
+                name="weather",
+                catalog_sha=CATALOG_SHA,
+                catalog_tier="official",
+                installed_revision=CATALOG_SHA,
+            )
+        )
+    )
+
+    assert f"catalog:official@{CATALOG_SHA[:8]}" in text
+    assert text.count(CATALOG_SHA[:8]) == 1
+    assert "drift" not in text
+
+
+def test_a_ref_install_off_the_catalog_pin_shows_both_shas_and_a_drift_marker():
+    """The disagreement is the signal: neither SHA may be dropped to tidy the cell."""
+    text = _section(
+        _plugins_text(
+            PluginInfo(
+                name="weather",
+                catalog_sha=CATALOG_SHA,
+                catalog_tier="official",
+                installed_revision=INSTALLED_SHA,
+                pinned_revision=INSTALLED_SHA,
+            )
+        )
+    )
+
+    assert f"catalog:official@{CATALOG_SHA[:8]}" in text
+    assert f"git pinned@{INSTALLED_SHA[:8]}" in text
+    assert "⚠" in text
+    assert "drift" in text
+
+
+def test_a_plugin_with_no_provenance_at_all_renders_a_dash():
+    text = _section(_plugins_text(PluginInfo(name="weather")))
+
+    assert "—" in text
+
+
+def test_declared_version_gates_and_capabilities_are_labelled_as_declarations():
+    text = _plugins_text(
+        PluginInfo(
+            name="weather",
+            requires_hermes=">=0.19",
+            declared_capabilities=["tools.override", "llm.model_override"],
+            declared_capability_count=2,
+        )
+    )
+
+    assert "Declares" in text
+    assert ">=0.19" in text
+    assert "caps:2" in text
+
+
+def test_the_declared_capability_count_survives_a_truncated_list():
+    """The cell reports what was declared, not what the display kept."""
+    text = _section(
+        _plugins_text(
+            PluginInfo(
+                name="weather",
+                declared_capabilities=[f"cap-{i}" for i in range(8)],
+                declared_capability_count=40,
+            )
+        )
+    )
+
+    assert "caps:40" in text
+
+
+def test_a_plugin_declaring_nothing_renders_no_declaration_tokens():
+    row = next(
+        line
+        for line in _section(_plugins_text(PluginInfo(name="weather"))).splitlines()
+        if "weather" in line
+    )
+
+    assert "caps:" not in row
+    assert ">=" not in row
+    # Both the Declares and the Provenance cell fall back to a dash.
+    assert row.count("—") == 2
+
+
+def test_the_panel_says_provenance_is_not_proof_a_plugin_loads():
+    text = _plugins_text(PluginInfo(name="weather", catalog_sha=CATALOG_SHA))
+
+    assert "never imports plugin code" in text
+    assert "declares" in text.lower() or "declaration" in text.lower()
+
+
+def test_a_conflicting_manifest_pair_is_reported_not_silently_resolved():
+    text = _plugins_text(
+        PluginInfo(
+            name="weather",
+            manifest_file="plugin.yaml",
+            manifest_shadowed=["plugin.yml", "plugin.json"],
+        )
+    )
+
+    assert "weather" in text
+    assert "plugin.yaml" in text
+    assert "plugin.yml" in text
+    assert "plugin.json" in text
+    assert "1 plugin carries" in text
+
+
+def test_conflicting_manifests_are_listed_with_their_true_count_past_the_cap():
+    plugins = [
+        PluginInfo(
+            name=f"plug-{i}",
+            manifest_file="plugin.yaml",
+            manifest_shadowed=["plugin.json"],
+        )
+        for i in range(6)
+    ]
+
+    text = _plugins_text(*plugins)
+    note = text.split("conflicting manifests", 1)[1]
+
+    assert "6 plugins" in text
+    assert "plug-0" in note
+    assert "(+3 more)" in note
+    # The omitted names must not appear in the note, which would read as complete.
+    assert "plug-5" not in note
+
+
+def test_a_truncated_plugin_scan_is_reported():
+    text = _plugins_text(PluginInfo(name="weather"), plugin_scan_truncated=True)
+
+    assert "truncated" in text
+
+
+def test_an_untruncated_scan_says_nothing_about_truncation():
+    text = _plugins_text(PluginInfo(name="weather"))
+
+    assert "truncated" not in text
+
+
+def test_skills_compact_marks_a_truncated_plugin_count():
+    """The compact count is a retained count, so the cap has to be visible there too."""
+    state = _plugins_state(PluginInfo(name="weather"), plugin_scan_truncated=True)
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=False), width=200, no_color=True)
+
+    assert "1+ plug" in text
+
+
+def test_skills_compact_leaves_an_untruncated_plugin_count_bare():
+    state = _plugins_state(PluginInfo(name="weather"))
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=False), width=200, no_color=True)
+
+    assert "1 plug" in text
+
+
+def test_provenance_cells_are_markup_escaped():
+    """The tier and the shadowed-manifest names come from files, so both are escaped."""
+    text = _plugins_text(
+        PluginInfo(
+            name="weather",
+            catalog_sha=CATALOG_SHA,
+            catalog_tier="[red]y\x1b]0;pwn\x07",
+            manifest_file="plugin.yaml",
+            manifest_shadowed=["[bold]plugin.json\x1b[2J"],
+            requires_hermes="[blink]>=0.19",
+        )
+    )
+
+    assert "[red]y" in text
+    assert "[bold]plugin.json" in text
+    assert "[blink]>=0.19" in text
+    assert "\x1b[2J" not in text
+    assert "\x1b]0;pwn" not in text
