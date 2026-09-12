@@ -125,6 +125,7 @@ def insert_model_usage(
     reasoning_tokens: int | None = 0,
     estimated_cost_usd: float | None = 0.0,
     actual_cost_usd: float | None = 0.0,
+    cost_status: str | None = None,
     last_seen: float | None = None,
 ) -> None:
     """Insert one session_model_usage row (test helper)."""
@@ -151,7 +152,7 @@ def insert_model_usage(
             reasoning_tokens,
             estimated_cost_usd,
             actual_cost_usd,
-            "exact" if actual_cost_usd else "estimated",
+            cost_status or ("exact" if actual_cost_usd else "estimated"),
             "provider" if actual_cost_usd else "pricing",
             seen,
             seen,

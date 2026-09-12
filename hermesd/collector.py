@@ -322,6 +322,10 @@ def _model_usage_from_rows(rows: list[dict[str, Any]]) -> tuple[ModelUsage, ...]
             estimated_cost_usd=_coerce_float(row.get("estimated_cost_usd")),
             actual_cost_usd=_coerce_float(row.get("actual_cost_usd")),
             has_actual_cost=_coerce_float(row.get("actual_cost_usd")) > 0,
+            reported_cost_usd=_coerce_float(row.get("reported_cost_usd")),
+            estimated_only_cost_usd=_coerce_float(row.get("estimated_only_cost_usd")),
+            reported_row_count=row.get("reported_row_count") or 0,
+            row_count=row.get("row_count") or 0,
             last_seen=row.get("last_seen") or 0.0,
         )
         for row in rows

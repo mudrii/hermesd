@@ -176,6 +176,15 @@ class ModelUsage(BaseModel):
     estimated_cost_usd: float = 0.0
     actual_cost_usd: float = 0.0
     has_actual_cost: bool = False
+    # Per-row split of the group's cost: rows with a provider-reported (or
+    # otherwise authoritative) cost contribute to reported_cost_usd, rows
+    # without one to estimated_only_cost_usd. A billed row's own estimate
+    # column is never double-counted. row_count/reported_row_count tell the
+    # all-reported / all-estimated / mixed cases apart.
+    reported_cost_usd: float = 0.0
+    estimated_only_cost_usd: float = 0.0
+    reported_row_count: int = 0
+    row_count: int = 0
     last_seen: float = 0.0
 
 

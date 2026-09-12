@@ -1655,3 +1655,78 @@ def test_read_model_usage_error_serves_last_good(hermes_home, monkeypatch):
         assert db.last_read_model_usage_stale is True
     finally:
         db.close()
+
+
+def test_read_model_usage_reports_mixed_actual_estimated_groups(hermes_home):
+    """Per-group completeness: billed vs estimate-only rows are counted apart."""
+    now = 1_800_000_000.0
+    _model_usage_db(
+        hermes_home,
+        [
+            # Same group: one billed row (also carrying an estimate) and one
+            # estimate-only row.
+            {
+                "session_id": "s1",
+                "model": "gpt-5.4",
+                "provider": "openai",
+                "input_tokens": 100,
+                "estimated_cost_usd": 0.9,
+                "actual_cost_usd": 0.55,
+                "last_seen": now - 10,
+            },
+            {
+                "session_id": "s2",
+                "model": "gpt-5.4",
+                "provider": "openai",
+                "input_tokens": 50,
+                "estimated_cost_usd": 0.30,
+                "actual_cost_usd": None,
+                "last_seen": now - 5,
+            },
+            # Estimate-only group.
+            {
+                "session_id": "s3",
+                "model": "claude-opus",
+                "provider": "anthropic",
+                "input_tokens": 40,
+                "estimated_cost_usd": 0.40,
+                "actual_cost_usd": None,
+                "last_seen": now - 5,
+            },
+            # Subscription-included row: authoritatively $0.00, not an estimate.
+            {
+                "session_id": "s4",
+                "model": "gpt-5.4-mini",
+                "provider": "openai",
+                "input_tokens": 10,
+                "estimated_cost_usd": 0.01,
+                "actual_cost_usd": 0.0,
+                "cost_status": "included",
+                "last_seen": now - 5,
+            },
+        ],
+    )
+    db = HermesDB(hermes_home / "state.db")
+    try:
+        rows = {row["model"]: row for row in db.read_model_usage(now)["all"]}
+
+        mixed = rows["gpt-5.4"]
+        assert mixed["row_count"] == 2
+        assert mixed["reported_row_count"] == 1
+        assert mixed["reported_cost_usd"] == pytest.approx(0.55)
+        # The billed row's own estimate column is not double-counted.
+        assert mixed["estimated_only_cost_usd"] == pytest.approx(0.30)
+
+        estimated = rows["claude-opus"]
+        assert estimated["row_count"] == 1
+        assert estimated["reported_row_count"] == 0
+        assert estimated["reported_cost_usd"] == 0
+        assert estimated["estimated_only_cost_usd"] == pytest.approx(0.40)
+
+        included = rows["gpt-5.4-mini"]
+        assert included["row_count"] == 1
+        assert included["reported_row_count"] == 1
+        assert included["reported_cost_usd"] == pytest.approx(0.01)
+        assert included["estimated_only_cost_usd"] == 0
+    finally:
+        db.close()

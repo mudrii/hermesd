@@ -130,11 +130,29 @@ def _usage_rows_available(state: DashboardState) -> bool:
     return analytics.usage_source == "session_model_usage" and bool(analytics.model_usage_all)
 
 
+def _split_cost_cell(reported: float, estimated_only: float, reported_rows: int, rows: int) -> str:
+    """Cost cell for an aggregate with a known reported/estimated row split."""
+    if reported_rows == 0:
+        return f"{fmt_usd(estimated_only)} est."
+    if reported_rows < rows:
+        return f"{fmt_usd(reported)} + {fmt_usd(estimated_only)} est."
+    return fmt_usd(reported)
+
+
 def _usage_cost_cell(usage: ModelUsage) -> str:
-    """Provider-billed cost when known, otherwise the estimate with an `est.` marker."""
-    if usage.has_actual_cost:
-        return fmt_usd(usage.actual_cost_usd)
-    return f"{fmt_usd(usage.estimated_cost_usd)} est."
+    """Provider-billed cost, the estimate with an `est.` marker, or both when mixed."""
+    if usage.row_count == 0:
+        # Rows built without aggregate counts keep the legacy winner-take-all
+        # display.
+        if usage.has_actual_cost:
+            return fmt_usd(usage.actual_cost_usd)
+        return f"{fmt_usd(usage.estimated_cost_usd)} est."
+    return _split_cost_cell(
+        usage.reported_cost_usd,
+        usage.estimated_only_cost_usd,
+        usage.reported_row_count,
+        usage.row_count,
+    )
 
 
 def _append_top_models(lines: Text, state: DashboardState, theme: Theme) -> None:
@@ -183,8 +201,19 @@ def _model_usage_section(analytics: TokenAnalytics, theme: Theme) -> list[Render
 
 def _aux_subtotal_row(aux: list[ModelUsage]) -> tuple[str, ...]:
     """One `aux` row summing the task-tagged (auxiliary) model usage."""
-    actual = sum(usage.actual_cost_usd for usage in aux)
-    estimated = sum(usage.estimated_cost_usd for usage in aux)
+    rows = sum(usage.row_count for usage in aux)
+    if rows:
+        cost = _split_cost_cell(
+            sum(usage.reported_cost_usd for usage in aux),
+            sum(usage.estimated_only_cost_usd for usage in aux),
+            sum(usage.reported_row_count for usage in aux),
+            rows,
+        )
+    else:
+        # Hand-built rows without aggregate counts: legacy winner-take-all.
+        actual = sum(usage.actual_cost_usd for usage in aux)
+        estimated = sum(usage.estimated_cost_usd for usage in aux)
+        cost = fmt_usd(actual) if actual > 0 else f"{fmt_usd(estimated)} est."
     return (
         f"aux ({len(aux)})",
         "—",
@@ -192,7 +221,7 @@ def _aux_subtotal_row(aux: list[ModelUsage]) -> tuple[str, ...]:
         fmt_tokens(sum(usage.input_tokens for usage in aux)),
         fmt_tokens(sum(usage.output_tokens for usage in aux)),
         fmt_tokens(sum(usage.cache_read_tokens for usage in aux)),
-        fmt_usd(actual) if actual > 0 else f"{fmt_usd(estimated)} est.",
+        cost,
     )
 
 

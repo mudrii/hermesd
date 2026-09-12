@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from hermesd.collect.common import _db_source_mtime_ns, _exists_strict, _safe_child_path
+from hermesd.models import AUTHORITATIVE_COST_STATUSES
 
 T = TypeVar("T")
 _RECONNECT_ERROR_THRESHOLD = 3
@@ -29,6 +30,11 @@ _SQLITE_TIMEOUT_SECONDS = 2
 _READONLY_SHM_MIN_SQLITE_VERSION = (3, 50, 0)
 _READONLY_SHM_SUPPORTED = sqlite3.sqlite_version_info >= _READONLY_SHM_MIN_SQLITE_VERSION
 _MODEL_USAGE_ROW_LIMIT = 50
+# SQL literal for the authoritative-cost classification, kept in sync with
+# AUTHORITATIVE_COST_STATUSES (single source of truth in models.py).
+_AUTHORITATIVE_COST_STATUS_SQL = ", ".join(
+    f"'{status}'" for status in sorted(AUTHORITATIVE_COST_STATUSES)
+)
 # Window cutoffs are rounded down to this bucket so repeated reads inside the
 # same bucket hit the cache instead of re-querying on every collector pass.
 _MODEL_USAGE_CUTOFF_BUCKET_SECONDS = 60
@@ -439,6 +445,22 @@ class HermesDB:
             "SUM(reasoning_tokens) AS reasoning_tokens, "
             "SUM(estimated_cost_usd) AS estimated_cost_usd, "
             "SUM(actual_cost_usd) AS actual_cost_usd, "
+            # Per-row cost split: a row with a provider-billed cost, or an
+            # authoritative zero/known one (reported/exact/included), counts
+            # toward the reported side; every other row toward the estimated
+            # side. A billed row's own estimate is never double-counted.
+            # NULL comparisons evaluate falsy, so NULL actual/cost_status rows
+            # land on the estimated side.
+            f"SUM(CASE WHEN actual_cost_usd > 0 THEN actual_cost_usd "
+            f"WHEN cost_status IN ({_AUTHORITATIVE_COST_STATUS_SQL}) "
+            f"THEN COALESCE(estimated_cost_usd, 0) ELSE 0 END) AS reported_cost_usd, "
+            f"SUM(CASE WHEN actual_cost_usd > 0 "
+            f"OR cost_status IN ({_AUTHORITATIVE_COST_STATUS_SQL}) "
+            f"THEN 0 ELSE COALESCE(estimated_cost_usd, 0) END) AS estimated_only_cost_usd, "
+            f"SUM(CASE WHEN actual_cost_usd > 0 "
+            f"OR cost_status IN ({_AUTHORITATIVE_COST_STATUS_SQL}) "
+            f"THEN 1 ELSE 0 END) AS reported_row_count, "
+            "COUNT(*) AS row_count, "
             "MAX(last_seen) AS last_seen "
             f"FROM session_model_usage {where_clause}"
             "GROUP BY model, billing_provider, task "

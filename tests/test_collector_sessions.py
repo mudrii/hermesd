@@ -1652,3 +1652,47 @@ def test_frozen_clock_collects_are_deterministic(hermes_home: Path):
         assert first.sessions == second.sessions
     finally:
         c.close()
+
+
+def test_collect_model_usage_populates_cost_split_fields(hermes_home: Path):
+    """The collector threads the per-group actual/estimated split into ModelUsage."""
+    now = time.time()
+    conn = sqlite3.connect(str(hermes_home / "state.db"))
+    create_state_db_tables(conn, include_schema_version=False, include_v021_columns=True)
+    insert_model_usage(
+        conn,
+        "s1",
+        "gpt-5.4",
+        provider="openai",
+        input_tokens=100,
+        estimated_cost_usd=1.5,
+        actual_cost_usd=1.0,
+        last_seen=now,
+    )
+    insert_model_usage(
+        conn,
+        "s2",
+        "gpt-5.4",
+        provider="openai",
+        input_tokens=50,
+        estimated_cost_usd=2.0,
+        actual_cost_usd=None,
+        last_seen=now,
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+        assert state.token_analytics.usage_source == "session_model_usage"
+        usage = next(
+            entry for entry in state.token_analytics.model_usage_all if entry.model == "gpt-5.4"
+        )
+        assert usage.row_count == 2
+        assert usage.reported_row_count == 1
+        assert usage.reported_cost_usd == pytest.approx(1.0)
+        assert usage.estimated_only_cost_usd == pytest.approx(2.0)
+        assert usage.has_actual_cost is True
+    finally:
+        c.close()
