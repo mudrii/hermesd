@@ -1049,6 +1049,36 @@ def test_redact_command_string_redacts_url_credentials_in_key_value_form():
     assert "url=https://[REDACTED]@host/x?token=[REDACTED]" in redacted
 
 
+def test_redact_secret_text_redacts_multi_word_bare_value_to_end_of_line():
+    # Bare values followed by space-separated prose with no top-level delimiter
+    # fail closed: everything to end-of-line is treated as the secret value.
+    assert _redact_secret_text("password=my secret pass") == "password=[REDACTED]"
+
+
+def test_redact_secret_text_redacts_multi_word_bare_value_up_to_next_field():
+    redacted = _redact_secret_text("password=my secret pass, next_key=foo")
+
+    assert redacted == "password=[REDACTED], next_key=[REDACTED]"
+
+
+def test_redact_secret_text_multi_word_bare_value_preserves_following_redacted_url():
+    redacted = _redact_secret_text("token=abc123 https://user:pass@example.com/mcp done")
+
+    assert "abc123" not in redacted
+    assert "user:pass" not in redacted
+    assert "https://[REDACTED]@example.com/mcp" in redacted
+
+
+def test_redact_secret_text_bare_single_token_and_quoted_values_unchanged():
+    assert _redact_secret_text("api_key=sk-secret-123") == "api_key=[REDACTED]"
+    assert _redact_secret_text("token: abc123") == "token: [REDACTED]"
+    assert _redact_secret_text('password="my secret pass"') == 'password="[REDACTED]"'
+
+
+def test_redact_secret_text_leaves_non_secret_key_with_spaces_visible():
+    assert _redact_secret_text("note=my secret pass") == "note=my secret pass"
+
+
 def test_redact_secret_args_non_list_returns_empty():
     assert _redact_secret_args("--token secret") == []
     assert _redact_secret_args(None) == []

@@ -245,7 +245,13 @@ _SECRET_TEXT_FIELD_RE = re.compile(
     r"(?P<sep>\s*[=:]\s*)",
     re.IGNORECASE,
 )
-_SECRET_TEXT_VALUE_RE = re.compile(r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,}]+""")
+# Bare (unquoted) values consume to a top-level `,`, `}`, `]`, or end-of-line
+# so multi-word secrets cannot leak their tail. A redacted URL that follows the
+# value stays visible: URLs are sanitized by the pre-pass in _redact_secret_text
+# before field redaction runs.
+_SECRET_TEXT_VALUE_RE = re.compile(
+    r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:(?!\s+https?://)[^,}\]\r\n])+"""
+)
 
 
 def _redact_text_fields(text: str) -> str:
