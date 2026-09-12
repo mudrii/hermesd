@@ -613,6 +613,28 @@ class CronState(BaseModel):
     ticker_heartbeat_age_seconds: float | None = None
     ticker_last_success_age_seconds: float | None = None
     ticker_health: CronTickerHealth = CronTickerHealth.UNKNOWN
+    # ``cron/ticker_last_error`` is ``"<epoch>\n<message>"`` and is *unlinked* on
+    # the next clean tick (``cron/jobs.py:1200-1220``), so an empty string means
+    # "no failure recorded right now" and never "scheduling has not failed". The
+    # message is an arbitrary exception string, so it is redacted and capped in
+    # the collector. ``ticker_last_error_age_seconds`` is None when the stamp on
+    # line 1 did not parse, which does not make the message any less recorded.
+    ticker_last_error: str = ""
+    ticker_last_error_age_seconds: float | None = None
+    # ``cron/catch_up_occurrences`` is a monotonic lifetime counter with no
+    # timestamp, never reset. Upstream's own reader returns 0 for a missing file
+    # and for a genuine zero alike (``cron/jobs.py:1186-1193``), which loses the
+    # only distinction that matters here, so presence is carried beside the
+    # value. The counter is written best effort and is not written at all while
+    # catch-up is disabled, so a flat or absent counter proves nothing.
+    catch_up_occurrences: int = 0
+    catch_up_occurrences_recorded: bool = False
+    # ``cron.catch_up_missed`` from config.yaml, read with upstream's own cast
+    # ``lambda value: value is not False`` (``cron/jobs.py:2908`` + ``:2615-2624``):
+    # only a literal YAML ``false`` disables catch-up, and ``None``/``0``/``"no"``
+    # all leave it on. ``_set`` keeps the upstream default apart from a choice.
+    catch_up_missed: bool = True
+    catch_up_missed_set: bool = False
     job_count: int = 0
     error_count: int = 0
     max_parallel_jobs: int = 0
@@ -625,6 +647,31 @@ class CronState(BaseModel):
     chronos_jwks_configured: bool = False
     suggestion_count: int = 0
     jobs: list[CronJob] = Field(default_factory=list)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ticker_error_recorded(self) -> bool:
+        """Derived: a tick failure is recorded *right now*.
+
+        Recovery deletes the marker, so this is a live signal and not a history.
+        """
+        return bool(self.ticker_last_error)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def catch_up_missed_disabled(self) -> bool:
+        """Derived: catch-up was explicitly switched off in config.yaml.
+
+        This is the "missed runs are being silently skipped" signal — upstream
+        re-anchors the schedule without recording anything when it is off.
+        """
+        return self.catch_up_missed_set and not self.catch_up_missed
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def has_catch_up_occurrences(self) -> bool:
+        """Derived: the marker was observed and at least one catch-up happened."""
+        return self.catch_up_occurrences_recorded and self.catch_up_occurrences > 0
 
 
 class ToolGatewayRoute(BaseModel):

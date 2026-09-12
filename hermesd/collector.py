@@ -63,12 +63,15 @@ from hermesd.collect.config import (
 )
 from hermesd.collect.cron import (
     _chronos_configured,
+    _cron_catch_up_occurrences,
+    _cron_catch_up_policy,
     _cron_job_dispatch,
     _cron_job_paused,
     _cron_job_repeat,
     _cron_suggestion_count,
     _cron_ticker_ages,
     _cron_ticker_health,
+    _cron_ticker_last_error,
     _delivery_target_label,
     _latest_cron_output_excerpt,
     _latest_cron_output_file,
@@ -1768,14 +1771,28 @@ class Collector:
                     )
                 )
 
-        heartbeat_age, last_success_age = _cron_ticker_ages(
-            self._paths.shared_path("cron"), now=self._clock(), root=self._paths.root_home
-        )
+        cron_dir = self._paths.shared_path("cron")
+        root = self._paths.root_home
+        now = self._clock()
+        heartbeat_age, last_success_age = _cron_ticker_ages(cron_dir, now=now, root=root)
+        ticker_error, ticker_error_age = _cron_ticker_last_error(cron_dir, now=now, root=root)
+        catch_up_count, catch_up_recorded = _cron_catch_up_occurrences(cron_dir, root)
+        catch_up_missed, catch_up_missed_set = _cron_catch_up_policy(cron_cfg)
         return CronState(
             last_tick_ago_seconds=last_tick,
             ticker_heartbeat_age_seconds=heartbeat_age,
             ticker_last_success_age_seconds=last_success_age,
-            ticker_health=_cron_ticker_health(heartbeat_age, last_success_age),
+            ticker_health=_cron_ticker_health(
+                heartbeat_age,
+                last_success_age,
+                ticker_error_recorded=bool(ticker_error),
+            ),
+            ticker_last_error=ticker_error,
+            ticker_last_error_age_seconds=ticker_error_age,
+            catch_up_occurrences=catch_up_count,
+            catch_up_occurrences_recorded=catch_up_recorded,
+            catch_up_missed=catch_up_missed,
+            catch_up_missed_set=catch_up_missed_set,
             job_count=len(jobs),
             error_count=error_count,
             max_parallel_jobs=_coerce_int(cron_cfg.get("max_parallel_jobs")),
@@ -1788,7 +1805,7 @@ class Collector:
                 _as_dict(cron_cfg.get("chronos")).get("expected_audience")
             ),
             chronos_jwks_configured=bool(_as_dict(cron_cfg.get("chronos")).get("nas_jwks_url")),
-            suggestion_count=_cron_suggestion_count(self._paths.shared_path("cron")),
+            suggestion_count=_cron_suggestion_count(cron_dir),
             jobs=jobs,
         )
 

@@ -15,6 +15,7 @@ import pytest
 import yaml
 
 import hermesd.collect.cron as cron_module
+from hermesd.collect.common import _EXCERPT_MAX_CHARS
 from hermesd.collect.cron import (
     _EXECUTIONS_RECENT_LIMIT,
     _INCIDENTS_LIMIT,
@@ -25,7 +26,7 @@ from hermesd.collector import (
     _delivery_target_label,
     _latest_cron_output_excerpt,
 )
-from hermesd.models import CronTickerHealth
+from hermesd.models import CronState, CronTickerHealth
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
 from tests.conftest import (
@@ -2204,3 +2205,410 @@ def test_cron_ticker_stamps_ignore_symlinks_outside_home(hermes_home: Path, tmp_
 
     assert state.cron.ticker_heartbeat_age_seconds is None
     assert state.cron.ticker_health is CronTickerHealth.UNKNOWN
+
+
+# --- cron/catch_up_occurrences and cron/ticker_last_error ---------------------
+#
+# Both markers are written by upstream's best-effort ``_write_marker``
+# (cron/jobs.py:1129-1136, every exception swallowed) and both live in the
+# profile-local cron store (``_current_cron_store()``, cron/jobs.py:119-133).
+# Absence therefore proves nothing, and these tests pin that hermesd reports it
+# as absence rather than as a zero or as a clean bill of health.
+
+_FIXED_NOW = 1_788_792_000.0
+
+
+def _collect_cron_at(home: Path, now: float = _FIXED_NOW) -> CronState:
+    c = Collector(home, clock=lambda: now)
+    try:
+        return c.collect().cron
+    finally:
+        c.close()
+
+
+def test_collect_cron_reports_an_absent_catch_up_counter_as_unobserved(hermes_home: Path):
+    """No marker is not a zero: upstream's reader collapses the two.
+
+    ``get_catch_up_occurrence_count`` returns 0 for a missing file and for a real
+    zero alike (cron/jobs.py:1186-1193), and ``record_catch_up_occurrence`` is
+    never called at all when catch-up is disabled (cron/jobs.py:2909-2918).
+    """
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.catch_up_occurrences == 0
+    assert cron.catch_up_occurrences_recorded is False
+    assert cron.has_catch_up_occurrences is False
+
+
+def test_collect_cron_distinguishes_a_recorded_zero_catch_up_count(hermes_home: Path):
+    (hermes_home / "cron" / "catch_up_occurrences").write_text("0\n")
+
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.catch_up_occurrences == 0
+    assert cron.catch_up_occurrences_recorded is True
+    assert cron.has_catch_up_occurrences is False
+
+
+def test_collect_cron_reads_a_nonzero_catch_up_counter(hermes_home: Path):
+    (hermes_home / "cron" / "catch_up_occurrences").write_text("  17 \n")
+
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.catch_up_occurrences == 17
+    assert cron.catch_up_occurrences_recorded is True
+    assert cron.has_catch_up_occurrences is True
+
+
+def test_collect_cron_catch_up_counter_clamps_a_negative_value(hermes_home: Path):
+    """Upstream clamps with ``max(0, ...)``; a negative marker still counts as observed."""
+    (hermes_home / "cron" / "catch_up_occurrences").write_text("-4")
+
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.catch_up_occurrences == 0
+    assert cron.catch_up_occurrences_recorded is True
+
+
+@pytest.mark.parametrize("payload", ["", "   \n", "not-a-number", "12.5", "{}"])
+def test_collect_cron_unreadable_catch_up_counter_is_not_a_recorded_zero(
+    hermes_home: Path, payload: str
+):
+    """A marker that yields no count reads as unobserved, never as `0 recorded`."""
+    (hermes_home / "cron" / "catch_up_occurrences").write_text(payload)
+
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.catch_up_occurrences == 0
+    assert cron.catch_up_occurrences_recorded is False
+
+
+def test_collect_cron_catch_up_marker_ignores_symlinks_outside_home(
+    hermes_home: Path, tmp_path: Path
+):
+    outside = tmp_path / "catch_up_occurrences"
+    outside.write_text("99")
+    (hermes_home / "cron" / "catch_up_occurrences").symlink_to(outside)
+
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.catch_up_occurrences == 0
+    assert cron.catch_up_occurrences_recorded is False
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected_enabled", "expected_set"),
+    [
+        pytest.param(True, True, True, id="explicit-true"),
+        pytest.param(False, False, True, id="explicit-false"),
+        # Upstream's cast is an identity check — ``lambda value: value is not
+        # False`` (cron/jobs.py:2908 + :2615-2624) — so every falsy value that is
+        # not the literal False leaves catch-up ENABLED. A naive ``bool(value)``
+        # reports each of these as disabled, which is the opposite of what
+        # hermes-agent does.
+        pytest.param(None, True, True, id="yaml-null"),
+        pytest.param(0, True, True, id="zero"),
+        pytest.param("no", True, True, id="quoted-string-no"),
+        pytest.param("", True, True, id="empty-string"),
+        pytest.param([], True, True, id="empty-list"),
+    ],
+)
+def test_collect_cron_catch_up_policy_mirrors_upstream_identity_cast(
+    hermes_home: Path,
+    configured: object,
+    expected_enabled: bool,
+    expected_set: bool,
+):
+    (hermes_home / "config.yaml").write_text(yaml.dump({"cron": {"catch_up_missed": configured}}))
+
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.catch_up_missed is expected_enabled
+    assert cron.catch_up_missed_set is expected_set
+    assert cron.catch_up_missed_disabled is (not expected_enabled)
+
+
+def test_collect_cron_catch_up_policy_defaults_to_enabled_when_the_key_is_absent(
+    hermes_home: Path,
+):
+    """A config.yaml with a cron block but no catch_up_missed key: default True."""
+    (hermes_home / "config.yaml").write_text(yaml.dump({"cron": {"max_parallel_jobs": 5}}))
+
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.catch_up_missed is True
+    assert cron.catch_up_missed_set is False
+    assert cron.catch_up_missed_disabled is False
+
+
+def test_collect_cron_catch_up_policy_defaults_to_enabled_without_any_config(
+    hermes_home: Path,
+):
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.catch_up_missed is True
+    assert cron.catch_up_missed_set is False
+
+
+def test_collect_cron_unquoted_yaml_no_disables_catch_up(hermes_home: Path):
+    """An *unquoted* `no` is a literal False after PyYAML's YAML 1.1 resolution.
+
+    What disables catch-up is the parsed Python value, not the spelling: upstream
+    reads the same file through ``load_config``, so ``catch_up_missed: no`` and
+    ``catch_up_missed: false`` are the same setting while ``catch_up_missed: 'no'``
+    is not.
+    """
+    (hermes_home / "config.yaml").write_text("cron:\n  catch_up_missed: no\n")
+
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.catch_up_missed is False
+    assert cron.catch_up_missed_set is True
+    assert cron.catch_up_missed_disabled is True
+
+
+def test_collect_cron_reads_ticker_last_error_message_and_age(hermes_home: Path):
+    (hermes_home / "cron" / "ticker_last_error").write_text(
+        f"{_FIXED_NOW - 45.5}\nRuntimeError: dispatch blew up\n"
+    )
+
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.ticker_last_error == "RuntimeError: dispatch blew up"
+    assert cron.ticker_last_error_age_seconds == pytest.approx(45.5)
+    assert cron.ticker_error_recorded is True
+
+
+def test_collect_cron_ticker_error_absent_by_default(hermes_home: Path):
+    """``clear_ticker_error`` unlinks the marker on the next clean tick."""
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.ticker_last_error == ""
+    assert cron.ticker_last_error_age_seconds is None
+    assert cron.ticker_error_recorded is False
+
+
+def test_collect_cron_ticker_error_ignores_a_torn_single_line_marker(hermes_home: Path):
+    """Upstream refuses fewer than two lines (cron/jobs.py:1218-1219); mirror it."""
+    (hermes_home / "cron" / "ticker_last_error").write_text(f"{_FIXED_NOW}\n")
+
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.ticker_last_error == ""
+    assert cron.ticker_last_error_age_seconds is None
+    assert cron.ticker_error_recorded is False
+
+
+def test_collect_cron_ticker_error_with_a_blank_message_reads_as_absent(hermes_home: Path):
+    """``record_ticker_error("")`` writes a stamp and nothing else; upstream -> None."""
+    (hermes_home / "cron" / "ticker_last_error").write_text(f"{_FIXED_NOW}\n\n")
+
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.ticker_last_error == ""
+    assert cron.ticker_error_recorded is False
+
+
+def test_collect_cron_ticker_error_without_a_parseable_stamp_keeps_the_message(
+    hermes_home: Path,
+):
+    (hermes_home / "cron" / "ticker_last_error").write_text("not-an-epoch\nValueError: bad\n")
+
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.ticker_last_error == "ValueError: bad"
+    assert cron.ticker_last_error_age_seconds is None
+    assert cron.ticker_error_recorded is True
+
+
+def test_collect_cron_ticker_error_clamps_a_future_stamp_to_zero(hermes_home: Path):
+    (hermes_home / "cron" / "ticker_last_error").write_text(
+        f"{_FIXED_NOW + 30.0}\nRuntimeError: clock skew\n"
+    )
+
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.ticker_last_error_age_seconds == 0.0
+
+
+def test_collect_cron_ticker_error_is_redacted_and_bounded(hermes_home: Path):
+    """The message is an arbitrary exception string that can carry credentials."""
+    secret = "https://user:super-secret-token@hooks.test/notify?key=abc123"
+    (hermes_home / "cron" / "ticker_last_error").write_text(
+        f"{_FIXED_NOW - 5}\nRuntimeError: POST {secret} failed " + "x" * 400 + "\n"
+    )
+
+    cron = _collect_cron_at(hermes_home)
+
+    assert "super-secret-token" not in cron.ticker_last_error
+    assert "abc123" not in cron.ticker_last_error
+    assert "[REDACTED]" in cron.ticker_last_error
+    assert len(cron.ticker_last_error) <= _EXCERPT_MAX_CHARS
+
+
+def test_collect_cron_ticker_error_uses_the_first_non_blank_message_line(hermes_home: Path):
+    (hermes_home / "cron" / "ticker_last_error").write_text(
+        f"{_FIXED_NOW}\n\nOSError: store locked\nTraceback follows\n"
+    )
+
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.ticker_last_error == "OSError: store locked"
+
+
+def test_cron_ticker_error_marker_ignores_symlinks_outside_home(hermes_home: Path, tmp_path: Path):
+    outside = tmp_path / "ticker_last_error"
+    outside.write_text(f"{_FIXED_NOW}\nRuntimeError: from outside\n")
+    (hermes_home / "cron" / "ticker_last_error").symlink_to(outside)
+
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.ticker_last_error == ""
+    assert cron.ticker_error_recorded is False
+
+
+def test_collect_cron_recorded_ticker_error_escalates_an_otherwise_ok_ticker(
+    hermes_home: Path,
+):
+    """An un-cleared error marker means the last tick failed, even inside 600s.
+
+    ``record_ticker_error`` is followed by ``record_ticker_heartbeat(success=ok)``
+    and the marker is unlinked only when ``ok`` (cron/scheduler_provider.py:438,447),
+    so a recorded error and a fresh last-success stamp cannot both be current —
+    but hermesd's 600s staleness window is 3x looser than upstream's ~200s, so
+    without this the panel would read `ok` next to a failure it is displaying.
+    """
+    (hermes_home / "cron" / "ticker_heartbeat").write_text(str(_FIXED_NOW - 10.0))
+    (hermes_home / "cron" / "ticker_last_success").write_text(str(_FIXED_NOW - 20.0))
+    (hermes_home / "cron" / "ticker_last_error").write_text(
+        f"{_FIXED_NOW - 20.0}\nRuntimeError: boom\n"
+    )
+
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.ticker_health is CronTickerHealth.FAILING
+
+
+def test_collect_cron_recorded_ticker_error_does_not_invent_a_heartbeat(
+    hermes_home: Path,
+):
+    """No heartbeat means hermesd cannot claim the loop is running at all."""
+    (hermes_home / "cron" / "ticker_last_error").write_text(
+        f"{_FIXED_NOW - 20.0}\nRuntimeError: boom\n"
+    )
+
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.ticker_health is CronTickerHealth.UNKNOWN
+    assert cron.ticker_error_recorded is True
+
+
+def test_collect_cron_stale_ticker_is_not_downgraded_by_a_recorded_error(
+    hermes_home: Path,
+):
+    (hermes_home / "cron" / "ticker_heartbeat").write_text(str(_FIXED_NOW - 300.0))
+    (hermes_home / "cron" / "ticker_last_error").write_text(
+        f"{_FIXED_NOW - 20.0}\nRuntimeError: boom\n"
+    )
+
+    cron = _collect_cron_at(hermes_home)
+
+    assert cron.ticker_health is CronTickerHealth.STALE
+
+
+def test_cron_marker_read_failure_keeps_last_good_and_fails_the_source(
+    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A marker that stops being readable fails `cron` and keeps the last good read."""
+    (hermes_home / "cron" / "catch_up_occurrences").write_text("3")
+    (hermes_home / "cron" / "ticker_last_error").write_text(
+        f"{_FIXED_NOW - 5}\nRuntimeError: boom\n"
+    )
+    c = Collector(hermes_home, clock=lambda: _FIXED_NOW)
+    try:
+        first = c.collect()
+        assert first.cron.catch_up_occurrences == 3
+        assert first.cron.ticker_last_error == "RuntimeError: boom"
+        assert "cron" not in first.health.failed_sources
+
+        def boom(cron_dir: object, name: str, root: object) -> bool:
+            raise OSError("marker read failed")
+
+        # Patch the presence probe these two readers own, not _read_text_capped:
+        # that one is shared with the ticker stamps, so patching it would prove
+        # only that a pre-existing reader fails the source. Restore by name rather
+        # than monkeypatch.undo(), which would also drop the autouse fixture that
+        # keeps this suite off the host process table.
+        real_present = cron_module._cron_marker_present
+        monkeypatch.setattr(cron_module, "_cron_marker_present", boom)
+        second = c.collect()
+
+        assert "cron" in second.health.failed_sources
+        assert second.cron.catch_up_occurrences == 3
+        assert second.cron.catch_up_occurrences_recorded is True
+        assert second.cron.ticker_last_error == "RuntimeError: boom"
+
+        monkeypatch.setattr(cron_module, "_cron_marker_present", real_present)
+        third = c.collect()
+
+        assert "cron" not in third.health.failed_sources
+        assert third.cron.catch_up_occurrences == 3
+    finally:
+        c.close()
+
+
+def test_cron_catch_up_markers_are_read_from_the_root_store_under_a_profile(
+    hermes_home: Path,
+):
+    """These markers keep the `cron` source's ROOT resolver (source-ownership.md).
+
+    Upstream writes them profile-locally, so under ``--profile`` a profile's own
+    ticker failure and catch-up counter are invisible — exactly as the rest of
+    ``cron/`` already is. Read them from the profile store instead and the
+    ownership table's `cron` row would be wrong for these two paths only.
+    """
+    profile_dir = hermes_home / "profiles" / "dev" / "cron"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "catch_up_occurrences").write_text("9")
+    (profile_dir / "ticker_last_error").write_text(f"{_FIXED_NOW}\nRuntimeError: profile\n")
+    (hermes_home / "cron" / "catch_up_occurrences").write_text("2")
+
+    c = Collector(hermes_home, profile_name="dev", clock=lambda: _FIXED_NOW)
+    try:
+        cron = c.collect().cron
+    finally:
+        c.close()
+
+    assert cron.catch_up_occurrences == 2
+    assert cron.ticker_last_error == ""
+
+
+@_skip_if_root
+def test_cron_marker_readers_propagate_a_permission_error(tmp_path: Path):
+    """An untraversable cron store must raise, not read as "no markers".
+
+    ``_read_text_capped`` swallows the *open* failure, so a store hermesd cannot
+    traverse would otherwise report a healthy absence — "no catch-up counter, no
+    ticker error" — which is a claim about scheduling health with no evidence
+    behind it. On Python 3.11 the ``is_symlink()`` checks raise first; the
+    ``_exists_strict`` in ``_cron_marker_present`` is what keeps that true on
+    3.14, where ``Path.exists()``/``is_symlink()`` swallow EACCES.
+    """
+    cron_dir = tmp_path / "cron"
+    cron_dir.mkdir()
+    (cron_dir / "catch_up_occurrences").write_text("4")
+    (cron_dir / "ticker_last_error").write_text(f"{_FIXED_NOW}\nRuntimeError: boom\n")
+
+    assert cron_module._cron_catch_up_occurrences(cron_dir, tmp_path) == (4, True)
+    assert cron_module._cron_ticker_last_error(cron_dir, now=_FIXED_NOW, root=tmp_path)[0]
+
+    os.chmod(cron_dir, 0o000)
+    try:
+        if not _unreadable(cron_dir / "catch_up_occurrences"):
+            pytest.skip("filesystem allowed traversal despite chmod 000")
+        with pytest.raises(PermissionError):
+            cron_module._cron_catch_up_occurrences(cron_dir, tmp_path)
+        with pytest.raises(PermissionError):
+            cron_module._cron_ticker_last_error(cron_dir, now=_FIXED_NOW, root=tmp_path)
+    finally:
+        os.chmod(cron_dir, 0o755)

@@ -33,12 +33,30 @@ _TICKER_STYLES = {
     CronTickerHealth.UNKNOWN: "banner_dim",
 }
 
+# Upstream's own per-job wording (hermes_cli/cron.py:119). Rendering the raw
+# `last_dispatch.kind` instead would show `catch_up` and `late` as the same
+# severity, when one means "slipped a few minutes" and the other means
+# "missed fires were accumulated and skipped, then ran once now".
+_DISPATCH_KIND_LABELS = {"catch_up": "catch-up after missed fire", "late": "late"}
+
+# Rendered on every detail pass: both catch-up markers are best effort and the
+# error marker is deleted on recovery, so a quiet panel is not a healthy cron.
+_CATCH_UP_ABSENCE_NOTE = (
+    "Absence is not proof of health: the counter is written best effort and stays flat "
+    "while catch-up is off, and ticker_last_error is deleted on the next clean tick."
+)
+
 
 def _fmt_age(age: float | None) -> str:
     """Compact age label, or the panel's placeholder when the age is unknown."""
     if age is None:
         return "—"
     return fmt_age_seconds(max(0, int(age)))
+
+
+def _fmt_error_age(age: float | None) -> str:
+    """Age phrase for a recorded failure; the stamp can be missing while the message is not."""
+    return f"{_fmt_age(age)} ago" if age is not None else "at an unknown time"
 
 
 def _job_markers(job: CronJob) -> str:
@@ -73,6 +91,15 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         f"{c.ticker_health.value}\n",
         style=getattr(theme, _TICKER_STYLES[c.ticker_health]),
     )
+    # Line budget: only current problems earn a compact line. A non-zero lifetime
+    # catch-up counter is history, so it stays in the detail view.
+    if c.catch_up_missed_disabled:
+        lines.append("  ⚠ Catch-up off: missed runs are skipped\n", style=theme.ui_warn)
+    if c.ticker_error_recorded:
+        lines.append(
+            f"  ⚠ Tick error {_fmt_error_age(c.ticker_last_error_age_seconds)}\n",
+            style=theme.ui_error,
+        )
     if executions.open_incident_count:
         lines.append("  Incidents: ", style=theme.ui_label)
         lines.append(
@@ -116,6 +143,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     c = state.cron
     executions = state.cron_executions
     sections: list[RenderableType] = [_cron_header(c, theme)]
+    sections.extend(_catch_up_section(c, theme))
 
     if c.jobs:
         stats_by_job = {stats.job_id: stats for stats in executions.job_stats}
@@ -197,6 +225,63 @@ def _chronos_label(c: CronState) -> str:
     return f"{configured}{suffix}"
 
 
+def _catch_up_policy_label(c: CronState) -> str:
+    """The configured `cron.catch_up_missed`, labelled with how it came to be set."""
+    if not c.catch_up_missed_set:
+        return "catch_up_missed not set in config.yaml (upstream default: catch up)"
+    if c.catch_up_missed:
+        return "catch_up_missed: true (catch up)"
+    return "catch_up_missed: false (missed runs are skipped)"
+
+
+def _catch_up_counter_label(c: CronState) -> str:
+    """The observed lifetime counter, never rendered as a rate or an age.
+
+    An unobserved marker is reported as unobserved: upstream collapses "absent"
+    and "0" into the same zero, and the write is best effort, so a missing file
+    must not become a claim that nothing was missed.
+    """
+    if not c.catch_up_occurrences_recorded:
+        return "no counter observed"
+    return f"{c.catch_up_occurrences} recorded (lifetime total, no timestamp — not a rate)"
+
+
+def _catch_up_section(c: CronState, theme: Theme) -> list[RenderableType]:
+    """Configured catch-up policy, the observed counter, and any recorded tick error."""
+    body = Text("  ")
+    body.append("Policy: ", style=theme.ui_label)
+    body.append(_catch_up_policy_label(c), style=theme.banner_text)
+    if c.catch_up_missed_disabled:
+        body.append(
+            "\n  ⚠ Missed recurring runs beyond the grace window are dropped, and the counter"
+            " below stays flat while they are.",
+            style=theme.ui_warn,
+        )
+    body.append("\n  ")
+    body.append("Catch-ups: ", style=theme.ui_label)
+    body.append(_catch_up_counter_label(c), style=theme.banner_text)
+    if c.ticker_error_recorded:
+        body.append("\n  ⚠ Last tick error ", style=theme.ui_error)
+        body.append(_fmt_error_age(c.ticker_last_error_age_seconds), style=theme.ui_error)
+        body.append(": ", style=theme.ui_error)
+        # Redaction happened in the collector; this is the terminal-control half,
+        # because the message is an arbitrary exception string.
+        body.append(sanitize_terminal_text(c.ticker_last_error), style=theme.ui_error)
+    body.append(f"\n  {_CATCH_UP_ABSENCE_NOTE}\n", style=theme.banner_dim)
+    return [section_heading("Missed-Run Catch-Up", theme), body]
+
+
+def _dispatch_flag(job: CronJob) -> str:
+    """`last_dispatch` lateness with the kind labelled rather than passed through.
+
+    An unseen kind is kept verbatim (sanitized) instead of bucketed, so a value a
+    newer agent adds is displayed rather than silently reading as "late".
+    """
+    kind = sanitize_terminal_text(job.dispatch_kind)
+    label = _DISPATCH_KIND_LABELS.get(kind) or kind or "dispatch"
+    return f"{label} {job.dispatch_lateness_seconds:.1f}s"
+
+
 def _window_counters(stats: CronJobExecutionStats | None) -> str:
     """`7✓ 2✗ 1▶ 1?` summary of a job's last 24 hours, or the placeholder.
 
@@ -275,8 +360,7 @@ def _job_flags_line(j: CronJob, theme: Theme) -> Text | None:
     if j.last_delivery_error:
         parts.append(f"delivery: {sanitize_terminal_text(j.last_delivery_error[:80])}")
     if j.dispatch_lateness_seconds is not None:
-        kind = sanitize_terminal_text(j.dispatch_kind) or "dispatch"
-        parts.append(f"{kind} {j.dispatch_lateness_seconds:.1f}s")
+        parts.append(_dispatch_flag(j))
     if j.repeat_completed or j.repeat_times is not None:
         parts.append(f"repeat {j.repeat_completed}/{j.repeat_times or '∞'}")
     if j.no_agent:

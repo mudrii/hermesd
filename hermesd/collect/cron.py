@@ -16,6 +16,7 @@ from hermesd.collect.common import (
     _as_dict,
     _coerce_float,
     _coerce_int,
+    _exists_strict,
     _iso_to_epoch,
     _mtime,
     _path_resolves_under,
@@ -55,6 +56,22 @@ _INCIDENTS_LIMIT = 5
 # keeps arriving while last_success falls ten beats behind means failing.
 _TICKER_HEARTBEAT_STALE_SECONDS = 120.0
 _TICKER_LAST_SUCCESS_STALE_SECONDS = 600.0
+
+# Markers in the cron store written by upstream's best-effort ``_write_marker``
+# (``cron/jobs.py:1129-1136``), which swallows every exception — so a marker can
+# be missing for purely benign reasons and absence must never read as "no
+# failures". Both resolve through ``_current_cron_store()`` upstream, i.e. the
+# profile-local store; hermesd reads them from the root store with the rest of
+# ``cron`` (see ``.codex/rules/source-ownership.md``).
+_CATCH_UP_OCCURRENCES_MARKER = "catch_up_occurrences"
+_TICKER_ERROR_MARKER = "ticker_last_error"
+# ``ticker_last_error`` is ``f"{time.time()}\n{message}\n"``; upstream refuses a
+# file with fewer than two lines because a torn write can leave the stamp alone
+# (``get_ticker_last_error``, ``cron/jobs.py:1212-1220``).
+_TICKER_ERROR_MIN_LINES = 2
+# ``config.yaml`` key deciding whether a recurring run missed beyond the grace
+# window is caught up or silently skipped (``cron/jobs.py:2908``).
+_CATCH_UP_MISSED_KEY = "catch_up_missed"
 
 
 def _truncate_lines(text: str) -> list[str]:
@@ -606,16 +623,105 @@ def _read_cron_executions_state(
         )
 
 
-def _cron_ticker_epoch(path: Path, root: Path) -> float | None:
-    """The single epoch float held in a ticker stamp file, or None if unusable."""
-    raw = _read_text_capped(path, root).strip()
-    if not raw:
+def _epoch_from_text(raw: str) -> float | None:
+    """A finite epoch float from marker text, or None when it holds anything else."""
+    text = raw.strip()
+    if not text:
         return None
     try:
-        parsed = float(raw)
+        parsed = float(text)
     except ValueError:
         return None
     return parsed if math.isfinite(parsed) else None
+
+
+def _cron_ticker_epoch(path: Path, root: Path) -> float | None:
+    """The single epoch float held in a ticker stamp file, or None if unusable."""
+    return _epoch_from_text(_read_text_capped(path, root))
+
+
+def _cron_marker_present(cron_dir: Path, name: str, root: Path) -> bool:
+    """Whether ``cron/<name>`` is a confined, non-symlinked marker that exists.
+
+    ``_exists_strict`` runs first so a permission error on the cron directory
+    propagates and fails the source to its last-good value, instead of reading as
+    "the marker is absent" — which for these two files would be a claim about
+    scheduling health hermesd has no evidence for. ``_read_text_capped`` swallows
+    OSError, and on Python 3.14 so do ``Path.exists()``/``is_symlink()``, so the
+    ordering is what makes propagation interpreter-independent.
+    """
+    path = cron_dir / name
+    return _exists_strict(path) and _safe_child_path(path, root)
+
+
+def _cron_catch_up_occurrences(cron_dir: Path, root: Path) -> tuple[int, bool]:
+    """``cron/catch_up_occurrences`` plus whether a count was actually observed.
+
+    Upstream's ``get_catch_up_occurrence_count`` returns ``0`` for a missing file
+    and for a genuine zero alike (``cron/jobs.py:1186-1193``), which is exactly
+    the distinction an operator needs: the write is best effort and is skipped
+    entirely while catch-up is disabled (``cron/jobs.py:2908-2918``), so an
+    absent marker is not evidence that no occurrence was missed. The counter is
+    monotonic with no timestamp and is never reset, so it is reported as a
+    lifetime total — never as a rate and never as an age.
+    """
+    if not _cron_marker_present(cron_dir, _CATCH_UP_OCCURRENCES_MARKER, root):
+        return 0, False
+    raw = _read_text_capped(cron_dir / _CATCH_UP_OCCURRENCES_MARKER, root).strip()
+    try:
+        # Upstream clamps with max(0, ...); a negative marker is still a marker.
+        return max(0, int(raw)), True
+    except ValueError:
+        # Present but holding no count. Reporting that as "0 recorded" would
+        # claim evidence hermesd does not have, so it reads as unobserved.
+        return 0, False
+
+
+def _cron_ticker_last_error(
+    cron_dir: Path,
+    *,
+    now: float,
+    root: Path,
+) -> tuple[str, float | None]:
+    """The redacted message and age from ``cron/ticker_last_error``.
+
+    ``clear_ticker_error`` unlinks the marker on the next clean tick
+    (``cron/jobs.py:1206-1209``), so an empty result means *no failure recorded
+    right now* and never *scheduling has not failed*. Fewer than two lines and a
+    blank message are both refused exactly as upstream refuses them
+    (``cron/jobs.py:1212-1220``); the line guard is upstream-faithful defence
+    that the blank-message check also covers, since ``lines[1:]`` is empty for any
+    input shorter than two lines. The message is ``f"{type(e).__name__}: {e}"`` —
+    an arbitrary exception string that can embed paths, tokens or URLs — so it is
+    redacted and capped here, at the data boundary, never in a panel.
+    """
+    if not _cron_marker_present(cron_dir, _TICKER_ERROR_MARKER, root):
+        return "", None
+    lines = _read_text_capped(cron_dir / _TICKER_ERROR_MARKER, root).splitlines()
+    if len(lines) < _TICKER_ERROR_MIN_LINES:
+        return "", None
+    message = _cron_error_excerpt("\n".join(lines[1:]))
+    if not message:
+        return "", None
+    return message, _age_seconds(_epoch_from_text(lines[0]), now)
+
+
+def _cron_catch_up_policy(cron_cfg: Mapping[str, Any]) -> tuple[bool, bool]:
+    """``cron.catch_up_missed`` as configured, and whether the key was set at all.
+
+    Upstream reads it as ``_cron_config_number("catch_up_missed", True, lambda
+    value: value is not False)`` (``cron/jobs.py:2908`` + ``:2615-2624``): the
+    cast is an *identity* check, so only a literal ``False`` disables catch-up,
+    while ``None``, ``0``, ``"no"``, a missing key and an unreadable config all
+    leave it enabled. A naive ``bool(value)`` reports the opposite for every one
+    of those. When it is off, ``_fast_forward_missed_recurring`` re-anchors the
+    schedule *without* calling ``record_catch_up_occurrence``, so missed runs are
+    dropped silently and the counter stays flat — which is why the configured
+    value is surfaced next to the observed one.
+    """
+    if _CATCH_UP_MISSED_KEY not in cron_cfg:
+        return True, False
+    return cron_cfg[_CATCH_UP_MISSED_KEY] is not False, True
 
 
 def _cron_ticker_ages(
@@ -634,13 +740,27 @@ def _cron_ticker_ages(
 def _cron_ticker_health(
     heartbeat_age: float | None,
     last_success_age: float | None,
+    *,
+    ticker_error_recorded: bool = False,
 ) -> CronTickerHealth:
-    """Ticker health from the two stamp ages; UNKNOWN when no heartbeat exists."""
+    """Ticker health from the two stamp ages; UNKNOWN when no heartbeat exists.
+
+    A recorded ``ticker_last_error`` escalates OK to FAILING: upstream only
+    unlinks that marker on a clean tick (``cron/scheduler_provider.py:438,447``),
+    so a marker that is still there means the last tick failed — even inside
+    hermesd's 600s success window, which is 3x looser than upstream's own ~200s
+    ``STALE_AFTER`` (``hermes_cli/cron.py:342``). Without this the panel would
+    print ``ok`` next to the failure it is displaying. It never invents a
+    heartbeat (UNKNOWN stays UNKNOWN) and never downgrades STALE, which is
+    already the stronger claim.
+    """
     if heartbeat_age is None:
         return CronTickerHealth.UNKNOWN
     if heartbeat_age > _TICKER_HEARTBEAT_STALE_SECONDS:
         return CronTickerHealth.STALE
     if last_success_age is None or last_success_age > _TICKER_LAST_SUCCESS_STALE_SECONDS:
+        return CronTickerHealth.FAILING
+    if ticker_error_recorded:
         return CronTickerHealth.FAILING
     return CronTickerHealth.OK
 

@@ -762,3 +762,187 @@ def test_cron_detail_escapes_execution_error_excerpt() -> None:
 
     assert "[bold red]evil" in text
     assert "\x1b[2J" not in text
+
+
+# --- Missed-run catch-up and ticker-error diagnostics ------------------------
+
+
+def _catch_up_detail(c: CronState, width: int = 140) -> str:
+    return render_to_str(
+        render_cron(DashboardState(cron=c), Theme(), detail=True), width=width, no_color=True
+    )
+
+
+def _catch_up_compact(c: CronState, width: int = 120) -> str:
+    return render_to_str(render_cron(DashboardState(cron=c), Theme()), width=width, no_color=True)
+
+
+def test_cron_detail_shows_the_catch_up_policy_and_a_recorded_counter() -> None:
+    text = _catch_up_detail(
+        CronState(
+            catch_up_missed=True,
+            catch_up_missed_set=True,
+            catch_up_occurrences=7,
+            catch_up_occurrences_recorded=True,
+        )
+    )
+
+    assert "Missed-Run Catch-Up" in text
+    assert "catch_up_missed: true" in text
+    assert "7 recorded" in text
+    # The counter is monotonic and carries no timestamp, so it must not read as a rate.
+    assert "not a rate" in text
+
+
+def test_cron_detail_labels_an_unset_catch_up_policy_as_the_upstream_default() -> None:
+    text = _catch_up_detail(CronState())
+
+    assert "not set in config.yaml" in text
+    assert "upstream default" in text
+    assert "no counter observed" in text
+
+
+def test_cron_detail_flags_an_explicitly_disabled_catch_up_policy() -> None:
+    text = _catch_up_detail(CronState(catch_up_missed=False, catch_up_missed_set=True))
+
+    assert "catch_up_missed: false" in text
+    assert "missed runs are skipped" in text
+    # The silent-skip consequence: the counter does not move while runs are dropped.
+    assert "stays flat" in text
+
+
+def test_cron_detail_reports_an_unobserved_counter_without_claiming_zero() -> None:
+    text = _catch_up_detail(CronState())
+
+    assert "no counter observed" in text
+    assert "0 recorded" not in text
+
+
+def test_cron_detail_reports_a_recorded_zero_catch_up_count() -> None:
+    text = _catch_up_detail(CronState(catch_up_occurrences=0, catch_up_occurrences_recorded=True))
+
+    assert "0 recorded" in text
+    assert "no counter observed" not in text
+
+
+def test_cron_detail_shows_the_recorded_ticker_error_with_its_age() -> None:
+    text = _catch_up_detail(
+        CronState(ticker_last_error="RuntimeError: boom", ticker_last_error_age_seconds=45.0)
+    )
+
+    assert "Last tick error" in text
+    assert "45s ago" in text
+    assert "RuntimeError: boom" in text
+
+
+def test_cron_detail_ticker_error_without_a_parseable_stamp_says_the_age_is_unknown() -> None:
+    text = _catch_up_detail(CronState(ticker_last_error="RuntimeError: boom"))
+
+    assert "RuntimeError: boom" in text
+    assert "unknown time" in text
+    assert "— ago" not in text
+
+
+def test_cron_detail_states_that_absence_is_not_proof_of_health() -> None:
+    """Both markers are deleted/best-effort, so a clean panel must not read as clean cron."""
+    text = _catch_up_detail(CronState())
+
+    assert "Absence is not proof" in text
+    assert "deleted on the next clean tick" in text
+
+
+def test_cron_detail_strips_terminal_controls_from_the_ticker_error() -> None:
+    text = _catch_up_detail(
+        CronState(
+            ticker_last_error=f"{MARKUP_BOMB}{CLEAR_SCREEN}boom",
+            ticker_last_error_age_seconds=1.0,
+        )
+    )
+
+    assert CLEAR_SCREEN not in text
+    assert "[bold red]owned" in text
+
+
+def test_cron_detail_distinguishes_catch_up_from_late_in_the_flags_line() -> None:
+    """Upstream labels a beyond-grace dispatch differently (hermes_cli/cron.py:119)."""
+    state = DashboardState(
+        cron=CronState(
+            job_count=2,
+            jobs=[
+                CronJob(
+                    job_id="job-a",
+                    name="alpha",
+                    dispatch_lateness_seconds=3600.0,
+                    dispatch_kind="catch_up",
+                ),
+                CronJob(
+                    job_id="job-b",
+                    name="beta",
+                    dispatch_lateness_seconds=46.8,
+                    dispatch_kind="late",
+                ),
+            ],
+        )
+    )
+
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "catch-up after missed fire 3600.0s" in text
+    assert "late 46.8s" in text
+    assert "catch_up 3600.0s" not in text
+
+
+def test_cron_detail_passes_an_unseen_dispatch_kind_through_sanitized() -> None:
+    job = CronJob(
+        job_id="job-a",
+        name="alpha",
+        dispatch_lateness_seconds=5.0,
+        dispatch_kind=f"{CLEAR_SCREEN}future_kind",
+    )
+
+    text = _catch_up_detail(CronState(job_count=1, jobs=[job]), width=160)
+
+    assert CLEAR_SCREEN not in text
+    assert "future_kind 5.0s" in text
+
+
+def test_cron_compact_warns_when_catch_up_is_disabled() -> None:
+    quiet = _catch_up_compact(CronState()).splitlines()
+    warned = _catch_up_compact(
+        CronState(catch_up_missed=False, catch_up_missed_set=True)
+    ).splitlines()
+
+    assert len(warned) == len(quiet) + 1
+    assert any("Catch-up off" in line and "missed runs are skipped" in line for line in warned)
+
+
+def test_cron_compact_warns_on_a_recorded_ticker_error() -> None:
+    quiet = _catch_up_compact(CronState()).splitlines()
+    warned = _catch_up_compact(
+        CronState(ticker_last_error="RuntimeError: boom", ticker_last_error_age_seconds=12.0)
+    ).splitlines()
+
+    assert len(warned) == len(quiet) + 1
+    assert any("Tick error" in line and "12s ago" in line for line in warned)
+
+
+def test_cron_compact_omits_the_tick_error_age_when_the_stamp_was_unparseable() -> None:
+    text = _catch_up_compact(CronState(ticker_last_error="RuntimeError: boom"))
+
+    assert "Tick error" in text
+    assert "— ago" not in text
+
+
+def test_cron_compact_spends_no_line_on_a_healthy_catch_up_counter() -> None:
+    """A non-zero lifetime counter is history, not a current problem."""
+    quiet = _catch_up_compact(CronState())
+    counted = _catch_up_compact(
+        CronState(
+            catch_up_occurrences=7,
+            catch_up_occurrences_recorded=True,
+            catch_up_missed=True,
+            catch_up_missed_set=True,
+        )
+    )
+
+    assert quiet.splitlines() == counted.splitlines()
