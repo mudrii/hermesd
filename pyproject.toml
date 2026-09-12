@@ -79,7 +79,7 @@ exclude_lines = [
     "raise NotImplementedError",
     "return NotImplemented",
     "@(abc\\.)?abstractmethod",
-    "\\.\\.\\.",
+    "^\\s*\\.\\.\\.\\s*(#.*)?$",
 ]
 show_missing = true
 fail_under = 96
