@@ -250,7 +250,7 @@ _SECRET_TEXT_FIELD_RE = re.compile(
 # value stays visible: URLs are sanitized by the pre-pass in _redact_secret_text
 # before field redaction runs.
 _SECRET_TEXT_VALUE_RE = re.compile(
-    r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:(?!\s+(?i:https?)://)[^,}\]\r\n])+"""
+    r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:(?!\s+(?i:[a-z][a-z0-9+.-]*)://)[^,}\]\r\n])+"""
 )
 
 
@@ -295,7 +295,7 @@ def _redact_secret_text(value: str) -> str:
             # bounds its own structured reads.
             pass
     redacted = re.sub(
-        r"(?i:https?)://[^,\s]+", lambda match: _redact_secret_url(match.group(0)), value
+        r"(?i)[a-z][a-z0-9+.-]*://[^,\s]+", lambda match: _redact_secret_url(match.group(0)), value
     )
     redacted = re.sub(r"(?i)(bearer)\s+[^,\s]+", r"\1 [REDACTED]", redacted)
     return _redact_text_fields(redacted)

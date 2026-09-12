@@ -1070,6 +1070,20 @@ def test_redact_secret_text_multi_word_bare_value_preserves_following_uppercase_
     assert redacted == "password=[REDACTED] https://[REDACTED]@host/x"
 
 
+def test_redact_secret_text_redacts_non_http_scheme_url_in_free_text():
+    redacted = _redact_secret_text("see ftp://user:pw@host/x?token=abc end")
+
+    assert "user:pw" not in redacted
+    assert "token=abc" not in redacted
+    assert "[REDACTED]@host" in redacted
+
+
+def test_redact_secret_text_multi_word_bare_value_preserves_following_ftp_url():
+    redacted = _redact_secret_text("password=see ftp://user:pw@host/x")
+
+    assert redacted == "password=[REDACTED] ftp://[REDACTED]@host/x"
+
+
 def test_redact_command_string_redacts_url_credentials_in_key_value_form():
     redacted = _redact_command_string("mcp-server url=https://user:pw@host/x?token=t1")
 
