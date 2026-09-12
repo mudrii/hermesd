@@ -48,7 +48,7 @@ hermesd/
   __main__.py     CLI entry point (argparse)
   app.py          Rich TUI: Live context, input thread, adaptive layout
   collector.py    Collector orchestration + public facade over collect/
-  collect/        Per-domain readers (sessions, kanban, cron, skills,
+  collect/        Per-domain readers (sessions, kanban, cron, skills, plugins,
                   operations, config, logs, redaction, sqlite_util, system, common)
   defaults.py     Shared refresh-rate and log-tail-bytes defaults
   db.py           Read-only SQLite with PRAGMA data_version caching

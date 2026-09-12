@@ -117,6 +117,11 @@ from hermesd.collect.operations import (
 from hermesd.collect.operations import (
     _read_state_db as _read_state_db_tables,
 )
+from hermesd.collect.plugins import (
+    gate_plugin,
+    plugin_name_set,
+    resolve_plugin_kind,
+)
 from hermesd.collect.redaction import (
     _has_secret_material,
     _redact_command_string,
@@ -191,6 +196,7 @@ from hermesd.models import (
     ModelCacheSummary,
     ModelUsage,
     OperationsState,
+    PluginActivation,
     PluginInfo,
     PRMonitorSummary,
     ProfilesState,
@@ -2346,9 +2352,9 @@ class Collector:
         if not plugins_dir.is_dir():
             return []
 
-        disabled_cfg = _as_dict(cfg.get("plugins"))
-        disabled_list = disabled_cfg.get("disabled") or []
-        disabled = {str(name) for name in disabled_list if name}
+        plugins_cfg = _as_dict(cfg.get("plugins"))
+        enabled = plugin_name_set(plugins_cfg.get("enabled"))
+        disabled = plugin_name_set(plugins_cfg.get("disabled"))
 
         plugins: list[PluginInfo] = []
         for plugin_dir in sorted(plugins_dir.iterdir()):
@@ -2357,26 +2363,57 @@ class Collector:
             manifest_path = plugin_dir / "plugin.yaml"
             if not _safe_capped_file(manifest_path, plugins_dir):
                 continue
+            if not manifest_path.exists():
+                # No manifest at all: upstream reads this as a *category*
+                # directory and recurses into it, not as a plugin.
+                continue
             manifest = self._file_cache.read_yaml_mapping(manifest_path)
             if not manifest:
+                # A manifest file is present but did not parse. Report it as
+                # unknown rather than dropping the directory or guessing.
+                plugins.append(
+                    PluginInfo(
+                        name=plugin_dir.name,
+                        activation=PluginActivation.UNKNOWN,
+                        activation_reason="manifest missing or unreadable",
+                    )
+                )
                 continue
             dashboard_manifest = self._read_json_cached(plugin_dir / "dashboard" / "manifest.json")
             tools = manifest.get("provides_tools") or []
             hooks = manifest.get("provides_hooks") or manifest.get("hooks") or []
             name = str(manifest.get("name") or plugin_dir.name)
+            key = str(manifest.get("key") or "") or name
+            kind = resolve_plugin_kind(manifest.get("kind"), self._plugin_init_source(plugin_dir))
+            gate = gate_plugin(key=key, name=name, kind=kind, enabled=enabled, disabled=disabled)
             plugins.append(
                 PluginInfo(
                     name=name,
                     version=str(manifest.get("version") or ""),
                     description=str(manifest.get("description") or ""),
                     source="user",
-                    enabled=name not in disabled,
+                    activation=gate.activation,
+                    activation_reason=gate.reason,
+                    kind=kind,
+                    manifest_key=key,
                     tool_count=len(tools) if isinstance(tools, list) else 0,
                     hook_count=len(hooks) if isinstance(hooks, list) else 0,
                     dashboard_enabled=bool(dashboard_manifest),
                 )
             )
         return plugins
+
+    def _plugin_init_source(self, plugin_dir: Path) -> str:
+        """Text of a plugin's ``__init__.py``, for import-free kind detection.
+
+        Upstream routes an undeclared memory/model provider to its own discovery
+        by scanning this file; reading it is what lets hermesd agree without
+        importing plugin code.
+        """
+        path = plugin_dir / "__init__.py"
+        if not _safe_capped_file(path, plugin_dir):
+            return ""
+        return _read_text_capped(path, self._paths.root_home)
 
     def _collect_mcp_servers(self, cfg: dict[str, Any]) -> list[MCPServerInfo]:
         servers = _as_dict(cfg.get("mcp_servers"))

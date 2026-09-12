@@ -6,7 +6,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from hermesd.models import DashboardState, SkillsMemory
+from hermesd.models import DashboardState, PluginActivation, SkillsMemory
 from hermesd.panels.formatting import escape_terminal_text as escape
 from hermesd.panels.formatting import fmt_age_seconds, sanitize_terminal_text, section_heading
 from hermesd.theme import Theme
@@ -221,7 +221,7 @@ def _plugins_table(sm: SkillsMemory, theme: Theme) -> Table:
     plugins_table = Table(box=None, show_header=True, padding=(0, 1))
     plugins_table.add_column("Name", style=theme.ui_accent, min_width=16)
     plugins_table.add_column("Version", style=theme.banner_text, min_width=8)
-    plugins_table.add_column("Enabled", style=theme.banner_text, min_width=7)
+    plugins_table.add_column("Activation", style=theme.banner_text, min_width=11)
     plugins_table.add_column("Dashboard", style=theme.banner_text, min_width=9)
     plugins_table.add_column("Hooks", justify="right", min_width=5)
     plugins_table.add_column("Tools", justify="right", min_width=5)
@@ -230,13 +230,29 @@ def _plugins_table(sm: SkillsMemory, theme: Theme) -> Table:
         plugins_table.add_row(
             escape(plugin.name),
             escape(plugin.version),
-            "Yes" if plugin.enabled else "No",
+            _activation_label(plugin.activation),
             "Yes" if plugin.dashboard_enabled else "No",
             str(plugin.hook_count),
             str(plugin.tool_count),
             escape(plugin.description),
         )
     return plugins_table
+
+
+# Activation is read from config.yaml and the manifest: it says what hermes-agent
+# would do, and a plugin that clears the gate can still fail to import.
+_ACTIVATION_LABELS = {
+    PluginActivation.ENABLED: "enabled",
+    PluginActivation.DISABLED: "disabled",
+    PluginActivation.NOT_ENABLED: "not enabled",
+    PluginActivation.CATEGORY_OWNED: "category",
+    PluginActivation.REMOVED: "removed",
+    PluginActivation.UNKNOWN: "unknown",
+}
+
+
+def _activation_label(activation: PluginActivation) -> str:
+    return escape(_ACTIVATION_LABELS.get(activation, str(activation)))
 
 
 def _mcp_servers_table(sm: SkillsMemory, theme: Theme) -> Table:

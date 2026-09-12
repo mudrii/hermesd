@@ -13,6 +13,7 @@ from hermesd.models import (
     HookInfo,
     MCPSchemaCache,
     MCPServerInfo,
+    PluginActivation,
     PluginInfo,
     ProviderInfo,
     SkillInfo,
@@ -205,8 +206,19 @@ def test_skills_detail_shows_integrations_sections():
                     tool_count=2,
                     hook_count=1,
                     dashboard_enabled=True,
-                    enabled=True,
-                )
+                    activation=PluginActivation.ENABLED,
+                ),
+                PluginInfo(
+                    name="notes",
+                    activation=PluginActivation.NOT_ENABLED,
+                    activation_reason="not enabled in config",
+                ),
+                PluginInfo(
+                    name="memx",
+                    kind="exclusive",
+                    activation=PluginActivation.CATEGORY_OWNED,
+                    activation_reason="exclusive plugin — activate via memory.provider config",
+                ),
             ],
             mcp_servers=[
                 MCPServerInfo(
@@ -230,6 +242,32 @@ def test_skills_detail_shows_integrations_sections():
     assert "MCP Servers" in text
     assert "playwright" in text
     assert "BOOT.md" in text
+
+
+def test_skills_detail_shows_configured_activation_not_a_yes_no_flag():
+    """F01: a discovered plugin is not enabled just because it is on disk."""
+    state = DashboardState(
+        skills_memory=SkillsMemory(
+            plugins=[
+                PluginInfo(name="weather", activation=PluginActivation.ENABLED),
+                PluginInfo(name="notes", activation=PluginActivation.NOT_ENABLED),
+                PluginInfo(name="blocked", activation=PluginActivation.DISABLED),
+                PluginInfo(name="memx", activation=PluginActivation.CATEGORY_OWNED),
+                PluginInfo(name="nemo_relay", activation=PluginActivation.REMOVED),
+                PluginInfo(name="broken", activation=PluginActivation.UNKNOWN),
+            ]
+        )
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Activation" in text
+    assert "not enabled" in text
+    assert "disabled" in text
+    assert "category" in text
+    assert "removed" in text
+    assert "unknown" in text
+    assert "Enabled" not in text.split("MCP Servers")[0]
 
 
 def test_skills_detail_scroll_offset():

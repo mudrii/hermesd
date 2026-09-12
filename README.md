@@ -36,7 +36,7 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 | 4 | **Tools** | Available tools count, toolset availability (enabled/unavailable/lazy/disabled), per-session call stats, background processes with purpose/port/profile and a dead-pid marker, filesystem checkpoints, full tool name grid |
 | 5 | **Config** | Model, provider, personality, MoA, Tool Search, dashboard auth, kanban, code execution, gateway, routing and memory/session settings, agent limits (delegation concurrency/depth/orchestrator, goal turn budget, tool-loop guardrails, live sessions, streaming, logging) and integrations (MCP, plugins, updates, proxy presence) |
 | 6 | **Cron** | Scheduler tick/provider, ticker health, open incidents, Chronos config presence, suggestion count, job table with schedule, delivery target, 24 h run counters, error count, latest error, and output metadata |
-| 7 | **Skills / Integrations** | Provider auth status/freshness, credential pools, hooks/plugins/MCP inventory, MCP schema cache with no-cache-entry hint, prompted-skill snapshot, BOOT.md presence, skills with descriptions |
+| 7 | **Skills / Integrations** | Provider auth status/freshness, credential pools, hooks/plugins/MCP inventory, plugin configured-activation gate, MCP schema cache with no-cache-entry hint, prompted-skill snapshot, BOOT.md presence, skills with descriptions |
 | 8 | **Logs** | Tailed agent, gateway, errors, cron, desktop, dashboard, GUI, update, gateway-error, crash, audit, MCP-stderr, and workspace logs with Tab switching and inline filtering |
 | 9 | **Profiles** | Read-only profile discovery with session counts, log freshness, skill counts, DB size, and SOUL excerpts |
 | 10 | **Memory** | Memory provider, MEMORY.md/USER.md word counts, learning summary, SOUL.md size/excerpt, and memory file inventory |
@@ -129,6 +129,8 @@ The job rows also surface the newer `cron/jobs.json` keys: `failure_streak` (sho
 ### [7] Skills & Integrations — What's Installed?
 
 Press `7` for provider and integration visibility in one place: **Providers** with active auth state and safely persisted credential freshness/expiry metadata, **Credential Pools** with redacted metadata, **Hooks** discovered from `~/.hermes/hooks/`, **Plugins** from `~/.hermes/plugins/`, **MCP Servers** from `config.yaml` with secret-bearing args and URL query params redacted, `BOOT.md` presence, and **Skills** grouped by category with descriptions loaded from each skill's `SKILL.md` frontmatter. Use `j`/`k` to scroll through the full skill list.
+
+The **Plugins** table reports *configured activation*, not a yes/no "is it on" flag, because hermes-agent requires an explicit `plugins.enabled` opt-in — a plugin that is merely present on disk will not load. The **Activation** column reproduces upstream's gate order and shows one of `enabled`, `disabled` (in `plugins.disabled`, which wins over the allow-list), `not enabled` (discovered but absent from `plugins.enabled`), `category` (an `exclusive` memory provider, activated through `<category>.provider` config instead), `removed` (a legacy Relay plugin key that core now refuses), or `unknown` (a manifest that exists but did not parse). Both the path-derived manifest `key` and the bare `name` are matched against each list, so a plugin opted in under its legacy name is still recognised. Where a manifest omits `kind`, hermesd scans the first 8 KiB of the plugin's `__init__.py` for provider markers exactly as upstream does — it reads text and never imports or executes plugin code. Activation is what the configuration says hermes-agent *would* do; it is not proof the plugin loaded successfully.
 
 An **MCP** section summarises `~/.hermes/cache/mcp_schema_cache.json`: how many servers have a cached schema, their names, the cache age, and a **No cache entry** row listing servers configured in `config.yaml` with no entry in that cache. The row is deliberately worded as an observation, not a history — a missing entry does not prove a server never connected, since the cache may have been cleared, invalidated, or written under another profile; when the cache file itself is absent the section says `no cache file observed` instead. Membership is computed from the complete configured and cached name sets, so the 20-name display cap cannot make a cached server look uncached; when a list is capped the row shows `(+N more)` rather than silently looking complete. Cached payloads are treated as opaque and never rendered. A `Prompted skills: N (snapshot 2h ago)` line summarises `~/.hermes/.skills_prompt_snapshot.json`. The compact view adds `mcp N cached` when the cache is populated.
 
@@ -429,6 +431,7 @@ hermesd/
     kanban.py     Kanban board SQL readers and board discovery
     logs.py       Log line parsing constants and helpers
     operations.py Verification, goals, projects, MoA, curator
+    plugins.py    Plugin discovery and the configured-activation gate
     redaction.py  Secret redaction for URLs, argv, config, log text
     sessions.py   Session, token and cost analytics
     skills.py     Skill, memory and SOUL filesystem readers

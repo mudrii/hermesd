@@ -5,7 +5,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 from hermesd.paths import default_hermes_home
 
@@ -479,15 +479,40 @@ class HookInfo(BaseModel):
     events: list[str] = Field(default_factory=list)
 
 
+class PluginActivation(StrEnum):
+    """Configured activation of a discovered plugin.
+
+    Each value is what ``config.yaml`` and the manifest say hermes-agent *would*
+    do with this plugin. None of them is evidence that it loaded: hermesd reads
+    files and never imports or executes plugin code.
+    """
+
+    ENABLED = "enabled"
+    DISABLED = "disabled"
+    NOT_ENABLED = "not_enabled"
+    CATEGORY_OWNED = "category_owned"
+    REMOVED = "removed"
+    UNKNOWN = "unknown"
+
+
 class PluginInfo(BaseModel):
     name: str
     version: str = ""
     description: str = ""
     source: str = "user"
-    enabled: bool = True
+    activation: PluginActivation = PluginActivation.UNKNOWN
+    activation_reason: str = ""
+    kind: str = ""
+    manifest_key: str = ""
     tool_count: int = 0
     hook_count: int = 0
     dashboard_enabled: bool = False
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def enabled(self) -> bool:
+        """Derived, never stored: activation is the single source of truth."""
+        return self.activation is PluginActivation.ENABLED
 
 
 class MCPServerInfo(BaseModel):
