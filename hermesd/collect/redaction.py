@@ -185,10 +185,10 @@ def _redact_secret_args(args: object) -> list[str]:
             if _is_secret_option(option):
                 redacted.append(f"{option}=[REDACTED]")
                 continue
-            if option_value.startswith(("http://", "https://")):
+            if "://" in option_value:
                 redacted.append(f"{option}={_redact_secret_url(option_value)}")
                 continue
-            if option.startswith(("http://", "https://")):
+            if "://" in option:
                 redacted.append(_redact_secret_url(arg))
                 continue
         if arg.startswith("-") and _is_secret_option(arg):
@@ -250,7 +250,7 @@ _SECRET_TEXT_FIELD_RE = re.compile(
 # value stays visible: URLs are sanitized by the pre-pass in _redact_secret_text
 # before field redaction runs.
 _SECRET_TEXT_VALUE_RE = re.compile(
-    r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:(?!\s+https?://)[^,}\]\r\n])+"""
+    r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:(?!\s+(?i:https?)://)[^,}\]\r\n])+"""
 )
 
 
@@ -294,7 +294,9 @@ def _redact_secret_text(value: str) -> str:
             # guarded): fail closed to the line-oriented path below, which
             # bounds its own structured reads.
             pass
-    redacted = re.sub(r"https?://[^,\s]+", lambda match: _redact_secret_url(match.group(0)), value)
+    redacted = re.sub(
+        r"(?i:https?)://[^,\s]+", lambda match: _redact_secret_url(match.group(0)), value
+    )
     redacted = re.sub(r"(?i)(bearer)\s+[^,\s]+", r"\1 [REDACTED]", redacted)
     return _redact_text_fields(redacted)
 
