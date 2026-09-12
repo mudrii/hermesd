@@ -39,6 +39,7 @@ _EXACT_SESSION_FILTER_FIELDS = {
 _ACTIVE_TRUE_VALUES = {"1", "true", "yes", "active"}
 _ACTIVE_FALSE_VALUES = {"0", "false", "no", "inactive"}
 _DETAIL_MAX_SESSION_ROWS = 50
+_DETAIL_VISIBLE_SESSION_ROWS = 20
 _DETAIL_MAX_SURFACE_ROWS = 20
 _PIN_MARKER = "📌"
 _MAX_NAME_CHARS = 30
@@ -57,6 +58,20 @@ _detail_sessions_cache: (
 ) = None
 
 
+def max_sessions_scroll_offset(
+    state: DashboardState,
+    filter_query: str = "",
+    session_sort: str = "recent",
+    message_match_ids: set[str] | None = None,
+) -> int:
+    """Largest scroll offset that still shows a full sessions window."""
+    sessions = _filtered_sorted_sessions(
+        state.sessions, filter_query, session_sort, message_match_ids
+    )
+    total = min(len(sessions), _DETAIL_MAX_SESSION_ROWS)
+    return max(0, total - _DETAIL_VISIBLE_SESSION_ROWS)
+
+
 def render_sessions(
     state: DashboardState,
     theme: Theme,
@@ -64,9 +79,12 @@ def render_sessions(
     filter_query: str = "",
     session_sort: str = "recent",
     message_match_ids: set[str] | None = None,
+    scroll_offset: int = 0,
 ) -> Panel:
     if detail:
-        return _render_detail(state, theme, filter_query, session_sort, message_match_ids)
+        return _render_detail(
+            state, theme, filter_query, session_sort, message_match_ids, scroll_offset
+        )
     return _render_compact(state, theme)
 
 
@@ -107,6 +125,7 @@ def _render_detail(
     filter_query: str,
     session_sort: str,
     message_match_ids: set[str] | None,
+    scroll_offset: int,
 ) -> Panel:
     sessions = _filtered_sorted_sessions(
         state.sessions, filter_query, session_sort, message_match_ids
@@ -136,8 +155,16 @@ def _render_detail(
         sections.append(section_heading("Billing & Context", theme))
         sections.append(billing_table)
     sections.append(section_heading("Sessions", theme))
+    capped = sessions[:_DETAIL_MAX_SESSION_ROWS]
+    total = len(capped)
+    # Clamp both ends so the rendered page stays a full window; a negative
+    # offset would slice from the end and render nothing.
+    offset = max(0, min(scroll_offset, max(0, total - _DETAIL_VISIBLE_SESSION_ROWS)))
+    visible = capped[offset : offset + _DETAIL_VISIBLE_SESSION_ROWS]
+    if total > _DETAIL_VISIBLE_SESSION_ROWS:
+        sections.append(_sessions_scroll_hint(theme, offset, len(visible), total))
     sections.append(
-        _sessions_table(sessions, theme)
+        _sessions_table(visible, theme)
         if sessions
         else Text("  No matching sessions\n", style=theme.banner_dim)
     )
@@ -181,6 +208,16 @@ def _detail_header(
     return header
 
 
+def _sessions_scroll_hint(theme: Theme, offset: int, shown: int, total: int) -> Text:
+    hint = Text()
+    hint.append(f" [{offset + 1}-{min(offset + shown, total)}/{total}] ", style=theme.ui_label)
+    if offset > 0:
+        hint.append("↑ ", style=theme.ui_accent)
+    hint.append("j/k scroll", style=theme.banner_dim)
+    hint.append("\n")
+    return hint
+
+
 def _sessions_table(sessions: list[SessionInfo], theme: Theme) -> Table:
     table = Table(box=None, show_header=True, padding=(0, 1))
     table.add_column("ID", style=theme.session_label)
@@ -196,7 +233,7 @@ def _sessions_table(sessions: list[SessionInfo], theme: Theme) -> Table:
     table.add_column("Out Tok", justify="right", style=theme.banner_text)
     table.add_column("Cost", justify="right", style=theme.ui_accent)
 
-    for s in sessions[:_DETAIL_MAX_SESSION_ROWS]:
+    for s in sessions:
         active = Text("● ", style=f"bold {theme.ui_ok}") if s.is_active else Text("  ")
         sid = Text()
         sid.append_text(active)

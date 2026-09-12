@@ -604,6 +604,7 @@ class DashboardApp:
                 state,
                 self._view.log_sub_view,
                 self._view.filter_query,
+                session_sort=self._view.session_sort,
             )
             is not None
         )
@@ -629,8 +630,25 @@ class DashboardApp:
         filter_query = view.filter_query
         filter_edit_mode = view.filter_edit_mode
         session_sort = view.session_sort
+        session_message_match_ids: set[str] | None = None
+        message_query = ""
+        if mode == "detail" and detail_panel == _SESSIONS_PANEL_NUM and filter_query:
+            from hermesd.panels.sessions import extract_message_search_query
+
+            message_query = extract_message_search_query(filter_query)
+        if message_query:
+            self._ensure_session_message_search(message_query)
+            if state.session_message_match_query == message_query:
+                session_message_match_ids = state.session_message_match_ids
         if mode == "detail" and detail_panel is not None:
-            max_offset = _detail_max_scroll_offset(detail_panel, state, log_sub_view, filter_query)
+            max_offset = _detail_max_scroll_offset(
+                detail_panel,
+                state,
+                log_sub_view,
+                filter_query,
+                session_sort=session_sort,
+                session_message_match_ids=session_message_match_ids,
+            )
             if max_offset is not None and scroll_offset > max_offset:
                 scroll_offset = max_offset
                 if write_back:
@@ -643,16 +661,6 @@ class DashboardApp:
                             and self._view.scroll_offset > max_offset
                         ):
                             self._view.scroll_offset = max_offset
-        session_message_match_ids: set[str] | None = None
-        message_query = ""
-        if mode == "detail" and detail_panel == _SESSIONS_PANEL_NUM and filter_query:
-            from hermesd.panels.sessions import extract_message_search_query
-
-            message_query = extract_message_search_query(filter_query)
-        if message_query:
-            self._ensure_session_message_search(message_query)
-            if state.session_message_match_query == message_query:
-                session_message_match_ids = state.session_message_match_ids
 
         layout = Layout()
         layout.split_column(
@@ -843,7 +851,8 @@ class DashboardApp:
         else:
             scrollable = (
                 panel is not None
-                and _detail_max_scroll_offset(panel, state, sub_view, query) is not None
+                and _detail_max_scroll_offset(panel, state, sub_view, query, session_sort=sort_mode)
+                is not None
             )
             self._append_detail_footer_actions(
                 t,
@@ -900,7 +909,7 @@ class DashboardApp:
         if panel == _SESSIONS_PANEL_NUM:
             self._append_footer_action(text, theme, "[s]", " Sort  ")
             text.append(f"sort={sort_mode}  ", style=f"{theme.banner_dim} on {theme.status_bar_bg}")
-        if panel in {_SKILLS_PANEL_NUM, _LOG_PANEL_NUM}:
+        if panel in {_SESSIONS_PANEL_NUM, _SKILLS_PANEL_NUM, _LOG_PANEL_NUM}:
             self._append_footer_action(text, theme, "[g/G]", " Top/bottom  ")
         if panel == _PROFILES_PANEL_NUM:
             self._append_footer_action(text, theme, "[p]", " Cycle profile  ")
@@ -1081,12 +1090,20 @@ def _detail_max_scroll_offset(
     state: DashboardState,
     log_sub_view: str,
     filter_query: str,
+    session_sort: str = "recent",
+    session_message_match_ids: set[str] | None = None,
 ) -> int | None:
     """Effective max scroll offset for scrollable detail panels, else None.
 
-    Logs delegates to the panel's own clamp; skills mirrors the row clamp in
-    hermesd/panels/overview.py.
+    Sessions and logs delegate to their panel's own clamp; skills mirrors the
+    row clamp in hermesd/panels/overview.py.
     """
+    if panel_num == _SESSIONS_PANEL_NUM:
+        from hermesd.panels.sessions import max_sessions_scroll_offset
+
+        return max_sessions_scroll_offset(
+            state, filter_query, session_sort, session_message_match_ids
+        )
     if panel_num == _LOG_PANEL_NUM:
         from hermesd.panels.logs import max_detail_scroll_offset
 

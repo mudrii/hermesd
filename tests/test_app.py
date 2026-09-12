@@ -538,9 +538,9 @@ def test_build_footer_uses_passed_log_sub_view(populated_hermes_home: Path, monk
     captured: dict[str, str] = {}
     real_max_scroll = app_module._detail_max_scroll_offset
 
-    def spy_max_scroll(panel_num, state, log_sub_view, filter_query):
+    def spy_max_scroll(panel_num, state, log_sub_view, filter_query, **kwargs):
         captured["log_sub_view"] = log_sub_view
-        return real_max_scroll(panel_num, state, log_sub_view, filter_query)
+        return real_max_scroll(panel_num, state, log_sub_view, filter_query, **kwargs)
 
     monkeypatch.setattr(app_module, "_detail_max_scroll_offset", spy_max_scroll)
     app._view.log_sub_view = "agent"

@@ -34,6 +34,7 @@ from hermesd.models import (
     LogState,
     LogStream,
     RuntimeStatus,
+    SessionInfo,
     SkillInfo,
 )
 from hermesd.panels import PANEL_NAMES
@@ -304,8 +305,13 @@ def test_footer_advertises_top_bottom_only_for_scrollable_detail_panels(
 
     app.handle_key("2")
     sessions_footer = app._build_footer(state).plain
-    assert "Scroll" not in sessions_footer
-    assert "Top/bottom" not in sessions_footer
+    assert "Scroll" in sessions_footer
+    assert "Top/bottom" in sessions_footer
+
+    app.handle_key("5")
+    config_footer = app._build_footer(state).plain
+    assert "Scroll" not in config_footer
+    assert "Top/bottom" not in config_footer
     app.close()
 
 
@@ -334,6 +340,64 @@ def test_jump_bottom_then_scroll_up_changes_skills_offset(populated_hermes_home:
     assert app._view.scroll_offset == 10  # 30 rows - 20-row window
     app.handle_key("k")
     assert app._view.scroll_offset == 9
+    app.close()
+
+
+def _sessions_view_state(app: DashboardApp, count: int) -> None:
+    sessions = [SessionInfo(session_id=f"sess{i:04d}", started_at=float(i)) for i in range(count)]
+    app._set_state(app._state.model_copy(update={"sessions": sessions}))
+
+
+def test_jump_bottom_then_scroll_up_changes_sessions_offset(populated_hermes_home: Path):
+    """The sessions detail view clamps G to the windowed bottom like logs/skills."""
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    _sessions_view_state(app, 40)
+    app.handle_key("2")
+    app.handle_key("G")
+    app._build_layout()
+    assert app._view.scroll_offset == 20  # 40 rows - 20-row window
+    app.handle_key("k")
+    assert app._view.scroll_offset == 19
+    app.close()
+
+
+def test_sessions_detail_scroll_offset_reaches_content_at_small_height(
+    populated_hermes_home: Path,
+):
+    """At ordinary terminal heights the windowed table keeps every row reachable."""
+    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    _sessions_view_state(app, 40)
+    app._console = Console(
+        file=io.StringIO(), width=140, height=24, force_terminal=True, no_color=True
+    )
+    app.handle_key("2")
+
+    with app._console.capture() as top_capture:
+        app._console.print(app._build_layout())
+    top_text = top_capture.get()
+    assert "sess0039" in top_text  # windowed top row survives the height crop
+    assert "sess0019" not in top_text
+
+    app.handle_key("G")
+    with app._console.capture() as bottom_capture:
+        app._console.print(app._build_layout())
+    bottom_text = bottom_capture.get()
+    assert "sess0019" in bottom_text  # scrolled window brings lower rows into view
+    assert "sess0039" not in bottom_text
+    app.close()
+
+
+def test_sessions_detail_scroll_offset_resets_when_leaving_panel(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    _sessions_view_state(app, 40)
+    app.handle_key("2")
+    app.handle_key("j")
+    app.handle_key("j")
+    assert app._view.scroll_offset == 2
+    app.handle_key("\x1b")
+    assert app._view.scroll_offset == 0
+    app.handle_key("2")
+    assert app._view.scroll_offset == 0
     app.close()
 
 
@@ -854,7 +918,8 @@ def test_build_footer_detail_sessions_shows_sort(populated_hermes_home: Path):
     app._view.enter_detail(2)
     footer = app._build_footer(app._state)
     assert "[s]" in footer.plain
-    assert "[j/k]" not in footer.plain
+    assert "[j/k]" in footer.plain
+    assert "[g/G]" in footer.plain
     assert "sort=recent" in footer.plain
     app.close()
 
@@ -862,7 +927,7 @@ def test_build_footer_detail_sessions_shows_sort(populated_hermes_home: Path):
 def test_top_bottom_keys_ignore_non_scrollable_detail_panels(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
 
-    app.handle_key("2")
+    app.handle_key("5")
     app.handle_key("G")
     assert app._view.scroll_offset == 0
 

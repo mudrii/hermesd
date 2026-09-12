@@ -323,3 +323,74 @@ def test_detail_recomputes_when_message_match_ids_change(
     render_sessions(state, Theme(), detail=True, message_match_ids=set(match_ids))
 
     assert sort_calls[0] == 2
+
+
+def _scroll_state(count: int) -> DashboardState:
+    """Sessions sorted 'recent' render sess{count-1} first, sess0000 last."""
+    sessions = [SessionInfo(session_id=f"sess{i:04d}", started_at=float(i)) for i in range(count)]
+    return DashboardState(sessions=sessions)
+
+
+def test_sessions_detail_windows_rows_over_visible_limit() -> None:
+    rendered = render_to_str(render_sessions(_scroll_state(40), Theme(), detail=True))
+    assert "[1-20/40]" in rendered
+    assert "sess0039" in rendered
+    # Row 21 is below the 20-row window.
+    assert "sess0019" not in rendered
+
+
+def test_sessions_detail_scroll_offset_pages_the_window() -> None:
+    rendered = render_to_str(
+        render_sessions(_scroll_state(40), Theme(), detail=True, scroll_offset=20)
+    )
+    assert "[21-40/40]" in rendered
+    assert "↑" in rendered
+    assert "sess0000" in rendered
+    assert "sess0039" not in rendered
+
+
+def test_sessions_detail_scroll_clamps_to_full_window() -> None:
+    """Scrolling past the end must clamp to a full window, not a 1-row stub."""
+    rendered = render_to_str(
+        render_sessions(_scroll_state(40), Theme(), detail=True, scroll_offset=39)
+    )
+    assert "[21-40/40]" in rendered
+    assert "sess0019" in rendered
+
+
+def test_sessions_detail_under_window_shows_every_row_without_hint() -> None:
+    rendered = render_to_str(render_sessions(_scroll_state(10), Theme(), detail=True))
+    assert "sess0000" in rendered
+    assert "sess0009" in rendered
+    assert "j/k scroll" not in rendered
+    assert "/10]" not in rendered
+
+
+def test_sessions_detail_negative_scroll_offset_renders_from_the_top() -> None:
+    state = _scroll_state(40)
+    negative = render_to_str(render_sessions(state, Theme(), detail=True, scroll_offset=-5))
+    top = render_to_str(render_sessions(state, Theme(), detail=True, scroll_offset=0))
+    assert negative == top
+    assert "sess0039" in negative
+
+
+def test_sessions_detail_scroll_window_stays_within_table_cap() -> None:
+    """The cap stays at 50 rows; the window scrolls inside the capped table."""
+    rendered = render_to_str(render_sessions(_scroll_state(60), Theme(), detail=True))
+    assert "[1-20/50]" in rendered
+    assert "… and 10 more" in rendered
+    scrolled = render_to_str(
+        render_sessions(_scroll_state(60), Theme(), detail=True, scroll_offset=30)
+    )
+    assert "[31-50/50]" in scrolled
+    assert "sess0010" in scrolled
+    assert "… and 10 more" in scrolled
+
+
+def test_detail_max_scroll_offset_sessions_accounts_for_window() -> None:
+    from hermesd.app import _SESSIONS_PANEL_NUM, _detail_max_scroll_offset
+
+    assert _detail_max_scroll_offset(_SESSIONS_PANEL_NUM, _scroll_state(40), "", "") == 20
+    # The table cap of 50 rows bounds the scrollable content.
+    assert _detail_max_scroll_offset(_SESSIONS_PANEL_NUM, _scroll_state(60), "", "") == 30
+    assert _detail_max_scroll_offset(_SESSIONS_PANEL_NUM, _scroll_state(10), "", "") == 0
