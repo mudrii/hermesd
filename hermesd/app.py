@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import re
 import signal
 import sys
 import threading
@@ -36,6 +37,9 @@ _PANEL_NUMBERS = tuple(sorted(PANEL_NAMES))
 # escape sequence, so an unbounded dump of a huge view can stall or drop it.
 _OSC52_MAX_BYTES = 96 * 1024
 _OSC52_TRUNCATION_MARKER = f"\n[hermesd: copy truncated at {_OSC52_MAX_BYTES} bytes]\n"
+# Matches an incomplete CSI/OSC escape at the end of a string so a byte-budget
+# cut never emits a half-written sequence.
+_ANSI_ESCAPE_TAIL_RE = re.compile(r"\x1b(?:\[[0-9;:?]*|\][^\a]*)?$")
 
 
 def _panel_num_by_name(name: str) -> int:
@@ -178,6 +182,21 @@ class ViewState:
         self.enter_detail(self.focus_panel)
 
 
+def _view_snapshot(view: ViewState) -> ViewSnapshot:
+    return ViewSnapshot(
+        mode=view.mode,
+        detail_panel=view.detail_panel,
+        focus_panel=view.focus_panel,
+        scroll_offset=view.scroll_offset,
+        log_sub_view=view.log_sub_view,
+        show_help=view.show_help,
+        profile_cycle_index=view.profile_cycle_index,
+        filter_query=view.filter_query,
+        filter_edit_mode=view.filter_edit_mode,
+        session_sort=view.session_sort,
+    )
+
+
 class DashboardApp:
     def __init__(
         self,
@@ -274,22 +293,25 @@ class DashboardApp:
     def _capture_layout_text(self, panel_num: int | None = None, refresh: bool = False) -> str:
         if refresh:
             self._set_state(self._collector.collect())
+        # Plain text only: the captured text is pasted verbatim by OSC 52
+        # clients, so it must never carry SGR sequences.
         snapshot_console = Console(
             width=max(self._console.width, 120),
             height=max(self._console.height, 48),
-            force_terminal=not self._no_color,
-            no_color=self._no_color,
+            force_terminal=False,
+            no_color=True,
         )
-        original_view = self._snapshot_view_state()
-        try:
-            if panel_num is not None:
-                with self._view_lock:
-                    self._view.enter_detail(panel_num)
-            with snapshot_console.capture() as capture:
-                snapshot_console.print(self._build_layout(console=snapshot_console))
-            return capture.get()
-        finally:
-            self._restore_view_state(original_view)
+        view = self._snapshot_view_state()
+        if panel_num is not None:
+            # Render the detail view from a scratch ViewState so a concurrent
+            # keypress mutating _view mid-capture is never restored away.
+            scratch = ViewState()
+            scratch.log_sub_view = view.log_sub_view
+            scratch.enter_detail(panel_num)
+            view = _view_snapshot(scratch)
+        with snapshot_console.capture() as capture:
+            snapshot_console.print(self._build_layout(console=snapshot_console, view=view))
+        return capture.get()
 
     def render_snapshot_text(self, panel_num: int | None = None) -> str:
         return self._capture_layout_text(panel_num=panel_num, refresh=True)
@@ -331,31 +353,7 @@ class DashboardApp:
 
     def _snapshot_view_state(self) -> ViewSnapshot:
         with self._view_lock:
-            return ViewSnapshot(
-                mode=self._view.mode,
-                detail_panel=self._view.detail_panel,
-                focus_panel=self._view.focus_panel,
-                scroll_offset=self._view.scroll_offset,
-                log_sub_view=self._view.log_sub_view,
-                show_help=self._view.show_help,
-                profile_cycle_index=self._view.profile_cycle_index,
-                filter_query=self._view.filter_query,
-                filter_edit_mode=self._view.filter_edit_mode,
-                session_sort=self._view.session_sort,
-            )
-
-    def _restore_view_state(self, snapshot: ViewSnapshot) -> None:
-        with self._view_lock:
-            self._view.mode = snapshot.mode
-            self._view.detail_panel = snapshot.detail_panel
-            self._view.focus_panel = snapshot.focus_panel
-            self._view.scroll_offset = snapshot.scroll_offset
-            self._view.log_sub_view = snapshot.log_sub_view
-            self._view.show_help = snapshot.show_help
-            self._view.profile_cycle_index = snapshot.profile_cycle_index
-            self._view.filter_query = snapshot.filter_query
-            self._view.filter_edit_mode = snapshot.filter_edit_mode
-            self._view.session_sort = snapshot.session_sort
+            return _view_snapshot(self._view)
 
     def close(self) -> None:
         self._closed.set()
@@ -603,35 +601,41 @@ class DashboardApp:
             is not None
         )
 
-    def _build_layout(self, console: Console | None = None) -> Layout:
+    def _build_layout(
+        self, console: Console | None = None, view: ViewSnapshot | None = None
+    ) -> Layout:
         render_console = console or self._console
         with self._lock:
             state = self._state
             theme = self._theme
             input_error = self._input_error
-        with self._view_lock:
-            mode = self._view.mode
-            detail_panel = self._view.detail_panel
-            scroll_offset = self._view.scroll_offset
-            log_sub_view = self._view.log_sub_view
-            show_help = self._view.show_help
-            profile_view_index = self._view.profile_cycle_index
-            filter_query = self._view.filter_query
-            filter_edit_mode = self._view.filter_edit_mode
-            session_sort = self._view.session_sort
+        write_back = view is None
+        if view is None:
+            with self._view_lock:
+                view = _view_snapshot(self._view)
+        mode = view.mode
+        detail_panel = view.detail_panel
+        scroll_offset = view.scroll_offset
+        log_sub_view = view.log_sub_view
+        show_help = view.show_help
+        profile_view_index = view.profile_cycle_index
+        filter_query = view.filter_query
+        filter_edit_mode = view.filter_edit_mode
+        session_sort = view.session_sort
         if mode == "detail" and detail_panel is not None:
             max_offset = _detail_max_scroll_offset(detail_panel, state, log_sub_view, filter_query)
             if max_offset is not None and scroll_offset > max_offset:
-                # Clamp the stored offset to the effective maximum so that
-                # scroll_up after jump_bottom moves off the bottom (G then k).
                 scroll_offset = max_offset
-                with self._view_lock:
-                    if (
-                        self._view.mode == "detail"
-                        and self._view.detail_panel == detail_panel
-                        and self._view.scroll_offset > max_offset
-                    ):
-                        self._view.scroll_offset = max_offset
+                if write_back:
+                    # Clamp the stored offset to the effective maximum so that
+                    # scroll_up after jump_bottom moves off the bottom (G then k).
+                    with self._view_lock:
+                        if (
+                            self._view.mode == "detail"
+                            and self._view.detail_panel == detail_panel
+                            and self._view.scroll_offset > max_offset
+                        ):
+                            self._view.scroll_offset = max_offset
         session_message_match_ids: set[str] | None = None
         message_query = ""
         if mode == "detail" and detail_panel == _SESSIONS_PANEL_NUM and filter_query:
@@ -1106,6 +1110,7 @@ def _truncate_for_osc52(text: str) -> str:
         return text
     budget = _OSC52_MAX_BYTES - len(_OSC52_TRUNCATION_MARKER.encode("utf-8"))
     head = encoded[:budget].decode("utf-8", errors="ignore")
+    head = _ANSI_ESCAPE_TAIL_RE.sub("", head)
     return f"{head}{_OSC52_TRUNCATION_MARKER}"
 
 

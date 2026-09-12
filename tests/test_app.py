@@ -559,40 +559,32 @@ def test_build_footer_uses_passed_log_sub_view(populated_hermes_home: Path, monk
     app.close()
 
 
-def test_capture_layout_text_enters_detail_under_view_lock(
-    populated_hermes_home: Path, monkeypatch
-):
-    """enter_detail during snapshot capture must be wrapped in _view_lock."""
+def test_capture_layout_text_does_not_mutate_view(populated_hermes_home: Path, monkeypatch):
+    """Snapshot capture renders from a ViewSnapshot; the live _view is never touched."""
+    import io
 
-    class TrackingLock:
-        def __init__(self) -> None:
-            self._lock = threading.RLock()
-            self.held = False
+    from rich.console import Console
 
-        def __enter__(self):
-            self._lock.acquire()
-            self.held = True
-            return self
-
-        def __exit__(self, exc_type, exc, traceback):
-            self.held = False
-            self._lock.release()
-
-    app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    lock = TrackingLock()
-    app._view_lock = lock
-    held_during_enter: list[bool] = []
+    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    app._console = Console(
+        file=io.StringIO(), width=120, height=40, force_terminal=True, no_color=True
+    )
+    app._set_state(app._collector.collect())
+    enter_calls: list[int] = []
     real_enter_detail = app._view.enter_detail
 
     def spy_enter_detail(panel_num: int) -> None:
-        held_during_enter.append(lock.held)
+        enter_calls.append(panel_num)
         real_enter_detail(panel_num)
 
     monkeypatch.setattr(app._view, "enter_detail", spy_enter_detail)
 
-    app._capture_layout_text(panel_num=2)
+    text = app._capture_layout_text(panel_num=2)
 
-    assert held_during_enter == [True]
+    assert "[2] Sessions" in text
+    assert enter_calls == []
+    assert app._view.mode == "overview"
+    assert app._view.detail_panel is None
     app.close()
 
 

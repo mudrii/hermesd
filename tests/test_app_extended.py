@@ -15,6 +15,7 @@ from hermesd import __version__
 from hermesd.app import (
     _LOG_PANEL_NUM,
     _OSC52_MAX_BYTES,
+    _OSC52_TRUNCATION_MARKER,
     _PROFILES_PANEL_NUM,
     _SESSIONS_PANEL_NUM,
     _SKILLS_PANEL_NUM,
@@ -24,6 +25,7 @@ from hermesd.app import (
     _normalize_json_payload,
     _panel_num_by_name,
     _panel_shortcut_label,
+    _truncate_for_osc52,
 )
 from hermesd.models import (
     DashboardState,
@@ -679,7 +681,7 @@ def test_input_loop_records_error_and_restores_terminal(
     app.close()
 
 
-def test_snapshot_view_state_round_trips_all_fields(populated_hermes_home: Path):
+def test_snapshot_view_state_captures_all_fields(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app._view.mode = "detail"
     app._view.detail_panel = 8
@@ -693,31 +695,27 @@ def test_snapshot_view_state_round_trips_all_fields(populated_hermes_home: Path)
     app._view.session_sort = "cost"
 
     snapshot = app._snapshot_view_state()
-    app._view = app._view.__class__()
-    app._restore_view_state(snapshot)
 
-    restored = app._snapshot_view_state()
-    assert restored == snapshot
-    assert restored.mode == "detail"
-    assert restored.detail_panel == 8
-    assert restored.focus_panel == 7
-    assert restored.scroll_offset == 12
-    assert restored.log_sub_view == "errors"
-    assert restored.show_help is True
-    assert restored.profile_cycle_index == 3
-    assert restored.filter_query == "message:timeout"
-    assert restored.filter_edit_mode is True
-    assert restored.session_sort == "cost"
+    assert snapshot.mode == "detail"
+    assert snapshot.detail_panel == 8
+    assert snapshot.focus_panel == 7
+    assert snapshot.scroll_offset == 12
+    assert snapshot.log_sub_view == "errors"
+    assert snapshot.show_help is True
+    assert snapshot.profile_cycle_index == 3
+    assert snapshot.filter_query == "message:timeout"
+    assert snapshot.filter_edit_mode is True
+    assert snapshot.session_sort == "cost"
     app.close()
 
 
-def test_capture_layout_text_restores_view_when_build_layout_raises(
+def test_capture_layout_text_leaves_view_untouched_when_build_layout_raises(
     populated_hermes_home: Path,
     monkeypatch,
 ):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
 
-    def fail_build_layout(console=None):
+    def fail_build_layout(*args, **kwargs):
         raise RuntimeError("render failed")
 
     monkeypatch.setattr(app, "_build_layout", fail_build_layout)
@@ -1549,9 +1547,9 @@ def test_copy_key_renders_outside_view_lock(populated_hermes_home: Path, monkeyp
     depths: list[int] = []
     original_build = app._build_layout
 
-    def spy_build(console=None):
+    def spy_build(console=None, view=None):
         depths.append(lock.depth)
-        return original_build(console=console)
+        return original_build(console=console, view=view)
 
     monkeypatch.setattr(app, "_build_layout", spy_build)
 
@@ -1604,6 +1602,67 @@ def test_copy_current_view_leaves_normal_payload_untouched(
     assert copied == "small view"
     assert _decoded_osc52_payload(buffer.getvalue()) == "small view"
     app.close()
+
+
+def test_copy_current_view_color_mode_copies_plain_text(populated_hermes_home: Path, monkeypatch):
+    """OSC 52 copy must carry plain text even when the live console renders color."""
+    monkeypatch.delenv("TERM", raising=False)
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    buffer = io.StringIO()
+    app._console = Console(file=buffer, width=120, height=40, force_terminal=True)
+
+    copied = app.copy_current_view()
+
+    assert "Gateway & Platforms" in copied
+    assert "\x1b" not in copied
+    assert "\x1b" not in _decoded_osc52_payload(buffer.getvalue())
+    app.close()
+
+
+def test_capture_layout_text_preserves_view_mutation_during_render(
+    populated_hermes_home: Path, monkeypatch
+):
+    """A view mutation landing mid-capture must survive; capture must not restore over it."""
+    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    app._console = Console(
+        file=io.StringIO(), width=120, height=40, force_terminal=True, no_color=True
+    )
+    original_build = app._build_layout
+
+    def mutating_build(*args, **kwargs):
+        with app._view_lock:
+            app._view.enter_detail(3)
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(app, "_build_layout", mutating_build)
+
+    app.copy_current_view()
+
+    assert app._view.mode == "detail"
+    assert app._view.detail_panel == 3
+    app.close()
+
+
+def test_truncate_for_osc52_strips_partial_escape_at_boundary():
+    """The byte cut must not leave a half-written ANSI escape at the boundary."""
+    budget = _OSC52_MAX_BYTES - len(_OSC52_TRUNCATION_MARKER.encode("utf-8"))
+    text = "x" * (budget - 2) + "\x1b[31m" + "y" * 64
+
+    truncated = _truncate_for_osc52(text)
+
+    assert truncated.endswith(_OSC52_TRUNCATION_MARKER)
+    head = truncated[: -len(_OSC52_TRUNCATION_MARKER)]
+    assert head == "x" * (budget - 2)
+
+
+def test_truncate_for_osc52_keeps_complete_escape_sequences():
+    budget = _OSC52_MAX_BYTES - len(_OSC52_TRUNCATION_MARKER.encode("utf-8"))
+    text = "\x1b[31m" + "x" * budget
+
+    truncated = _truncate_for_osc52(text)
+
+    assert truncated.startswith("\x1b[31m" + "x" * (budget - 5))
 
 
 def test_ensure_search_runs_query_queued_while_old_thread_lingers(
