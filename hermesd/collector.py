@@ -22,6 +22,8 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, Never, TypeVar
 
+from pydantic import BaseModel
+
 from hermesd.collect.common import (
     _MAX_TEXT_READ_BYTES,
     _age_seconds,
@@ -209,6 +211,7 @@ from hermesd.paths import HermesPaths
 from hermesd.theme import normalize_skin_name
 
 T = TypeVar("T")
+M = TypeVar("M", bound=BaseModel)
 
 
 def _closing_source() -> Never:
@@ -274,9 +277,10 @@ _LEDGER_FIELDS = (
 class _SourceSpec(NamedTuple):
     """One entry in the dashboard-state collection table.
 
-    ``field`` is both the DashboardState field and the ``_last_state``
-    attribute read for the last-good fallback; ``fallback`` overrides that
-    default for the two sources whose fallback is not a plain attribute read.
+    ``field`` is the DashboardState field the result lands in; ``source_name``
+    keys the per-source last-good baseline read by the default fallback.
+    ``fallback`` overrides that default for the sources whose fallback is not a
+    plain per-source value read.
     """
 
     field: str
@@ -477,7 +481,11 @@ class Collector:
         self._session_tool_names_cache: dict[
             str, tuple[tuple[str, int, int] | None, tuple[str, ...]]
         ] = {}
-        self._last_state: DashboardState | None = None
+        # Last successful value per source name. A source's fallback baseline
+        # advances whenever that source succeeds, so one permanently failing
+        # source cannot freeze every other source's last-good data (which a
+        # whole-state snapshot taken only on fully clean passes did).
+        self._last_good_by_source: dict[str, Any] = {}
         self._last_session_rows: list[dict[str, Any]] = []
         self._log_stream_cache: dict[str, tuple[float | None, int, LogStream]] = {}
         self._cron_excerpt_cache: dict[
@@ -511,10 +519,10 @@ class Collector:
         # _lock serializes collect() passes and guards the collector-internal
         # caches mutated during a pass (_file_cache, _log_cache,
         # _log_stream_cache, _available_tools_cache_*, _profile_count_cache,
-        # _derived_*) plus _last_state/_last_session_rows. It is deliberately
-        # NOT taken by search_session_ids_by_message(): HermesDB serializes its
-        # own access, so a slow collect pass (git subprocesses, per-profile DB
-        # snapshots) must not stall message search.
+        # _derived_*) plus _last_good_by_source/_last_session_rows. It is
+        # deliberately NOT taken by search_session_ids_by_message(): HermesDB
+        # serializes its own access, so a slow collect pass (git subprocesses,
+        # per-profile DB snapshots) must not stall message search.
         self._lock = threading.RLock()
 
     def collect(self) -> DashboardState:
@@ -524,10 +532,7 @@ class Collector:
             self._prune_stale_caches()
             health = _CollectionHealth()
             session_rows = self._collect_session_rows(health)
-            state = self._build_dashboard_state(health, session_rows)
-            if not health.failed_sources:
-                self._last_state = state
-            return state
+            return self._build_dashboard_state(health, session_rows)
 
     def _prune_stale_caches(self) -> None:
         """Evict path-keyed cache entries whose backing file or board is gone."""
@@ -565,12 +570,10 @@ class Collector:
                 compute,
             )
 
-        def last_good(field_name: str, default_factory: Callable[[], Any]) -> Callable[[], Any]:
-            return lambda: (
-                getattr(self._last_state, field_name)
-                if self._last_state is not None
-                else default_factory()
-            )
+        def last_good(source_name: str, default_factory: Callable[[], Any]) -> Callable[[], Any]:
+            # Per-source baseline: the value this source last produced
+            # successfully, regardless of how other sources fared that pass.
+            return lambda: self._last_good_by_source.get(source_name, default_factory())
 
         # Collected in order: entries below may read an earlier source's result
         # out of `results` (channels/runtime need gateway, operations needs the
@@ -585,7 +588,7 @@ class Collector:
                 self._collect_available_tools,
                 lambda: (0, []),
                 # One source feeds two state fields, so its last-good fallback
-                # cannot be a plain attribute read off _last_state.
+                # cannot be a plain per-source value read.
                 fallback=self._last_available_tools,
             ),
             _SourceSpec(
@@ -603,22 +606,26 @@ class Collector:
                 "gateway_heartbeat",
                 lambda: self._with_heartbeat(results["gateway"]),
                 lambda: results["gateway"],
-                fallback=lambda: self._last_gateway_fields(results["gateway"], _HEARTBEAT_FIELDS),
+                fallback=lambda: self._last_source_fields(
+                    "gateway_heartbeat", results["gateway"], _HEARTBEAT_FIELDS
+                ),
             ),
             _SourceSpec(
                 "gateway",
                 "gateway_lifecycle",
                 lambda: self._with_lifecycle(results["gateway"]),
                 lambda: results["gateway"],
-                fallback=lambda: self._last_gateway_fields(results["gateway"], _LIFECYCLE_FIELDS),
+                fallback=lambda: self._last_source_fields(
+                    "gateway_lifecycle", results["gateway"], _LIFECYCLE_FIELDS
+                ),
             ),
             _SourceSpec(
                 "gateway",
                 "update_receipt",
                 lambda: self._with_update_receipt(results["gateway"]),
                 lambda: results["gateway"],
-                fallback=lambda: self._last_gateway_fields(
-                    results["gateway"], _UPDATE_RECEIPT_FIELDS
+                fallback=lambda: self._last_source_fields(
+                    "update_receipt", results["gateway"], _UPDATE_RECEIPT_FIELDS
                 ),
             ),
             _SourceSpec(
@@ -626,7 +633,9 @@ class Collector:
                 "gateway_ledgers",
                 lambda: self._with_gateway_ledgers(results["gateway"]),
                 lambda: results["gateway"],
-                fallback=lambda: self._last_gateway_fields(results["gateway"], _LEDGER_FIELDS),
+                fallback=lambda: self._last_source_fields(
+                    "gateway_ledgers", results["gateway"], _LEDGER_FIELDS
+                ),
             ),
             _SourceSpec(
                 "tokens_today",
@@ -707,8 +716,8 @@ class Collector:
                 "blocked_scripts",
                 lambda: self._with_blocked_scripts(results["operations"]),
                 lambda: results["operations"],
-                fallback=lambda: self._last_operations_fields(
-                    results["operations"], _BLOCKED_SCRIPT_FIELDS
+                fallback=lambda: self._last_source_fields(
+                    "blocked_scripts", results["operations"], _BLOCKED_SCRIPT_FIELDS
                 ),
             ),
             _SourceSpec("skills_memory", "skills", self._collect_skills_memory, SkillsMemory),
@@ -723,8 +732,8 @@ class Collector:
             _SourceSpec("profiles", "profiles", self._collect_profiles, ProfilesState),
             _SourceSpec("logs", "logs", self._collect_logs, LogState),
             _SourceSpec("version_behind", "version_check", self._collect_version_behind, int),
-            # Without a last state the fallback is the shipped skin name, not
-            # the "" that the str default factory would yield.
+            # Without a last good read the fallback is the shipped skin name,
+            # not the "" that the str default factory would yield.
             _SourceSpec("active_skin", "skin", self._collect_skin, str, fallback=self._last_skin),
             _SourceSpec("curator", "curator", self._collect_curator, CuratorRun),
             _SourceSpec(
@@ -733,7 +742,7 @@ class Collector:
                 self._collect_model_usage,
                 lambda: _EMPTY_MODEL_USAGE_BUNDLE,
                 # The bundle is merged into token_analytics below, so its
-                # last-good value is not a plain _last_state attribute read.
+                # last-good value is not a plain per-source value read.
                 fallback=self._last_model_usage,
             ),
             _SourceSpec(
@@ -751,19 +760,29 @@ class Collector:
         )
 
         self._kanban_board_errors = []
+        pass_good: dict[str, Any] = {}
         for spec in specs:
             # close() sets _closing before it queues for the collect lock, so a
             # quit does not wait out a full pass: every source after the current
             # one falls straight back to its last-good value.
             fn = _closing_source if self._closing.is_set() else spec.collect
             results[spec.field] = health.collect(
-                spec.fallback or last_good(spec.field, spec.default_factory),
+                spec.fallback or last_good(spec.source_name, spec.default_factory),
                 spec.source_name,
                 fn,
                 spec.default_factory,
             )
+            if spec.source_name not in health.failed_sources:
+                pass_good[spec.source_name] = results[spec.field]
         if self._kanban_board_errors:
             health.mark_failed("kanban", "; ".join(self._kanban_board_errors))
+        # Advance each source's last-good baseline only when that source
+        # succeeded this pass; a failed source's fallback/default value must
+        # never become the next pass's baseline. Kanban board errors are
+        # reported after the loop, so the merge re-checks failed_sources.
+        for source_name, value in pass_good.items():
+            if source_name not in health.failed_sources:
+                self._last_good_by_source[source_name] = value
 
         tool_count, tool_names = results.pop("available_tools")
         model_usage = results.pop("model_usage")
@@ -782,8 +801,7 @@ class Collector:
             errors={source: health.errors[source] for source in sorted(health.errors)},
         )
         # Every remaining `results` key is a DashboardState field name by
-        # construction: _SourceSpec.field is what both the fallback getattr and
-        # this expansion key off.
+        # construction: _SourceSpec.field is what this expansion keys off.
         return DashboardState(
             hermes_home=self._paths.root_home,
             selected_profile=self._paths.profile_name,
@@ -797,12 +815,19 @@ class Collector:
         )
 
     def _last_available_tools(self) -> tuple[int, list[str]]:
-        if self._last_state is None:
-            return 0, []
-        return self._last_state.available_tools, self._last_state.available_tool_names
+        cached: tuple[int, list[str]] = self._last_good_by_source.get("tools_index", (0, []))
+        return cached
 
     def _last_skin(self) -> str:
-        return self._last_state.active_skin if self._last_state is not None else "default"
+        skin: str = self._last_good_by_source.get("skin", "default")
+        return skin
+
+    def _last_source_fields(self, source_name: str, current: M, fields: tuple[str, ...]) -> M:
+        """Restore one source's fields from its own last successful result."""
+        last: M | None = self._last_good_by_source.get(source_name)
+        if last is None:
+            return current
+        return current.model_copy(update={name: getattr(last, name) for name in fields})
 
     def _fresh_session_rows(
         self,
@@ -923,7 +948,7 @@ class Collector:
     def _collect_gateway(self) -> GatewayState:
         path = self._paths.shared_path("gateway_state.json")
         if not _safe_child_path(path, self._paths.root_home):
-            if self._last_state is not None:
+            if "gateway" in self._last_good_by_source:
                 raise RuntimeError(f"{path.name} became unsafe")
             return GatewayState()
         data = self._read_json_reporting_stale(path)
@@ -1012,13 +1037,6 @@ class Collector:
             self._paths.shared_path("config.yaml"), self._paths.root_home, start_epoch
         )
 
-    def _last_gateway_fields(self, gateway: GatewayState, fields: tuple[str, ...]) -> GatewayState:
-        """Restore one source's fields from the last good state (cache preservation)."""
-        last = self._last_state.gateway if self._last_state is not None else None
-        if last is None:
-            return gateway
-        return gateway.model_copy(update={name: getattr(last, name) for name in fields})
-
     def _read_liveness_json(self, path: Path, had_last_good: bool) -> JsonMapping:
         """Read a gateway liveness file, failing the source on a last-good fallback."""
         if not _safe_child_path(path, self._paths.root_home):
@@ -1032,7 +1050,7 @@ class Collector:
 
     def _with_heartbeat(self, gateway: GatewayState) -> GatewayState:
         path = self._paths.shared_path("state", "gateway.heartbeat")
-        last = self._last_state.gateway if self._last_state is not None else None
+        last = self._last_good_by_source.get("gateway_heartbeat")
         had_last_good = last is not None and last.loop_health is not GatewayLoopHealth.UNKNOWN
         data = self._read_liveness_json(path, had_last_good)
         file_mtime = _mtime(path) if _safe_child_path(path, self._paths.root_home) else None
@@ -1046,7 +1064,7 @@ class Collector:
 
     def _with_lifecycle(self, gateway: GatewayState) -> GatewayState:
         path = self._paths.shared_path("state", "gateway.lifecycle.json")
-        last = self._last_state.gateway if self._last_state is not None else None
+        last = self._last_good_by_source.get("gateway_lifecycle")
         data = self._read_liveness_json(path, bool(last is not None and last.lifecycle_phase))
         status = _lifecycle_status(data, self._pid_exists)
         return gateway.model_copy(
@@ -1060,7 +1078,7 @@ class Collector:
 
     def _with_update_receipt(self, gateway: GatewayState) -> GatewayState:
         path = self._paths.shared_path("logs", "update_receipts", "latest.json")
-        last = self._last_state.gateway if self._last_state is not None else None
+        last = self._last_good_by_source.get("update_receipt")
         data = self._read_liveness_json(path, bool(last is not None and last.last_update_outcome))
         receipt = _update_receipt_status(data, self._clock(), gateway.code_sha)
         return gateway.model_copy(
@@ -1077,7 +1095,8 @@ class Collector:
     def _with_gateway_ledgers(self, gateway: GatewayState) -> GatewayState:
         readout = self._read_state_db()
         if readout is None:
-            if self._last_state is not None and self._last_state.gateway.gateway_incarnation_count:
+            last = self._last_good_by_source.get("gateway_ledgers")
+            if last is not None and last.gateway_incarnation_count:
                 raise RuntimeError("state.db gateway ledgers disappeared or became unsafe")
             return gateway
         return gateway.model_copy(update=_gateway_ledger_fields(readout.ledgers, self._clock()))
@@ -1231,15 +1250,10 @@ class Collector:
         return surfaces
 
     def _last_model_usage(self) -> _ModelUsageBundle:
-        if self._last_state is None:
-            return _EMPTY_MODEL_USAGE_BUNDLE
-        analytics = self._last_state.token_analytics
-        return _ModelUsageBundle(
-            usage_source=analytics.usage_source,
-            all_time=tuple(analytics.model_usage_all),
-            last_24h=tuple(analytics.model_usage_24h),
-            last_7d=tuple(analytics.model_usage_7d),
+        bundle: _ModelUsageBundle = self._last_good_by_source.get(
+            "model_usage", _EMPTY_MODEL_USAGE_BUNDLE
         )
+        return bundle
 
     def _collect_tokens_today(self, rows: list[dict[str, Any]] | None = None) -> TokenSummary:
         rows = self._session_rows_or_read(rows)
@@ -1417,7 +1431,8 @@ class Collector:
             # truncated or emptied write, not a real "no configuration": fail
             # the source so the last-good summary survives instead of blanking
             # the config panel (same guard shape as the kanban.db readers).
-            if self._last_state is not None and self._last_state.config != ConfigSummary():
+            last = self._last_good_by_source.get("config")
+            if last is not None and last != ConfigSummary():
                 raise RuntimeError("config.yaml parsed empty")
             return ConfigSummary()
         model_cfg = _as_dict(cfg.get("model"))
@@ -1631,7 +1646,7 @@ class Collector:
         # A database that still exists but no longer resolves under ~/.hermes
         # was swapped for something else; that is a failure, not an absence.
         if _exists_strict(db_path) and not _safe_child_path(db_path, self._paths.root_home):
-            last = self._last_state.cron_executions if self._last_state is not None else None
+            last = self._last_good_by_source.get("cron_executions")
             if last is not None and last.db_present:
                 raise RuntimeError("cron/executions.db replaced by unsafe path")
             return CronExecutionsState()
@@ -1705,27 +1720,29 @@ class Collector:
             failure_limit=_coerce_int(kanban_cfg.get("failure_limit")),
         )
         db_path = self._paths.shared_path("kanban.db")
+        last_kanban = self._last_good_by_source.get("kanban")
         if not _exists_strict(db_path):
-            if self._last_state is not None and self._last_state.kanban.db_present:
+            if last_kanban is not None and last_kanban.db_present:
                 raise RuntimeError("kanban.db disappeared")
             return self._with_kanban_boards(base_state)
         if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
-            if self._last_state is not None and self._last_state.kanban.db_present:
+            if last_kanban is not None and last_kanban.db_present:
                 raise RuntimeError("kanban.db replaced by unsafe path")
             return self._with_kanban_boards(base_state)
         return self._with_kanban_boards(_read_kanban_state(db_path, base_state, now=self._clock()))
 
     def _read_current_kanban_board(self) -> str:
         path = self._paths.shared_path("kanban", "current")
+        last_kanban = self._last_good_by_source.get("kanban")
         if path.is_symlink() or not _path_resolves_under(path, self._paths.root_home):
-            if self._last_state is not None and self._last_state.kanban.current_board:
+            if last_kanban is not None and last_kanban.current_board:
                 raise RuntimeError("kanban current board replaced by unsafe path")
             return ""
         try:
             with path.open("rb") as handle:
                 raw = handle.read(_MAX_TEXT_READ_BYTES)
         except OSError:
-            if self._last_state is not None and self._last_state.kanban.current_board:
+            if last_kanban is not None and last_kanban.current_board:
                 raise
             return ""
         return raw.decode("utf-8", errors="replace").strip()
@@ -1831,12 +1848,13 @@ class Collector:
 
     def _with_response_store(self, operations: OperationsState) -> OperationsState:
         db_path = self._paths.shared_path("response_store.db")
+        last = self._last_good_by_source.get("operations")
         if not _exists_strict(db_path):
-            if self._last_state is not None and self._last_state.operations.response_store_present:
+            if last is not None and last.response_store_present:
                 raise RuntimeError("response_store.db disappeared")
             return operations
         if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
-            if self._last_state is not None and self._last_state.operations.response_store_present:
+            if last is not None and last.response_store_present:
                 raise RuntimeError("response_store.db replaced by unsafe path")
             return operations
         with _connect_readonly_sqlite(db_path) as conn:
@@ -1852,12 +1870,13 @@ class Collector:
 
     def _with_verification_evidence(self, operations: OperationsState) -> OperationsState:
         db_path = self._paths.profile_path("verification_evidence.db")
+        last = self._last_good_by_source.get("operations")
         if not _exists_strict(db_path):
-            if self._last_state is not None and self._last_state.operations.verification_db_present:
+            if last is not None and last.verification_db_present:
                 raise RuntimeError("verification_evidence.db disappeared")
             return operations
         if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
-            if self._last_state is not None and self._last_state.operations.verification_db_present:
+            if last is not None and last.verification_db_present:
                 raise RuntimeError("verification_evidence.db replaced by unsafe path")
             return operations
         with _connect_readonly_sqlite(db_path) as conn:
@@ -1881,7 +1900,8 @@ class Collector:
             or not _path_resolves_under(trace_dir, self._paths.root_home)
             or not trace_dir.is_dir()
         ):
-            if self._last_state is not None and self._last_state.operations.moa_trace_count:
+            last = self._last_good_by_source.get("operations")
+            if last is not None and last.moa_trace_count:
                 raise RuntimeError("MoA trace directory disappeared or became unsafe")
             return operations
         traces = [
@@ -1908,12 +1928,13 @@ class Collector:
 
     def _with_projects(self, operations: OperationsState) -> OperationsState:
         db_path = self._paths.profile_path("projects.db")
+        last = self._last_good_by_source.get("operations")
         if not _exists_strict(db_path):
-            if self._last_state is not None and self._last_state.operations.projects_db_present:
+            if last is not None and last.projects_db_present:
                 raise RuntimeError("projects.db disappeared")
             return operations
         if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
-            if self._last_state is not None and self._last_state.operations.projects_db_present:
+            if last is not None and last.projects_db_present:
                 raise RuntimeError("projects.db replaced by unsafe path")
             return operations
         with _connect_readonly_sqlite(db_path) as conn:
@@ -1930,7 +1951,7 @@ class Collector:
         """
         readout = self._read_state_db()
         if readout is None:
-            last = self._last_state.operations if self._last_state is not None else None
+            last = self._last_good_by_source.get("operations")
             if last is not None and (
                 last.goal_count or last.delegation_count or last.state_db_schema_version
             ):
@@ -1978,15 +1999,6 @@ class Collector:
                 now=self._clock(),
             )
         )
-
-    def _last_operations_fields(
-        self, operations: OperationsState, fields: tuple[str, ...]
-    ) -> OperationsState:
-        """Restore one operations sub-source's fields from the last good state."""
-        last = self._last_state.operations if self._last_state is not None else None
-        if last is None:
-            return operations
-        return operations.model_copy(update={name: getattr(last, name) for name in fields})
 
     def _with_state_snapshots(self, operations: OperationsState) -> OperationsState:
         return operations.model_copy(
@@ -2519,9 +2531,10 @@ class Collector:
         )
 
     def _last_profile_exists(self, name: str) -> bool:
-        if self._last_state is None:
+        last = self._last_good_by_source.get("profiles")
+        if last is None:
             return False
-        return any(profile.name == name for profile in self._last_state.profiles.profiles)
+        return any(profile.name == name for profile in last.profiles)
 
     def _profile_session_count(self, name: str, db_path: Path) -> int:
         # Opening a profile DB snapshots WAL files to a temp dir, so only

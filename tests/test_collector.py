@@ -1730,3 +1730,168 @@ def test_toolset_availability_absent_snapshot_is_empty(hermes_home: Path):
 
     assert availability.enabled_toolsets == []
     assert availability.unavailable_toolsets == []
+
+
+def test_last_good_fallback_does_not_regress_across_alternating_failures(
+    populated_hermes_home: Path,
+):
+    """Each source's fallback baseline advances whenever THAT source succeeds.
+
+    Pass 2 fails cron while config refreshes; pass 3 fails config while cron
+    refreshes. Config's pass-3 fallback must serve the pass-2 value, not the
+    older pass-1 whole-state snapshot.
+    """
+    import yaml
+
+    jobs_path = populated_hermes_home / "cron" / "jobs.json"
+    config_path = populated_hermes_home / "config.yaml"
+    jobs_path.write_text(json.dumps({"jobs": [{"id": "nightly", "name": "Nightly digest"}]}))
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+
+    def cron_boom() -> None:
+        raise RuntimeError("cron exploded")
+
+    def config_boom() -> None:
+        raise RuntimeError("config exploded")
+
+    try:
+        first = c.collect()
+        assert first.config.model == "gpt-5.4"
+        assert [job.name for job in first.cron.jobs] == ["Nightly digest"]
+
+        config_path.write_text(yaml.dump({"model": {"default": "gpt-6", "provider": "acme"}}))
+        c._collect_cron = cron_boom  # type: ignore[method-assign]
+        second = c.collect()
+        assert "cron" in second.health.failed_sources
+        assert [job.name for job in second.cron.jobs] == ["Nightly digest"]
+        assert second.config.model == "gpt-6"
+
+        del c._collect_cron  # type: ignore[attr-defined]
+        c._collect_config = config_boom  # type: ignore[method-assign]
+        jobs_path.write_text(json.dumps({"jobs": [{"id": "weekly", "name": "Weekly digest"}]}))
+        third = c.collect()
+        assert "config" in third.health.failed_sources
+        assert "cron" not in third.health.failed_sources
+        assert [job.name for job in third.cron.jobs] == ["Weekly digest"]
+        # The regression: config's fallback must be the pass-2 value (gpt-6),
+        # not the pass-1 value (gpt-5.4) frozen in the last clean state.
+        assert third.config.model == "gpt-6"
+    finally:
+        c.close()
+
+
+def test_last_good_baseline_advances_while_unrelated_source_fails_permanently(
+    populated_hermes_home: Path,
+    monkeypatch,
+):
+    import yaml
+
+    config_path = populated_hermes_home / "config.yaml"
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+
+    def cron_boom() -> None:
+        raise RuntimeError("cron exploded")
+
+    try:
+        assert c.collect().config.model == "gpt-5.4"
+        monkeypatch.setattr(c, "_collect_cron", cron_boom)
+        for model in ("gpt-6", "gpt-7"):
+            config_path.write_text(yaml.dump({"model": {"default": model}}))
+            state = c.collect()
+            assert state.config.model == model
+            assert "cron" in state.health.failed_sources
+
+        def config_boom() -> None:
+            raise RuntimeError("config exploded")
+
+        monkeypatch.setattr(c, "_collect_config", config_boom)
+        degraded = c.collect()
+        assert "config" in degraded.health.failed_sources
+        # Config's own baseline advanced on every successful pass despite cron
+        # failing throughout, so the fallback serves gpt-7, not gpt-5.4.
+        assert degraded.config.model == "gpt-7"
+    finally:
+        c.close()
+
+
+def test_last_good_recovers_after_multiple_partial_failures(
+    populated_hermes_home: Path,
+    monkeypatch,
+):
+    import yaml
+
+    jobs_path = populated_hermes_home / "cron" / "jobs.json"
+    config_path = populated_hermes_home / "config.yaml"
+    jobs_path.write_text(json.dumps({"jobs": [{"id": "nightly", "name": "Nightly digest"}]}))
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+
+    def cron_boom() -> None:
+        raise RuntimeError("cron exploded")
+
+    def config_boom() -> None:
+        raise RuntimeError("config exploded")
+
+    try:
+        c.collect()
+        monkeypatch.setattr(c, "_collect_cron", cron_boom)
+        assert "cron" in c.collect().health.failed_sources
+        monkeypatch.setattr(c, "_collect_config", config_boom)
+        both_failed = c.collect()
+        assert "cron" in both_failed.health.failed_sources
+        assert "config" in both_failed.health.failed_sources
+        assert both_failed.config.model == "gpt-5.4"
+        assert [job.name for job in both_failed.cron.jobs] == ["Nightly digest"]
+
+        monkeypatch.undo()
+        config_path.write_text(yaml.dump({"model": {"default": "gpt-8"}}))
+        jobs_path.write_text(json.dumps({"jobs": [{"id": "hourly", "name": "Hourly sync"}]}))
+        recovered = c.collect()
+        assert recovered.health.failed_sources == []
+        assert recovered.config.model == "gpt-8"
+        assert [job.name for job in recovered.cron.jobs] == ["Hourly sync"]
+
+        # The recovery pass advanced both baselines: a fresh failure serves the
+        # recovered values, not the pre-failure ones.
+        monkeypatch.setattr(c, "_collect_config", config_boom)
+        config_path.write_text(yaml.dump({"model": {"default": "gpt-9"}}))
+        final = c.collect()
+        assert final.config.model == "gpt-8"
+    finally:
+        c.close()
+
+
+def test_shared_field_enrichment_keeps_latest_successful_contribution(
+    populated_hermes_home: Path,
+    monkeypatch,
+):
+    """A gateway sub-source's fallback restores ITS last success, not the last
+    fully-clean pass's whole-state value."""
+    lifecycle_path = populated_hermes_home / "state" / "gateway.lifecycle.json"
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+
+    def cron_boom() -> None:
+        raise RuntimeError("cron exploded")
+
+    try:
+        first = c.collect()
+        assert first.gateway.lifecycle_phase == "running"
+
+        # Cron now fails on every pass, so no later pass is fully clean.
+        monkeypatch.setattr(c, "_collect_cron", cron_boom)
+        lifecycle_path.write_text(
+            json.dumps({"phase": "exited", "pid": 12345, "exit_code": 3, "exit_reason": "stopped"})
+        )
+        second = c.collect()
+        assert "cron" in second.health.failed_sources
+        assert second.gateway.lifecycle_phase == "exited"
+        assert second.gateway.last_exit_code == 3
+
+        # The lifecycle file corrupts: the source fails and must restore the
+        # pass-2 lifecycle fields (its own last success), not pass-1's.
+        lifecycle_path.write_text("{ not json")
+        third = c.collect()
+        assert "gateway_lifecycle" in third.health.failed_sources
+        assert third.gateway.lifecycle_phase == "exited"
+        assert third.gateway.last_exit_code == 3
+    finally:
+        c.close()
