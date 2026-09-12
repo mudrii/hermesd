@@ -241,6 +241,12 @@ class DashboardApp:
         self._input_thread: threading.Thread | None = None
         self._message_search_thread: threading.Thread | None = None
         self._message_search_inflight = ""
+        # Monotonic data revision, bumped by every _set_state. Message-search
+        # results are tagged with the revision they were computed against so a
+        # collector refresh invalidates them even when the query is unchanged.
+        self._state_generation = 0
+        self._message_search_ok: tuple[str, int] | None = None
+        self._message_search_failed: tuple[str, int] | None = None
         # True while a worker is still willing to pick up _message_search_inflight.
         # Cleared by the worker under _lock in the same critical section that
         # observes an empty queue, so a query enqueued while the thread object
@@ -468,6 +474,7 @@ class DashboardApp:
 
     def _set_state(self, state: DashboardState) -> None:
         with self._lock:
+            self._state_generation += 1
             message_query = self._state.session_message_match_query
             message_match_ids = self._state.session_message_match_ids
             if message_query and not state.session_message_match_query:
@@ -694,7 +701,12 @@ class DashboardApp:
         with self._lock:
             if self._closed.is_set():
                 return
-            if self._state.session_message_match_query == message_query:
+            generation = self._state_generation
+            if self._message_search_ok == (message_query, generation):
+                return
+            if self._message_search_failed == (message_query, generation):
+                # Failed searches are retried on the next data refresh, not on
+                # every render of the same revision.
                 return
             self._message_search_inflight = message_query
             if self._message_search_active:
@@ -715,6 +727,7 @@ class DashboardApp:
                     self._message_search_inflight = ""
                     self._message_search_active = False
                     return
+                generation = self._state_generation
             search_error = ""
             try:
                 match_ids = self._collector.search_session_ids_by_message(message_query)
@@ -735,9 +748,14 @@ class DashboardApp:
                     }
                 )
                 if search_error:
+                    # Not resolved: the next refresh must retry this query.
+                    self._message_search_failed = (message_query, generation)
                     self._input_error = search_error
-                elif self._input_error and self._input_error.startswith("message search error:"):
-                    self._input_error = None
+                else:
+                    self._message_search_ok = (message_query, generation)
+                    self._message_search_failed = None
+                    if self._input_error and self._input_error.startswith("message search error:"):
+                        self._input_error = None
                 self._message_search_inflight = ""
 
     def _build_header(

@@ -1303,6 +1303,127 @@ def test_completed_message_search_is_not_rerun_on_next_render(
     app.close()
 
 
+def test_message_search_reruns_after_refresh_with_unchanged_query(
+    populated_hermes_home: Path,
+    monkeypatch,
+):
+    """A collector refresh re-runs the same query so new matches appear."""
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._set_state(app._collector.collect())
+    app._view.enter_detail(2)
+    app._view.filter_query = "message:response"
+    results = iter([{"sess_001"}, {"sess_001", "sess_002"}])
+    calls: list[str] = []
+
+    def search(query: str) -> set[str]:
+        calls.append(query)
+        return next(results, {"sess_001", "sess_002"})
+
+    monkeypatch.setattr(app._collector, "search_session_ids_by_message", search)
+    app._build_layout()
+    app._message_search_thread.join(timeout=1)
+    assert app._state.session_message_match_ids == {"sess_001"}
+
+    app._set_state(app._collector.collect())  # data refresh, query unchanged
+    app._build_layout()
+    app._message_search_thread.join(timeout=1)
+
+    assert calls == ["response", "response"]
+    assert app._state.session_message_match_query == "response"
+    assert app._state.session_message_match_ids == {"sess_001", "sess_002"}
+    app.close()
+
+
+def test_message_search_refresh_drops_removed_matches(
+    populated_hermes_home: Path,
+    monkeypatch,
+):
+    """A collector refresh re-runs the same query so removed matches disappear."""
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._set_state(app._collector.collect())
+    app._view.enter_detail(2)
+    app._view.filter_query = "message:response"
+    results = iter([{"sess_001", "sess_002"}, set()])
+
+    def search(query: str) -> set[str]:
+        return next(results, set())
+
+    monkeypatch.setattr(app._collector, "search_session_ids_by_message", search)
+    app._build_layout()
+    app._message_search_thread.join(timeout=1)
+    assert app._state.session_message_match_ids == {"sess_001", "sess_002"}
+
+    app._set_state(app._collector.collect())
+    app._build_layout()
+    app._message_search_thread.join(timeout=1)
+
+    assert app._state.session_message_match_query == "response"
+    assert app._state.session_message_match_ids == set()
+    app.close()
+
+
+def test_failed_message_search_retries_on_next_refresh(
+    populated_hermes_home: Path,
+    monkeypatch,
+):
+    """A transient search failure is retried after a refresh, then succeeds."""
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._set_state(app._collector.collect())
+    app._view.enter_detail(2)
+    app._view.filter_query = "message:response"
+    calls: list[str] = []
+    failing = [True]
+
+    def search(query: str) -> set[str]:
+        calls.append(query)
+        if failing[0]:
+            failing[0] = False
+            raise RuntimeError("db down")
+        return {"sess_001"}
+
+    monkeypatch.setattr(app._collector, "search_session_ids_by_message", search)
+    app._build_layout()
+    app._message_search_thread.join(timeout=1)
+    assert app._input_error == "message search error: RuntimeError"
+    assert app._state.session_message_match_ids == set()
+
+    app._set_state(app._collector.collect())
+    app._build_layout()
+    app._message_search_thread.join(timeout=1)
+
+    assert calls == ["response", "response"]
+    assert app._input_error is None
+    assert app._state.session_message_match_query == "response"
+    assert app._state.session_message_match_ids == {"sess_001"}
+    app.close()
+
+
+def test_failed_message_search_does_not_retry_without_refresh(
+    populated_hermes_home: Path,
+    monkeypatch,
+):
+    """A failed search must not be retried on every render at the same data revision."""
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._set_state(app._collector.collect())
+    app._view.enter_detail(2)
+    app._view.filter_query = "message:response"
+    calls: list[str] = []
+
+    def fail_search(query: str) -> set[str]:
+        calls.append(query)
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(app._collector, "search_session_ids_by_message", fail_search)
+    app._build_layout()
+    app._message_search_thread.join(timeout=1)
+
+    app._build_layout()
+    app._build_layout()
+
+    assert calls == ["response"]
+    app.close()
+
+
 def test_ensure_session_message_search_noop_after_close(
     populated_hermes_home: Path,
     monkeypatch,
