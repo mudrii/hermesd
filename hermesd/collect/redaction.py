@@ -181,9 +181,12 @@ def _redact_secret_args(args: object) -> list[str]:
             continue
         arg = _redact_secret_url(str(raw_arg))
         if "=" in arg:
-            option, _value = arg.split("=", 1)
+            option, option_value = arg.split("=", 1)
             if _is_secret_option(option):
                 redacted.append(f"{option}=[REDACTED]")
+                continue
+            if option_value.startswith(("http://", "https://")):
+                redacted.append(f"{option}={_redact_secret_url(option_value)}")
                 continue
             if option.startswith(("http://", "https://")):
                 redacted.append(_redact_secret_url(arg))

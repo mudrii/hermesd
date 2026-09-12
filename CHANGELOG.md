@@ -9,6 +9,7 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ### Fixed
 
+- Argv redaction now covers `key=<url>` forms (e.g. `url=https://user:pw@host/x?token=t1` and `--url=https://…`): the URL value has its userinfo and secret query parameters masked instead of passing through byte-identical because the `key=` prefix defeated whole-argument URL detection.
 - Snapshot export (`--snapshot-file`) now writes to a temporary file that is atomically renamed into place: a destination hard-linked to a file inside `~/.hermes/` can no longer truncate the protected file, and failed or interrupted writes clean up their partial temporary output.
 - Secret redaction is now consistent across representations: JSON-style `"api_key": "..."` text, quoted values containing spaces, keys with whitespace around the separator, and nested dict/list arguments (e.g. `private_token`) are all redacted through one canonical secret-key classifier, and the `billing_base_url` endpoint is redacted where it enters dashboard state, breakdown labels, and JSON snapshots.
 - Redaction also covers escaped or truncated quoted values, structured secret values in prefixed log messages, and malformed URLs with encoded secret keys or no path before their query string.

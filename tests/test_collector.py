@@ -1024,6 +1024,31 @@ def test_redact_secret_args_handles_aliases_headers_and_dicts():
     assert text.count("[REDACTED]") >= 5
 
 
+def test_redact_secret_args_redacts_url_credentials_in_key_value_form():
+    redacted = _redact_secret_args(["url=https://user:pw@host/x?token=t1"])
+
+    assert redacted == ["url=https://[REDACTED]@host/x?token=[REDACTED]"]
+
+
+def test_redact_secret_args_redacts_url_credentials_in_dashed_option_value():
+    redacted = _redact_secret_args(["--url=https://user:pw@host/x?token=t1"])
+
+    assert redacted == ["--url=https://[REDACTED]@host/x?token=[REDACTED]"]
+
+
+def test_redact_secret_args_key_value_form_leaves_non_url_values_unchanged():
+    assert _redact_secret_args(["token=abc"]) == ["token=[REDACTED]"]
+    assert _redact_secret_args(["name=foo"]) == ["name=foo"]
+
+
+def test_redact_command_string_redacts_url_credentials_in_key_value_form():
+    redacted = _redact_command_string("mcp-server url=https://user:pw@host/x?token=t1")
+
+    assert "user:pw" not in redacted
+    assert "token=t1" not in redacted
+    assert "url=https://[REDACTED]@host/x?token=[REDACTED]" in redacted
+
+
 def test_redact_secret_args_non_list_returns_empty():
     assert _redact_secret_args("--token secret") == []
     assert _redact_secret_args(None) == []
