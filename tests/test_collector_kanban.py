@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import time
 from pathlib import Path
 
+import pytest
 import yaml
 
 import hermesd.collect.kanban as kanban_module
@@ -725,3 +727,71 @@ def test_read_recent_enriched_tasks_without_any_enrichment_columns_returns_empty
 
     assert _read_recent_enriched_tasks(conn) == []
     conn.close()
+
+
+_PRAGMA_DENYING_AUTHORIZER = lambda action, *_: (  # noqa: E731
+    sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_PRAGMA else sqlite3.SQLITE_OK
+)
+
+
+def test_stale_claim_count_propagates_pragma_failure():
+    """A denied PRAGMA inside the column-aware claim query must propagate."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    try:
+        create_kanban_db_tables(conn)
+        conn.set_authorizer(_PRAGMA_DENYING_AUTHORIZER)
+        with pytest.raises(sqlite3.DatabaseError):
+            kanban_module._stale_claim_count_from_tasks(conn, 300, time.time())
+    finally:
+        conn.close()
+
+
+def test_recent_enriched_tasks_propagates_pragma_failure():
+    """A denied PRAGMA inside the enrichment column probes must propagate."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    try:
+        create_kanban_db_tables(conn)
+        conn.set_authorizer(_PRAGMA_DENYING_AUTHORIZER)
+        with pytest.raises(sqlite3.DatabaseError):
+            _read_recent_enriched_tasks(conn)
+    finally:
+        conn.close()
+
+
+def test_kanban_pragma_failure_fails_source_and_keeps_last_good(hermes_home: Path, monkeypatch):
+    """A real PRAGMA denial on the kanban connection fails the kanban source."""
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('t1', 'Task', 'todo', 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert first.kanban.task_count == 1
+        assert "kanban" not in first.health.failed_sources
+
+        real_connect = kanban_module._connect_readonly_sqlite
+
+        @contextlib.contextmanager
+        def pragma_denying_connect(db_path):
+            with real_connect(db_path) as conn:
+                conn.set_authorizer(_PRAGMA_DENYING_AUTHORIZER)
+                yield conn
+
+        monkeypatch.setattr(kanban_module, "_connect_readonly_sqlite", pragma_denying_connect)
+        second = c.collect()
+        assert "kanban" in second.health.failed_sources
+        assert second.kanban == first.kanban
+
+        monkeypatch.setattr(kanban_module, "_connect_readonly_sqlite", real_connect)
+        third = c.collect()
+        assert "kanban" not in third.health.failed_sources
+        assert third.kanban.task_count == 1
+    finally:
+        c.close()

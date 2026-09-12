@@ -1478,7 +1478,37 @@ def test_count_helpers_propagate_errors_on_a_dead_connection():
         sqlite_util_module._table_count_or_zero(conn, "projects")
     with pytest.raises(sqlite3.Error):
         sqlite_util_module._count_rows(conn, "SELECT COUNT(*) FROM projects")
-    assert sqlite_util_module._column_exists(conn, "projects", "id") is False
+    with pytest.raises(sqlite3.Error):
+        sqlite_util_module._column_exists(conn, "projects", "id")
+
+
+def test_column_exists_propagates_pragma_failure():
+    """A denied PRAGMA on a present table is an error, not 'column absent'."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE tasks (id TEXT, block_kind TEXT)")
+        conn.set_authorizer(
+            lambda action, *_: (
+                sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_PRAGMA else sqlite3.SQLITE_OK
+            )
+        )
+        with pytest.raises(sqlite3.DatabaseError):
+            sqlite_util_module._column_exists(conn, "tasks", "block_kind")
+    finally:
+        conn.close()
+
+
+def test_column_exists_false_for_absent_column_or_table():
+    """Missing columns and genuinely absent tables legitimately read as False."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE tasks (id TEXT)")
+        assert sqlite_util_module._column_exists(conn, "tasks", "id") is True
+        assert sqlite_util_module._column_exists(conn, "tasks", "block_kind") is False
+        # PRAGMA table_info on an absent table legitimately yields no rows.
+        assert sqlite_util_module._column_exists(conn, "task_runs", "id") is False
+    finally:
+        conn.close()
 
 
 def test_connect_readonly_sqlite_cleans_up_snapshot_when_close_raises(

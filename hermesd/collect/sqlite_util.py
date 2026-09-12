@@ -109,11 +109,15 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
 
 
 def _column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
-    with contextlib.suppress(sqlite3.Error):
-        # Same identifier-interpolation carve-out as _table_count.
-        rows = conn.execute(f"PRAGMA table_info({_checked_table(table_name)})").fetchall()
-        return any(str(row[1] or "") == column_name for row in rows)
-    return False
+    """Column membership from PRAGMA table_info; PRAGMA failures propagate.
+
+    An absent table legitimately yields no rows (False); a present-but-
+    unreadable table raises so the caller's source fails to its last-good
+    value instead of silently degrading column-aware queries to empty results.
+    """
+    # Same identifier-interpolation carve-out as _table_count.
+    rows = conn.execute(f"PRAGMA table_info({_checked_table(table_name)})").fetchall()
+    return any(str(row[1] or "") == column_name for row in rows)
 
 
 def _count_rows(conn: sqlite3.Connection, sql: str) -> int:
