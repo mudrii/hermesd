@@ -28,7 +28,7 @@ from hermesd.collect.logs import _MAX_LOG_LINE_CHARS
 from hermesd.collect.redaction import _redact_secret_text
 from hermesd.collect.sqlite_util import (
     _connect_readonly_sqlite,
-    _count_rows_or_zero,
+    _count_rows,
     _query_rows,
     _table_exists,
 )
@@ -334,8 +334,8 @@ def _read_cron_incidents(
     if not _table_exists(conn, "cron_incidents"):
         return 0, 0, []
     open_clause = "WHERE COALESCE(state, '') != 'closed' AND closed_at IS NULL"
-    open_count = _count_rows_or_zero(conn, f"SELECT COUNT(*) FROM cron_incidents {open_clause}")
-    unacked_count = _count_rows_or_zero(
+    open_count = _count_rows(conn, f"SELECT COUNT(*) FROM cron_incidents {open_clause}")
+    unacked_count = _count_rows(
         conn,
         f"SELECT COUNT(*) FROM cron_incidents {open_clause} AND acked_at IS NULL",
     )

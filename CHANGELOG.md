@@ -7,6 +7,10 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ## [Unreleased]
 
+### Fixed
+
+- Transient SQLite read errors (locked db, torn snapshot) in the kanban, gateway, cron, operations, and response-store row-count readers now fail the affected source so the panels keep their last-good counts, instead of being swallowed into a false `0`. A genuinely absent table still legitimately reports zero, and a `conn.close()` failure on the WAL snapshot path no longer leaks its temporary directory.
+
 ### Changed
 
 - `state.db` in WAL mode is now opened live and read-only whenever its `-shm` sidecar exists — WAL readers see consistent data without blocking the writer — instead of copying the whole database into a temp dir on every refresh. The full snapshot copy remains as the fallback when the `-shm` is missing (read-only WAL recovery would need write access to `~/.hermes/`) or the live open itself fails. The `-wal` probe now uses strict existence checking so an unreadable sidecar fails the source instead of silently serving checkpoint-lagging data via `immutable=1`.

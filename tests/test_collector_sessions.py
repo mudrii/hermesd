@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import hermesd.collect.sqlite_util as sqlite_util_module
 from hermesd.collector import (
     _ACTIVE_SURFACE_LIMIT,
     Collector,
@@ -188,6 +189,53 @@ def test_collect_response_store_absent_is_zero(hermes_home: Path):
     state = c.collect()
     assert state.operations.response_store_present is False
     assert state.operations.conversation_count == 0
+    c.close()
+
+
+def test_collect_response_store_missing_tables_counts_zero(hermes_home: Path):
+    """A response_store.db without the tables yet legitimately reports zero."""
+    db_path = hermes_home / "response_store.db"
+    sqlite3.connect(str(db_path)).close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.operations.response_store_present is True
+    assert state.operations.conversation_count == 0
+    assert state.operations.response_count == 0
+    assert "operations" not in state.health.failed_sources
+    c.close()
+
+
+def test_collect_response_store_count_error_preserves_last_good(
+    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A transient sqlite error must fail the source to last-good, not report 0."""
+    db_path = hermes_home / "response_store.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        "CREATE TABLE conversations (id TEXT PRIMARY KEY);"
+        "CREATE TABLE responses (id TEXT PRIMARY KEY);"
+        "INSERT INTO conversations VALUES ('c1'), ('c2');"
+        "INSERT INTO responses VALUES ('r1'), ('r2'), ('r3');"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    first = c.collect()
+    assert first.operations.conversation_count == 2
+
+    def _locked(conn: sqlite3.Connection, table_name: str) -> int:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(sqlite_util_module, "_table_count", _locked)
+    second = c.collect()
+
+    assert "operations" in second.health.failed_sources
+    assert second.operations.response_store_present is True
+    assert second.operations.conversation_count == first.operations.conversation_count
+    assert second.operations.response_count == first.operations.response_count
     c.close()
 
 

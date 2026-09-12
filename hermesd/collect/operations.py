@@ -27,7 +27,7 @@ from hermesd.collect.common import (
 )
 from hermesd.collect.kanban import _kanban_board_present
 from hermesd.collect.sqlite_util import (
-    _count_rows_or_zero,
+    _count_rows,
     _query_rows,
     _table_count,
     _table_count_or_zero,
@@ -211,15 +211,15 @@ def _delegation_counts(conn: sqlite3.Connection) -> dict[str, int]:
     failed = ", ".join(f"'{state}'" for state in _DELEGATION_FAILED_STATES)
     return {
         "delegation_count": _table_count_or_zero(conn, "async_delegations"),
-        "delegation_running_count": _count_rows_or_zero(
+        "delegation_running_count": _count_rows(
             conn,
             f"SELECT COUNT(*) FROM async_delegations WHERE COALESCE(state, '') NOT IN ({terminal})",
         ),
-        "delegation_failed_count": _count_rows_or_zero(
+        "delegation_failed_count": _count_rows(
             conn,
             f"SELECT COUNT(*) FROM async_delegations WHERE COALESCE(state, '') IN ({failed})",
         ),
-        "delegation_undelivered_count": _count_rows_or_zero(
+        "delegation_undelivered_count": _count_rows(
             conn,
             "SELECT COUNT(*) FROM async_delegations "
             "WHERE COALESCE(delivery_state, '') != 'delivered' "
@@ -436,13 +436,13 @@ def _read_projects_state(
         update={
             "projects_db_present": True,
             "project_count": _table_count(conn, "projects"),
-            "project_archived_count": _count_rows_or_zero(
+            "project_archived_count": _count_rows(
                 conn,
                 "SELECT COUNT(*) FROM projects WHERE archived != 0",
             ),
             "project_folder_count": _table_count_or_zero(conn, "project_folders"),
             "discovered_repo_count": _table_count_or_zero(conn, "discovered_repos"),
-            "project_missing_primary_path_count": _count_rows_or_zero(
+            "project_missing_primary_path_count": _count_rows(
                 conn,
                 "SELECT COUNT(*) FROM projects WHERE COALESCE(primary_path, '') = ''",
             ),

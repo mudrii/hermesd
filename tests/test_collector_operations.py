@@ -1451,20 +1451,67 @@ def test_unknown_table_name_is_refused_by_the_allow_list():
         with pytest.raises(ValueError, match="unknown table name"):
             sqlite_util_module._table_count(conn, "projects; DROP TABLE projects")
         with pytest.raises(ValueError, match="unknown table name"):
+            sqlite_util_module._table_count_or_zero(conn, "projects; DROP TABLE projects")
+        with pytest.raises(ValueError, match="unknown table name"):
             sqlite_util_module._column_exists(conn, "sessions", "id")
     finally:
         conn.close()
 
 
-def test_sqlite_helpers_degrade_to_defaults_on_a_dead_connection():
-    """A connection closed underneath the readers yields zeros, not an exception."""
+def test_table_count_or_zero_returns_zero_for_a_missing_table():
+    """A table the agent has not created yet legitimately counts as zero."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        assert sqlite_util_module._table_count_or_zero(conn, "task_links") == 0
+    finally:
+        conn.close()
+
+
+def test_count_helpers_propagate_errors_on_a_dead_connection():
+    """A transient read error must propagate so the source falls back to last-good."""
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE projects (id TEXT)")
     conn.close()
 
-    assert sqlite_util_module._table_count_or_zero(conn, "projects") == 0
+    with pytest.raises(sqlite3.Error):
+        sqlite_util_module._table_count_or_zero(conn, "projects")
+    with pytest.raises(sqlite3.Error):
+        sqlite_util_module._count_rows(conn, "SELECT COUNT(*) FROM projects")
     assert sqlite_util_module._column_exists(conn, "projects", "id") is False
-    assert sqlite_util_module._count_rows_or_zero(conn, "SELECT COUNT(*) FROM projects") == 0
+
+
+def test_connect_readonly_sqlite_cleans_up_snapshot_when_close_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A failing conn.close() must not skip the WAL snapshot dir cleanup."""
+    db_path = tmp_path / "kanban.db"
+    db_path.write_bytes(b"")
+    db_path.with_name("kanban.db-wal").write_bytes(b"")
+
+    cleaned_up = False
+
+    class _FakeSnapshotDir:
+        def cleanup(self) -> None:
+            nonlocal cleaned_up
+            cleaned_up = True
+
+    class _CloseRaisingConnection:
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    monkeypatch.setattr(
+        sqlite_util_module,
+        "snapshot_wal_database",
+        lambda path, *, prefix: (_FakeSnapshotDir(), path),
+    )
+    monkeypatch.setattr(sqlite3, "connect", lambda *args, **kwargs: _CloseRaisingConnection())
+
+    with (
+        pytest.raises(RuntimeError, match="close failed"),
+        sqlite_util_module._connect_readonly_sqlite(db_path),
+    ):
+        pass
+    assert cleaned_up
 
 
 def test_state_snapshots_root_symlinked_outside_home_is_ignored(

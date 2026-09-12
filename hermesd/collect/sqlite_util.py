@@ -25,9 +25,11 @@ def _connect_readonly_sqlite(db_path: Path) -> Iterator[sqlite3.Connection]:
             yield conn
             return
         finally:
-            if conn is not None:
-                conn.close()
-            snapshot_dir.cleanup()
+            try:
+                if conn is not None:
+                    conn.close()
+            finally:
+                snapshot_dir.cleanup()
     conn = sqlite3.connect(
         f"{db_path.resolve().as_uri()}?mode=ro&immutable=1",
         uri=True,
@@ -85,9 +87,13 @@ def _table_count(conn: sqlite3.Connection, table_name: str) -> int:
 
 
 def _table_count_or_zero(conn: sqlite3.Connection, table_name: str) -> int:
-    with contextlib.suppress(sqlite3.Error):
-        return _table_count(conn, table_name)
-    return 0
+    """Row count, or 0 when the table is absent; read errors propagate so the
+    caller's source fails to its last-good value instead of reporting a false
+    zero."""
+    _checked_table(table_name)
+    if not _table_exists(conn, table_name):
+        return 0
+    return _table_count(conn, table_name)
 
 
 def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
@@ -106,12 +112,12 @@ def _column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) 
     return False
 
 
-def _count_rows_or_zero(conn: sqlite3.Connection, sql: str) -> int:
-    with contextlib.suppress(sqlite3.Error):
-        cur = conn.execute(sql)
-        row = cur.fetchone()
-        return int(row[0] or 0) if row is not None else 0
-    return 0
+def _count_rows(conn: sqlite3.Connection, sql: str) -> int:
+    """Count from a query over a table the caller has already confirmed to
+    exist; read errors propagate so the source fails to its last-good value."""
+    cur = conn.execute(sql)
+    row = cur.fetchone()
+    return int(row[0] or 0) if row is not None else 0
 
 
 def _count_by(conn: sqlite3.Connection, sql: str) -> dict[str, int]:

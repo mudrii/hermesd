@@ -12,7 +12,7 @@ from hermesd.collect.sqlite_util import (
     _column_exists,
     _connect_readonly_sqlite,
     _count_by,
-    _count_rows_or_zero,
+    _count_rows,
     _query_rows,
     _table_count,
     _table_count_or_zero,
@@ -108,7 +108,7 @@ def _read_kanban_board_summary(
             current=current,
             task_count=_table_count(conn, "tasks"),
             run_count=_table_count_or_zero(conn, "task_runs"),
-            problem_count=_count_rows_or_zero(
+            problem_count=_count_rows(
                 conn,
                 "SELECT COUNT(*) FROM tasks WHERE status IN ('blocked', 'failed', 'error')",
             ),
@@ -139,7 +139,7 @@ def _stale_claim_count_from_tasks(
         conditions.append(f"COALESCE(last_heartbeat_at, 0) > 0 AND last_heartbeat_at < {now - ttl}")
     if not conditions:
         return 0
-    return _count_rows_or_zero(
+    return _count_rows(
         conn,
         "SELECT COUNT(*) FROM tasks WHERE "
         + " OR ".join(f"({condition})" for condition in conditions),
