@@ -109,15 +109,12 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
 
 
 def _mcp_cache_section(state: DashboardState, theme: Theme) -> list[RenderableType]:
-    """MCP schema cache block: cached names, age, and a never-connected hint."""
+    """MCP schema cache block: cached names, age, and servers with no entry."""
     cache = state.mcp_cache
     heading = section_heading("MCP", theme)
-    if not cache.mcp_cached_server_count:
-        return [heading, Text("  —", style=theme.banner_dim)]
+    if not cache.mcp_cache_present:
+        return [heading, Text("  no cache file observed", style=theme.banner_dim)]
 
-    never_cached = [
-        name for name in state.config.mcp_server_names if name not in cache.mcp_cached_server_names
-    ]
     table = Table(box=None, show_header=False, padding=(0, 2))
     table.add_column("Key", style=theme.ui_label)
     table.add_column("Value", style=theme.ui_accent)
@@ -127,8 +124,22 @@ def _mcp_cache_section(state: DashboardState, theme: Theme) -> list[RenderableTy
         escape(f"{cache.mcp_cached_server_count} ({names})") if names else "—",
     )
     table.add_row("Cache age", _age_label(cache.mcp_schema_cache_age_seconds))
-    table.add_row("Never connected", escape(", ".join(never_cached)) if never_cached else "—")
+    # An absent entry says nothing about whether the server ever connected: the
+    # cache can be cleared, invalidated, or written under another profile.
+    table.add_row(
+        "No cache entry",
+        _bounded_name_list(cache.mcp_uncached_server_count, cache.mcp_uncached_server_names),
+    )
     return [heading, table]
+
+
+def _bounded_name_list(count: int, names: list[str]) -> str:
+    """Render a display-bounded name list without hiding that it was bounded."""
+    if not names:
+        return "—"
+    hidden = count - len(names)
+    suffix = f" (+{hidden} more)" if hidden > 0 else ""
+    return escape(f"{', '.join(names)}{suffix}")
 
 
 def _prompted_skills_text(state: DashboardState, theme: Theme) -> Text:

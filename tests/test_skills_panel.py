@@ -362,9 +362,12 @@ def test_skills_detail_shows_mcp_cache_section():
         configured_count=3,
         configured_names=["notion", "playwright", "sheets"],
         cache={
+            "mcp_cache_present": True,
             "mcp_cached_server_count": 2,
             "mcp_cached_server_names": ["playwright", "sheets"],
             "mcp_schema_cache_age_seconds": 300.0,
+            "mcp_uncached_server_count": 1,
+            "mcp_uncached_server_names": ["notion"],
         },
     )
 
@@ -377,9 +380,59 @@ def test_skills_detail_shows_mcp_cache_section():
     assert "notion" in text
 
 
+def test_skills_detail_says_no_cache_entry_instead_of_never_connected():
+    """Cache absence is an observation about this read, not a connection history."""
+    state = _mcp_state(
+        configured_count=2,
+        configured_names=["notion", "playwright"],
+        cache={
+            "mcp_cache_present": True,
+            "mcp_cached_server_count": 1,
+            "mcp_cached_server_names": ["playwright"],
+            "mcp_uncached_server_count": 1,
+            "mcp_uncached_server_names": ["notion"],
+        },
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "No cache entry" in text
+    assert "notion" in text
+    assert "Never connected" not in text
+    assert "never connected" not in text.lower()
+
+
+def test_skills_detail_flags_uncached_names_omitted_by_the_display_cap():
+    """A bounded list must not silently look complete (the F02 truncation bug)."""
+    names = [f"srv-{index:02d}" for index in range(20)]
+    state = _mcp_state(
+        cache={
+            "mcp_cache_present": True,
+            "mcp_cached_server_count": 1,
+            "mcp_cached_server_names": ["alpha"],
+            "mcp_uncached_server_count": 25,
+            "mcp_uncached_server_names": names,
+        },
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "(+5 more)" in text
+
+
+def test_skills_detail_reports_absent_cache_file():
+    text = render_to_str(
+        render_panel(7, _mcp_state(), Theme(), detail=True), width=200, no_color=True
+    )
+
+    assert "MCP" in text
+    assert "no cache file observed" in text
+
+
 def test_skills_detail_shows_dash_when_cache_age_is_unknown():
     state = _mcp_state(
         cache={
+            "mcp_cache_present": True,
             "mcp_cached_server_count": 1,
             "mcp_cached_server_names": ["playwright"],
             "mcp_schema_cache_age_seconds": None,
@@ -406,7 +459,7 @@ def test_skills_detail_without_cache_or_snapshot_renders_placeholder():
     )
 
     assert "MCP" in text
-    assert "—" in text
+    assert "no cache file observed" in text
     assert "Prompted skills" not in text
 
 
@@ -431,9 +484,12 @@ def test_skills_detail_escapes_markup_hostile_cached_names():
         configured_count=1,
         configured_names=["[bold]never-cached\x1b[2J"],
         cache={
+            "mcp_cache_present": True,
             "mcp_cached_server_count": 1,
             "mcp_cached_server_names": ["[red]evil\x1b]0;pwn\x07"],
             "mcp_schema_cache_age_seconds": 60.0,
+            "mcp_uncached_server_count": 1,
+            "mcp_uncached_server_names": ["[bold]never-cached\x1b[2J"],
         },
     )
 

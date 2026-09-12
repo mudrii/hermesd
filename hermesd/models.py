@@ -522,11 +522,20 @@ class ToolsetAvailability(BaseModel):
 
 
 class MCPSchemaCache(BaseModel):
-    """Summary of ``cache/mcp_schema_cache.json`` — server names only."""
+    """Summary of ``cache/mcp_schema_cache.json`` — server names only.
 
+    ``mcp_uncached_*`` is configured-minus-cached, computed from the complete
+    name sets on both sides. Absence of a cache entry is an observation about
+    this read, not evidence a server never connected: the cache may have been
+    cleared, invalidated, or written under another profile.
+    """
+
+    mcp_cache_present: bool = False
     mcp_cached_server_count: int = 0
     mcp_cached_server_names: list[str] = Field(default_factory=list)
     mcp_schema_cache_age_seconds: float | None = None
+    mcp_uncached_server_count: int = 0
+    mcp_uncached_server_names: list[str] = Field(default_factory=list)
 
 
 class SkillsPromptSnapshot(BaseModel):

@@ -685,6 +685,98 @@ def test_mcp_cache_age_is_clamped_to_zero(hermes_home: Path):
     assert _collect_state(hermes_home, mtime - 5000).mcp_cache.mcp_schema_cache_age_seconds == 0.0
 
 
+# F02/F03: cache membership is a fact about the complete name sets on both
+# sides. Bounding the *rendered* lists must never change which servers count as
+# having an entry, or the 21st configured server reads as uncached purely
+# because it fell off a display cap.
+
+
+def _write_configured_mcp_servers(home: Path, names: list[str]) -> None:
+    import yaml
+
+    home.joinpath("config.yaml").write_text(
+        yaml.dump({"mcp_servers": {name: {"enabled": True} for name in names}})
+    )
+
+
+def test_mcp_cache_membership_survives_the_display_cap(hermes_home: Path):
+    names = [f"srv-{index:02d}" for index in range(25)]
+    _write_configured_mcp_servers(hermes_home, names)
+    _write_mcp_cache(hermes_home, {name: {} for name in names})
+
+    cache = _collect_state(hermes_home).mcp_cache
+
+    assert cache.mcp_cached_server_count == 25
+    assert len(cache.mcp_cached_server_names) == 20
+    assert cache.mcp_uncached_server_count == 0
+    assert cache.mcp_uncached_server_names == []
+
+
+def test_mcp_cache_reports_configured_server_with_no_entry(hermes_home: Path):
+    _write_configured_mcp_servers(hermes_home, ["alpha", "beta", "gamma"])
+    _write_mcp_cache(hermes_home, {"alpha": {}, "beta": {}})
+
+    cache = _collect_state(hermes_home).mcp_cache
+
+    assert cache.mcp_uncached_server_count == 1
+    assert cache.mcp_uncached_server_names == ["gamma"]
+
+
+def test_mcp_cache_uncached_count_is_complete_when_names_are_capped(hermes_home: Path):
+    configured = [f"srv-{index:02d}" for index in range(30)]
+    _write_configured_mcp_servers(hermes_home, configured)
+    _write_mcp_cache(hermes_home, {"srv-00": {}})
+
+    cache = _collect_state(hermes_home).mcp_cache
+
+    assert cache.mcp_uncached_server_count == 29
+    assert len(cache.mcp_uncached_server_names) == 20
+
+
+def test_mcp_cache_uncached_ignores_servers_that_are_not_configured(hermes_home: Path):
+    """A cached server absent from config is not an uncached server."""
+    _write_configured_mcp_servers(hermes_home, ["alpha"])
+    _write_mcp_cache(hermes_home, {"alpha": {}, "unconfigured": {}})
+
+    cache = _collect_state(hermes_home).mcp_cache
+
+    assert cache.mcp_cached_server_count == 2
+    assert cache.mcp_uncached_server_count == 0
+
+
+def test_mcp_cache_present_flag_distinguishes_absent_from_empty(hermes_home: Path):
+    _write_configured_mcp_servers(hermes_home, ["alpha"])
+
+    assert _collect_state(hermes_home).mcp_cache.mcp_cache_present is False
+
+    _write_mcp_cache(hermes_home, {})
+    cache = _collect_state(hermes_home).mcp_cache
+
+    assert cache.mcp_cache_present is True
+    assert cache.mcp_cached_server_count == 0
+    assert cache.mcp_uncached_server_count == 1
+
+
+def test_mcp_cache_symlink_is_not_present(hermes_home: Path, tmp_path: Path):
+    outside = tmp_path / "outside_mcp.json"
+    outside.write_text(json.dumps({"escaped": {}}))
+    cache_dir = hermes_home / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "mcp_schema_cache.json").symlink_to(outside)
+
+    assert _collect_state(hermes_home).mcp_cache.mcp_cache_present is False
+
+
+def test_mcp_cache_without_config_reports_no_uncached(hermes_home: Path):
+    """No config.yaml means no configured set to compare against, not all-uncached."""
+    _write_mcp_cache(hermes_home, {"playwright": {}})
+
+    cache = _collect_state(hermes_home).mcp_cache
+
+    assert cache.mcp_cached_server_count == 1
+    assert cache.mcp_uncached_server_count == 0
+
+
 def test_skills_prompt_snapshot_present(hermes_home: Path, sample_skills_prompt_snapshot: Path):
     mtime = sample_skills_prompt_snapshot.stat().st_mtime
     snapshot = _collect_state(hermes_home, clock_value=mtime + 7200).skills_prompt

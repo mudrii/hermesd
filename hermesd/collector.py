@@ -2252,9 +2252,23 @@ class Collector:
         path = self._paths.shared_path("cache", "mcp_schema_cache.json")
         if not _safe_or_absent_child_path(path, self._paths.root_home):
             return MCPSchemaCache()
+        if not path.is_file() or path.is_symlink():
+            return MCPSchemaCache()
         return _mcp_schema_cache_summary(
-            self._read_json_reporting_stale(path), self._file_age_seconds(path)
+            self._read_json_reporting_stale(path),
+            self._file_age_seconds(path),
+            self._configured_mcp_server_names(),
         )
+
+    def _configured_mcp_server_names(self) -> list[str]:
+        """Every configured MCP server name, for cache-membership comparison.
+
+        ``ConfigSummary.mcp_server_names`` is display-bounded, so membership has
+        to be computed from the full set here: comparing against the truncated
+        list would report every configured server past the cap as uncached.
+        """
+        servers = _as_dict(self._read_yaml_reporting_stale().get("mcp_servers"))
+        return sorted(str(name) for name in servers)
 
     def _collect_skills_prompt(self) -> SkillsPromptSnapshot:
         path = self._paths.shared_path(".skills_prompt_snapshot.json")

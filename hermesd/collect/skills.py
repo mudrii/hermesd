@@ -43,13 +43,25 @@ def _name_list(value: object) -> list[str]:
     return sorted(names)
 
 
-def _mcp_schema_cache_summary(data: dict[str, Any], age_seconds: float | None) -> MCPSchemaCache:
-    """Summarize the MCP schema cache mapping; cached payloads stay opaque."""
+def _mcp_schema_cache_summary(
+    data: dict[str, Any], age_seconds: float | None, configured: list[str]
+) -> MCPSchemaCache:
+    """Summarize the MCP schema cache mapping; cached payloads stay opaque.
+
+    Membership is decided from the complete name sets on both sides and only the
+    rendered lists are bounded, so a configured server past the display cap is
+    never misreported as having no cache entry.
+    """
     names = sorted(str(name) for name in data)
+    cached = set(names)
+    uncached = [name for name in configured if name not in cached]
     return MCPSchemaCache(
+        mcp_cache_present=True,
         mcp_cached_server_count=len(names),
         mcp_cached_server_names=names[:_MAX_LISTED_NAMES],
         mcp_schema_cache_age_seconds=age_seconds,
+        mcp_uncached_server_count=len(uncached),
+        mcp_uncached_server_names=uncached[:_MAX_LISTED_NAMES],
     )
 
 
