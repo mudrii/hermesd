@@ -416,7 +416,7 @@ User-facing release notes live in [`CHANGELOG.md`](CHANGELOG.md). Before tagging
 
 ```
 hermesd/
-  __init__.py          Version string
+  __init__.py          Version derived from package metadata
   __main__.py          CLI entry point (argparse)
   app.py               Rich TUI: Live context, input thread, adaptive layout
   collector.py         Collector orchestration + public facade over collect/

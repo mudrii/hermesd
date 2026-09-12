@@ -35,11 +35,11 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
    python -m venv /tmp/hermesd-wheel-smoke
    /tmp/hermesd-wheel-smoke/bin/python -m pip install dist/hermesd-*.whl
    /tmp/hermesd-wheel-smoke/bin/hermesd --version
-   /tmp/hermesd-wheel-smoke/bin/python -m hermesd --version
+   /tmp/hermesd-wheel-smoke/bin/python -I -m hermesd --version
    python -m venv /tmp/hermesd-sdist-smoke
    /tmp/hermesd-sdist-smoke/bin/python -m pip install dist/hermesd-*.tar.gz
    /tmp/hermesd-sdist-smoke/bin/hermesd --version
-   /tmp/hermesd-sdist-smoke/bin/python -m hermesd --version
+   /tmp/hermesd-sdist-smoke/bin/python -I -m hermesd --version
    uv run twine check dist/*
    ```
 
@@ -114,11 +114,11 @@ Test categories:
 - `test_app.py` / `test_app_extended.py` / `test_app_input.py` — TUI key handling, input thread, layout, lifecycle
 - `test_panels.py` / `test_panels_extended.py` — cross-panel rendering (compact + detail)
 - `test_<panel>_panel.py` — one file per panel (`gateway`, `sessions`, `tokens`, `tools`, `config`, `cron`, `skills`, `logs`, `profiles`, `memory`, `kanban`, `operations`, `curator`)
-- `test_markup_safety.py` / `test_unicode_rendering.py` — Rich markup escaping and CJK/wide-character rendering across every panel
+- `test_markup_safety.py` / `test_unicode_rendering.py` — Rich markup escaping, secret-redaction safety and CJK/wide-character rendering across every panel
 - `test_*_resilience.py` (`collector`, `db`, `gateway`, `curator`) — every test injects an error and asserts the next read returns last-good data
 - `test_package_metadata.py` — packaging, workflow, long-description, and wheel-smoke contracts
 - `test_import_hygiene.py` / `test_readonly_invariant.py` — standalone-package and read-only safety contracts
-- `test_markup_safety.py` — Rich markup and secret-redaction safety
+- `test_tui_integration.py` — real-pty end-to-end TUI test
 - `test_contract.py` — opt-in contract test against a real `~/.hermes` (not part of the default suite)
 
 ## Reporting Issues

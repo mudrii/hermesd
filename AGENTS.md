@@ -49,7 +49,7 @@ hermesd/
   app.py          Rich TUI: Live context, input thread, adaptive layout
   collector.py    Collector orchestration + public facade over collect/
   collect/        Per-domain readers (sessions, kanban, cron, skills,
-                  operations, config, logs, redaction, sqlite, system, common)
+                  operations, config, logs, redaction, sqlite_util, system, common)
   defaults.py     Shared refresh-rate and log-tail-bytes defaults
   db.py           Read-only SQLite with PRAGMA data_version caching
   file_cache.py   mtime-keyed JSON/YAML cache
