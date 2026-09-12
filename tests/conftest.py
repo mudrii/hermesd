@@ -94,6 +94,16 @@ SESSION_V021_COLUMNS_SQL = """,
             last_activity_description TEXT,
             compression_failure_error TEXT"""
 
+# The durable half of the compressor's anti-thrash guard
+# (hermes_state_common.py:375-379). Split out from SESSION_V021_COLUMNS_SQL so a
+# fixture can build an early-0.21 database that has `compression_failure_error`
+# but none of these, exercising the availability filter's degraded path.
+SESSION_COMPRESSION_COLUMNS_SQL = """,
+            compression_failure_cooldown_until REAL,
+            compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
+            compression_ineffective_count INTEGER NOT NULL DEFAULT 0,
+            compression_recovery_deadline REAL"""
+
 SESSION_MODEL_USAGE_SQL = """
         CREATE TABLE session_model_usage (
             session_id TEXT NOT NULL,
@@ -179,11 +189,17 @@ def create_state_db_tables(
     include_schema_version: bool = True,
     source_required: bool = True,
     include_v021_columns: bool = False,
+    include_compression_columns: bool = True,
 ) -> None:
     """Create the session/message tables used by collector and DB tests.
 
     ``include_v021_columns`` adds the hermes-agent 0.21 session columns and the
     ``session_model_usage`` table; legacy-schema tests keep the default.
+    ``include_compression_columns`` adds the four durable anti-thrash columns on
+    top of the 0.21 set — set it False to build an early-0.21 database that has
+    ``compression_failure_error`` but no cooldown, streak, strike-count or
+    recovery-deadline column, which is the shape the availability filter has to
+    degrade over rather than fail on.
     """
     schema_version_sql = (
         "CREATE TABLE schema_version (version INTEGER NOT NULL);\n"
@@ -193,6 +209,8 @@ def create_state_db_tables(
     )
     source_column = "source TEXT NOT NULL" if source_required else "source TEXT"
     extra_session_columns = SESSION_V021_COLUMNS_SQL if include_v021_columns else ""
+    if include_v021_columns and include_compression_columns:
+        extra_session_columns += SESSION_COMPRESSION_COLUMNS_SQL
     model_usage_table = SESSION_MODEL_USAGE_SQL if include_v021_columns else ""
     conn.executescript(
         f"""

@@ -267,6 +267,13 @@ def test_null_v021_session_columns_map_to_defaults(hermes_home: Path) -> None:
     assert session.actual_cost_usd == 0.0
     assert session.cost_source == ""
     assert session.compression_failure_error == ""
+    # The durable anti-thrash columns default to "no deadline" / zero strikes,
+    # and a NULL deadline must never arrive as a 0.0 epoch.
+    assert session.compression_failure_cooldown_until is None
+    assert session.compression_fallback_streak == 0
+    assert session.compression_ineffective_count == 0
+    assert session.compression_recovery_deadline is None
+    assert session.compression_recovery_active(time.time()) is False
 
 
 def test_null_model_usage_columns_collect_as_zero(hermes_home: Path) -> None:

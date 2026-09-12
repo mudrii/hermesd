@@ -1431,6 +1431,230 @@ def test_collector_maps_new_session_columns(hermes_home: Path) -> None:
     assert state.tokens_total.cost_is_estimated is False
 
 
+# --------------------------------------------------------------------------
+# compression recovery state (the durable half of the anti-thrash guard)
+#
+# `compression_failure_cooldown_until`, `compression_fallback_streak`,
+# `compression_ineffective_count` and `compression_recovery_deadline` are
+# sessions-table columns (hermes_state_common.py:375-379). They are counters and
+# timestamps only — no conversation content is read to produce them.
+# --------------------------------------------------------------------------
+
+_COMPRESSION_NOW = 1_800_000_000.0
+
+
+def _write_compression_db(
+    hermes_home: Path,
+    *,
+    cooldown_until: object = None,
+    fallback_streak: object = None,
+    ineffective_count: object = None,
+    recovery_deadline: object = None,
+    with_columns: bool = True,
+    v021: bool = True,
+) -> None:
+    """A state.db holding one session with the given compression-recovery values."""
+    conn = sqlite3.connect(str(hermes_home / "state.db"))
+    create_state_db_tables(
+        conn,
+        include_schema_version=False,
+        include_v021_columns=v021,
+        include_compression_columns=with_columns,
+    )
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+        ("sess_compression", "cli", _COMPRESSION_NOW - 600),
+    )
+    if with_columns and v021:
+        # The two counters are NOT NULL DEFAULT 0 upstream, so a None here means
+        # "leave the default" rather than "store NULL".
+        conn.execute(
+            "UPDATE sessions SET compression_failure_cooldown_until = ?, "
+            "compression_fallback_streak = ?, compression_ineffective_count = ?, "
+            "compression_recovery_deadline = ? WHERE id = ?",
+            (
+                cooldown_until,
+                0 if fallback_streak is None else fallback_streak,
+                0 if ineffective_count is None else ineffective_count,
+                recovery_deadline,
+                "sess_compression",
+            ),
+        )
+    conn.commit()
+    conn.close()
+
+
+def _compression_session(hermes_home: Path, **kwargs: object):
+    _write_compression_db(hermes_home, **kwargs)  # type: ignore[arg-type]
+    state = _collect_once(hermes_home, clock=lambda: _COMPRESSION_NOW)
+    assert "sessions" not in state.health.failed_sources
+    return state.sessions[0]
+
+
+def test_collector_maps_compression_recovery_columns(hermes_home: Path) -> None:
+    session = _compression_session(
+        hermes_home,
+        cooldown_until=_COMPRESSION_NOW + 45,
+        fallback_streak=2,
+        ineffective_count=3,
+        recovery_deadline=_COMPRESSION_NOW + 240,
+    )
+
+    assert session.compression_failure_cooldown_until == pytest.approx(_COMPRESSION_NOW + 45)
+    assert session.compression_fallback_streak == 2
+    assert session.compression_ineffective_count == 3
+    assert session.compression_recovery_deadline == pytest.approx(_COMPRESSION_NOW + 240)
+
+
+def test_collector_defaults_compression_columns_when_they_are_absent(
+    hermes_home: Path,
+) -> None:
+    """An early-0.21 database has the error column but none of the four new ones."""
+    session = _compression_session(hermes_home, with_columns=False)
+
+    assert session.compression_failure_cooldown_until is None
+    assert session.compression_fallback_streak == 0
+    assert session.compression_ineffective_count == 0
+    assert session.compression_recovery_deadline is None
+    assert session.compression_recovery_active(_COMPRESSION_NOW) is False
+
+
+def test_collector_defaults_compression_columns_on_a_legacy_schema(
+    hermes_home: Path,
+) -> None:
+    session = _compression_session(hermes_home, v021=False, with_columns=False)
+
+    assert session.compression_fallback_streak == 0
+    assert session.compression_recovery_deadline is None
+
+
+def test_compression_recovery_deadline_zero_is_disarmed_not_an_epoch(
+    hermes_home: Path,
+) -> None:
+    """Upstream stores 0 for "not armed"; surfacing it as an epoch reads as 1970."""
+    session = _compression_session(hermes_home, recovery_deadline=0.0)
+
+    assert session.compression_recovery_deadline is None
+    assert session.compression_recovery_remaining(_COMPRESSION_NOW) is None
+    assert session.compression_recovery_active(_COMPRESSION_NOW) is False
+
+
+def test_compression_cooldown_zero_is_disarmed(hermes_home: Path) -> None:
+    session = _compression_session(hermes_home, cooldown_until=0)
+
+    assert session.compression_failure_cooldown_until is None
+    assert session.compression_cooldown_remaining(_COMPRESSION_NOW) is None
+
+
+def test_null_compression_columns_are_not_active(hermes_home: Path) -> None:
+    session = _compression_session(hermes_home)
+
+    assert session.compression_failure_cooldown_until is None
+    assert session.compression_recovery_deadline is None
+    assert session.compression_fallback_streak == 0
+    assert session.compression_ineffective_count == 0
+    assert session.compression_recovery_active(_COMPRESSION_NOW) is False
+
+
+@pytest.mark.parametrize(
+    ("cooldown_until", "recovery_deadline"),
+    [
+        pytest.param("not-a-number", "also-not", id="text"),
+        pytest.param("", "", id="empty-text"),
+        pytest.param(-5.0, -1.0, id="negative"),
+        pytest.param(float("inf"), float("nan"), id="non-finite"),
+    ],
+)
+def test_malformed_compression_values_coerce_without_failing_the_source(
+    hermes_home: Path, cooldown_until: object, recovery_deadline: object
+) -> None:
+    """SQLite columns are untyped: a TEXT value in a REAL column must not blank
+    the whole `sessions` source."""
+    session = _compression_session(
+        hermes_home,
+        cooldown_until=cooldown_until,
+        recovery_deadline=recovery_deadline,
+        fallback_streak="7",
+        ineffective_count="bogus",
+    )
+
+    assert session.compression_fallback_streak == 7
+    assert session.compression_ineffective_count == 0
+    assert session.compression_recovery_active(_COMPRESSION_NOW) is False
+
+
+def test_expired_compression_cooldown_is_not_active(hermes_home: Path) -> None:
+    session = _compression_session(hermes_home, cooldown_until=_COMPRESSION_NOW - 1)
+
+    assert session.compression_failure_cooldown_until == pytest.approx(_COMPRESSION_NOW - 1)
+    assert session.compression_cooldown_remaining(_COMPRESSION_NOW) is None
+    assert session.compression_recovery_active(_COMPRESSION_NOW) is False
+
+
+def test_live_compression_cooldown_is_active_with_remaining(hermes_home: Path) -> None:
+    session = _compression_session(hermes_home, cooldown_until=_COMPRESSION_NOW + 45)
+
+    assert session.compression_cooldown_remaining(_COMPRESSION_NOW) == pytest.approx(45.0)
+    assert session.compression_recovery_active(_COMPRESSION_NOW) is True
+
+
+def test_cooldown_exactly_at_now_is_expired(hermes_home: Path) -> None:
+    """Upstream keeps a cooldown only while `cooldown_until > now`
+    (hermes_state_compression.py:329-335)."""
+    session = _compression_session(hermes_home, cooldown_until=_COMPRESSION_NOW)
+
+    assert session.compression_cooldown_remaining(_COMPRESSION_NOW) is None
+
+
+def test_future_recovery_deadline_is_active_and_a_past_one_is_not(
+    hermes_home: Path,
+) -> None:
+    armed = _compression_session(hermes_home, recovery_deadline=_COMPRESSION_NOW + 300)
+    assert armed.compression_recovery_remaining(_COMPRESSION_NOW) == pytest.approx(300.0)
+    assert armed.compression_recovery_active(_COMPRESSION_NOW) is True
+
+    hermes_home.joinpath("state.db").unlink()
+    elapsed = _compression_session(hermes_home, recovery_deadline=_COMPRESSION_NOW - 300)
+    assert elapsed.compression_recovery_remaining(_COMPRESSION_NOW) is None
+    assert elapsed.compression_recovery_active(_COMPRESSION_NOW) is False
+
+
+def test_recovery_deadline_counts_down_against_the_injected_clock(
+    hermes_home: Path,
+) -> None:
+    """The same stored row is active at one clock reading and expired at another."""
+    _write_compression_db(hermes_home, recovery_deadline=_COMPRESSION_NOW + 100)
+
+    early = Collector(hermes_home, clock=lambda: _COMPRESSION_NOW)
+    try:
+        session = early.collect().sessions[0]
+    finally:
+        early.close()
+    assert session.compression_recovery_active(_COMPRESSION_NOW) is True
+    # The stored epoch does not move; only the clock does.
+    assert session.compression_recovery_active(_COMPRESSION_NOW + 101) is False
+
+
+def test_either_signal_alone_makes_recovery_active(hermes_home: Path) -> None:
+    cooldown_only = _compression_session(hermes_home, cooldown_until=_COMPRESSION_NOW + 10)
+    assert cooldown_only.compression_recovery_active(_COMPRESSION_NOW) is True
+
+    hermes_home.joinpath("state.db").unlink()
+    deadline_only = _compression_session(hermes_home, recovery_deadline=_COMPRESSION_NOW + 10)
+    assert deadline_only.compression_recovery_active(_COMPRESSION_NOW) is True
+
+
+def test_compression_counters_are_active_without_a_live_timer(hermes_home: Path) -> None:
+    """A tripped strike count with no armed clock is state, not active recovery."""
+    session = _compression_session(
+        hermes_home, fallback_streak=4, ineffective_count=2, recovery_deadline=0
+    )
+
+    assert session.compression_fallback_streak == 4
+    assert session.compression_ineffective_count == 2
+    assert session.compression_recovery_active(_COMPRESSION_NOW) is False
+
+
 def test_collector_model_usage_windows(hermes_home: Path) -> None:
     _write_v021_session_db(hermes_home, v021=True)
 

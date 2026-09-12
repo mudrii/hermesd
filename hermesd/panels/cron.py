@@ -494,7 +494,13 @@ def _job_delivery_line(
         f"  {sanitize_terminal_text(j.name or j.job_id[:8] or '—')}: ",
         style=theme.ui_label,
     )
-    line.append("  ".join(escape(part) for part in parts) + "\n", style=theme.banner_text)
+    # Text.append does not parse markup, so the DB-sourced outcome names are
+    # sanitized like the job name above rather than escaped — escaping would
+    # render a literal backslash before any '['.
+    line.append(
+        "  ".join(sanitize_terminal_text(part) for part in parts) + "\n",
+        style=theme.banner_text,
+    )
     return line
 
 

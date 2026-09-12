@@ -214,6 +214,173 @@ def test_detail_truncates_long_compression_error() -> None:
     assert "x" * 40 in rendered
 
 
+# --------------------------------------------------------------------------
+# active compression recovery (the durable half of the anti-thrash guard)
+# --------------------------------------------------------------------------
+
+
+def _recovery_state(**overrides: object) -> DashboardState:
+    """A state whose single session carries the given compression-recovery row."""
+    return DashboardState(
+        collected_at=_NOW,
+        sessions=[_session(**overrides)],  # type: ignore[arg-type]
+    )
+
+
+def test_detail_warns_about_a_live_compression_cooldown() -> None:
+    state = _recovery_state(compression_failure_cooldown_until=_NOW + 45)
+
+    rendered = render_to_str(render_sessions(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "recovery — cooldown 45s left" in rendered
+
+
+def test_detail_warns_about_a_future_anti_thrash_recovery_deadline() -> None:
+    state = _recovery_state(compression_recovery_deadline=_NOW + 240)
+
+    rendered = render_to_str(render_sessions(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "recovery — anti-thrash probe in 4m" in rendered
+
+
+def test_detail_shows_both_timers_and_both_counters_on_one_line() -> None:
+    state = _recovery_state(
+        compression_failure_cooldown_until=_NOW + 45,
+        compression_recovery_deadline=_NOW + 240,
+        compression_fallback_streak=2,
+        compression_ineffective_count=3,
+    )
+
+    rendered = render_to_str(render_sessions(state, Theme(), detail=True), width=240, no_color=True)
+
+    assert (
+        "recovery — cooldown 45s left, anti-thrash probe in 4m, "
+        "fallback streak 2, ineffective 3" in rendered
+    )
+
+
+def test_detail_renders_a_sub_second_cooldown_with_one_decimal() -> None:
+    state = _recovery_state(compression_failure_cooldown_until=_NOW + 0.5)
+
+    rendered = render_to_str(render_sessions(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "recovery — cooldown 0.5s left" in rendered
+
+
+def test_detail_omits_an_expired_compression_cooldown() -> None:
+    """An expired cooldown is cleared state, not a warning."""
+    state = _recovery_state(compression_failure_cooldown_until=_NOW - 1)
+
+    rendered = render_to_str(render_sessions(state, Theme(), detail=True), width=200)
+
+    assert "recovery" not in rendered
+    assert "Warnings" not in rendered
+
+
+def test_detail_omits_an_elapsed_recovery_deadline() -> None:
+    state = _recovery_state(compression_recovery_deadline=_NOW - 300)
+
+    rendered = render_to_str(render_sessions(state, Theme(), detail=True), width=200)
+
+    assert "anti-thrash" not in rendered
+
+
+def test_detail_treats_a_zero_recovery_deadline_as_disarmed_not_1970() -> None:
+    """Upstream stores 0 for "not armed"; it must never render as an epoch."""
+    state = _recovery_state(compression_recovery_deadline=0.0)
+
+    rendered = render_to_str(render_sessions(state, Theme(), detail=True), width=200)
+
+    assert "1970" not in rendered
+    assert "anti-thrash" not in rendered
+    assert "recovery" not in rendered
+
+
+def test_detail_shows_counters_only_beside_a_live_timer() -> None:
+    """A tripped strike count with no armed clock is state, not active recovery."""
+    state = _recovery_state(compression_fallback_streak=4, compression_ineffective_count=2)
+
+    rendered = render_to_str(render_sessions(state, Theme(), detail=True), width=200)
+
+    assert "recovery" not in rendered
+    assert "fallback streak" not in rendered
+
+
+def test_detail_counts_down_against_the_collected_clock() -> None:
+    """The same stored deadline is a warning at one clock reading and gone at another."""
+    session = _session(compression_recovery_deadline=_NOW + 100)
+
+    armed = render_to_str(
+        render_sessions(DashboardState(collected_at=_NOW, sessions=[session]), Theme(), True),
+        width=200,
+    )
+    elapsed = render_to_str(
+        render_sessions(DashboardState(collected_at=_NOW + 101, sessions=[session]), Theme(), True),
+        width=200,
+    )
+
+    assert "anti-thrash probe in 1m" in armed
+    assert "anti-thrash" not in elapsed
+
+
+def test_detail_says_compression_warnings_never_read_conversation_content() -> None:
+    state = _recovery_state(compression_failure_cooldown_until=_NOW + 45)
+
+    rendered = " ".join(
+        render_to_str(render_sessions(state, Theme(), detail=True), width=200).split()
+    ).lower()
+
+    assert "never reads conversation content" in rendered
+    assert "threshold" not in rendered
+
+
+def test_detail_shows_no_compression_threshold() -> None:
+    """A configured threshold is policy, not the effective runtime value, so the
+    warnings section shows none."""
+    state = _recovery_state(
+        compression_failure_error="boom",
+        compression_failure_cooldown_until=_NOW + 45,
+    )
+
+    rendered = render_to_str(render_sessions(state, Theme(), detail=True), width=200).lower()
+
+    assert "threshold" not in rendered
+    assert "0.86" not in rendered
+
+
+def test_compact_marks_active_compression_recovery() -> None:
+    state = _recovery_state(compression_failure_cooldown_until=_NOW + 45)
+
+    rendered = render_to_str(render_sessions(state, Theme(), detail=False), width=200)
+
+    assert "1 compression recovery" in rendered
+
+
+def test_compact_omits_the_recovery_marker_when_nothing_is_active() -> None:
+    state = _recovery_state(compression_recovery_deadline=_NOW - 5)
+
+    rendered = render_to_str(render_sessions(state, Theme(), detail=False), width=200)
+
+    assert "compression recovery" not in rendered
+
+
+def test_detail_recovery_warning_sanitizes_the_session_id() -> None:
+    state = DashboardState(
+        collected_at=_NOW,
+        sessions=[
+            _session(
+                session_id="sess_[/]x\x1b[2J",
+                compression_recovery_deadline=_NOW + 60,
+            )
+        ],
+    )
+
+    rendered = render_to_str(render_sessions(state, Theme(), detail=True), width=200)
+
+    assert "\x1b[2J" not in rendered
+    assert "recovery —" in rendered
+
+
 def test_detail_escapes_markup_hostile_free_text() -> None:
     state = DashboardState(
         sessions=[

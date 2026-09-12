@@ -228,3 +228,16 @@ def _coerce_float(value: object) -> float:
             return 0.0
         return result if math.isfinite(result) else 0.0
     return 0.0
+
+
+def _optional_epoch(value: object) -> float | None:
+    """A persisted epoch, or None when the column holds no usable deadline.
+
+    NULL, ``0`` and anything that coerces to a non-positive or non-finite number
+    all read as "no deadline". ``0`` in particular is not an epoch: upstream
+    stores it to mean *disarmed* (``set_compression_recovery_deadline`` writes
+    ``normalized or None``, ``hermes_state_compression.py:413-431``), and
+    surfacing it as a timestamp would render as January 1970.
+    """
+    coerced = _coerce_float(value)
+    return coerced if coerced > 0.0 else None

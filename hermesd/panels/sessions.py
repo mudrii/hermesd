@@ -13,6 +13,7 @@ from hermesd.panels.formatting import (
     escape_terminal_text as escape,
 )
 from hermesd.panels.formatting import (
+    fmt_age_seconds,
     fmt_tokens,
     fmt_usd,
     sanitize_terminal_text,
@@ -45,6 +46,9 @@ _MAX_NAME_CHARS = 30
 _MAX_BRANCH_CHARS = 24
 _MAX_ACTIVITY_CHARS = 40
 _MAX_ERROR_CHARS = 60
+# Bound on the sessions examined for compression warnings, matching the other
+# per-section row caps in this panel.
+_COMPRESSION_WARNING_ROWS = 10
 
 # The render loop rebuilds the detail layout at 2 Hz while the collector
 # replaces state.sessions only once per collect, so the filter+sort result is
@@ -89,6 +93,11 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             lines.append(f" {live} live", style=f"bold {theme.ui_ok}")
         if unverified:
             lines.append(f" {unverified} unverified", style=theme.ui_warn)
+    recovering = sum(1 for s in state.sessions if s.compression_recovery_active(state.collected_at))
+    if recovering:
+        # A live cooldown or an armed anti-thrash deadline: the compressor is
+        # backing off on these sessions right now.
+        lines.append(f"  ⚠ {recovering} compression recovery", style=f"bold {theme.ui_warn}")
     lines.append(f"   {total_msgs} msgs  {total_tc} tools\n", style=theme.banner_text)
     for s in state.sessions[:4]:
         sid_short = s.session_id[-6:] if len(s.session_id) > 6 else s.session_id
@@ -133,7 +142,7 @@ def _render_detail(
     if surfaces_table is not None:
         sections.append(section_heading("Live Surfaces", theme))
         sections.append(surfaces_table)
-    warnings = _compression_warnings(sessions, theme)
+    warnings = _compression_warnings(sessions, theme, now=state.collected_at)
     if warnings is not None:
         sections.append(section_heading("Warnings", theme))
         sections.append(warnings)
@@ -545,16 +554,68 @@ def _liveness_label(liveness: ProcessLiveness, theme: Theme) -> Text:
     return Text("unverified", style=theme.ui_warn)
 
 
-def _compression_warnings(sessions: list[SessionInfo], theme: Theme) -> Text | None:
-    failing = [session for session in sessions[:10] if session.compression_failure_error]
-    if not failing:
-        return None
+def _compression_warnings(sessions: list[SessionInfo], theme: Theme, *, now: float) -> Text | None:
+    """Compression failure diagnostics plus the durable anti-thrash recovery state.
+
+    Both halves come from counters and timestamps on the session row; hermesd
+    never reads conversation content to produce them. ``now`` is
+    ``state.collected_at`` — the injected clock — so a cooldown or recovery
+    deadline that has already elapsed renders as nothing at all rather than as a
+    warning about a timer that is no longer running.
+    """
+    recent = sessions[:_COMPRESSION_WARNING_ROWS]
     lines = Text()
-    for session in failing:
+    for session in recent:
+        if not session.compression_failure_error:
+            continue
         error = _truncate(session.compression_failure_error, _MAX_ERROR_CHARS)
         lines.append(f"  {sanitize_terminal_text(session.session_id[-8:])}  ", style=theme.ui_label)
         lines.append(f"{sanitize_terminal_text(error)}\n", style=theme.ui_warn)
+    for session in recent:
+        if not session.compression_recovery_active(now):
+            continue
+        lines.append(f"  {sanitize_terminal_text(session.session_id[-8:])}  ", style=theme.ui_label)
+        lines.append("recovery — ", style=theme.ui_accent)
+        lines.append(
+            f"{sanitize_terminal_text(_recovery_detail(session, now))}\n", style=theme.ui_warn
+        )
+    if not lines.plain:
+        return None
+    lines.append(f"  {_COMPRESSION_WARNING_NOTE}", style=theme.banner_dim)
     return lines
+
+
+# Rendered whenever the section has anything in it: the rows above are a
+# cooldown the compressor imposed on itself, and reading them as a failure — or
+# as a threshold hermesd measured — is the mistake worth pre-empting.
+_COMPRESSION_WARNING_NOTE = (
+    "Compression recovery state is counters and timestamps from the session row; "
+    "hermesd never reads conversation content, and a live cooldown is the "
+    "compressor's own back-off, not a failure."
+)
+
+
+def _recovery_detail(session: SessionInfo, now: float) -> str:
+    """The live timers first, then the durable counters behind them."""
+    parts: list[str] = []
+    cooldown = session.compression_cooldown_remaining(now)
+    if cooldown is not None:
+        parts.append(f"cooldown {_duration_label(cooldown)} left")
+    probe = session.compression_recovery_remaining(now)
+    if probe is not None:
+        parts.append(f"anti-thrash probe in {_duration_label(probe)}")
+    if session.compression_fallback_streak:
+        parts.append(f"fallback streak {session.compression_fallback_streak}")
+    if session.compression_ineffective_count:
+        parts.append(f"ineffective {session.compression_ineffective_count}")
+    return ", ".join(parts)
+
+
+def _duration_label(seconds: float) -> str:
+    """A countdown window; sub-second values keep one decimal place."""
+    if seconds < 1.0:
+        return f"{seconds:.1f}s"
+    return fmt_age_seconds(int(seconds))
 
 
 def _runtime_table(sessions: list[SessionInfo], theme: Theme) -> Table | None:

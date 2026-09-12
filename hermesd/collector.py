@@ -39,6 +39,7 @@ from hermesd.collect.common import (
     _len_if_sized,
     _local_date,
     _mtime,
+    _optional_epoch,
     _path_resolves_under,
     _read_tail_text,
     _read_text_capped,
@@ -1372,6 +1373,15 @@ class Collector:
                 actual_cost_usd=_coerce_float(r.get("actual_cost_usd")),
                 cost_source=r.get("cost_source") or "",
                 compression_failure_error=r.get("compression_failure_error") or "",
+                # 0 and NULL both mean "no deadline" — see _optional_epoch.
+                compression_failure_cooldown_until=_optional_epoch(
+                    r.get("compression_failure_cooldown_until")
+                ),
+                compression_fallback_streak=_coerce_int(r.get("compression_fallback_streak")),
+                compression_ineffective_count=_coerce_int(r.get("compression_ineffective_count")),
+                compression_recovery_deadline=_optional_epoch(
+                    r.get("compression_recovery_deadline")
+                ),
             )
             for r in rows
         ]
@@ -2392,6 +2402,9 @@ class Collector:
             self._read_json_reporting_stale(path),
             self._file_age_seconds(path),
             self._configured_mcp_server_names(),
+            # Entry TTL is evaluated against the injected clock, not the file
+            # mtime and not time.time(), so a frozen clock is testable.
+            self._clock(),
         )
 
     def _configured_mcp_server_names(self) -> list[str]:

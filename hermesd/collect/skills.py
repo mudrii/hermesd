@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -10,10 +11,22 @@ from typing import Any
 import yaml
 
 from hermesd.collect.common import _EXCERPT_MAX_CHARS, _as_dict, _as_list, _read_text_capped
-from hermesd.models import MCPSchemaCache, SkillsPromptSnapshot, ToolsetAvailability
+from hermesd.models import (
+    MCPCacheEntry,
+    MCPCacheEntryState,
+    MCPSchemaCache,
+    SkillsPromptSnapshot,
+    ToolsetAvailability,
+)
 
 # Upper bound on cached server names surfaced from the MCP schema cache.
 _MAX_LISTED_NAMES = 20
+# Display bound on the per-entry validity list, and on the recorded fingerprint
+# prefix carried per entry. Neither bound feeds a count.
+_MAX_CACHE_ENTRIES = 20
+_FINGERPRINT_PREFIX_CHARS = 8
+_NOT_A_MAPPING = "entry is not a mapping"
+_NO_FINGERPRINT = "no usable fingerprint recorded"
 
 
 def _toolset_availability(data: dict[str, Any]) -> ToolsetAvailability:
@@ -43,18 +56,85 @@ def _name_list(value: object) -> list[str]:
     return sorted(names)
 
 
+def _cache_number(value: object) -> float | None:
+    """``float(value)`` when upstream would treat it as a number, else None.
+
+    ``isinstance(True, int)`` holds, so a JSON ``true`` sitting in a numeric
+    slot counts as a number here exactly as it does in ``get_cached_entry``
+    (``tools/mcp_schema_cache.py:66-70``): mirroring the arithmetic means
+    mirroring its type test, including the parts that look like bugs.
+    """
+    if isinstance(value, int | float):
+        return float(value)
+    return None
+
+
+def _assess_mcp_cache_entry(name: str, raw: object, now: float) -> MCPCacheEntry:
+    """Decide whether hermes-agent would serve this entry, from its own numbers.
+
+    Reproduces ``get_cached_entry`` (``tools/mcp_schema_cache.py:59-73``) minus
+    the fingerprint comparison hermesd cannot make — see
+    ``MCPCacheEntryState``'s docstring for why the interpolated, default-merged
+    config upstream hashed is out of reach. Expiry uses the entry's own
+    ``written_at``, never the file mtime, and the elapsed-milliseconds
+    expression is left **unclamped** so a future-dated ``written_at`` behaves as
+    it does upstream; only the displayed age is clamped at zero.
+
+    ``ttl_ms: 0`` is therefore always expired (``age >= 0`` holds for any real
+    clock), and no numeric TTL means the entry never expires at all. Neither is
+    an error: an expired entry just makes the next call re-probe the server.
+    """
+    if not isinstance(raw, dict):
+        return MCPCacheEntry(name=name, reason=_NOT_A_MAPPING)
+    recorded = raw.get("fingerprint")
+    if not isinstance(recorded, str) or not recorded:
+        return MCPCacheEntry(name=name, reason=_NO_FINGERPRINT)
+
+    ttl_ms = _cache_number(raw.get("ttl_ms"))
+    written_at = _cache_number(raw.get("written_at"))
+    age_seconds = None if written_at is None else max(0.0, now - written_at)
+    state = MCPCacheEntryState.VALID
+    remaining: float | None = None
+    # Upstream needs BOTH numbers before it can expire anything; one alone
+    # leaves the entry permanently servable.
+    if ttl_ms is not None and written_at is not None:
+        elapsed_ms = (now - written_at) * 1000.0
+        if elapsed_ms >= ttl_ms:
+            state = MCPCacheEntryState.EXPIRED
+        else:
+            window = (ttl_ms - elapsed_ms) / 1000.0
+            remaining = window if math.isfinite(window) else None
+    return MCPCacheEntry(
+        name=name,
+        state=state,
+        fingerprint=recorded[:_FINGERPRINT_PREFIX_CHARS],
+        ttl_ms=ttl_ms,
+        age_seconds=age_seconds,
+        remaining_seconds=remaining,
+    )
+
+
 def _mcp_schema_cache_summary(
-    data: dict[str, Any], age_seconds: float | None, configured: list[str]
+    data: dict[str, Any], age_seconds: float | None, configured: list[str], now: float
 ) -> MCPSchemaCache:
     """Summarize the MCP schema cache mapping; cached payloads stay opaque.
 
     Membership is decided from the complete name sets on both sides and only the
     rendered lists are bounded, so a configured server past the display cap is
-    never misreported as having no cache entry.
+    never misreported as having no cache entry. The validity rollups are counted
+    over every entry in the file for the same reason: bounding ``mcp_entries``
+    must never change what the counts say.
     """
     names = sorted(str(name) for name in data)
     cached = set(names)
     uncached = [name for name in configured if name not in cached]
+    counts = dict.fromkeys(MCPCacheEntryState, 0)
+    entries: list[MCPCacheEntry] = []
+    for key, raw in sorted(data.items(), key=lambda item: str(item[0])):
+        entry = _assess_mcp_cache_entry(str(key), raw, now)
+        counts[entry.state] += 1
+        if len(entries) < _MAX_CACHE_ENTRIES:
+            entries.append(entry)
     return MCPSchemaCache(
         mcp_cache_present=True,
         mcp_cached_server_count=len(names),
@@ -62,6 +142,10 @@ def _mcp_schema_cache_summary(
         mcp_schema_cache_age_seconds=age_seconds,
         mcp_uncached_server_count=len(uncached),
         mcp_uncached_server_names=uncached[:_MAX_LISTED_NAMES],
+        mcp_valid_entry_count=counts[MCPCacheEntryState.VALID],
+        mcp_expired_entry_count=counts[MCPCacheEntryState.EXPIRED],
+        mcp_unassessable_entry_count=counts[MCPCacheEntryState.UNASSESSABLE],
+        mcp_entries=entries,
     )
 
 

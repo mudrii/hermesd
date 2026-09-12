@@ -483,7 +483,9 @@ def _migration_gap_sentence(mig: MigrationState) -> str:
             "recorded secondaries were retained"
         )
     if gap is MigrationVerificationGap.PROFILES_UNSERVED:
-        names = ", ".join(escape(name) for name in mig.unserved_profiles)
+        # Text.append does not parse markup, so sanitize the manifest-sourced
+        # profile names instead of escaping them.
+        names = ", ".join(sanitize_terminal_text(name) for name in mig.unserved_profiles)
         return f"not in the live served set: {names}"
     return "no migration manifest recorded"
 
@@ -498,7 +500,8 @@ def _append_migration_intent(text: Text, mig: MigrationState, theme: Theme) -> N
         return
     if mig.migrated_at:
         text.append("\n  Started: ", style=theme.ui_label)
-        text.append(escape(mig.migrated_at), style=theme.banner_text)
+        # Manifest-sourced and appended to a Text, which does not parse markup.
+        text.append(sanitize_terminal_text(mig.migrated_at), style=theme.banner_text)
         # The only local-time stamp hermesd reads; every other source writes UTC.
         suffix = (
             " (local time; the recorded stamp could not be parsed)"

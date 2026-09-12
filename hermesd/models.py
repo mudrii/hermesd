@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import time
 from enum import StrEnum
@@ -28,6 +29,20 @@ MANIFEST_NAMES: tuple[str, ...] = (*YAML_MANIFEST_NAMES, PORTABLE_MANIFEST_NAME)
 # that does not match is never rendered as a revision — a corrupt sidecar is not
 # a pin, and comparing garbage against a real SHA would fabricate drift.
 _FULL_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _remaining_seconds(deadline: float | None, now: float) -> float | None:
+    """Seconds until ``deadline`` at ``now``; None when it is disarmed or past.
+
+    A non-positive deadline is *disarmed*, not an epoch: upstream writes ``0``
+    for "not armed" (``set_compression_recovery_deadline`` stores
+    ``normalized or None``, ``hermes_state_compression.py:413-431``), and
+    treating ``0`` as a timestamp would render as January 1970. A non-finite
+    value coerced out of an untyped SQLite column is likewise no deadline.
+    """
+    if deadline is None or not math.isfinite(deadline) or deadline <= 0.0 or deadline <= now:
+        return None
+    return deadline - now
 
 
 class GatewayLoopHealth(StrEnum):
@@ -366,6 +381,47 @@ class SessionInfo(BaseModel):
     actual_cost_usd: float = 0.0
     cost_source: str = ""
     compression_failure_error: str = ""
+    # The durable half of the compressor's anti-thrash guard
+    # (hermes_state_common.py:375-379). Counters and timestamps only: nothing
+    # here is derived from conversation content, which hermesd never reads.
+    # Both deadlines are None when the column is NULL *or* 0, because upstream
+    # stores 0 to mean "disarmed" and 0 rendered as an epoch reads as 1970.
+    compression_failure_cooldown_until: float | None = None
+    compression_fallback_streak: int = 0
+    compression_ineffective_count: int = 0
+    compression_recovery_deadline: float | None = None
+
+    def compression_cooldown_remaining(self, now: float) -> float | None:
+        """Seconds of live compression-failure cooldown at ``now``, else None.
+
+        Mirrors ``get_compression_failure_cooldown``
+        (``hermes_state_compression.py:329-335``), which reports a cooldown only
+        while ``cooldown_until > now`` — an expired one is cleared state, not a
+        warning.
+        """
+        return _remaining_seconds(self.compression_failure_cooldown_until, now)
+
+    def compression_recovery_remaining(self, now: float) -> float | None:
+        """Seconds until the durable anti-thrash probe at ``now``, else None.
+
+        ``context_compressor`` treats ``deadline <= 0.0`` as unarmed (``:2558``)
+        and re-probes once ``now >= deadline`` (``:2563``), so both ends are
+        "not active" here.
+        """
+        return _remaining_seconds(self.compression_recovery_deadline, now)
+
+    def compression_recovery_active(self, now: float) -> bool:
+        """Derived: a live cooldown and/or a future recovery deadline.
+
+        A parameterized method rather than a ``computed_field`` because the
+        answer is clock-relative, and the clock is injected: the sessions source
+        is memoized on row identity, so baking a countdown into the model would
+        freeze it until the database next changed.
+        """
+        return (
+            self.compression_cooldown_remaining(now) is not None
+            or self.compression_recovery_remaining(now) is not None
+        )
 
 
 class ProcessLiveness(StrEnum):
@@ -946,13 +1002,79 @@ class ToolsetAvailability(BaseModel):
     disabled_tool_count: int = 0
 
 
+class MCPCacheEntryState(StrEnum):
+    """Whether hermes-agent would serve one ``cache/mcp_schema_cache.json`` entry.
+
+    Mirrors ``get_cached_entry`` (``tools/mcp_schema_cache.py:59-73``): an entry
+    whose ``ttl_ms`` and ``written_at`` are both numeric expires once
+    ``(now - written_at) * 1000 >= ttl_ms`` — so ``ttl_ms: 0`` is always expired
+    — and an entry with no numeric TTL never expires at all.
+
+    There is deliberately **no** ``configuration-mismatched`` member. Upstream's
+    first test is ``entry["fingerprint"] != config_fingerprint(config)``, but the
+    ``config`` it hashes is not the ``config.yaml`` hermesd can read:
+    ``_load_mcp_config`` (``tools/mcp_tool_config.py:322-345``) hands
+    ``config_fingerprint`` the ``${VAR}``-interpolated block, resolved through
+    the active profile's secret scope and ``${workspaceFolder}``
+    (``:244-259``), from a ``load_config()`` that is already ``DEFAULT_CONFIG +
+    config.yaml + managed scope, env-expanded`` (``hermes_cli/config.py:1965``),
+    and merges in plugin-provided portable servers that appear in no YAML at all
+    (``:307-320``). Recomputing the hash from raw YAML would therefore report a
+    mismatch for every server whose ``command``/``args``/``url`` carries a
+    placeholder, and hermesd can neither resolve secrets nor import the loader
+    that would. ``fingerprint`` below is the cache's own record, exposed as a
+    prefix so an operator can compare it against ``hermes mcp`` output instead
+    of being handed a verdict hermesd cannot prove.
+
+    ``UNASSESSABLE`` is likewise a first-class answer, not a fallback: a
+    non-mapping entry or a missing/unusable ``fingerprint`` is a cache upstream
+    would also refuse, and saying so is more useful than guessing.
+    """
+
+    VALID = "valid"
+    EXPIRED = "expired"
+    UNASSESSABLE = "unassessable"
+
+
+class MCPCacheEntry(BaseModel):
+    """Validity metadata for one cached MCP server entry.
+
+    Only metadata: ``tools``, ``utility_tools`` and every ``inputSchema`` inside
+    them stay on disk. They are opaque, unbounded, and a tool manifest can carry
+    a default credential, so nothing from them is copied into state — nor is
+    ``cache_scope``, which upstream documents as irrelevant to validity
+    (``tools/mcp_schema_cache.py:63``).
+    """
+
+    name: str = ""
+    state: MCPCacheEntryState = MCPCacheEntryState.UNASSESSABLE
+    # Why the state is not VALID, when that reason is not already the numbers
+    # below (an unassessable entry has no TTL story to tell).
+    reason: str = ""
+    # First 8 hex chars of the entry's own recorded fingerprint — a display
+    # bound on an untrusted string, not a comparison hermesd performed.
+    fingerprint: str = ""
+    # ``ttl_ms`` exactly as recorded, or None when it is not a number upstream
+    # would treat as one.
+    ttl_ms: float | None = None
+    # Age of the entry's own ``written_at`` against the injected clock — never
+    # the cache file's mtime, which advances on every unrelated write-through.
+    age_seconds: float | None = None
+    # TTL left, when there is a numeric TTL and it has not run out.
+    remaining_seconds: float | None = None
+
+
 class MCPSchemaCache(BaseModel):
-    """Summary of ``cache/mcp_schema_cache.json`` — server names only.
+    """Summary of ``cache/mcp_schema_cache.json`` — server names and validity.
 
     ``mcp_uncached_*`` is configured-minus-cached, computed from the complete
     name sets on both sides. Absence of a cache entry is an observation about
     this read, not evidence a server never connected: the cache may have been
     cleared, invalidated, or written under another profile.
+
+    The ``mcp_*_entry_count`` rollups are computed over **every** entry in the
+    file while ``mcp_entries`` is display-bounded, so truncating the list can
+    never change a count.
     """
 
     mcp_cache_present: bool = False
@@ -961,6 +1083,10 @@ class MCPSchemaCache(BaseModel):
     mcp_schema_cache_age_seconds: float | None = None
     mcp_uncached_server_count: int = 0
     mcp_uncached_server_names: list[str] = Field(default_factory=list)
+    mcp_valid_entry_count: int = 0
+    mcp_expired_entry_count: int = 0
+    mcp_unassessable_entry_count: int = 0
+    mcp_entries: list[MCPCacheEntry] = Field(default_factory=list)
 
 
 class SkillsPromptSnapshot(BaseModel):

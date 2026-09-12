@@ -346,7 +346,13 @@ class HermesDB:
             "last_activity_description",
             "actual_cost_usd",
             "cost_source",
+            # Durable anti-thrash guard (hermes_state_common.py:375-379);
+            # absent on databases written before it landed.
+            "compression_failure_cooldown_until",
             "compression_failure_error",
+            "compression_fallback_streak",
+            "compression_ineffective_count",
+            "compression_recovery_deadline",
         ]
         available = self._session_column_set(conn)
         return [column for column in wanted_columns if column in available]

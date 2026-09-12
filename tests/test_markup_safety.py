@@ -34,6 +34,8 @@ from hermesd.models import (
     KanbanTaskSummary,
     LogLine,
     LogState,
+    MCPCacheEntry,
+    MCPCacheEntryState,
     MCPSchemaCache,
     MCPServerInfo,
     MemoryOverview,
@@ -350,9 +352,19 @@ def _state_for(panel_num: int) -> DashboardState:
             ),
             config=ConfigSummary(mcp_server_count=2, mcp_server_names=[INJECT, "cached-server"]),
             mcp_cache=MCPSchemaCache(
+                mcp_cache_present=True,
                 mcp_cached_server_count=1,
                 mcp_cached_server_names=["cached-server"],
                 mcp_schema_cache_age_seconds=60.0,
+                mcp_unassessable_entry_count=1,
+                mcp_entries=[
+                    MCPCacheEntry(
+                        name=INJECT,
+                        state=MCPCacheEntryState.UNASSESSABLE,
+                        reason=INJECT,
+                        fingerprint=INJECT,
+                    )
+                ],
             ),
             skills_prompt=SkillsPromptSnapshot(
                 prompted_skill_count=1,

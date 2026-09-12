@@ -15,6 +15,7 @@ from hermesd.collector import (
     _count_skills,
     _word_count,
 )
+from hermesd.models import MCPCacheEntryState
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
 from tests.conftest import (
@@ -775,6 +776,257 @@ def test_mcp_cache_without_config_reports_no_uncached(hermes_home: Path):
 
     assert cache.mcp_cached_server_count == 1
     assert cache.mcp_uncached_server_count == 0
+
+
+# --------------------------------------------------------------------------
+# per-entry validity
+#
+# Every expectation below mirrors `get_cached_entry`
+# (hermes-agent tools/mcp_schema_cache.py:59-73) exactly: an entry with no
+# numeric TTL never expires, `ttl_ms: 0` is always expired because age >= 0
+# always holds, and expiry is measured from the entry's own `written_at` —
+# never from the cache file's mtime.
+# --------------------------------------------------------------------------
+
+_NOW = 1_800_000_000.0
+
+
+def _entry(**overrides: object) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "fingerprint": "0123456789abcdef",
+        "tools": [],
+        "utility_tools": [],
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _entry_no_fingerprint() -> dict[str, object]:
+    entry = _entry()
+    del entry["fingerprint"]
+    return entry
+
+
+def _single_entry_cache(home: Path, entry: object, *, mtime_offset: float = 0.0) -> None:
+    path = _write_mcp_cache(home, {"srv": entry})
+    if mtime_offset:
+        stamp = _NOW + mtime_offset
+        os.utime(path, (stamp, stamp))
+
+
+def _entry_state(home: Path, entry: object, *, mtime_offset: float = 0.0):
+    _single_entry_cache(home, entry, mtime_offset=mtime_offset)
+    cache = _collect_state(home, _NOW).mcp_cache
+    assert cache.mcp_cached_server_count == 1
+    return cache.mcp_entries[0]
+
+
+def test_mcp_cache_entry_without_ttl_never_expires(hermes_home: Path):
+    """No numeric `ttl_ms` means upstream serves the entry forever."""
+    entry = _entry_state(hermes_home, _entry(written_at=_NOW - 86400 * 365))
+
+    assert entry.state is MCPCacheEntryState.VALID
+    assert entry.ttl_ms is None
+    assert entry.remaining_seconds is None
+    assert entry.age_seconds == pytest.approx(86400 * 365)
+
+
+def test_mcp_cache_entry_with_zero_ttl_is_always_expired(hermes_home: Path):
+    """`ttl_ms: 0` expires immediately: `(now - written_at) * 1000 >= 0` always holds."""
+    entry = _entry_state(hermes_home, _entry(ttl_ms=0, written_at=_NOW))
+
+    assert entry.state is MCPCacheEntryState.EXPIRED
+    assert entry.ttl_ms == 0.0
+    assert entry.remaining_seconds is None
+
+
+def test_mcp_cache_entry_zero_ttl_is_expired_even_when_just_written(hermes_home: Path):
+    """The live-home shape: a cache that looks populated but is never served."""
+    entry = _entry_state(hermes_home, _entry(ttl_ms=0, written_at=_NOW - 0.0001))
+
+    assert entry.state is MCPCacheEntryState.EXPIRED
+
+
+def test_mcp_cache_entry_inside_ttl_is_valid_with_remaining(hermes_home: Path):
+    entry = _entry_state(hermes_home, _entry(ttl_ms=60_000, written_at=_NOW - 30))
+
+    assert entry.state is MCPCacheEntryState.VALID
+    assert entry.ttl_ms == 60_000.0
+    assert entry.remaining_seconds == pytest.approx(30.0)
+
+
+def test_mcp_cache_entry_past_ttl_is_expired(hermes_home: Path):
+    entry = _entry_state(hermes_home, _entry(ttl_ms=60_000, written_at=_NOW - 120))
+
+    assert entry.state is MCPCacheEntryState.EXPIRED
+    assert entry.age_seconds == pytest.approx(120.0)
+    assert entry.remaining_seconds is None
+
+
+def test_mcp_cache_entry_at_the_exact_ttl_boundary_is_expired(hermes_home: Path):
+    """Upstream uses `>=`, so age == ttl is already a miss."""
+    entry = _entry_state(hermes_home, _entry(ttl_ms=60_000, written_at=_NOW - 60))
+
+    assert entry.state is MCPCacheEntryState.EXPIRED
+
+
+def test_mcp_cache_entry_a_millisecond_inside_ttl_is_valid(hermes_home: Path):
+    entry = _entry_state(hermes_home, _entry(ttl_ms=60_000, written_at=_NOW - 59.999))
+
+    assert entry.state is MCPCacheEntryState.VALID
+
+
+def test_mcp_cache_entry_ttl_without_written_at_never_expires(hermes_home: Path):
+    """Upstream needs BOTH numbers to expire an entry; one alone is not enough."""
+    entry = _entry_state(hermes_home, _entry(ttl_ms=1))
+
+    assert entry.state is MCPCacheEntryState.VALID
+    assert entry.age_seconds is None
+    assert entry.remaining_seconds is None
+
+
+def test_mcp_cache_entry_text_ttl_is_not_a_number(hermes_home: Path):
+    """A string TTL is not numeric, so upstream never expires the entry."""
+    entry = _entry_state(hermes_home, _entry(ttl_ms="60000", written_at=_NOW - 3600))
+
+    assert entry.state is MCPCacheEntryState.VALID
+    assert entry.ttl_ms is None
+
+
+@pytest.mark.parametrize(
+    ("entry", "reason"),
+    [
+        pytest.param(_entry(fingerprint=None), "no usable fingerprint recorded", id="null"),
+        pytest.param(_entry_no_fingerprint(), "no usable fingerprint recorded", id="absent"),
+        pytest.param(_entry(fingerprint=""), "no usable fingerprint recorded", id="empty"),
+        pytest.param(_entry(fingerprint=1234), "no usable fingerprint recorded", id="non-string"),
+        pytest.param(["not", "a", "mapping"], "entry is not a mapping", id="list"),
+        pytest.param("a string", "entry is not a mapping", id="string"),
+        pytest.param(None, "entry is not a mapping", id="null-entry"),
+    ],
+)
+def test_mcp_cache_entry_is_unassessable(hermes_home: Path, entry: object, reason: str):
+    assessed = _entry_state(hermes_home, entry)
+
+    assert assessed.state is MCPCacheEntryState.UNASSESSABLE
+    assert assessed.reason == reason
+
+
+def test_mcp_cache_entry_uses_written_at_not_the_file_mtime(hermes_home: Path):
+    """A freshly rewritten file can still hold an entry whose own TTL ran out."""
+    stale = _entry_state(
+        hermes_home, _entry(ttl_ms=60_000, written_at=_NOW - 3600), mtime_offset=-1.0
+    )
+
+    assert stale.state is MCPCacheEntryState.EXPIRED
+
+
+def test_mcp_cache_entry_survives_an_old_file_mtime(hermes_home: Path):
+    """The converse: an ancient mtime must not expire a recently written entry."""
+    fresh = _entry_state(
+        hermes_home, _entry(ttl_ms=600_000, written_at=_NOW - 30), mtime_offset=-86400.0
+    )
+
+    assert fresh.state is MCPCacheEntryState.VALID
+    assert fresh.remaining_seconds == pytest.approx(570.0)
+
+
+def test_mcp_cache_entry_records_a_bounded_fingerprint_prefix(hermes_home: Path):
+    entry = _entry_state(hermes_home, _entry(fingerprint="0123456789abcdef"))
+
+    assert entry.fingerprint == "01234567"
+
+
+def test_mcp_cache_never_claims_a_configuration_mismatch_it_cannot_prove(hermes_home: Path):
+    """hermesd reads raw config.yaml; upstream fingerprints the env-expanded,
+    default-merged, managed-scope-merged config it actually connected with
+    (`hermes_cli/config.py:1965-1968`, `tools/mcp_tool_config.py:244-259,322-345`),
+    so a differing fingerprint has causes hermesd cannot separate."""
+    _write_configured_mcp_servers(hermes_home, ["srv"])
+    _write_mcp_cache(hermes_home, {"srv": _entry(fingerprint="ffffffffffffffff")})
+
+    cache = _collect_state(hermes_home, _NOW).mcp_cache
+
+    assert "configuration-mismatched" not in {state.value for state in MCPCacheEntryState}
+    assert cache.mcp_entries[0].state is MCPCacheEntryState.VALID
+    assert cache.mcp_entries[0].fingerprint == "ffffffff"
+
+
+def test_mcp_cache_validity_counts_survive_the_display_cap(hermes_home: Path):
+    """Truncating the rendered entry list must never change a computed count."""
+    entries: dict[str, object] = {}
+    for index in range(25):
+        entries[f"srv-{index:02d}"] = _entry(ttl_ms=0, written_at=_NOW)
+    for index in range(4):
+        entries[f"ok-{index}"] = _entry(ttl_ms=600_000, written_at=_NOW)
+    entries["broken"] = ["not a mapping"]
+    _write_mcp_cache(hermes_home, entries)
+
+    cache = _collect_state(hermes_home, _NOW).mcp_cache
+
+    assert cache.mcp_cached_server_count == 30
+    assert cache.mcp_expired_entry_count == 25
+    assert cache.mcp_valid_entry_count == 4
+    assert cache.mcp_unassessable_entry_count == 1
+    assert len(cache.mcp_entries) == 20
+    assert [entry.name for entry in cache.mcp_entries] == sorted(
+        entry.name for entry in cache.mcp_entries
+    )
+
+
+def test_mcp_cache_validity_counts_are_zero_when_the_file_is_absent(hermes_home: Path):
+    cache = _collect_state(hermes_home, _NOW).mcp_cache
+
+    assert cache.mcp_cache_present is False
+    assert cache.mcp_entries == []
+    assert (cache.mcp_valid_entry_count, cache.mcp_expired_entry_count) == (0, 0)
+    assert cache.mcp_unassessable_entry_count == 0
+
+
+def test_mcp_cache_never_copies_tool_payloads_into_state(hermes_home: Path):
+    """`tools` / `utility_tools` / `inputSchema` are opaque, unbounded and can
+    carry credentials, so nothing from them may reach the serialized state."""
+    _write_mcp_cache(
+        hermes_home,
+        {
+            "srv": _entry(
+                ttl_ms=60_000,
+                written_at=_NOW,
+                tools=[
+                    {
+                        "name": "sk-tool-name-should-never-render",
+                        "description": "sk-tool-description-should-never-render",
+                        "inputSchema": {
+                            "properties": {"token": {"default": "sk-schema-should-never-render"}}
+                        },
+                        "annotations": {"readOnlyHint": False},
+                    }
+                ],
+                utility_tools=[
+                    {
+                        "schema": {"name": "sk-utility-should-never-render"},
+                        "handler_key": "sk-handler-should-never-render",
+                    }
+                ],
+                cache_scope="sk-scope-should-never-render",
+            )
+        },
+    )
+
+    state = _collect_state(hermes_home, _NOW)
+    dumped = json.dumps(state.model_dump(mode="json"))
+
+    for canary in (
+        "sk-tool-name-should-never-render",
+        "sk-tool-description-should-never-render",
+        "sk-schema-should-never-render",
+        "sk-utility-should-never-render",
+        "sk-handler-should-never-render",
+        "sk-scope-should-never-render",
+        "inputSchema",
+        "utility_tools",
+    ):
+        assert canary not in dumped
 
 
 def test_skills_prompt_snapshot_present(hermes_home: Path, sample_skills_prompt_snapshot: Path):

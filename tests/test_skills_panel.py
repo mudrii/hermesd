@@ -11,6 +11,8 @@ from hermesd.models import (
     CredentialPoolEntry,
     DashboardState,
     HookInfo,
+    MCPCacheEntry,
+    MCPCacheEntryState,
     MCPSchemaCache,
     MCPServerInfo,
     PluginActivation,
@@ -540,6 +542,324 @@ def test_skills_detail_escapes_markup_hostile_cached_names():
 
 
 # --------------------------------------------------------------------------
+# MCP schema-cache entry validity
+# --------------------------------------------------------------------------
+
+
+def _cache_entry(**overrides: object) -> MCPCacheEntry:
+    entry: dict[str, object] = {"name": "codegraph", "fingerprint": "7df47d93"}
+    entry.update(overrides)
+    return MCPCacheEntry(**entry)  # type: ignore[arg-type]
+
+
+def _flat(text: str) -> str:
+    """Collapse rendered whitespace so a wrapped prose note can be matched."""
+    return " ".join(text.split())
+
+
+def test_skills_detail_lists_entry_validity_counts():
+    state = _mcp_state(
+        cache={
+            "mcp_cache_present": True,
+            "mcp_cached_server_count": 3,
+            "mcp_cached_server_names": ["a", "b", "c"],
+            "mcp_valid_entry_count": 1,
+            "mcp_expired_entry_count": 1,
+            "mcp_unassessable_entry_count": 1,
+        },
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Entry validity" in text
+    assert "1 valid" in text
+    assert "1 expired" in text
+    assert "1 unassessable" in text
+
+
+def test_skills_detail_shows_dash_when_no_entry_could_be_assessed():
+    state = _mcp_state(
+        cache={"mcp_cache_present": True, "mcp_cached_server_count": 0},
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Entry validity" in text
+
+
+def test_skills_detail_renders_the_zero_ttl_expired_entry():
+    """The live-home shape: one entry, ``ttl_ms: 0``, so it is never served."""
+    state = _mcp_state(
+        cache={
+            "mcp_cache_present": True,
+            "mcp_cached_server_count": 1,
+            "mcp_cached_server_names": ["codegraph"],
+            "mcp_expired_entry_count": 1,
+            "mcp_entries": [
+                _cache_entry(
+                    state=MCPCacheEntryState.EXPIRED,
+                    ttl_ms=0.0,
+                    age_seconds=42158.0,
+                )
+            ],
+        },
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "codegraph" in text
+    assert "expired" in text
+    assert "0ms ttl elapsed 11h ago" in text
+    assert "fp 7df47d93" in text
+
+
+def test_skills_detail_renders_a_valid_entry_with_ttl_remaining():
+    state = _mcp_state(
+        cache={
+            "mcp_cache_present": True,
+            "mcp_cached_server_count": 1,
+            "mcp_cached_server_names": ["srv"],
+            "mcp_valid_entry_count": 1,
+            "mcp_entries": [
+                _cache_entry(
+                    name="srv",
+                    state=MCPCacheEntryState.VALID,
+                    ttl_ms=600_000.0,
+                    age_seconds=30.0,
+                    remaining_seconds=570.0,
+                )
+            ],
+        },
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "9m of 10m ttl left" in text
+
+
+def test_skills_detail_says_a_valid_entry_without_ttl_never_expires():
+    state = _mcp_state(
+        cache={
+            "mcp_cache_present": True,
+            "mcp_cached_server_count": 1,
+            "mcp_cached_server_names": ["srv"],
+            "mcp_valid_entry_count": 1,
+            "mcp_entries": [_cache_entry(name="srv", state=MCPCacheEntryState.VALID)],
+        },
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "no ttl recorded" in text
+    assert "never expires" in text
+
+
+def test_skills_detail_says_a_ttl_without_written_at_never_expires():
+    """Upstream needs both numbers to expire an entry, so this one stays valid."""
+    state = _mcp_state(
+        cache={
+            "mcp_cache_present": True,
+            "mcp_cached_server_count": 1,
+            "mcp_cached_server_names": ["srv"],
+            "mcp_valid_entry_count": 1,
+            "mcp_entries": [
+                _cache_entry(
+                    name="srv",
+                    state=MCPCacheEntryState.VALID,
+                    ttl_ms=1.0,
+                    age_seconds=None,
+                    remaining_seconds=None,
+                )
+            ],
+        },
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "no written_at recorded — never expires" in text
+
+
+def test_skills_detail_renders_a_sub_second_ttl_in_milliseconds():
+    state = _mcp_state(
+        cache={
+            "mcp_cache_present": True,
+            "mcp_cached_server_count": 1,
+            "mcp_cached_server_names": ["srv"],
+            "mcp_valid_entry_count": 1,
+            "mcp_entries": [
+                _cache_entry(
+                    name="srv",
+                    state=MCPCacheEntryState.VALID,
+                    ttl_ms=250.0,
+                    age_seconds=0.1,
+                    remaining_seconds=0.15,
+                )
+            ],
+        },
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "150ms of 250ms ttl left" in text
+
+
+def test_skills_detail_renders_an_unassessable_entry_reason():
+    state = _mcp_state(
+        cache={
+            "mcp_cache_present": True,
+            "mcp_cached_server_count": 1,
+            "mcp_cached_server_names": ["srv"],
+            "mcp_unassessable_entry_count": 1,
+            "mcp_entries": [
+                _cache_entry(
+                    name="srv",
+                    state=MCPCacheEntryState.UNASSESSABLE,
+                    reason="no usable fingerprint recorded",
+                    fingerprint="",
+                )
+            ],
+        },
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "unassessable" in text
+    assert "no usable fingerprint recorded" in text
+    assert "fp " not in text
+
+
+def test_skills_detail_validity_never_claims_credentials_or_connectivity():
+    """A matching TTL says nothing about auth or reachability, and an expired
+    entry is not an error — so the section must not imply either."""
+    state = _mcp_state(
+        cache={
+            "mcp_cache_present": True,
+            "mcp_cached_server_count": 2,
+            "mcp_cached_server_names": ["ok", "srv"],
+            "mcp_valid_entry_count": 1,
+            "mcp_expired_entry_count": 1,
+            "mcp_entries": [
+                _cache_entry(name="ok", state=MCPCacheEntryState.VALID),
+                _cache_entry(
+                    name="srv",
+                    state=MCPCacheEntryState.EXPIRED,
+                    ttl_ms=0.0,
+                    age_seconds=10.0,
+                ),
+            ],
+        },
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=200, no_color=True)
+    # The note is prose and wraps, so compare against a whitespace-flat copy.
+    lowered = _flat(text).lower()
+
+    assert "does not prove credentials work" in lowered
+    assert "not an error" in lowered
+    assert "re-probes" in lowered
+    assert "mismatch" not in lowered
+    assert "unreachable" not in lowered
+    assert "authenticated" not in lowered
+
+
+def test_skills_detail_says_the_fingerprint_is_the_cache_own_record():
+    state = _mcp_state(
+        cache={
+            "mcp_cache_present": True,
+            "mcp_cached_server_count": 1,
+            "mcp_cached_server_names": ["srv"],
+            "mcp_valid_entry_count": 1,
+            "mcp_entries": [_cache_entry(name="srv", state=MCPCacheEntryState.VALID)],
+        },
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "fingerprint shown is the cache's own record" in _flat(text)
+
+
+def test_skills_detail_bounds_the_entry_list_without_hiding_the_count():
+    entries = [
+        _cache_entry(name=f"srv-{index:02d}", state=MCPCacheEntryState.EXPIRED, ttl_ms=0.0)
+        for index in range(20)
+    ]
+    state = _mcp_state(
+        cache={
+            "mcp_cache_present": True,
+            "mcp_cached_server_count": 25,
+            "mcp_cached_server_names": [f"srv-{index:02d}" for index in range(20)],
+            "mcp_expired_entry_count": 25,
+            "mcp_entries": entries,
+        },
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=200, no_color=True)
+
+    # The rendered list is capped, but the row above still reports all 25.
+    assert "25 expired" in text
+    assert "(+5 more)" in text
+    assert text.count("expired —") == 20
+
+
+def test_skills_compact_marks_expired_cache_entries():
+    state = _mcp_state(
+        cache={"mcp_cached_server_count": 2, "mcp_expired_entry_count": 1},
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=False), width=200, no_color=True)
+
+    assert "mcp 2 cached (1 expired)" in text
+
+
+def test_skills_compact_marks_unassessable_cache_entries():
+    state = _mcp_state(
+        cache={"mcp_cached_server_count": 3, "mcp_unassessable_entry_count": 2},
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=False), width=200, no_color=True)
+
+    assert "mcp 3 cached (2 unassessable)" in text
+
+
+def test_skills_compact_leaves_an_all_valid_cache_unannotated():
+    state = _mcp_state(
+        cache={"mcp_cached_server_count": 2, "mcp_valid_entry_count": 2},
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=False), width=200, no_color=True)
+
+    assert "mcp 2 cached" in text
+    assert "(" not in text.split("Schema cache:")[1]
+
+
+def test_skills_detail_escapes_markup_hostile_cache_entries():
+    state = _mcp_state(
+        cache={
+            "mcp_cache_present": True,
+            "mcp_cached_server_count": 1,
+            "mcp_cached_server_names": ["[red]srv\x1b]0;pwn\x07"],
+            "mcp_unassessable_entry_count": 1,
+            "mcp_entries": [
+                _cache_entry(
+                    name="[red]srv\x1b]0;pwn\x07",
+                    state=MCPCacheEntryState.UNASSESSABLE,
+                    reason="[/] reason [x]\x1b[2J",
+                    fingerprint="[/]abcde",
+                )
+            ],
+        },
+    )
+
+    text = render_to_str(render_panel(7, state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "[red]srv" in text
+    assert "[/] reason [x]" in text
+    assert "[/]abcde" in text
+    assert "\x1b]0;pwn" not in text
+    assert "\x1b[2J" not in text
+
+
+# --------------------------------------------------------------------------
 # plugin provenance and declarations
 # --------------------------------------------------------------------------
 
@@ -791,3 +1111,39 @@ def test_provenance_cells_are_markup_escaped():
     assert "[blink]>=0.19" in text
     assert "\x1b[2J" not in text
     assert "\x1b]0;pwn" not in text
+
+
+def test_plugins_conflict_note_sanitizes_instead_of_escaping():
+    """``Text.append`` skips markup parsing, so escaping leaks a literal backslash.
+
+    The existing markup test asserts ``"[bold]plugin.json" in text``, which passes
+    either way because ``\\[bold]plugin.json`` contains that substring — the
+    backslash is the actual failure signature. Control bytes must still be
+    stripped, which is what sanitizing (not escaping) does here.
+    """
+    text = render_to_str(
+        render_panel(
+            7,
+            DashboardState(
+                skills_memory=SkillsMemory(
+                    plugins=[
+                        PluginInfo(
+                            name="[bold]tracer\x1b[2J",
+                            manifest_file="plugin.yaml\x1b[2J",
+                            manifest_shadowed=["[bold]plugin.yml"],
+                            activation=PluginActivation.NOT_ENABLED,
+                        )
+                    ]
+                )
+            ),
+            Theme(),
+            detail=True,
+        ),
+        width=200,
+        no_color=True,
+    )
+
+    assert "\\[bold]" not in text
+    assert "[bold]tracer: plugin.yaml used" in text
+    assert "[bold]plugin.yml ignored" in text
+    assert "\x1b[2J" not in text

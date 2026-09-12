@@ -946,3 +946,32 @@ def test_cron_compact_spends_no_line_on_a_healthy_catch_up_counter() -> None:
     )
 
     assert quiet.splitlines() == counted.splitlines()
+
+
+def test_cron_delivery_line_sanitizes_instead_of_escaping() -> None:
+    """``Text.append`` skips markup parsing, so escaping leaks a literal backslash.
+
+    Delivery outcome strings come from the database and are preserved verbatim,
+    so one can contain ``[``. Control bytes must still be stripped.
+    """
+    state = DashboardState(
+        cron=CronState(job_count=1, jobs=[CronJob(job_id="job-a", name="alpha")]),
+        cron_executions=_executions_state(
+            db_present=True,
+            job_stats=[
+                CronJobExecutionStats(
+                    job_id="job-a",
+                    total_24h=1,
+                    completed_24h=1,
+                    delivery_tracked=True,
+                    delivery_outcomes_24h={"[bold]teleported\x1b[2J": 1},
+                )
+            ],
+        ),
+    )
+
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "\\[bold]" not in text
+    assert "[bold]teleported 1" in text
+    assert "\x1b[2J" not in text

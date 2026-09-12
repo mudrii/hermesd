@@ -6,9 +6,21 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from hermesd.models import DashboardState, PluginActivation, PluginInfo, SkillsMemory
+from hermesd.models import (
+    DashboardState,
+    MCPCacheEntry,
+    MCPCacheEntryState,
+    MCPSchemaCache,
+    PluginActivation,
+    PluginInfo,
+    SkillsMemory,
+)
 from hermesd.panels.formatting import escape_terminal_text as escape
-from hermesd.panels.formatting import fmt_age_seconds, sanitize_terminal_text, section_heading
+from hermesd.panels.formatting import (
+    fmt_age_seconds,
+    sanitize_terminal_text,
+    section_heading,
+)
 from hermesd.theme import Theme
 
 _DETAIL_VISIBLE_SKILL_ROWS = 20
@@ -46,7 +58,9 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     if state.mcp_cache.mcp_cached_server_count:
         lines.append("  Schema cache: ", style=theme.ui_label)
         lines.append(
-            f"mcp {state.mcp_cache.mcp_cached_server_count} cached\n", style=theme.banner_text
+            f"mcp {state.mcp_cache.mcp_cached_server_count} cached"
+            f"{_cache_validity_suffix(state.mcp_cache)}\n",
+            style=theme.banner_text,
         )
     for p in sm.providers[:4]:
         sym = "✓" if p.is_active else "✗"
@@ -113,7 +127,8 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
 
 
 def _mcp_cache_section(state: DashboardState, theme: Theme) -> list[RenderableType]:
-    """MCP schema cache block: cached names, age, and servers with no entry."""
+    """MCP schema cache block: cached names, age, per-entry validity, and
+    servers with no entry."""
     cache = state.mcp_cache
     heading = section_heading("MCP", theme)
     if not cache.mcp_cache_present:
@@ -128,13 +143,105 @@ def _mcp_cache_section(state: DashboardState, theme: Theme) -> list[RenderableTy
         escape(f"{cache.mcp_cached_server_count} ({names})") if names else "—",
     )
     table.add_row("Cache age", _age_label(cache.mcp_schema_cache_age_seconds))
+    table.add_row("Entry validity", _validity_summary(cache))
     # An absent entry says nothing about whether the server ever connected: the
     # cache can be cleared, invalidated, or written under another profile.
     table.add_row(
         "No cache entry",
         _bounded_name_list(cache.mcp_uncached_server_count, cache.mcp_uncached_server_names),
     )
-    return [heading, table]
+    sections: list[RenderableType] = [heading, table]
+    if cache.mcp_entries:
+        sections.append(_mcp_entry_lines(cache, theme))
+    sections.append(Text(f"  {_MCP_VALIDITY_NOTE}", style=theme.banner_dim))
+    return sections
+
+
+# Rendered on every pass, like the plugins note: the validity column is a TTL
+# verdict about a cache file, and reading it as a health verdict about the
+# server is exactly the mistake worth pre-empting.
+_MCP_VALIDITY_NOTE = (
+    "Entry validity is the schema-cache TTL rule only: a valid entry does not "
+    "prove credentials work or that the server is reachable, and an expired one "
+    "is not an error — the next call re-probes it. The fingerprint shown is the "
+    "cache's own record, not a comparison hermesd performed."
+)
+
+
+def _cache_validity_suffix(cache: MCPSchemaCache) -> str:
+    """Compact-view marker for the entries that are not being served as-is.
+
+    An all-valid cache stays unannotated: the compact line has room for a
+    problem, not for a restatement of the count beside it.
+    """
+    flags = (
+        (cache.mcp_expired_entry_count, "expired"),
+        (cache.mcp_unassessable_entry_count, "unassessable"),
+    )
+    parts = [f"{count} {label}" for count, label in flags if count]
+    return f" ({', '.join(parts)})" if parts else ""
+
+
+def _validity_summary(cache: MCPSchemaCache) -> str:
+    """Rollup over every entry in the file, not over the bounded rendered list."""
+    counts = (
+        (cache.mcp_valid_entry_count, "valid"),
+        (cache.mcp_expired_entry_count, "expired"),
+        (cache.mcp_unassessable_entry_count, "unassessable"),
+    )
+    parts = [f"{count} {label}" for count, label in counts if count]
+    return escape(" · ".join(parts)) if parts else "—"
+
+
+def _mcp_entry_lines(cache: MCPSchemaCache, theme: Theme) -> Text:
+    """One line per retained entry, plus a marker when the list was bounded."""
+    lines = Text()
+    for entry in cache.mcp_entries:
+        lines.append(f"  {sanitize_terminal_text(entry.name)}  ", style=theme.ui_label)
+        lines.append(entry.state.value, style=_entry_style(entry.state, theme))
+        lines.append(f" — {sanitize_terminal_text(_entry_detail(entry))}", style=theme.banner_dim)
+        if entry.fingerprint:
+            lines.append(
+                f"  fp {sanitize_terminal_text(entry.fingerprint)}", style=theme.banner_dim
+            )
+        lines.append("\n")
+    hidden = cache.mcp_cached_server_count - len(cache.mcp_entries)
+    if hidden > 0:
+        lines.append(f"  (+{hidden} more)\n", style=theme.banner_dim)
+    return lines
+
+
+def _entry_style(state: MCPCacheEntryState, theme: Theme) -> str:
+    """Expired is deliberately *not* an error colour: it only means the next
+    call re-probes the server instead of using the cache."""
+    if state is MCPCacheEntryState.VALID:
+        return theme.ui_ok
+    if state is MCPCacheEntryState.EXPIRED:
+        return theme.banner_dim
+    return theme.ui_warn
+
+
+def _entry_detail(entry: MCPCacheEntry) -> str:
+    """The TTL story behind an entry's state, in the entry's own numbers."""
+    if entry.state is MCPCacheEntryState.UNASSESSABLE:
+        return entry.reason or "entry could not be assessed"
+    ttl = _duration_label(entry.ttl_ms / 1000.0) if entry.ttl_ms is not None else ""
+    if entry.state is MCPCacheEntryState.EXPIRED:
+        head = f"{ttl} ttl elapsed" if ttl else "ttl elapsed"
+        elapsed = _age_label(entry.age_seconds) if entry.age_seconds is not None else ""
+        return f"{head} {elapsed} ago" if elapsed else head
+    if not ttl:
+        return "no ttl recorded — never expires"
+    if entry.remaining_seconds is None:
+        return "no written_at recorded — never expires"
+    return f"{_duration_label(entry.remaining_seconds)} of {ttl} ttl left"
+
+
+def _duration_label(seconds: float) -> str:
+    """A TTL or a remaining window; sub-second values keep their milliseconds."""
+    if seconds < 1.0:
+        return f"{seconds * 1000:.0f}ms"
+    return fmt_age_seconds(int(seconds))
 
 
 def _bounded_name_list(count: int, names: list[str]) -> str:
@@ -344,9 +451,14 @@ def _plugins_note(sm: SkillsMemory, theme: Theme) -> Text:
         )
         for plugin in conflicts[:_CONFLICT_NOTE_LIMIT]:
             ignored = ", ".join(plugin.manifest_shadowed)
+            # Text.append does not parse markup, so these are sanitized (control
+            # bytes stripped) rather than escaped — escaping would render the
+            # backslash literally. Table cells above are markup-parsed and do
+            # need escape().
             note.append(
-                f"    {escape(plugin.name)}: {escape(plugin.manifest_file)} used;"
-                f" {escape(ignored)} ignored\n",
+                f"    {sanitize_terminal_text(plugin.name)}:"
+                f" {sanitize_terminal_text(plugin.manifest_file)} used;"
+                f" {sanitize_terminal_text(ignored)} ignored\n",
                 style=theme.banner_dim,
             )
         if len(conflicts) > _CONFLICT_NOTE_LIMIT:
