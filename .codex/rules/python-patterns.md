@@ -7,7 +7,7 @@ Sections irrelevant to hermesd (HTTP clients, DB transactions, structlog, pydant
 ## Python Style
 
 - Write modern Python; target the project's minimum version (`>=3.11`)
-- Reference `.codex/rules/python-idioms.md` for version-tagged syntax — do not use 3.12+ or 3.13+ forms in library code
+- Reference `.codex/rules/python-idioms.md` for version-tagged syntax — do not use 3.12+, 3.13+, or 3.14+ forms in library code
 - `from __future__ import annotations` at the top of every module (project convention; see all `hermesd/*.py`)
 - `snake_case` for functions, methods, variables, modules; `PascalCase` for classes; `UPPER_SNAKE_CASE` for module-level constants
 - Boolean names should read clearly: `is_`, `has_`, `can_`, `should_` prefixes

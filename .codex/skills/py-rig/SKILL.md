@@ -61,7 +61,7 @@ Follow this workflow:
    If the task materially changes project conventions, architecture, or workflow expectations, update `AGENTS.md` or the relevant rule/skill in the same change. Update `CHANGELOG.md` for user-visible changes and `README.md` when install/usage instructions change.
 
 8. Verify locally before opening a PR.
-   Run `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy hermesd`, `uv run pytest tests/ -v -W error::ResourceWarning`, `uv run pip-audit`, `uv lock --check`, `uv build`, wheel smoke installs, and `uvx twine check dist/*`. CI runs the same gate commands across Python 3.11/3.12/3.13.
+   Run `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy hermesd`, `uv run pytest tests/ -v -W error::ResourceWarning`, `uv run pip-audit`, `uv lock --check`, `uv build`, wheel smoke installs, and `uvx twine check dist/*`. CI runs the same gate commands across Python 3.11/3.12/3.13/3.14.
 </process>
 
 <design_rules>
@@ -380,7 +380,7 @@ Reject these patterns:
 - deep inheritance hierarchies when composition would be clearer
 - writing to `~/.hermes/` or importing from `hermes-agent`
 - returning blank/None renderables from panels on error (violates "never blank the display")
-- 3.12+ syntax (inline generics, `type` statement, `@override`) or 3.13+ syntax (`TypeIs`, `warnings.deprecated`) in library code while `requires-python` still includes 3.11
+- 3.12+ syntax (inline generics, `type` statement, `@override`), 3.13+ syntax (`TypeIs`, `warnings.deprecated`), or 3.14+ syntax (template strings) in library code while `requires-python` still includes 3.11
 </reject_patterns>
 
 <success_criteria>

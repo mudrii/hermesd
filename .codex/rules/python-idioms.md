@@ -1,6 +1,6 @@
-# Modern Python Idioms (3.11 – 3.13)
+# Modern Python Idioms (3.11 – 3.14)
 
-Each pattern below is tagged with its minimum Python version. hermesd's `requires-python = ">=3.11"` and CI matrix-tests on 3.11, 3.12, and 3.13 — so **any syntax tagged 3.12+ or 3.13+ cannot be used unconditionally** in the codebase. It may only appear behind a version guard or in code paths that the 3.11 interpreter never parses.
+Each pattern below is tagged with its minimum Python version. hermesd's `requires-python = ">=3.11"` and CI matrix-tests on 3.11, 3.12, 3.13, and 3.14 — so **any syntax tagged 3.12+, 3.13+, or 3.14+ cannot be used unconditionally** in the codebase. It may only appear behind a version guard or in code paths that the 3.11 interpreter never parses.
 
 If you raise `requires-python` in `pyproject.toml`, update this file's floor.
 
@@ -17,6 +17,7 @@ Project-wide conventions that apply on every version:
 - **3.11+** — safe everywhere in hermesd.
 - **3.12+** — SyntaxError on 3.11. Do not use in library code.
 - **3.13+** — ImportError/AttributeError on 3.11 and 3.12. Do not use in library code.
+- **3.14+** — SyntaxError/ImportError on 3.11 through 3.13. Do not use in library code.
 
 ---
 
@@ -219,6 +220,20 @@ def old_function() -> None: ...
 ```
 
 `warnings.deprecated` is 3.13-only. On 3.11/3.12, import from `typing_extensions` (add dependency first) or use a manual deprecation decorator.
+
+---
+
+## 3.14+ only — do not use unconditionally
+
+### Template strings (3.14)
+
+```python
+# 3.14+ only — SyntaxError on 3.11 through 3.13:
+name = "world"
+msg = t"hello {name}"
+```
+
+Template strings (`t"..."`, PEP 750) parse only on 3.14+. Stick with f-strings while `requires-python = ">=3.11"`.
 
 ---
 
