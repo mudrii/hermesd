@@ -5,7 +5,7 @@ import shutil
 import sqlite3
 import tempfile
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -36,7 +36,7 @@ _MODEL_USAGE_WINDOWS: tuple[tuple[str, float | None], ...] = (
 class HermesDB:
     def __init__(self, db_path: Path, allowed_root: Path | None = None):
         self._path = db_path
-        # When set, _open_target re-validates on every (re)connect that the db
+        # When set, _open_targets re-validates on every (re)connect that the db
         # path is not a symlink and still resolves under this root, closing the
         # profile symlink TOCTOU window left by startup-only validation.
         self._allowed_root = allowed_root
@@ -95,11 +95,20 @@ class HermesDB:
             self._mark_cached_reads_stale()
             return
         try:
-            db_path, uri_params = self._open_target()
-            self._uri = f"{db_path.resolve().as_uri()}?{uri_params}"
-            conn = sqlite3.connect(
-                self._uri, uri=True, timeout=_SQLITE_TIMEOUT_SECONDS, check_same_thread=False
-            )
+            conn: sqlite3.Connection | None = None
+            uri = ""
+            for db_path, uri_params in self._open_targets():
+                uri = f"{db_path.resolve().as_uri()}?{uri_params}"
+                try:
+                    conn = sqlite3.connect(
+                        uri, uri=True, timeout=_SQLITE_TIMEOUT_SECONDS, check_same_thread=False
+                    )
+                except (OSError, sqlite3.OperationalError):
+                    continue
+                break
+            if conn is None:
+                raise sqlite3.OperationalError(f"unable to open database: {self._path}")
+            self._uri = uri
             conn.row_factory = sqlite3.Row
             with self._connection_ref_lock:
                 self._conn = conn
@@ -135,12 +144,28 @@ class HermesDB:
             self._snapshot_dir.cleanup()
             self._snapshot_dir = None
 
-    def _open_target(self) -> tuple[Path, str]:
+    def _open_targets(self) -> Iterator[tuple[Path, str]]:
+        """Yield (db path, URI params) candidates in preference order.
+
+        A live WAL database is opened read-only in place when its -shm sidecar
+        exists: WAL readers see consistent data without blocking the writer, so
+        a reconnect no longer copies the whole database. Without -shm, opening
+        read-only would force WAL recovery with write access to the database
+        directory, which hermesd must not do; the snapshot copy handles that
+        case and is also the fallback when the live open itself fails.
+        """
         if self._allowed_root is not None and not _safe_child_path(self._path, self._allowed_root):
             raise OSError(f"Refusing to open database outside allowed root: {self._path}")
-        if not self._path.with_name(f"{self._path.name}-wal").exists():
-            return self._path, "mode=ro&immutable=1"
-        return self._snapshot_wal_database(), "mode=ro"
+        wal_path = self._path.with_name(f"{self._path.name}-wal")
+        # _exists_strict, not Path.exists(): on Python 3.14 an unreadable -wal
+        # would otherwise read as "no WAL" and silently route to immutable=1,
+        # serving checkpoint-lagging data instead of failing the source.
+        if not _exists_strict(wal_path):
+            yield self._path, "mode=ro&immutable=1"
+            return
+        if _exists_strict(self._path.with_name(f"{self._path.name}-shm")):
+            yield self._path, "mode=ro"
+        yield self._snapshot_wal_database(), "mode=ro"
 
     def _snapshot_wal_database(self) -> Path:
         snapshot_dir, snapshot_db = snapshot_wal_database(self._path, prefix="hermesd-state-")
@@ -498,10 +523,10 @@ class HermesDB:
     def run_readout(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         """Run `fn` against the shared read-only connection, reconnecting if needed.
 
-        The connection is already a WAL snapshot, so callers that need extra
-        tables out of the same database reuse this instead of taking a second
-        full copy of it every tick. ``sqlite3.Error`` propagates on purpose:
-        the calling source treats it as a failure and keeps its last-good data.
+        Callers that need extra tables out of the same database reuse this
+        instead of opening a second connection every tick. ``sqlite3.Error``
+        propagates on purpose: the calling source treats it as a failure and
+        keeps its last-good data.
         """
         with self._lock:
             conn = self._ensure_connection()

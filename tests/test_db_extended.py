@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import hermesd.db as db_module
 from hermesd.collector import Collector
 from hermesd.db import _LIKE_SEARCH_LIMIT, HermesDB
 from hermesd.models import DashboardState, RuntimeStatus
@@ -361,6 +362,151 @@ def test_open_db_reader_refreshes_after_later_wal_commit(tmp_path: Path):
     finally:
         db.close()
         writer.close()
+
+
+def test_wal_reconnect_reads_live_without_snapshot_copy(tmp_path: Path, monkeypatch):
+    """A live WAL database is read in place: reconnects must not copy the whole db."""
+    db_path = tmp_path / "state.db"
+    writer = sqlite3.connect(str(db_path))
+    writer.execute("PRAGMA journal_mode=WAL")
+    create_state_db_tables(writer, include_schema_version=False)
+    writer.execute("INSERT INTO sessions (id, source, started_at) VALUES ('sess_1', 'cli', 1.0)")
+    writer.commit()
+
+    snapshots: list[Path] = []
+    original = db_module.snapshot_wal_database
+
+    def counting(target: Path, *, prefix: str):
+        snapshots.append(Path(target))
+        return original(target, prefix=prefix)
+
+    monkeypatch.setattr(db_module, "snapshot_wal_database", counting)
+
+    db = HermesDB(db_path)
+    try:
+        assert [row["id"] for row in db.read_sessions()] == ["sess_1"]
+
+        writer.execute(
+            "INSERT INTO sessions (id, source, started_at) VALUES ('sess_2', 'cli', 2.0)"
+        )
+        writer.commit()
+
+        assert {row["id"] for row in db.read_sessions()} == {"sess_1", "sess_2"}
+    finally:
+        db.close()
+        writer.close()
+
+    assert snapshots == []
+
+
+def test_wal_live_open_failure_falls_back_to_snapshot(tmp_path: Path, monkeypatch):
+    """When the live read-only open fails, the WAL snapshot copy takes over."""
+    db_path = tmp_path / "state.db"
+    writer = sqlite3.connect(str(db_path))
+    writer.execute("PRAGMA journal_mode=WAL")
+    create_state_db_tables(writer, include_schema_version=False)
+    writer.execute("INSERT INTO sessions (id, source, started_at) VALUES ('sess_fb', 'cli', 1.0)")
+    writer.commit()
+    assert db_path.with_name("state.db-shm").exists()
+
+    snapshots: list[Path] = []
+    original_snapshot = db_module.snapshot_wal_database
+
+    def counting_snapshot(target: Path, *, prefix: str):
+        snapshots.append(Path(target))
+        return original_snapshot(target, prefix=prefix)
+
+    monkeypatch.setattr(db_module, "snapshot_wal_database", counting_snapshot)
+
+    live_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    live_attempts = 0
+    original_connect = sqlite3.connect
+
+    def blocking_connect(target: object, *args: object, **kwargs: object) -> sqlite3.Connection:
+        nonlocal live_attempts
+        if target == live_uri:
+            live_attempts += 1
+            raise sqlite3.OperationalError("unable to open database file")
+        return original_connect(target, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sqlite3, "connect", blocking_connect)
+
+    db = HermesDB(db_path)
+    try:
+        assert [row["id"] for row in db.read_sessions()] == ["sess_fb"]
+    finally:
+        db.close()
+        writer.close()
+
+    assert live_attempts == 1
+    assert snapshots == [db_path]
+
+
+def test_wal_without_shm_uses_snapshot_and_creates_no_sidecars(tmp_path: Path, monkeypatch):
+    """Without -shm, read-only WAL recovery would write to the db dir: use the snapshot."""
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source_db = source_dir / "state.db"
+    writer = sqlite3.connect(str(source_db))
+    writer.execute("PRAGMA journal_mode=WAL")
+    create_state_db_tables(writer, include_schema_version=False)
+    writer.execute("INSERT INTO sessions (id, source, started_at) VALUES ('sess_wal', 'cli', 1.0)")
+    writer.commit()
+
+    db_path = tmp_path / "state.db"
+    shutil.copy2(source_db, db_path)
+    shutil.copy2(source_db.with_name("state.db-wal"), db_path.with_name("state.db-wal"))
+    assert not db_path.with_name("state.db-shm").exists()
+
+    snapshots: list[Path] = []
+    original = db_module.snapshot_wal_database
+
+    def counting(target: Path, *, prefix: str):
+        snapshots.append(Path(target))
+        return original(target, prefix=prefix)
+
+    monkeypatch.setattr(db_module, "snapshot_wal_database", counting)
+
+    db = HermesDB(db_path)
+    try:
+        assert [row["id"] for row in db.read_sessions()] == ["sess_wal"]
+        assert not db_path.with_name("state.db-shm").exists()
+    finally:
+        db.close()
+        writer.close()
+
+    assert snapshots == [db_path]
+
+
+def test_wal_sidecar_probe_uses_exists_strict(tmp_path: Path, monkeypatch):
+    """The -wal probe must go through _exists_strict: on Python 3.14 Path.exists()
+    reads EACCES as absence, silently routing to immutable=1 checkpoint-lagged data."""
+    db_path = tmp_path / "state.db"
+    writer = sqlite3.connect(str(db_path))
+    writer.execute("PRAGMA journal_mode=WAL")
+    create_state_db_tables(writer, include_schema_version=False)
+    writer.execute("INSERT INTO sessions (id, source, started_at) VALUES ('sess_1', 'cli', 1.0)")
+    writer.commit()
+    wal_path = db_path.with_name("state.db-wal")
+    assert wal_path.exists()
+
+    probed: list[Path] = []
+    real = db_module._exists_strict
+
+    def spy(path: Path) -> bool:
+        probed.append(path)
+        return real(path)
+
+    monkeypatch.setattr(db_module, "_exists_strict", spy)
+
+    db = HermesDB(db_path)
+    try:
+        assert [row["id"] for row in db.read_sessions()] == ["sess_1"]
+    finally:
+        db.close()
+        writer.close()
+
+    assert wal_path in probed
 
 
 def test_wal_snapshot_ignores_symlinked_sidecars_outside_home(tmp_path: Path):

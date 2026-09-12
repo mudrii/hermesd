@@ -304,7 +304,7 @@ The header/footer show `AGENT OFFLINE` when Hermes Agent appears inactive: the g
 The green/yellow/red dot next to the polling spinner shows how many collector sources succeeded on the last refresh (`ok/total`). Green means every source read cleanly, yellow means some failed (the failed source names are listed inline), red means none did. A `(stale)` marker after the refresh interval means the last refresh failed outright and hermesd is showing cached data.
 
 **Does hermesd fight Hermes Agent for the SQLite database?**
-No. All databases are opened read-only (`mode=ro`). When `state.db` is in WAL mode, hermesd copies the database plus its `-wal`/`-shm` sidecars to a temporary snapshot and reads that, so a busy writer never blocks the dashboard. If a read does fail transiently (e.g. during a WAL checkpoint), hermesd keeps the last good data on screen and retries on the next poll instead of blanking panels.
+No. All databases are opened read-only (`mode=ro`). When `state.db` is in WAL mode and its `-shm` sidecar exists, hermesd reads the live database in place — WAL readers see consistent data without blocking the writer, so no full copy is needed. Only when the `-shm` is missing or the live open fails does hermesd fall back to copying the database plus its `-wal`/`-shm` sidecars to a temporary snapshot and reading that. If a read does fail transiently (e.g. during a WAL checkpoint), hermesd keeps the last good data on screen and retries on the next poll instead of blanking panels.
 
 **hermesd is slow with very large log files**
 Each refresh reads only the last `--log-tail-bytes` bytes of every log file and cron output excerpt (default: 32768). Lower it to cut I/O on multi-GB logs:

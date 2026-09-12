@@ -1835,10 +1835,11 @@ def test_goal_json_under_the_cap_is_decoded(hermes_home: Path):
     assert [goal.goal for goal in ops.goals] == ["ship it"]
 
 
-def test_state_db_wal_is_snapshotted_once_per_change(
+def test_state_db_wal_is_read_live_without_snapshot_copies(
     hermes_home: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """HermesDB and the operations readout must share one WAL snapshot per tick."""
+    """A live WAL state.db is read in place: no full-db copies across ticks,
+    and the operations readout still refreshes through the shared connection."""
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode=WAL")
@@ -1859,9 +1860,7 @@ def test_state_db_wal_is_snapshotted_once_per_change(
     c = Collector(hermes_home)
     try:
         assert c.collect().operations.goal_count == 1
-        after_first = len(snapshots)
         c.collect()
-        assert len(snapshots) == after_first
 
         conn.execute(
             "INSERT INTO state_meta VALUES (?, ?)",
@@ -1873,7 +1872,7 @@ def test_state_db_wal_is_snapshotted_once_per_change(
         c.close()
         conn.close()
 
-    assert [path.name for path in snapshots] == ["state.db", "state.db"]
+    assert snapshots == []
 
 
 def test_corrupt_state_db_keeps_last_good_operations_rows(hermes_home: Path, sample_db: Path):

@@ -7,6 +7,10 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ## [Unreleased]
 
+### Changed
+
+- `state.db` in WAL mode is now opened live and read-only whenever its `-shm` sidecar exists — WAL readers see consistent data without blocking the writer — instead of copying the whole database into a temp dir on every refresh. The full snapshot copy remains as the fallback when the `-shm` is missing (read-only WAL recovery would need write access to `~/.hermes/`) or the live open itself fails. The `-wal` probe now uses strict existence checking so an unreadable sidecar fails the source instead of silently serving checkpoint-lagging data via `immutable=1`.
+
 ## [2026.9.8] - 2026-09-08
 
 ### Added
