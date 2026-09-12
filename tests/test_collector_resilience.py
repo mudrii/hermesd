@@ -384,10 +384,12 @@ def test_config_yaml_scalar_then_list_then_empty_never_blanks_config(
         for payload in ("just a string\n", "- one\n- two\n"):
             config_path.write_text(payload)
             # A wrong top-level type never reaches the collector: the file
-            # cache serves the last-good mapping, so the source still passes.
+            # cache serves the last-good mapping, so the panels stay populated —
+            # but the stale serve is now reported as a degraded source, the
+            # same contract JSON-backed sources already had.
             state = collector.collect()
             assert state.config.model == "gpt-5.4"
-            assert "config" not in state.health.failed_sources
+            assert "config" in state.health.failed_sources
 
         config_path.write_text("")
         emptied = collector.collect()

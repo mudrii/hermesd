@@ -933,6 +933,19 @@ class Collector:
     def _read_yaml_cached(self) -> JsonMapping:
         return self._file_cache.read_yaml_mapping(self._paths.shared_path("config.yaml"))
 
+    def _read_yaml_reporting_stale(self) -> JsonMapping:
+        """Read config.yaml, raising when the file cache had to serve last-good.
+
+        Same contract as ``_read_json_reporting_stale``: a config that was once
+        readable and is now malformed or unreadable must degrade the reading
+        source's health instead of silently showing the stale mapping. A file
+        that was never readable (or is absent) is not stale and does not raise.
+        """
+        data = self._read_yaml_cached()
+        if self._file_cache.last_read_was_stale(self._paths.shared_path("config.yaml")):
+            raise RuntimeError("config.yaml is unreadable; keeping last-good values")
+        return data
+
     def search_session_ids_by_message(self, query: str) -> set[str]:
         # Intentionally no self._lock here: HermesDB serializes its own reads,
         # and taking the collect lock would block searches for the full
@@ -982,7 +995,7 @@ class Collector:
                 else:
                     running = False
         version, behind = self._collect_hermes_version()
-        cfg = self._read_yaml_cached()
+        cfg = self._read_yaml_reporting_stale()
         gateway_cfg = _as_dict(cfg.get("gateway"))
         scale_cfg = _as_dict(cfg.get("scale_to_zero")) or _as_dict(gateway_cfg.get("scale_to_zero"))
         active_agents = _coerce_int(data.get("active_agents"))
@@ -1425,7 +1438,7 @@ class Collector:
         return self._available_tools_cache_value
 
     def _collect_config(self) -> ConfigSummary:
-        cfg = self._read_yaml_cached()
+        cfg = self._read_yaml_reporting_stale()
         if not cfg:
             # A config.yaml that parses to nothing after a good read is a
             # truncated or emptied write, not a real "no configuration": fail
@@ -1545,7 +1558,7 @@ class Collector:
         return routes
 
     def _collect_cron(self) -> CronState:
-        cfg = self._read_yaml_cached()
+        cfg = self._read_yaml_reporting_stale()
         cron_cfg = _as_dict(cfg.get("cron"))
         tick_path = self._paths.shared_path("cron", ".tick.lock")
         last_tick: float | None = None
@@ -1708,7 +1721,7 @@ class Collector:
         )
 
     def _collect_kanban(self) -> KanbanState:
-        cfg = self._read_yaml_cached()
+        cfg = self._read_yaml_reporting_stale()
         kanban_cfg = _as_dict(cfg.get("kanban"))
         base_state = KanbanState(
             db_present=_exists_strict(self._paths.shared_path("kanban.db")),
@@ -1885,7 +1898,7 @@ class Collector:
             return _read_verification_evidence(conn, operations)
 
     def _with_moa_traces(self, operations: OperationsState) -> OperationsState:
-        cfg = self._read_yaml_cached()
+        cfg = self._read_yaml_reporting_stale()
         moa_cfg = _as_dict(cfg.get("moa"))
         trace_dir_value = str(moa_cfg.get("trace_dir") or "")
         trace_dir = (
@@ -2015,7 +2028,7 @@ class Collector:
         scheduler_state = self._read_json_cached(
             self._paths.profile_path("skills", ".curator_state")
         )
-        curator_cfg = _as_dict(self._read_yaml_cached().get("curator"))
+        curator_cfg = _as_dict(self._read_yaml_reporting_stale().get("curator"))
         base_run = _curator_with_scheduler_state(CuratorRun(), scheduler_state, curator_cfg)
         curator_dir = self._paths.shared_path("logs", "curator")
         if (
@@ -2162,7 +2175,7 @@ class Collector:
         mem_count = len(_memory_file_names(mem_dir))
 
         auth_data = self._read_json_cached(self._paths.shared_path("auth.json"))
-        cfg = self._read_yaml_cached()
+        cfg = self._read_yaml_reporting_stale()
         boot_md = self._paths.shared_path("BOOT.md")
         providers = self._collect_providers(auth_data)
         return SkillsMemory(
@@ -2200,7 +2213,7 @@ class Collector:
         return _age_seconds(_mtime(path), self._clock())
 
     def _collect_memory(self) -> MemoryOverview:
-        cfg = self._read_yaml_cached()
+        cfg = self._read_yaml_reporting_stale()
         memory_cfg = _as_dict(cfg.get("memory"))
         memories_dir = self._paths.profile_path("memories")
         soul_path = self._paths.profile_path("SOUL.md")
@@ -2664,7 +2677,7 @@ class Collector:
         return 0
 
     def _collect_skin(self) -> str:
-        cfg = self._read_yaml_cached()
+        cfg = self._read_yaml_reporting_stale()
         skin = _as_dict(cfg.get("display")).get("skin", "default")
         if not skin:
             return "default"

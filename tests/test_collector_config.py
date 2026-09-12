@@ -757,3 +757,64 @@ def test_config_fixture_home_surfaces_new_sections(populated_hermes_home: Path):
     assert config.mcp_server_names == ["playwright", "sheets"]
     assert config.network_proxy_configured is True
     assert "hunter2" not in json.dumps(config.model_dump(mode="json"))
+
+
+def test_malformed_config_yaml_marks_source_failed_while_showing_last_good(
+    hermes_home: Path,
+):
+    """A config.yaml that goes bad after a good read degrades health visibly.
+
+    The file cache keeps serving the last-good mapping (panels stay populated),
+    but the config source must report degraded — the same contract JSON sources
+    already have via _read_json_reporting_stale.
+    """
+    cfg = hermes_home / "config.yaml"
+    cfg.write_text(yaml.dump({"model": {"default": "claude-4"}}))
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert first.config.model == "claude-4"
+        assert "config" not in first.health.failed_sources
+
+        cfg.write_text("just a string\n")
+        second = c.collect()
+        assert second.config.model == "claude-4"
+        assert "config" in second.health.failed_sources
+        assert "unreadable" in second.health.errors["config"]
+
+        cfg.write_text("key: [unclosed\n")
+        third = c.collect()
+        assert third.config.model == "claude-4"
+        assert "config" in third.health.failed_sources
+    finally:
+        c.close()
+
+
+def test_repaired_config_yaml_clears_degradation(hermes_home: Path):
+    cfg = hermes_home / "config.yaml"
+    cfg.write_text(yaml.dump({"model": {"default": "claude-4"}}))
+    c = Collector(hermes_home)
+    try:
+        c.collect()
+        cfg.write_text("key: [unclosed\n")
+        assert "config" in c.collect().health.failed_sources
+
+        cfg.write_text(yaml.dump({"model": {"default": "gpt-6"}}))
+        recovered = c.collect()
+        assert recovered.config.model == "gpt-6"
+        assert "config" not in recovered.health.failed_sources
+    finally:
+        c.close()
+
+
+def test_absent_config_yaml_does_not_fail_config_source(hermes_home: Path):
+    """An intentionally absent optional config is not a read failure."""
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+        assert state.config.model == ""
+        assert "config" not in state.health.failed_sources
+        # A still-absent file on the next pass stays healthy too.
+        assert "config" not in c.collect().health.failed_sources
+    finally:
+        c.close()
