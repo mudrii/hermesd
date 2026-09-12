@@ -303,6 +303,77 @@ def test_main_rejects_symlinked_snapshot_file_into_hermes_home(
     assert not (populated_hermes_home / "snapshot.txt").exists()
 
 
+def test_main_snapshot_file_hard_link_preserves_in_home_inode(
+    populated_hermes_home: Path, tmp_path: Path
+):
+    protected = populated_hermes_home / "protected.yaml"
+    protected.write_text("original: true\n")
+    output_path = tmp_path / "snapshot.txt"
+    os.link(protected, output_path)
+
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-file",
+            str(output_path),
+            "--no-color",
+        ]
+    )
+
+    assert protected.read_text() == "original: true\n"
+    assert "Gateway & Platforms" in output_path.read_text()
+    assert not os.path.samefile(protected, output_path)
+
+
+def test_main_snapshot_file_replaces_existing_file(populated_hermes_home: Path, tmp_path: Path):
+    output_path = tmp_path / "snapshot.txt"
+    output_path.write_text("stale contents")
+
+    main(
+        [
+            "--hermes-home",
+            str(populated_hermes_home),
+            "--snapshot-file",
+            str(output_path),
+            "--no-color",
+        ]
+    )
+
+    text = output_path.read_text()
+    assert "Gateway & Platforms" in text
+    assert "stale contents" not in text
+
+
+def test_main_snapshot_file_write_failure_leaves_no_partial_output(
+    populated_hermes_home: Path,
+    tmp_path: Path,
+    monkeypatch,
+):
+    output_path = tmp_path / "snapshot.txt"
+    output_path.write_text("previous contents")
+
+    def fail_replace(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="disk full"):
+        main(
+            [
+                "--hermes-home",
+                str(populated_hermes_home),
+                "--snapshot-file",
+                str(output_path),
+                "--no-color",
+            ]
+        )
+
+    assert output_path.read_text() == "previous contents"
+    leftovers = [p for p in tmp_path.iterdir() if p.name.startswith(f".{output_path.name}.")]
+    assert leftovers == []
+
+
 def test_main_closes_snapshot_app_when_file_write_fails(
     populated_hermes_home: Path,
     tmp_path: Path,
@@ -323,11 +394,11 @@ def test_main_closes_snapshot_app_when_file_write_fails(
             nonlocal closed
             closed = True
 
-    def fail_write_text(self: Path, text: str):
+    def fail_named_temporary_file(*args, **kwargs):
         raise OSError("disk full")
 
     monkeypatch.setattr("hermesd.app.DashboardApp", FakeApp)
-    monkeypatch.setattr(Path, "write_text", fail_write_text)
+    monkeypatch.setattr("hermesd.__main__.tempfile.NamedTemporaryFile", fail_named_temporary_file)
 
     with pytest.raises(OSError, match="disk full"):
         main_module.main(

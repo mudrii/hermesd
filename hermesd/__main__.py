@@ -4,6 +4,7 @@ import argparse
 import os
 import signal
 import sys
+import tempfile
 from pathlib import Path
 from types import FrameType
 
@@ -123,6 +124,25 @@ def _snapshot_file_inside_hermes_home(snapshot_file: Path, hermes_home: Path) ->
     return output_path == home_path or output_path.is_relative_to(home_path)
 
 
+def _write_snapshot_file(output_path: Path, snapshot_text: str) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            delete=False,
+        ) as temp_file:
+            temp_file.write(snapshot_text)
+            temp_path = Path(temp_file.name)
+        os.replace(temp_path, output_path)
+    except BaseException:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     hermes_home = resolve_hermes_home(args)
@@ -186,8 +206,7 @@ def main(argv: list[str] | None = None) -> None:
                         "Error: --snapshot-file must not write under hermes home", file=sys.stderr
                     )
                     sys.exit(1)
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                output_path.write_text(snapshot_text)
+                _write_snapshot_file(output_path, snapshot_text)
             else:
                 if args.snapshot_format == "json":
                     print(snapshot_text)
