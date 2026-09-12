@@ -98,6 +98,26 @@ jobs:
         run: docker build --tag hermesd-ci .
       - name: Smoke test Docker image
         run: docker run --rm hermesd-ci --version
+      - name: Smoke test Docker checkpoint support
+        run: |
+          docker run --rm -i --network none --entrypoint python hermesd-ci - <<'PY'
+          import subprocess
+          import tempfile
+          from pathlib import Path
+          from hermesd.collect.system import _git_checkpoint_summary
+
+          with tempfile.TemporaryDirectory() as directory:
+              repo = Path(directory)
+              subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+              for number in range(2):
+                  subprocess.run([
+                      "git", "-C", str(repo), "-c", "user.name=Smoke Test",
+                      "-c", "user.email=smoke@example.invalid", "commit", "--quiet",
+                      "--allow-empty", "-m", f"checkpoint {number}",
+                  ], check=True)
+              count, timestamp, reason = _git_checkpoint_summary(repo / ".git")
+              assert count == 2 and timestamp is not None and reason == "checkpoint 1"
+          PY
 
   nix:
     runs-on: ubuntu-24.04

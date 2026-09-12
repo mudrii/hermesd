@@ -6,9 +6,11 @@ import json
 import math
 import sqlite3
 import time
+from io import StringIO
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
 import hermesd.collect.sqlite_util as sqlite_util_module
 from hermesd.collector import (
@@ -21,6 +23,8 @@ from hermesd.collector import (
     _summarize_tokens,
     _today_epoch,
 )
+from hermesd.panels.tokens import render_tokens
+from hermesd.theme import Theme
 from tests.conftest import create_state_db_tables, insert_model_usage
 
 
@@ -789,6 +793,65 @@ def test_summarize_tokens_all_included_rows_clears_estimated_flag():
         {"input_tokens": 20, "estimated_cost_usd": 0.0, "cost_status": "exact"},
     ]
     assert _summarize_tokens(rows).cost_is_estimated is False
+
+
+@pytest.mark.parametrize("cost_status", ["included", "exact", "reported"])
+@pytest.mark.parametrize(("actual_cost", "expected"), [(0.0, 0.0), (None, 2.0)])
+def test_authoritative_cost_agrees_across_sessions_and_model_usage(
+    hermes_home: Path, cost_status: str, actual_cost: float | None, expected: float
+):
+    conn = sqlite3.connect(str(hermes_home / "state.db"))
+    create_state_db_tables(conn, include_schema_version=False, include_v021_columns=True)
+    now = time.time()
+    conn.execute(
+        "INSERT INTO sessions (id, source, model, started_at, input_tokens, "
+        "estimated_cost_usd, actual_cost_usd, cost_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("s1", "cli", "model", now, 100, 2.0, actual_cost, cost_status),
+    )
+    insert_model_usage(
+        conn,
+        "s1",
+        "model",
+        input_tokens=100,
+        estimated_cost_usd=2.0,
+        actual_cost_usd=actual_cost,
+        cost_status=cost_status,
+        last_seen=now,
+    )
+    conn.commit()
+    conn.close()
+
+    collector = Collector(hermes_home)
+    try:
+        state = collector.collect()
+        assert state.sessions[0].estimated_cost_usd == expected
+        assert state.tokens_total.total_cost_usd == expected
+        assert state.tokens_total.cost_is_estimated is False
+        usage = state.token_analytics.model_usage_all[0]
+        assert usage.reported_cost_usd == expected
+        assert usage.estimated_only_cost_usd == 0.0
+        assert usage.reported_row_count == usage.row_count == 1
+        console = Console(file=StringIO(), record=True, width=180)
+        console.print(render_tokens(state, Theme(), detail=True))
+        rendered = console.export_text()
+        assert f"${expected:.2f}" in rendered
+        assert "~$" not in rendered
+    finally:
+        collector.close()
+
+
+@pytest.mark.parametrize("cost_status", ["included", "exact", "reported"])
+def test_authoritative_actual_zero_without_estimate_is_reported(cost_status: str):
+    row = {
+        "actual_cost_usd": 0.0,
+        "estimated_cost_usd": None,
+        "cost_status": cost_status,
+        "input_tokens": 100_000,
+    }
+    assert _resolved_session_cost(row) == 0.0
+    totals = _summarize_tokens([row])
+    assert totals.total_cost_usd == 0.0
+    assert totals.cost_is_estimated is False
 
 
 @pytest.mark.parametrize(
@@ -1567,6 +1630,34 @@ def test_context_length_cache_edit_refreshes_session_context_limit(hermes_home: 
         assert c.collect().sessions[0].context_limit == 200
     finally:
         c.close()
+
+
+def test_context_length_transient_read_retries_without_another_edit(hermes_home: Path, monkeypatch):
+    from hermesd import file_cache as cache_module
+
+    _insert_session_with_endpoint(
+        hermes_home / "state.db", "MiniMax-M3", "https://api.minimax.io/v1"
+    )
+    path = hermes_home / "context_length_cache.yaml"
+    path.write_text("context_lengths:\n  MiniMax-M3@https://api.minimax.io/v1: 100\n")
+    collector = Collector(hermes_home)
+    try:
+        assert collector.collect().sessions[0].context_limit == 100
+        path.write_text("context_lengths:\n  MiniMax-M3@https://api.minimax.io/v1: 200\n")
+        with monkeypatch.context() as transient:
+
+            def fail_read(path):
+                raise PermissionError("temporary YAML read failure")
+
+            transient.setattr(cache_module, "_load_yaml", fail_read)
+            stale = collector.collect()
+        recovered = collector.collect()
+        assert stale.sessions[0].context_limit == 100
+        assert "session_models" in stale.health.failed_sources
+        assert recovered.sessions[0].context_limit == 200
+        assert "session_models" not in recovered.health.failed_sources
+    finally:
+        collector.close()
 
 
 def test_context_length_edit_does_not_invalidate_unrelated_derived_entries(

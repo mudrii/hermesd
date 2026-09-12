@@ -39,6 +39,7 @@ from hermesd.models import (
 )
 from hermesd.panels import PANEL_NAMES
 from hermesd.theme import Theme, load_theme
+from tests.conftest import render_to_str
 
 
 def test_panel_name_constants_resolve():
@@ -349,22 +350,23 @@ def _sessions_view_state(app: DashboardApp, count: int) -> None:
 
 
 def test_jump_bottom_then_scroll_up_changes_sessions_offset(populated_hermes_home: Path):
-    """The sessions detail view clamps G to the windowed bottom like logs/skills."""
+    """G clamps to the rendered bottom so k moves up immediately."""
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     _sessions_view_state(app, 40)
     app.handle_key("2")
     app.handle_key("G")
-    app._build_layout()
-    assert app._view.scroll_offset == 20  # 40 rows - 20-row window
+    app._build_layout(console=Console(width=120, height=24))
+    bottom = app._view.scroll_offset
+    assert 0 < bottom < 1000
     app.handle_key("k")
-    assert app._view.scroll_offset == 19
+    assert app._view.scroll_offset == bottom - 1
     app.close()
 
 
 def test_sessions_detail_scroll_offset_reaches_content_at_small_height(
     populated_hermes_home: Path,
 ):
-    """At ordinary terminal heights the windowed table keeps every row reachable."""
+    """At ordinary terminal heights the viewport makes the final row reachable."""
     app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
     _sessions_view_state(app, 40)
     app._console = Console(
@@ -382,9 +384,44 @@ def test_sessions_detail_scroll_offset_reaches_content_at_small_height(
     with app._console.capture() as bottom_capture:
         app._console.print(app._build_layout())
     bottom_text = bottom_capture.get()
-    assert "sess0019" in bottom_text  # scrolled window brings lower rows into view
+    assert "sess0000" in bottom_text
     assert "sess0039" not in bottom_text
     app.close()
+
+
+@pytest.mark.parametrize("height", [24, 40])
+def test_sessions_scroll_reaches_final_table_with_populated_sections(
+    populated_hermes_home: Path, height: int
+):
+    app = DashboardApp(populated_hermes_home, no_color=True)
+    try:
+        sessions = [
+            SessionInfo(
+                session_id=f"sess{i:04d}",
+                started_at=i + 1,
+                display_name=f"Name {i}",
+                cwd="/tmp/example",
+                billing_provider="provider",
+                billing_mode="api",
+                cost_status="exact",
+            )
+            for i in range(10)
+        ]
+        app._set_state(app._state.model_copy(update={"sessions": sessions}))
+        app._console = Console(file=io.StringIO(), width=120, height=height, no_color=True)
+        app.handle_key("2")
+        app.handle_key("G")
+        with app._console.capture() as captured:
+            app._console.print(app._build_layout())
+        assert "Cost Status" in captured.get()
+        assert "sess0000" in captured.get()
+        assert app._view.scroll_offset > 0
+        bottom = app._view.scroll_offset
+        app.handle_key("k")
+        app._build_layout()
+        assert app._view.scroll_offset == bottom - 1
+    finally:
+        app.close()
 
 
 def test_sessions_detail_scroll_offset_resets_when_leaving_panel(populated_hermes_home: Path):
@@ -399,6 +436,45 @@ def test_sessions_detail_scroll_offset_resets_when_leaving_panel(populated_herme
     app.handle_key("2")
     assert app._view.scroll_offset == 0
     app.close()
+
+
+def test_sessions_viewport_reclamps_after_resize_and_filter(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, no_color=True)
+    try:
+        _sessions_view_state(app, 40)
+        app._console = Console(file=io.StringIO(), width=120, height=24, no_color=True)
+        app.handle_key("2")
+        app.handle_key("G")
+        app._build_layout()
+        short_bottom = app._view.scroll_offset
+
+        app._console.height = 40
+        app._build_layout()
+        assert app._view.scroll_offset == max(0, short_bottom - 16)
+
+        app._view.filter_query = "id:sess0000"
+        with app._console.capture() as captured:
+            app._console.print(app._build_layout())
+        assert app._view.scroll_offset == 0
+        assert "sess0000" in captured.get()
+        assert "sess0039" not in captured.get()
+    finally:
+        app.close()
+
+
+def test_sessions_copy_clamps_its_view_without_mutating_live_offset(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, no_color=True)
+    try:
+        _sessions_view_state(app, 40)
+        app._console = Console(file=io.StringIO(), width=120, height=24, no_color=True)
+        app.handle_key("2")
+        app.handle_key("G")
+        before = app._snapshot_view_state()
+        copied = app.copy_current_view()
+        assert "sess0000" in copied
+        assert app._snapshot_view_state() == before
+    finally:
+        app.close()
 
 
 def test_handle_key_invalid_returns_none(populated_hermes_home: Path):
@@ -475,7 +551,7 @@ def test_build_detail_layout(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app._view.enter_detail(2)
     layout = app._build_layout()
-    assert "[2] Sessions" in str(layout["body"].renderable.title)
+    assert "[2] Sessions" in render_to_str(layout["body"].renderable)
     app.close()
 
 
@@ -492,7 +568,7 @@ def test_build_detail_layout_uses_session_message_search(populated_hermes_home: 
 
     monkeypatch.setattr(app._collector, "search_session_ids_by_message", fake_search)
     layout = app._build_layout()
-    assert "[2] Sessions" in str(layout["body"].renderable.title)
+    assert "[2] Sessions" in render_to_str(layout["body"].renderable)
     app._message_search_thread.join(timeout=1)
     assert called["query"] == "response"
     assert app._state.session_message_match_query == "response"
@@ -515,7 +591,7 @@ def test_build_detail_layout_does_not_block_on_session_message_search(
     monkeypatch.setattr(app._collector, "search_session_ids_by_message", fail_if_called_inline)
     layout = app._build_layout()
 
-    assert "[2] Sessions" in str(layout["body"].renderable.title)
+    assert "[2] Sessions" in render_to_str(layout["body"].renderable)
     app._message_search_thread.join(timeout=1)
     app.close()
 

@@ -27,7 +27,7 @@ Sections irrelevant to hermesd (HTTP clients, DB transactions, structlog, pydant
 - `mypy` is enforced in CI via `[tool.mypy]` in `pyproject.toml`
 - Every public function has explicit parameter and return types
 - Minimize `Any` in domain code; use `object`, `Protocol`, generics, `Union`, or narrower types
-- **Boundary `Any` carve-out**: `hermesd/db.py` returns `list[dict[str, Any]]` because SQLite rows are untyped at the source. The per-module mypy override allows this. Convert to Pydantic models at the earliest reasonable point (`hermesd/collector.py`). Do not let `Any` spread past the collector.
+- **Boundary `Any` policy**: follow `<type_discipline>` in `.codex/skills/py-rig/SKILL.md` for raw SQLite and parsed JSON/YAML/state data. This boundary is a review convention, not a mypy-enforced restriction. Convert to typed Pydantic models at the earliest reasonable point; keep `Any` out of models and panels.
 - `Protocol` for structural typing at dependency boundaries; prefer over ABCs when no shared state or default behavior is needed
 - `TypeVar`, `ParamSpec`, `TypeVarTuple` for generic APIs; use the pre-3.12 form in library code (`T = TypeVar("T")`), not the 3.12+ inline `def fn[T](...)` syntax
 - `NewType` for domain IDs and values that should not mix; uses plain assignment (`UserId = NewType("UserId", int)`), not the 3.12 `type` statement
@@ -58,11 +58,12 @@ Version-guarded type features (import from `typing_extensions` on older versions
 - Use stdlib exceptions (`ValueError`, `TypeError`, `KeyError`) for programming errors and invalid arguments
 - `raise NewError("context") from original_err` to preserve cause chains
 - Never bare `except:` — catches `SystemExit` and `KeyboardInterrupt`
-- `except Exception:` without re-raise is acceptable only at top-level boundary handlers:
+- `except Exception:` without re-raise is acceptable only at these boundary handlers:
   - CLI entry point (`hermesd/__main__.py::main`)
   - Collector and input threads (`hermesd/app.py::_collector_loop`, `_input_loop`) — exceptions become `is_stale=True` rather than crashing the TUI
   - Per-source collection boundary (`hermesd/collector.py::_CollectionHealth.collect`) — a failing data source is marked failed and falls back to last-good/default data rather than aborting the whole refresh; preserves the cache-preservation invariant
   - Message-search worker thread (`hermesd/app.py::_search_session_messages_worker`) — a search failure surfaces a distinct error string instead of crashing the daemon worker
+  - Exception-message sanitizer (`hermesd/collect/redaction.py::_safe_exception_text`) — must remain non-throwing while handling another error; return only the exception type if sanitization fails
   - Signal handlers — set a flag and return fast
   Everywhere else, re-raise or handle specifically.
 - `contextlib.suppress(SpecificError)` only for known-safe suppression

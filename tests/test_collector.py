@@ -1044,6 +1044,40 @@ def test_redact_command_string_with_unbalanced_quotes_falls_back_to_text_redacti
     assert "[REDACTED]" in redacted
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        r'{"password": "prefix\"SYNTHETIC_SECRET suffix"}',
+        r"password='prefix\'SYNTHETIC_SECRET suffix'",
+        '{"api_key": {"value": "SYNTHETIC_SECRET"}}',
+        '{"api_key": ["prefix", ["SYNTHETIC_SECRET"]]}',
+        'INFO {"api_key": {"value": "SYNTHETIC_SECRET"}, "page": 1}',
+        'INFO {"api_key": ["prefix", ["SYNTHETIC_SECRET"]], "page": 1}',
+        'password="prefix SYNTHETIC_SECRET suffix',
+    ],
+)
+def test_redact_secret_text_masks_complete_escaped_and_structured_values(value: str):
+    assert "SYNTHETIC_SECRET" not in _redact_secret_text(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://[broken?api_key=SYNTHETIC_SECRET",
+        "https://[broken/path?api%5Fkey=SYNTHETIC_SECRET",
+        "https://user:SYNTHETIC_SECRET@[broken?token=SYNTHETIC_SECRET",
+    ],
+)
+def test_redact_malformed_url_masks_query_without_path_and_encoded_keys(value: str):
+    assert "SYNTHETIC_SECRET" not in _redact_secret_url(value)
+
+
+def test_redact_secret_text_preserves_nonsecret_query_after_masked_value():
+    text = "request https://example.invalid/?token=secret&page=2 completed"
+    redacted = _redact_secret_text(text)
+    assert "token=[REDACTED]&page=2 completed" in redacted
+
+
 def test_redact_secret_text_redacts_json_style_pairs():
     redacted = _redact_secret_text('{"api_key": "sk-secret-123"}')
 

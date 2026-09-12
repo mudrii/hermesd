@@ -18,9 +18,7 @@ from hermesd.collect.common import (
     _as_list,
     _coerce_float,
     _coerce_int,
-    _file_size,
     _iso_to_epoch,
-    _mtime,
     _path_resolves_under,
     _read_tail_text,
     _safe_child_path,
@@ -366,20 +364,19 @@ def _read_state_snapshots(root: Path, home: Path, *, now: float) -> dict[str, An
     total_bytes = 0
     newest: float | None = None
     if _safe_child_path(root, home) and root.is_dir():
-        with contextlib.suppress(OSError):
-            for entry in islice(root.iterdir(), _BOUNDED_SCAN_LIMIT):
-                if entry.is_symlink() or not _path_resolves_under(entry, home):
-                    continue
-                if entry.is_dir():
-                    total_bytes += _immediate_file_bytes(entry)
-                elif entry.is_file():
-                    total_bytes += _file_size(entry)
-                else:
-                    continue
-                count += 1
-                mtime = _mtime(entry)
-                if mtime is not None and (newest is None or mtime > newest):
-                    newest = mtime
+        for entry in islice(root.iterdir(), _BOUNDED_SCAN_LIMIT):
+            if entry.is_symlink() or not _path_resolves_under(entry, home):
+                continue
+            if entry.is_dir():
+                total_bytes += _immediate_file_bytes(entry)
+            elif entry.is_file():
+                total_bytes += entry.stat().st_size
+            else:
+                continue
+            count += 1
+            mtime = entry.stat().st_mtime
+            if newest is None or mtime > newest:
+                newest = mtime
     return {
         "snapshot_count": count,
         "snapshot_total_bytes": total_bytes,
@@ -389,10 +386,9 @@ def _read_state_snapshots(root: Path, home: Path, *, now: float) -> dict[str, An
 
 def _immediate_file_bytes(directory: Path) -> int:
     total = 0
-    with contextlib.suppress(OSError):
-        for child in islice(directory.iterdir(), _BOUNDED_SCAN_LIMIT):
-            if child.is_file() and not child.is_symlink():
-                total += _file_size(child)
+    for child in islice(directory.iterdir(), _BOUNDED_SCAN_LIMIT):
+        if child.is_file() and not child.is_symlink():
+            total += child.stat().st_size
     return total
 
 

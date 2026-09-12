@@ -134,8 +134,8 @@ def _write_snapshot_file(output_path: Path, snapshot_text: str) -> None:
             prefix=f".{output_path.name}.",
             delete=False,
         ) as temp_file:
-            temp_file.write(snapshot_text)
             temp_path = Path(temp_file.name)
+            temp_file.write(snapshot_text)
         os.replace(temp_path, output_path)
     except BaseException:
         if temp_path is not None:

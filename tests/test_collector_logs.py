@@ -20,6 +20,18 @@ from tests.conftest import (
 )
 
 
+def test_collector_honors_small_positive_log_tail_limit(hermes_home: Path):
+    from hermesd.collect.common import _read_tail_text
+
+    log = hermes_home / "logs" / "agent.log"
+    log.write_text("abcdef")
+    collector = Collector(hermes_home, log_tail_bytes=1)
+    try:
+        assert _read_tail_text(log, collector._log_tail_bytes) == "f"
+    finally:
+        collector.close()
+
+
 def test_collect_logs_respects_log_tail_bytes(hermes_home: Path):
     agent_log = hermes_home / "logs" / "agent.log"
     lines = [f"2026-04-09 15:42:{idx:02d},000 - hermes - INFO - line {idx}\n" for idx in range(30)]

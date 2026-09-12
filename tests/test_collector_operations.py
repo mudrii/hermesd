@@ -1635,6 +1635,39 @@ def test_state_snapshots_happy_path(
     assert ops.newest_snapshot_age_seconds is not None
 
 
+@pytest.mark.parametrize("fail_at_reader", [False, True])
+def test_state_snapshot_failure_preserves_latest_count_and_fresh_operations(
+    hermes_home: Path, sample_db: Path, sample_state_snapshots: Path, monkeypatch, fail_at_reader
+):
+    c = Collector(hermes_home)
+    try:
+        before = c.collect()
+        assert before.operations.snapshot_count > 0
+        (hermes_home / "web-ui-build-stamp.json").write_text('{"contentHash": "new-build"}')
+
+        def fail_scan(*args, **kwargs):
+            raise OSError("temporary snapshot scan failure")
+
+        if fail_at_reader:
+            monkeypatch.setattr(collector_module, "_read_state_snapshots", fail_scan)
+        else:
+            original = Path.iterdir
+
+            def fail_directory(path):
+                if path == sample_state_snapshots:
+                    raise OSError("temporary snapshot directory failure")
+                return original(path)
+
+            monkeypatch.setattr(Path, "iterdir", fail_directory)
+        after = c.collect()
+        assert "state_snapshots" in after.health.failed_sources
+        assert after.operations.snapshot_count == before.operations.snapshot_count
+        assert after.operations.snapshot_total_bytes == before.operations.snapshot_total_bytes
+        assert after.operations.web_ui_build_hash == "new-build"
+    finally:
+        c.close()
+
+
 def test_state_snapshots_directory_absent(hermes_home: Path, sample_db: Path):
     ops = _collect_ops(hermes_home).operations
     assert ops.snapshot_count == 0
@@ -1905,11 +1938,10 @@ def test_goal_json_under_the_cap_is_decoded(hermes_home: Path):
     assert [goal.goal for goal in ops.goals] == ["ship it"]
 
 
-def test_state_db_wal_is_read_live_without_snapshot_copies(
+def test_state_db_wal_snapshot_is_shared_and_reused_until_change(
     hermes_home: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """A live WAL state.db is read in place: no full-db copies across ticks,
-    and the operations readout still refreshes through the shared connection."""
+    """All state.db consumers share one private copy per source generation."""
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode=WAL")
@@ -1930,7 +1962,9 @@ def test_state_db_wal_is_read_live_without_snapshot_copies(
     c = Collector(hermes_home)
     try:
         assert c.collect().operations.goal_count == 1
+        assert snapshots == [db_path]
         c.collect()
+        assert snapshots == [db_path]
 
         conn.execute(
             "INSERT INTO state_meta VALUES (?, ?)",
@@ -1942,7 +1976,7 @@ def test_state_db_wal_is_read_live_without_snapshot_copies(
         c.close()
         conn.close()
 
-    assert snapshots == []
+    assert snapshots == [db_path, db_path]
 
 
 def test_corrupt_state_db_keeps_last_good_operations_rows(hermes_home: Path, sample_db: Path):

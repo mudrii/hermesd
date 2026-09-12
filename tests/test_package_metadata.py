@@ -14,6 +14,13 @@ PYPI_PUBLISH_ACTION = "pypa/gh-action-pypi-publish"
 UV_VERSION = "0.12.10"
 
 
+def test_docker_includes_and_smokes_git_checkpoint_support():
+    dockerfile = Path("Dockerfile").read_text()
+    assert re.search(r"apt-get install[^\n]*\bgit\b", dockerfile)
+    commands = "\n".join(_job_run_commands(_workflow(".github/workflows/ci.yml"), "docker"))
+    assert "_git_checkpoint_summary" in commands
+
+
 def _workflow(path: str) -> dict:
     data = yaml.safe_load(Path(path).read_text())
     assert isinstance(data, dict)

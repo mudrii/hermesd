@@ -298,11 +298,12 @@ Docstrings (hermesd convention):
 Keep errors and types strict and readable.
 
 - Raise specific exceptions with context; never bare `except:` — it catches `SystemExit` and `KeyboardInterrupt`
-- `except Exception:` without re-raise is acceptable only at top-level boundary handlers:
+- `except Exception:` without re-raise is acceptable only at these boundary handlers:
   - CLI entry point (`hermesd/__main__.py::main`)
   - Collector and input threads (`hermesd/app.py::_collector_loop`, `_input_loop`)
   - Per-source collection boundary (`hermesd/collector.py::_CollectionHealth.collect`)
   - Message-search worker thread (`hermesd/app.py::_search_session_messages_worker`)
+  - Exception-message sanitizer (`hermesd/collect/redaction.py::_safe_exception_text`) — must remain non-throwing while handling another error; return only the exception type if sanitization fails
   - Signal handlers
   Everywhere else, re-raise or handle specifically.
 - `raise NewError("context") from original_err` to preserve cause chains
@@ -341,7 +342,7 @@ Before finishing, verify:
 - [ ] structure is clean, predictable, and free of dumping-ground modules
 - [ ] dependencies are injected explicitly below the composition root — no hidden construction or global state
 - [ ] no hardcoded runtime values (URLs, ports, credentials, paths, timeouts)
-- [ ] types are strict and explicit — no `Any` outside the documented `db.py` boundary, no bare `# type: ignore`
+- [ ] types follow `<type_discipline>` — `Any` stays at the documented SQLite and parsed-data boundaries, no bare `# type: ignore`
 - [ ] every public function has explicit parameter and return type annotations
 - [ ] functions are short, focused, and readable in one pass
 - [ ] formatting, indentation, and whitespace follow `ruff format` defaults
@@ -365,7 +366,7 @@ Reject these patterns:
 - Protocol-per-class abstraction without consumer need
 - hardcoded configuration or collaborator construction **below the composition root**
 - `Any` added or left in touched code without explicit justification or the documented boundary carve-out
-- bare `except:` anywhere; `except Exception:` without re-raise outside top-level boundary handlers
+- bare `except:` anywhere; `except Exception:` without re-raise outside the handlers listed in `<error_and_type_rules>`
 - mutable default arguments (`def fn(items=[])`)
 - `import *` in non-`__init__.py` files
 - module-level mutable global state used as hidden dependency

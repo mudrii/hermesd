@@ -155,9 +155,8 @@ def _session_cost_is_reported(row: dict[str, Any]) -> bool:
     # authoritative regardless of cost_status.
     if _coerce_float(row.get("actual_cost_usd")) > 0:
         return True
-    return (
-        str(row.get("cost_status") or "") in AUTHORITATIVE_COST_STATUSES
-        and row.get("estimated_cost_usd") is not None
+    return str(row.get("cost_status") or "") in AUTHORITATIVE_COST_STATUSES and (
+        row.get("actual_cost_usd") is not None or row.get("estimated_cost_usd") is not None
     )
 
 
@@ -168,6 +167,10 @@ def _resolved_session_cost(row: dict[str, Any]) -> float:
     raw_cost = row.get("estimated_cost_usd")
     cost = _coerce_float(raw_cost)
     if _session_cost_is_reported(row):
+        # An explicit authoritative zero wins over a positive estimate; older
+        # rows without actual_cost_usd store their reported cost in raw_cost.
+        if row.get("actual_cost_usd") is not None:
+            return actual_cost
         return cost
     if cost:
         return cost

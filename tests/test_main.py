@@ -345,6 +345,31 @@ def test_main_snapshot_file_replaces_existing_file(populated_hermes_home: Path, 
     assert "stale contents" not in text
 
 
+@pytest.mark.parametrize("error_type", [OSError, KeyboardInterrupt])
+def test_snapshot_partial_write_removes_temporary_file(tmp_path: Path, monkeypatch, error_type):
+    from hermesd import __main__ as main_module
+
+    destination = tmp_path / "snapshot.txt"
+    destination.write_text("previous")
+    original = main_module.tempfile.NamedTemporaryFile
+
+    def interrupted_file(*args, **kwargs):
+        handle = original(*args, **kwargs)
+
+        def fail_write(text):
+            handle.file.write(text[:5])
+            raise error_type("synthetic interrupted write")
+
+        handle.write = fail_write
+        return handle
+
+    monkeypatch.setattr(main_module.tempfile, "NamedTemporaryFile", interrupted_file)
+    with pytest.raises(error_type):
+        main_module._write_snapshot_file(destination, "synthetic snapshot")
+    assert destination.read_text() == "previous"
+    assert list(tmp_path.iterdir()) == [destination]
+
+
 def test_main_snapshot_file_write_failure_leaves_no_partial_output(
     populated_hermes_home: Path,
     tmp_path: Path,

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 from typing import Any
-from urllib.parse import parse_qsl, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote_plus, urlsplit, urlunsplit
 
 _OAUTH_FIELD_NAMES = {"id_token", "access_token", "refresh_token"}
 
@@ -133,7 +134,7 @@ def _redact_secret_url(value: str) -> str:
 
 def _redact_malformed_query_pair(pair: str) -> str:
     key, sep, _value = pair.partition("=")
-    if sep and _is_secret_url_query_key(key):
+    if sep and _is_secret_url_query_key(unquote_plus(key)):
         return f"{key}=[REDACTED]"
     return pair
 
@@ -145,9 +146,10 @@ def _redact_malformed_url(value: str) -> str:
     if scheme_end < 0:
         return "[REDACTED]"
     authority_start = scheme_end + 3
-    path_start = value.find("/", authority_start)
-    if path_start < 0:
-        path_start = len(value)
+    path_start = min(
+        (pos for sep in "/?#" if (pos := value.find(sep, authority_start)) >= 0),
+        default=len(value),
+    )
     authority = value[authority_start:path_start]
     if "@" in authority:
         authority = f"[REDACTED]@{authority.rsplit('@', 1)[1]}"
@@ -237,33 +239,52 @@ def _looks_like_secret_value(value: str) -> bool:
 
 _SECRET_TEXT_FIELD_RE = re.compile(
     r"(?P<key_quote>[\"']?)(?P<key>[A-Za-z0-9][A-Za-z0-9_-]*)(?P<key_end_quote>[\"']?)"
-    r"(?P<sep>\s*[=:]\s*)"
-    # Quoted values consume to the closing quote (spaces included); JSON arrays
-    # to the closing bracket; bare scalars must not start with `{` so a nested
-    # object's own key is matched on its own instead of being swallowed.
-    r"(?P<value>\"[^\"]*\"|'[^']*'|\[[^\]]*\]|[^\s,{]+)",
+    r"(?P<sep>\s*[=:]\s*)",
     re.IGNORECASE,
 )
+_SECRET_TEXT_VALUE_RE = re.compile(r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,}]+""")
 
 
-def _redact_text_field(match: re.Match[str]) -> str:
-    key = match.group("key")
-    if not _is_secret_key(_secret_key_name(key)):
-        return match.group(0)
-    value = match.group("value")
-    if len(value) >= 2 and value[0] in ('"', "'") and value[-1] == value[0]:
-        value = f"{value[0]}[REDACTED]{value[0]}"
-    else:
-        value = "[REDACTED]"
-    return (
-        f"{match.group('key_quote')}{key}{match.group('key_end_quote')}{match.group('sep')}{value}"
-    )
+def _redact_text_fields(text: str) -> str:
+    pieces: list[str] = []
+    consumed = 0
+    for match in _SECRET_TEXT_FIELD_RE.finditer(text):
+        if match.start() < consumed or not _is_secret_key(_secret_key_name(match.group("key"))):
+            continue
+        start = match.end()
+        if text.startswith("[REDACTED]", start):
+            continue
+        if text[start : start + 1] in ("{", "["):
+            try:
+                _, end = json.JSONDecoder().raw_decode(text, start)
+            except (ValueError, RecursionError):
+                # An incomplete structured secret cannot safely expose its tail.
+                end = len(text)
+        else:
+            value_match = _SECRET_TEXT_VALUE_RE.match(text, start)
+            if value_match is None:
+                continue
+            end = value_match.end()
+        quote = text[start : start + 1]
+        if quote in ('"', "'") and (end <= start + 1 or text[end - 1] != quote):
+            end = len(text)
+        replacement = f"{quote}[REDACTED]{quote}" if quote in ('"', "'") else "[REDACTED]"
+        pieces.extend((text[consumed:start], replacement))
+        consumed = end
+    return "".join((*pieces, text[consumed:]))
 
 
 def _redact_secret_text(value: str) -> str:
+    if value.lstrip().startswith(("{", "[")):
+        try:
+            structured = json.loads(value)
+        except (ValueError, RecursionError):
+            pass
+        else:
+            return json.dumps(_redact_secret_structure(structured), ensure_ascii=False)
     redacted = re.sub(r"https?://[^,\s]+", lambda match: _redact_secret_url(match.group(0)), value)
     redacted = re.sub(r"(?i)(bearer)\s+[^,\s]+", r"\1 [REDACTED]", redacted)
-    return _SECRET_TEXT_FIELD_RE.sub(_redact_text_field, redacted)
+    return _redact_text_fields(redacted)
 
 
 def _safe_exception_text(exc: Exception) -> str:

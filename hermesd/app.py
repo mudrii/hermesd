@@ -18,6 +18,7 @@ from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
+from rich.segment import Segments
 from rich.text import Text
 
 from hermesd import __version__
@@ -596,6 +597,8 @@ class DashboardApp:
         detail_panel = self._view.detail_panel
         if detail_panel is None:
             return False
+        if detail_panel == _SESSIONS_PANEL_NUM:
+            return True
         with self._lock:
             state = self._state
         return (
@@ -604,7 +607,6 @@ class DashboardApp:
                 state,
                 self._view.log_sub_view,
                 self._view.filter_query,
-                session_sort=self._view.session_sort,
             )
             is not None
         )
@@ -640,27 +642,16 @@ class DashboardApp:
             self._ensure_session_message_search(message_query)
             if state.session_message_match_query == message_query:
                 session_message_match_ids = state.session_message_match_ids
+        max_offset = None
         if mode == "detail" and detail_panel is not None:
             max_offset = _detail_max_scroll_offset(
                 detail_panel,
                 state,
                 log_sub_view,
                 filter_query,
-                session_sort=session_sort,
-                session_message_match_ids=session_message_match_ids,
             )
             if max_offset is not None and scroll_offset > max_offset:
                 scroll_offset = max_offset
-                if write_back:
-                    # Clamp the stored offset to the effective maximum so that
-                    # scroll_up after jump_bottom moves off the bottom (G then k).
-                    with self._view_lock:
-                        if (
-                            self._view.mode == "detail"
-                            and self._view.detail_panel == detail_panel
-                            and self._view.scroll_offset > max_offset
-                        ):
-                            self._view.scroll_offset = max_offset
 
         layout = Layout()
         layout.split_column(
@@ -686,9 +677,24 @@ class DashboardApp:
                 session_sort=session_sort,
                 session_message_match_ids=session_message_match_ids,
             )
-            layout["body"].update(panel)
+            if detail_panel == _SESSIONS_PANEL_NUM:
+                viewport, max_offset = _sessions_viewport(panel, render_console, scroll_offset)
+                layout["body"].update(viewport)
+            else:
+                layout["body"].update(panel)
         else:
             layout["body"].update(self._build_overview(state, theme, console=render_console))
+
+        if write_back and max_offset is not None:
+            # Persist the effective bottom so G followed by k immediately moves
+            # up; snapshot/copy rendering must not mutate the live view.
+            with self._view_lock:
+                if (
+                    self._view.mode == "detail"
+                    and self._view.detail_panel == detail_panel
+                    and self._view.scroll_offset > max_offset
+                ):
+                    self._view.scroll_offset = max_offset
 
         layout["footer"].update(
             self._build_footer(
@@ -849,10 +855,9 @@ class DashboardApp:
         if mode == "overview":
             self._append_overview_footer_actions(t, active_theme)
         else:
-            scrollable = (
+            scrollable = panel == _SESSIONS_PANEL_NUM or (
                 panel is not None
-                and _detail_max_scroll_offset(panel, state, sub_view, query, session_sort=sort_mode)
-                is not None
+                and _detail_max_scroll_offset(panel, state, sub_view, query) is not None
             )
             self._append_detail_footer_actions(
                 t,
@@ -1085,25 +1090,32 @@ def _decode_input_keys_with_remainder(data: bytes) -> tuple[list[str], bytes]:
     return keys, b""
 
 
+def _sessions_viewport(panel: Panel, console: Console, offset: int) -> tuple[Segments, int]:
+    # Scroll the complete rendered detail, not just its last table: preceding
+    # sections may themselves exceed the terminal height. Header/footer use two
+    # rows, and removing the height constraint keeps Rich from cropping first.
+    lines = console.render_lines(
+        panel, console.options.update(height=None), new_lines=True, pad=False
+    )
+    height = max(1, console.height - 2)
+    max_offset = max(0, len(lines) - height)
+    offset = max(0, min(offset, max_offset))
+    return Segments(
+        [segment for line in lines[offset : offset + height] for segment in line]
+    ), max_offset
+
+
 def _detail_max_scroll_offset(
     panel_num: int,
     state: DashboardState,
     log_sub_view: str,
     filter_query: str,
-    session_sort: str = "recent",
-    session_message_match_ids: set[str] | None = None,
 ) -> int | None:
     """Effective max scroll offset for scrollable detail panels, else None.
 
-    Sessions and logs delegate to their panel's own clamp; skills mirrors the
-    row clamp in hermesd/panels/overview.py.
+    Logs delegates to its panel's own clamp; skills mirrors the row clamp in
+    hermesd/panels/overview.py. Sessions uses a rendered-line viewport instead.
     """
-    if panel_num == _SESSIONS_PANEL_NUM:
-        from hermesd.panels.sessions import max_sessions_scroll_offset
-
-        return max_sessions_scroll_offset(
-            state, filter_query, session_sort, session_message_match_ids
-        )
     if panel_num == _LOG_PANEL_NUM:
         from hermesd.panels.logs import max_detail_scroll_offset
 

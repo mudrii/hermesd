@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
 import sqlite3
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -1156,6 +1158,75 @@ def test_collect_cron_executions_window_boundary_is_inclusive(hermes_home: Path)
     assert stats["job-edge"].last_duration_seconds == pytest.approx(1.0)
 
 
+def test_cron_execution_timestamps_are_compared_chronologically(hermes_home: Path):
+    now = datetime(2026, 9, 12, 12, tzinfo=UTC).timestamp()
+    db_path = hermes_home / "cron" / "executions.db"
+    with contextlib.closing(sqlite3.connect(db_path)) as conn:
+        create_cron_executions_tables(conn)
+        for execution_id, status, claimed_at in [
+            ("newer-offset", "failed", "2026-09-11T11:30:00-02:00"),
+            ("older-utc", "completed", "2026-09-11T12:30:00+00:00"),
+            ("outside", "running", "2026-09-11T12:30:00+02:00"),
+            ("boundary-naive", "completed", "2026-09-11T12:00:00"),
+            ("garbage", "failed", "not-a-timestamp"),
+        ]:
+            insert_cron_execution(
+                conn, execution_id, "job", status, claimed_at=claimed_at, error=execution_id
+            )
+        conn.commit()
+    collector = Collector(hermes_home, clock=lambda: now)
+    try:
+        state = collector.collect()
+    finally:
+        collector.close()
+
+    stats = _stats_by_job(state)["job"]
+    assert stats.completed_24h == 2
+    assert stats.failed_24h == 1
+    assert stats.running_24h == 0
+    assert stats.last_status == "failed"
+    assert stats.last_error_excerpt == "newer-offset"
+    assert state.cron_executions.recent[0].execution_id == "newer-offset"
+
+
+def test_cron_window_query_returns_aggregates_not_execution_history():
+    with contextlib.closing(sqlite3.connect(":memory:")) as conn:
+        conn.row_factory = sqlite3.Row
+        create_cron_executions_tables(conn)
+        for index in range(600):
+            insert_cron_execution(conn, str(index), "job", "completed", claimed_at=iso_ago(index))
+        rows = cron_module._execution_window_rows(conn, now=time.time())
+
+    assert len(rows) == 1
+    assert rows[0]["completed_24h"] == 600
+
+
+def test_cron_last_run_uses_id_to_break_equal_instants():
+    with contextlib.closing(sqlite3.connect(":memory:")) as conn:
+        conn.row_factory = sqlite3.Row
+        create_cron_executions_tables(conn)
+        for execution_id, claimed_at in [
+            ("a", "2026-09-12T13:30:00+02:00"),
+            ("b", "2026-09-12T11:30:00Z"),
+        ]:
+            insert_cron_execution(conn, execution_id, "job", "failed", claimed_at=claimed_at)
+        rows = cron_module._last_execution_rows(conn)
+
+    assert [row["id"] for row in rows] == ["b"]
+
+
+def test_cron_schema_inspection_errors_propagate():
+    with contextlib.closing(sqlite3.connect(":memory:")) as conn:
+        create_cron_executions_tables(conn)
+        conn.set_authorizer(
+            lambda action, *_: (
+                sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_PRAGMA else sqlite3.SQLITE_OK
+            )
+        )
+        with pytest.raises(sqlite3.DatabaseError):
+            cron_module._recent_execution_rows(conn)
+
+
 def test_cron_window_aggregation_query_error_fails_source_and_keeps_last_good(
     hermes_home: Path, sample_cron_executions_db: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1169,7 +1240,7 @@ def test_cron_window_aggregation_query_error_fails_source_and_keeps_last_good(
         real_query_rows = cron_module._query_rows
 
         def flaky_query_rows(conn, sql, *args):
-            if "WHERE claimed_at >=" in sql:
+            if "WHERE hermes_epoch(claimed_at) BETWEEN" in sql:
                 raise sqlite3.OperationalError("simulated window aggregation failure")
             return real_query_rows(conn, sql, *args)
 
@@ -1190,14 +1261,21 @@ def test_job_execution_stats_skips_out_of_window_and_garbage_rows():
     """Direct counter unit: garbage stamps, old rows, and unknown statuses
     never reach the 24h counters, even without a last-run row."""
     now = 1_788_800_000.0
-    window_rows = [
-        {"job_id": "job-x", "status": "completed", "claimed_at": iso_ago(60, now=now)},
-        {"job_id": "job-x", "status": "completed", "claimed_at": iso_ago(2 * 86400, now=now)},
-        {"job_id": "job-x", "status": "failed", "claimed_at": "not-a-timestamp"},
-        {"job_id": "job-x", "status": "queued", "claimed_at": iso_ago(30, now=now)},
-    ]
-
-    stats = cron_module._job_execution_stats(window_rows, [], now=now)
+    with contextlib.closing(sqlite3.connect(":memory:")) as conn:
+        conn.row_factory = sqlite3.Row
+        create_cron_executions_tables(conn)
+        for index, (status, claimed_at) in enumerate(
+            [
+                ("completed", iso_ago(60, now=now)),
+                ("completed", iso_ago(2 * 86400, now=now)),
+                ("failed", "not-a-timestamp"),
+                ("unknown", iso_ago(30, now=now)),
+                ("failed", iso_ago(-30, now=now)),
+            ]
+        ):
+            insert_cron_execution(conn, str(index), "job-x", status, claimed_at=claimed_at)
+        window_rows = cron_module._execution_window_rows(conn, now=now)
+    stats = cron_module._job_execution_stats(window_rows, [])
 
     assert len(stats) == 1
     entry = stats[0]

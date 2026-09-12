@@ -7,7 +7,6 @@ import json
 import math
 import sqlite3
 from collections.abc import Mapping
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +27,6 @@ from hermesd.collect.common import (
 from hermesd.collect.logs import _MAX_LOG_LINE_CHARS
 from hermesd.collect.redaction import _redact_secret_text
 from hermesd.collect.sqlite_util import (
-    _column_exists,
     _connect_readonly_sqlite,
     _count_rows,
     _query_rows,
@@ -45,7 +43,7 @@ from hermesd.models import (
 
 # executions.db grows without bound (1k rows on a month-old home). The 24h
 # counters aggregate the full window in SQL and each job's last run comes from
-# a per-job MAX(claimed_at) grouping, so a busy job cannot crowd another job
+# a per-job chronological ranking, so a busy job cannot crowd another job
 # out of either; only the display history is capped at _EXECUTIONS_SCAN_LIMIT
 # (the newest _EXECUTIONS_RECENT_LIMIT of those are shown).
 _EXECUTIONS_SCAN_LIMIT = 500
@@ -261,15 +259,12 @@ def _execution_from_row(
 def _job_execution_stats(
     window_rows: list[dict[str, Any]],
     last_rows: list[dict[str, Any]],
-    *,
-    now: float,
 ) -> list[CronJobExecutionStats]:
-    """Per-job 24h counters from the full-window rows plus last-run detail.
+    """Per-job 24h counters from SQL aggregates plus last-run detail.
 
     `last_rows` carries each job's newest execution from the full table, so a
     busy job cannot crowd another job's last-run status off the panel.
     """
-    window_start = now - _EXECUTIONS_WINDOW_SECONDS
     stats: dict[str, CronJobExecutionStats] = {}
     for row in sorted(last_rows, key=_claimed_sort_key, reverse=True):
         job_id = str(row.get("job_id") or "")
@@ -283,20 +278,13 @@ def _job_execution_stats(
             last_error_excerpt=_cron_error_excerpt(str(row.get("error") or "")),
         )
     for row in window_rows:
-        claimed = _iso_to_epoch(str(row.get("claimed_at") or ""))
-        if claimed is None or claimed < window_start:
-            continue
         job_id = str(row.get("job_id") or "")
         if job_id not in stats:
             stats[job_id] = CronJobExecutionStats(job_id=job_id)
         entry = stats[job_id]
-        status = str(row.get("status") or "")
-        if status == "completed":
-            entry.completed_24h += 1
-        elif status == "failed":
-            entry.failed_24h += 1
-        elif status in {"running", "claimed"}:
-            entry.running_24h += 1
+        entry.completed_24h = int(row.get("completed_24h") or 0)
+        entry.failed_24h = int(row.get("failed_24h") or 0)
+        entry.running_24h = int(row.get("running_24h") or 0)
     return list(stats.values())
 
 
@@ -316,9 +304,21 @@ _EXECUTIONS_REQUIRED_COLUMNS = (
 
 def _executions_schema_compatible(conn: sqlite3.Connection) -> bool:
     """True when the executions table exists with every column the reads use."""
-    return _table_exists(conn, "executions") and all(
-        _column_exists(conn, "executions", column) for column in _EXECUTIONS_REQUIRED_COLUMNS
-    )
+    if not _table_exists(conn, "executions"):
+        return False
+    columns = {str(row[1] or "") for row in conn.execute("PRAGMA table_info(executions)")}
+    return set(_EXECUTIONS_REQUIRED_COLUMNS).issubset(columns)
+
+
+def _execution_rows(
+    conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = ()
+) -> list[dict[str, Any]]:
+    if not _executions_schema_compatible(conn):
+        return []
+    # Keep SQL ordering and cutoffs identical to the shared ISO parser, including
+    # offsets, naive UTC timestamps, fractional seconds, and malformed values.
+    conn.create_function("hermes_epoch", 1, _iso_to_epoch, deterministic=True)
+    return _query_rows(conn, sql, params)
 
 
 def _recent_execution_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -327,54 +327,39 @@ def _recent_execution_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     Operational read errors propagate so the cron_executions source fails to
     its last-good value instead of reporting a false empty history.
     """
-    if not _executions_schema_compatible(conn):
-        return []
     # The LIMIT is a module-level int constant, never caller-supplied text.
-    return _query_rows(
+    return _execution_rows(
         conn,
         "SELECT id, job_id, status, claimed_at, started_at, finished_at, error "
-        "FROM executions ORDER BY claimed_at DESC, id DESC "
+        "FROM executions ORDER BY hermes_epoch(claimed_at) DESC, id DESC "
         f"LIMIT {_EXECUTIONS_SCAN_LIMIT}",
     )
 
 
 def _execution_window_rows(conn: sqlite3.Connection, *, now: float) -> list[dict[str, Any]]:
-    """job_id/status/claimed_at for the whole 24h window, never capped.
-
-    The WHERE clause is only a lexicographic pre-filter (claimed_at is ISO
-    text); _job_execution_stats re-parses every row so garbage stamps never
-    reach the counters.
-    """
-    if not _executions_schema_compatible(conn):
-        return []
-    cutoff = datetime.fromtimestamp(now - _EXECUTIONS_WINDOW_SECONDS, tz=UTC).isoformat()
-    return _query_rows(
+    """Aggregate the complete 24h window, returning one row per job."""
+    return _execution_rows(
         conn,
-        "SELECT job_id, status, claimed_at FROM executions WHERE claimed_at >= ?",
-        (cutoff,),
+        "SELECT COALESCE(job_id, '') AS job_id, "
+        "SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed_24h, "
+        "SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_24h, "
+        "SUM(CASE WHEN status IN ('running', 'claimed') THEN 1 ELSE 0 END) AS running_24h "
+        "FROM executions WHERE hermes_epoch(claimed_at) BETWEEN ? AND ? "
+        "GROUP BY COALESCE(job_id, '')",
+        (now - _EXECUTIONS_WINDOW_SECONDS, now),
     )
 
 
 def _last_execution_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """Each job's newest execution (claimed_at, then id), one row per job."""
-    if not _executions_schema_compatible(conn):
-        return []
-    rows = _query_rows(
+    return _execution_rows(
         conn,
-        "SELECT e.id, e.job_id, e.status, e.claimed_at, e.started_at, e.finished_at, e.error "
-        "FROM executions e "
-        "JOIN (SELECT COALESCE(job_id, '') AS job_id, MAX(claimed_at) AS max_claimed "
-        "FROM executions GROUP BY COALESCE(job_id, '')) latest "
-        "ON latest.job_id = COALESCE(e.job_id, '') AND latest.max_claimed = e.claimed_at "
-        "ORDER BY e.job_id ASC, e.id DESC",
+        "SELECT id, job_id, status, claimed_at, started_at, finished_at, error FROM ("
+        "SELECT id, job_id, status, claimed_at, started_at, finished_at, error, "
+        "ROW_NUMBER() OVER (PARTITION BY COALESCE(job_id, '') "
+        "ORDER BY hermes_epoch(claimed_at) DESC, id DESC) AS run_rank "
+        "FROM executions) WHERE run_rank = 1",
     )
-    # Rows tied on claimed_at arrive highest-id first; keep one row per job.
-    latest: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        job_id = str(row.get("job_id") or "")
-        if job_id not in latest:
-            latest[job_id] = row
-    return list(latest.values())
 
 
 def _incident_from_row(
@@ -448,7 +433,7 @@ def _read_cron_executions_state(
         open_count, unacked_count, incidents = _read_cron_incidents(conn, job_names, now=now)
         return CronExecutionsState(
             db_present=True,
-            job_stats=_job_execution_stats(window_rows, last_rows, now=now),
+            job_stats=_job_execution_stats(window_rows, last_rows),
             recent=[
                 _execution_from_row(row, job_names, now=now)
                 for row in ordered[:_EXECUTIONS_RECENT_LIMIT]

@@ -250,6 +250,7 @@ _BLOCKED_SCRIPT_FIELDS = (
     "newest_blocked_script_age_seconds",
     "blocked_script_names",
 )
+_STATE_SNAPSHOT_FIELDS = ("snapshot_count", "snapshot_total_bytes", "newest_snapshot_age_seconds")
 _LIFECYCLE_FIELDS = (
     "lifecycle_phase",
     "last_exit_code",
@@ -468,7 +469,7 @@ class Collector:
         self._file_cache = file_cache if file_cache is not None else LastGoodFileCache()
         self._log_cache: dict[str, list[LogLine]] = {}
         self._pid_exists = pid_exists or _pid_exists
-        self._log_tail_bytes = max(1024, log_tail_bytes)
+        self._log_tail_bytes = max(1, log_tail_bytes)
         self._paths = HermesPaths(hermes_home, profile_name)
         if db_factory is None:
             # Wire allowed_root so profile db targets are re-validated against
@@ -739,7 +740,9 @@ class Collector:
                 "state_snapshots",
                 lambda: self._with_state_snapshots(results["operations"]),
                 lambda: results["operations"],
-                fallback=lambda: results["operations"],
+                fallback=lambda: self._last_source_fields(
+                    "state_snapshots", results["operations"], _STATE_SNAPSHOT_FIELDS
+                ),
             ),
             # Third writer of `operations`: an unreadable blocked-scripts dir
             # keeps the last-good counts rather than reporting a false zero.
@@ -1197,9 +1200,10 @@ class Collector:
         return version, behind
 
     def _read_context_lengths(self) -> dict[str, int]:
-        data = self._file_cache.read_yaml_mapping(
-            self._paths.shared_path("context_length_cache.yaml")
-        )
+        path = self._paths.shared_path("context_length_cache.yaml")
+        data = self._file_cache.read_yaml_mapping(path)
+        if self._file_cache.last_read_was_stale(path):
+            raise RuntimeError("context_length_cache.yaml is unreadable; keeping last-good values")
         raw = data.get("context_lengths")
         if not isinstance(raw, dict):
             return {}

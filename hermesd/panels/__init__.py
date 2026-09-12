@@ -42,7 +42,6 @@ def _render_sessions_panel(ctx: PanelRenderContext) -> Panel:
         filter_query=ctx.filter_query,
         session_sort=ctx.session_sort,
         message_match_ids=ctx.session_message_match_ids,
-        scroll_offset=ctx.scroll_offset,
     )
 
 
