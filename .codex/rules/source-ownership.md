@@ -1,0 +1,261 @@
+# Source Ownership: which Hermes home each source is read from
+
+Every on-disk source hermesd reads is resolved through exactly two methods on
+`HermesPaths` (`hermesd/paths.py`). This file records **which of the two owns
+which source**, and why. Read it before adding a reader; the ownership table at
+the bottom is checked against the code by
+`tests/test_collector_profiles.py::test_source_ownership_doc_matches_resolver_call_sites`,
+so a new reader that is not in the table fails the suite.
+
+The reason this file exists: hermes-agent's default is *profile*-scoped. Its
+`hermes_constants.get_hermes_home()` returns the profile home whenever a profile
+is active, and the root is the exception — always explicitly justified at the
+call site (`get_default_hermes_root()`). hermesd inverts the default: it stays
+root-only unless `--profile`/`HERMES_PROFILE` opts in, and it deliberately does
+not follow the `active_profile` file. So "where does upstream put this?" and
+"where does hermesd look for it?" are two different questions, and conflating
+them silently produces a panel that reads the wrong profile's data — or no data
+at all, with green health.
+
+## Scope vocabulary
+
+There are exactly three classes. Do not add a fourth.
+
+| class | meaning |
+| --- | --- |
+| `ROOT` | `~/.hermes` — `HermesPaths.shared_path()`. Same directory whether or not a profile is selected. |
+| `PROFILE` | `~/.hermes/profiles/<name>` when a profile is selected, `~/.hermes` otherwise — `HermesPaths.profile_path()`. |
+| `PROCESS-ENV` | Not on disk at all: a value from hermesd's own process environment. |
+
+There is deliberately **no `SHARED` class**. `HermesPaths.shared_home` is a hard
+alias for `root_home` — `shared_path()` *is* the root resolver — so a `SHARED`
+label would name a distinction the code does not have and would misdocument it.
+
+`SourceScope` in `hermesd/models.py` carries `ROOT` and `PROFILE` only.
+`PROCESS-ENV` has no model consumer yet, so it has no enum member; add one when a
+model needs to distinguish a value that did not come from disk.
+
+A row whose scope is `MIXED` is not a fourth class: it is one `source_name` that
+resolves some of its paths `ROOT` and others `PROFILE`. Those rows are the ones
+that need the mixed-model register below.
+
+`PROFILE (derived)` marks a source that resolves no path of its own — it computes
+from the session rows another source already read — and therefore inherits that
+source's scope.
+
+## Scope is re-derived per call, never cached
+
+`profile_path()` calls `_validate_profile_home()` on **every** call. That is not
+redundant work: it is what defeats a symlink swapped in *after* the `HermesPaths`
+was constructed, which construction-time validation alone cannot see. Pinned by
+`test_profiled_collector_rejects_profile_root_swapped_to_outside` and
+`test_collect_profiles_preserves_last_good_when_profile_child_becomes_unsafe_symlink`.
+
+Do not "optimize" a reader by hoisting a resolved path into `Collector.__init__`
+or a module-level constant. Upstream does exactly that in places and then has to
+re-resolve at call time anyway (see the `_CHECKPOINT_BASE_AT_IMPORT` /
+`_IMPORT_STORE` / `_HOOKS_DIR_AT_IMPORT` dance in `tools/checkpoint_manager.py:34-42`,
+`cron/jobs.py:114-133`, `gateway/hooks.py:26-37`), because a multiplexed gateway
+serves every profile from one process. hermesd resolves per call and stays
+correct by construction.
+
+## Rule for new readers (normative)
+
+1. Default to `profile_path()`. If hermes-agent resolves the source through
+   `get_hermes_home()`, it is `PROFILE` — that is the overwhelming majority of
+   sources (see the table: upstream is profile-scoped for `cron`, `logs`,
+   `cache/`, `state/`, `processes.json`, `plugins/`, `hooks/`, `config.yaml`).
+2. Use `shared_path()` only when one of these is true:
+   - upstream explicitly anchors at `get_default_hermes_root()` (or an equivalent
+     root derivation) *and says why* — e.g. `hermes_cli/kanban_db.py:382-390`
+     ("Shared across profiles BY DESIGN"), `hermes_cli/process_identity.py:127-131`
+     ("Machine-root ledger path");
+   - the source is machine-global rather than per-home — e.g. the desktop app's
+     `HERMES_HOME` *is* the root (`apps/desktop/electron/main.ts:826,837`), so
+     `desktop.log` and `hermes-agent/` live at the root.
+3. Cite the upstream `file.py:line` in the reader's docstring, not just in this
+   file. The citation is what makes the choice reviewable two years later.
+4. If you choose `shared_path()` for something upstream scopes per profile, add a
+   pinning test to `tests/test_collector_profiles.py` that names the intent, and
+   add the row to the intentional-divergence register below. A divergence with no
+   test and no register entry is a bug, not a decision.
+5. Add the row to the ownership table with its `source_name`. The test fails
+   until you do.
+
+## Ownership table
+
+Keyed by the `source_name` string from the `_SourceSpec` table in
+`collector.py::_build_dashboard_state` — that is exactly what appears in
+`health.failed_sources`, so an operator can grep a health failure straight to its
+owner here. "resolver" is what the scope class means in code: `ROOT` →
+`shared_path`, `PROFILE` → `profile_path`, `MIXED` → both.
+
+"verdict" compares hermesd's resolver with upstream's, per path:
+`agrees` = same home; `diverges` = different home; `ambiguous` = upstream has
+both anchors, or no upstream writer was found. A divergence is **not** an
+endorsement: only the rows in the intentional-divergence register are decided.
+Everything else that diverges is listed under open divergences.
+
+Upstream paths are relative to `/Users/mudrii/.hermes/hermes-agent/`.
+
+| source_name | scope | DashboardState field(s) | on-disk path(s) | resolver | upstream resolver (file:line) | verdict | pinned by |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `sessions` | PROFILE | (raw session rows; no field of its own) | `state.db` | `profile_path` | `get_hermes_home()/"state.db"` — `hermes_state.py:160,178` | agrees | `test_profiled_collector_reads_profile_scoped_runtime_data` |
+| `session_models` | MIXED | `sessions` | `state.db` (profile); `context_length_cache.yaml` (root) | both | `hermes_state.py:160,178`; `get_hermes_home()/"context_length_cache.yaml"` — `agent/model_metadata.py:1041-1044` | diverges (context cache) | UNPINNED |
+| `tools_index` | MIXED | `available_tools`, `available_tool_names` | `cache/banner_snapshot.json` (root); `sessions/`, `sessions/session_*.json` (profile) | both | `hermes_cli/banner.py:625-626`; `hermes_cli/status.py:295` | diverges (banner snapshot) | `test_profiled_collector_reads_profile_scoped_runtime_data` (sessions half only) |
+| `toolset_availability` | ROOT | `toolset_availability` | `cache/banner_snapshot.json` | `shared_path` | `get_hermes_home()/"cache"/"banner_snapshot.json"` — `hermes_cli/banner.py:625-626` | diverges | UNPINNED |
+| `gateway` | ROOT | `gateway` | `gateway_state.json`, `gateway.pid`, `.drain_request.json`, `.update_check`, `config.yaml`, `hermes-agent/pyproject.toml` | `shared_path` | `gateway/status.py:157-158,165-166` (process home); root-anchored readers `hermes_cli/gateway_multiplex_served.py:23,36,54` + `gateway/status.py:927` (#97120); `gateway/drain_control.py:29,61`; `hermes_cli/banner.py:266`; `hermes_constants.py:1132-1135`; `apps/desktop/electron/main.ts:837` | ambiguous (`gateway.pid`/`gateway_state.json`); diverges (`.drain_request.json`, `.update_check`) | `test_profiled_collector_reads_root_scoped_cron_kanban_and_gateway` (behaviour pin) |
+| `gateway_heartbeat` | ROOT | `gateway.heartbeat_age_seconds`, `gateway.loop_health` | `state/gateway.heartbeat` | `shared_path` | `<HERMES_HOME>/state/gateway.heartbeat` — `gateway/shutdown_watchdog.py:27,44` | diverges | UNPINNED |
+| `gateway_lifecycle` | ROOT | `gateway.lifecycle_phase`, `gateway.last_exit_code`, `gateway.last_exit_reason`, `gateway.unclean_previous_exit` | `state/gateway.lifecycle.json` | `shared_path` | `gateway/lifecycle_ledger.py:27-41` (`HERMES_HOME` env, else `get_hermes_home()`) | diverges | UNPINNED |
+| `update_receipt` | ROOT | `gateway.last_update_*`, `gateway.runtime_code_skew*` | `logs/update_receipts/latest.json` | `shared_path` | `hermes_cli/update_receipt.py:120-122` | diverges | UNPINNED |
+| `gateway_ledgers` | PROFILE | `gateway.gateway_incarnation_count`, `gateway.gateway_restarts_24h`, `gateway.current_incarnation_uptime_seconds`, `gateway.pending_delivery_count`, `gateway.failed_delivery_count`, `gateway.pending_deliveries` | `state.db` (`gateway_heartbeats`, `delivery_obligations`) | `profile_path` | `hermes_state.py:160,178` | agrees | UNPINNED |
+| `tokens_today` | PROFILE (derived) | `tokens_today` | (session rows) | none | `hermes_state.py:160,178` | agrees | UNPINNED |
+| `tokens_total` | PROFILE (derived) | `tokens_total` | (session rows) | none | `hermes_state.py:160,178` | agrees | UNPINNED |
+| `token_analytics` | PROFILE (derived) | `token_analytics` | (session rows) | none | `hermes_state.py:160,178` | agrees | UNPINNED |
+| `tool_stats` | PROFILE (derived) | `tool_stats` | (session rows) | none | `hermes_state.py:160,178` | agrees | UNPINNED |
+| `tool_call_total` | PROFILE (derived) | `total_tool_calls` | (session rows) | none | `hermes_state.py:160,178` | agrees | UNPINNED |
+| `model_usage` | PROFILE (derived) | `token_analytics.usage_source`, `token_analytics.model_usage_*` | (session rows: `session_model_usage`) | none | `hermes_state.py:160,178` | agrees | UNPINNED |
+| `background_processes` | ROOT | `background_processes` | `spawn-ledger.json`, `processes.json` | `shared_path` | `get_default_hermes_root()/LEDGER_FILENAME` — `hermes_cli/process_identity.py:27,127-131` ("Machine-root ledger path"); `get_hermes_home()/"processes.json"` — `tools/process_registry.py:41,45-50` | agrees (`spawn-ledger.json`); diverges (`processes.json`) | UNPINNED |
+| `checkpoints` | PROFILE | `checkpoints` | `checkpoints/` | `profile_path` | `tools/checkpoint_manager.py:33,37-42` | agrees | `test_profiled_collector_does_not_read_root_scoped_profile_sources` |
+| `config` | ROOT | `config` | `config.yaml` | `shared_path` | `get_hermes_home()/"config.yaml"` — `hermes_constants.py:1132-1135` (`get_config_path()`) | diverges — **intentional, see register** | `test_profiled_collector_keeps_shared_root_config_and_auth` |
+| `cron` | ROOT | `cron` | `cron/jobs.json`, `cron/.tick.lock`, `cron/output/`, `cron/ticker_heartbeat`, `cron/ticker_last_success`, `cron/suggestions.json`, `channel_directory.json`, `config.yaml` | `shared_path` | `cron/jobs.py:60-72,96` + `_current_cron_store()` `cron/jobs.py:114-133`; `cron/scheduler.py:1017-1032`; `cron/suggestions.py:31,47-48` — all `get_hermes_home()`, "Cron is per-profile by design (#4707) … Do NOT change this to the default root" | diverges | `test_profiled_collector_reads_root_scoped_cron_kanban_and_gateway` (behaviour pin) |
+| `cron_executions` | ROOT | `cron_executions` | `cron/executions.db` | `shared_path` | `cron/executions.py:37`; `cron/incidents.py:52` | diverges | UNPINNED |
+| `channels` | ROOT | `channels` | `channel_directory.json`, `channel_aliases.json` | `shared_path` | `gateway/channel_directory.py:40-45` | diverges | UNPINNED |
+| `kanban` | ROOT | `kanban` | `kanban.db`, `kanban/boards/<slug>/kanban.db`, `kanban/current`, `config.yaml` | `shared_path` | `kanban_home()` = `get_default_hermes_root()` — `hermes_cli/kanban_db.py:382-401`, "Shared across profiles BY DESIGN: resolving through the active profile's HERMES_HOME would fork the board per profile and break the dispatcher/worker handoff" | agrees | `test_profiled_collector_reads_root_scoped_cron_kanban_and_gateway` |
+| `operations` | MIXED | `operations` | profile: `projects.db`, `verification_evidence.db`, `state.db`; root: `desktop-build-stamp.json`, `web-ui-build-stamp.json`, `response_store.db`, `moa-traces/`, `cache/delegation/live/`, `kanban.db`, `kanban/boards/*/kanban.db`, `config.yaml` | both | `hermes_cli/projects_db.py:23-25`; `agent/verification_evidence.py:111`; `hermes_state.py:160`; `hermes_cli/main_desktop.py:42-45`; `hermes_cli/main_web_build.py:187-190`; `gateway/platforms/api_server.py:688`; `agent/moa_trace.py:25-38`; `tools/delegation_live_log.py:40-43`; `hermes_cli/kanban_db.py:382-401` | agrees (`projects.db`, `verification_evidence.db`, `state.db`, `kanban*`); diverges (`response_store.db`, `moa-traces/`, `cache/delegation/live/`, both build stamps) | `test_profiled_operations_readers_confine_to_selected_profile_home`, `test_root_mode_operations_confinement_is_unchanged`, `test_profiled_collector_rejects_cross_profile_symlinked_projects_db` |
+| `state_snapshots` | ROOT | `operations.snapshot_count`, `operations.snapshot_total_bytes`, `operations.newest_snapshot_age_seconds` | `state-snapshots/` | `shared_path` | `home/"state-snapshots"` where `home = get_hermes_home()` — `hermes_cli/backup.py:35,1088-1090`; "each lands under its OWN `<home>/state-snapshots/`" `hermes_cli/backup.py:1380` | diverges | UNPINNED |
+| `blocked_scripts` | ROOT | `operations.blocked_script_count`, `operations.newest_blocked_script_age_seconds`, `operations.blocked_script_names` | `cache/blocked-scripts/` | `shared_path` | `tools/approval_floors.py:63-64` | diverges | UNPINNED |
+| `skills` | MIXED | `skills_memory` | profile: `skills/`, `memories/`; root: `auth.json`, `BOOT.md`, `hooks/`, `plugins/`, `config.yaml` | both | `hermes_constants.py:1137-1140` (`get_skills_dir()`); `tools/memory_tool.py:40`; `hermes_cli/auth.py:471-472` (profile) + `hermes_cli/auth.py:484-493` (root read-only fallback); `gateway/hooks.py:25,29-37`; `plugins/plugin_loader.py:28-34`; `hermes_constants.py:1132-1135` | agrees (`skills/`, `memories/`); diverges (`hooks/`, `plugins/`); diverges — **intentional** (`auth.json`); ambiguous (`BOOT.md`) | `test_profiled_collector_reads_profile_scoped_skills`, `test_profiled_collector_keeps_shared_root_config_and_auth` |
+| `mcp_cache` | ROOT | `mcp_cache` | `cache/mcp_schema_cache.json`, `config.yaml` | `shared_path` | `tools/mcp_schema_cache.py:18,22-24` | diverges | UNPINNED |
+| `skills_prompt` | ROOT | `skills_prompt` | `.skills_prompt_snapshot.json` | `shared_path` | `agent/prompt_builder.py:1077-1078` | diverges | UNPINNED |
+| `memory` | MIXED | `memory` | profile: `memories/`, `SOUL.md`, `skills/`, `skills/.usage.json`; root: `config.yaml` | both | `tools/memory_tool.py:40`; `hermes_cli/config.py:600`; `hermes_constants.py:1137-1140`; `tools/skill_usage.py:50`; `hermes_constants.py:1132-1135` | agrees (profile paths); diverges — **intentional** (`config.yaml`) | `test_profiled_collector_does_not_read_root_scoped_profile_sources` |
+| `profiles` | ROOT | `profiles` | `profiles/*/` | `shared_path` | `hermes_constants.py:165-181`; `hermes_cli/profiles.py:29` | agrees | `test_collect_profiles_lists_profile_directories` |
+| `logs` | MIXED | `logs` | profile: `logs/agent.log`, `logs/gateway.log`, `logs/errors.log`; root: `logs/desktop.log`, `logs/dashboard.log`, `logs/gui.log`, `logs/update.log`, `logs/gateway.error.log`, `logs/tui_gateway_crash.log`, `logs/audit.log`, `logs/mcp-stderr.log`, `logs/workspace.log`, `logs/workspace.error.log`, `cron/output/` | both | `hermes_logging.py:180-181,194-199` (agent/errors/gateway/gui all `<home>/logs`); `hermes_cli/gateway.py:3762-3768`; `tools/mcp_tool_config.py:31-35`; `tui_gateway/server.py:43,49`; `hermes_cli/update_cmd.py:437`; `apps/desktop/electron/main.ts:826,880` (desktop.log at the root); `cron/jobs.py:96` | agrees (`agent`, `gateway`, `errors`, `desktop`); diverges (`gui`, `update`, `gateway.error`, `tui crash`, `mcp.stderr`, `cron/output`); ambiguous (`dashboard`, `workspace`, `workspace.error`, `audit` — no upstream writer found) | `test_profiled_collector_labels_log_stream_scope`, `test_root_collector_keeps_ownership_labels_on_log_streams` |
+| `version_check` | ROOT | `version_check` | `.update_check` | `shared_path` | `hermes_cli/banner.py:266,390` | diverges | UNPINNED |
+| `skin` | ROOT | `skin` | `config.yaml` (`display.skin`) | `shared_path` | `hermes_constants.py:1132-1135`; skins themselves live at `get_hermes_home()/"skins"` — `hermes_cli/skin_engine.py:365` | diverges — **intentional** (same decision as `config`) | `test_profiled_collector_keeps_shared_root_config_and_auth` |
+| `curator` | MIXED | `curator` | profile: `skills/.curator_state`; root: `logs/curator/`, `config.yaml` | both | `agent/curator.py:38`; `agent/curator.py:455-457` ("telemetry next to agent.log, not under skills/"); `hermes_cli/config.py:615-617,623` | agrees (`.curator_state`); diverges (`logs/curator/`) | UNPINNED |
+| `active_sessions` | PROFILE | `active_surfaces`, `active_surface_count` | `runtime/active_sessions.json` | `profile_path` | `hermes_cli/active_sessions.py:164-168` | agrees | `test_profiled_collector_does_not_read_root_scoped_profile_sources` |
+| `runtime` | MIXED | `runtime` | profile: `state.db`, `sessions/sessions.json`, `logs/agent.log`; root: `gateway_state.json` | both | `hermes_state.py:160`; `hermes_cli/status.py:295`; `hermes_logging.py:180-195`; `gateway/status.py:165-166` | agrees (profile paths); ambiguous (`gateway_state.json`) | UNPINNED |
+
+## Intentional-divergence register
+
+Rows where hermesd **deliberately** reads a different home than upstream, each
+pinned by a test that names the intent. This list is the only place a divergence
+is a decision. Adding a row here requires a pinning test in
+`tests/test_collector_profiles.py`.
+
+| path | hermesd | upstream | why | pinned by |
+| --- | --- | --- | --- | --- |
+| `~/.hermes/config.yaml` | ROOT | PROFILE — `hermes_constants.py:1132-1135` | hermesd is one dashboard over the whole install. Following a profile's `config.yaml` would make the Config, Skin, Cron-config and MoA panels change meaning depending on a flag, and hermesd does not follow `active_profile`, so the root file is the only one whose provenance is stable. | `test_profiled_collector_keeps_shared_root_config_and_auth` |
+| `~/.hermes/auth.json` | ROOT | PROFILE primary — `hermes_cli/auth.py:471-472`, with a documented **read-only root fallback** at `hermes_cli/auth.py:484-493` (also `hermes_cli/auth_oauth_grants.py:79`) | hermesd reads the same root copy upstream falls back to, so provider and credential-pool names stay comparable across profiles. Known cost: a profile-local `auth.json` that *overrides* the root store is invisible to hermesd. | `test_profiled_collector_keeps_shared_root_config_and_auth` |
+
+Nothing else belongs here yet. In particular `cron` is **not** an intentional
+divergence: upstream comments it as per-profile by design in three separate
+places and warns against exactly what hermesd does.
+
+## Open divergences (not blessed)
+
+hermesd reads these `ROOT` while upstream resolves them through
+`get_hermes_home()`, i.e. `PROFILE`. Each is an open question. With a profile
+selected, hermesd shows the root copy and silently misses the selected profile's
+data. None of them is covered by an intentional-divergence decision; the tests
+named "behaviour pin" record what the code does today so a change is deliberate,
+not so that the behaviour is endorsed.
+
+| path | upstream | note |
+| --- | --- | --- |
+| `~/.hermes/cron/jobs.json` | PROFILE — `cron/jobs.py:60-72,114-133` | Upstream: "Cron is per-profile by design (#4707) … Do NOT change this to the default root: that re-breaks per-profile isolation." Strongest divergence in this list. Behaviour pin: `test_profiled_collector_reads_root_scoped_cron_kanban_and_gateway`. |
+| `~/.hermes/cron/executions.db` | PROFILE — `cron/executions.py:37`, `cron/incidents.py:52` | Same `cron/` store as `jobs.json`; must move with it. |
+| `~/.hermes/cron/.tick.lock`, `cron/ticker_heartbeat`, `cron/ticker_last_success` | PROFILE — `cron/scheduler.py:1017-1032`, `cron/jobs.py:76-77` | Ticker health is currently reported for the root store only. |
+| `~/.hermes/cron/output/` | PROFILE — `cron/jobs.py:96` (`OUTPUT_DIR = CRON_DIR/"output"`) | Feeds both the `cron` excerpts and the `logs` "cron" stream. |
+| `~/.hermes/cron/suggestions.json` | PROFILE — `cron/suggestions.py:31,47-48` | "Per-profile by design (issue #4707)". |
+| `~/.hermes/logs/update_receipts/latest.json` | PROFILE — `hermes_cli/update_receipt.py:120-122` | Update/code-skew verdicts describe the root home's last update only. |
+| `~/.hermes/.update_check` | PROFILE — `hermes_cli/banner.py:266,390` | Drives `version_check` and `gateway.updates_behind`. |
+| `~/.hermes/context_length_cache.yaml` | PROFILE — `agent/model_metadata.py:1041-1044` | Feeds `SessionInfo.context_limit`. |
+| `~/.hermes/cache/banner_snapshot.json` | PROFILE — `hermes_cli/banner.py:625-626` | Feeds `tools_index` and `toolset_availability`. |
+| `~/.hermes/.skills_prompt_snapshot.json` | PROFILE — `agent/prompt_builder.py:1077-1078` | |
+| `~/.hermes/state/gateway.heartbeat` | PROFILE — `gateway/shutdown_watchdog.py:27,44` | Loop-liveness for the root gateway only. |
+| `~/.hermes/state/gateway.lifecycle.json` | PROFILE — `gateway/lifecycle_ledger.py:27-41` | Exit code / unclean-exit for the root gateway only. |
+| `~/.hermes/response_store.db` | PROFILE — `gateway/platforms/api_server.py:688` | |
+| `~/.hermes/state-snapshots/` | PROFILE — `hermes_cli/backup.py:35,1088-1090,1380` | |
+| `~/.hermes/cache/blocked-scripts/` | PROFILE — `tools/approval_floors.py:63-64` | |
+| `~/.hermes/cache/delegation/live/` | PROFILE — `tools/delegation_live_log.py:40-43` ("profile-safe, never ~/.hermes") | |
+| `~/.hermes/cache/mcp_schema_cache.json` | PROFILE — `tools/mcp_schema_cache.py:18,22-24` | |
+| `~/.hermes/processes.json` | PROFILE — `tools/process_registry.py:41,45-50` | Contrast `spawn-ledger.json`, which upstream *does* anchor at the root — the two registries are not the same scope. |
+| `~/.hermes/desktop-build-stamp.json` | PROFILE — `hermes_cli/main_desktop.py:42-45` | In practice the desktop backend runs with the root `HERMES_HOME`, so the root copy is usually the real one; that is an observation about one deployment, not an upstream guarantee. |
+| `~/.hermes/web-ui-build-stamp.json` | PROFILE — `hermes_cli/main_web_build.py:187-190` | Same caveat as the desktop stamp. |
+| `~/.hermes/channel_directory.json`, `channel_aliases.json` | PROFILE — `gateway/channel_directory.py:40-45` | |
+| `~/.hermes/.drain_request.json` | PROFILE — `gateway/drain_control.py:29,61` | |
+| `~/.hermes/logs/curator/` | PROFILE — `agent/curator.py:455-457`, `hermes_cli/config.py:615-617,623` | The Curator panel's run reports come from the root copy; `skills/.curator_state` next to it is already profile-scoped, so panel 13 mixes both. |
+| `~/.hermes/hooks/` | PROFILE — `gateway/hooks.py:25,29-37` | Upstream is explicit: "under `gateway.multiplex_profiles` every served profile has its own `hooks/`". Created per home at `hermes_cli/config.py:615-617,623`. |
+| `~/.hermes/plugins/` | PROFILE — `plugins/plugin_loader.py:28-34`, `hermes_cli/config_migrations.py:271` | `user_plugins_dir()` is `get_hermes_home()/"plugins"`. |
+| `~/.hermes/moa-traces/` | PROFILE (default) — `agent/moa_trace.py:25-38` | Default is `get_hermes_home()/"moa-traces"`; `moa.trace_dir` overrides it. Upstream resolves a *relative* override against the process cwd (`expandvars`/`expanduser` only), hermesd resolves it against `root_home` — a second, separate difference. |
+| `~/.hermes/logs/gui.log` | PROFILE — `hermes_logging.py:180-181,198` | |
+| `~/.hermes/logs/update.log` | PROFILE — `hermes_cli/update_cmd.py:437` | |
+| `~/.hermes/logs/gateway.error.log` | PROFILE — `hermes_cli/gateway.py:3762-3768` | Note `logs/gateway.log` is written by the same `log_dir` and hermesd already reads *that* one profile-scoped. |
+| `~/.hermes/logs/tui_gateway_crash.log` | PROFILE — `tui_gateway/server.py:43,49` | Frozen at import time upstream, but still `get_hermes_home()`. |
+| `~/.hermes/logs/mcp-stderr.log` | PROFILE — `tools/mcp_tool_config.py:31-35` | |
+
+### Ambiguous upstream
+
+Neither `_PROFILE_DIRS` (`hermes_cli/profiles.py:29`) nor an exclude set settles
+these, or upstream has both anchors at once. Do not "fix" them without deciding
+the question first.
+
+| path | evidence |
+| --- | --- |
+| `~/.hermes/gateway_state.json`, `~/.hermes/gateway.pid` | The *writer* uses the process home (`gateway/status.py:157-158,165-166`), which is the profile home for a profile-launched gateway. But the root-anchored readers are deliberate (`hermes_cli/gateway_multiplex_served.py:23,36,54`), and `gateway/status.py:927` records that "a served profile owns no `gateway.pid`/`gateway_state.json` (#97120)" — so under the multiplexer the root copy is the only one that exists. Per-profile copies are nonetheless read at `hermes_cli/web_routers/status.py:235` and `hermes_cli/gateway.py:769,773`. hermesd's root-only read is correct for the multiplexed case and blind for a standalone profile gateway. |
+| `~/.hermes/BOOT.md` | No path builder anywhere in the upstream tree. The only reference is prose — `hermes_cli/tips.py:334`: "Drop a `~/.hermes/BOOT.md` checklist…" — which names the root. hermesd's `shared_path("BOOT.md")` follows that prose. |
+| `~/.hermes/logs/dashboard.log`, `logs/workspace.log`, `logs/workspace.error.log`, `logs/audit.log` | No writer for these four names anywhere in the upstream checkout (searched `.py`, `.ts`, `.mjs` and `.sh`). Upstream's `audit.log` lives at `skills/.hub/audit.log` (`tools/skills_hub.py:60`) and in the proxy state dir (`hermes_cli/proxy_cli.py:237`), not under `logs/`. Three of the four nonetheless exist in the root `~/.hermes/logs/` on the maintainer's machine — `dashboard.log`, `workspace.log` and `workspace.error.log`, written alongside `dashboard.error.log` and `dashboard-restart.log` — so something outside this checkout produces them. hermesd discovers all four opportunistically and shows a stream only when its file exists. They are `ROOT` by observation, not by decision. |
+
+## Mixed-model register
+
+Models whose fields span more than one scope. A single panel rendering one of
+these is showing more than one home at once; per-field labels would be a redesign,
+so they are recorded here instead. `LogStream` is the exception: it now carries
+`scope` per entry, and the Logs detail view renders it.
+
+| model | what it mixes |
+| --- | --- |
+| `LogStream` | **Labelled.** `scope` per stream; panel 8's detail view renders `Scope: root` / `Scope: profile` for the selected stream, and `--snapshot-format json` carries it. The scope names the resolver that *owns* the stream, not the directory it resolved to — in root mode a profile-owned stream reads the root copy and is still labelled `profile`. |
+| `RuntimeStatus` | `agent_running` / `last_activity_age_seconds` come from profile `state.db`, `sessions/sessions.json` and `logs/agent.log`, but also from root `gateway_state.json` (`collect/system.py:227-237`). A "runtime idle" banner can therefore mix one profile's activity with the root gateway's. |
+| `LogState` | `streams` mixes 3 profile-scoped and ~11 root-scoped entries (see `logs` above). The four legacy convenience fields (`agent_lines`, `gateway_lines`, `error_lines`, `cron_lines`) inherit whichever stream they came from: the first three are profile-owned, `cron_lines` is root-owned. |
+| `SkillsMemory` | `skills`/`memory_file_count` are profile-scoped; `providers`/`credential_pools` come from root `auth.json` (intentional); `hooks` from root `hooks/`; `plugins` from root `plugins/`; `boot_md_*` from root `BOOT.md` (ambiguous). One panel, at least three provenances. |
+| `OperationsState` | Profile: `projects*`, `verification_*`, goals/delegations/`state_db_*`. Root: `response_store_*`, `moa_trace_*`, `snapshot_*`, `blocked_script_*`, `delegation_live_log_count`, both build stamps, `pr_monitors`. |
+| `CuratorRun` | `skills/.curator_state` is profile-scoped; the `logs/curator/<stamp>/run.json` report tree is root-scoped. The two halves of one panel describe different homes. |
+| `GatewayState` | Field groups are already separated by the `_HEARTBEAT_FIELDS`, `_LIFECYCLE_FIELDS`, `_UPDATE_RECEIPT_FIELDS` and `_LEDGER_FIELDS` constants in `collector.py`, and each group is its own `source_name`. Three of the four are root-scoped (`state/gateway.heartbeat`, `state/gateway.lifecycle.json`, `logs/update_receipts/latest.json`); **`_LEDGER_FIELDS` is the only profile-scoped contributor to this nominally root panel** — it reads `gateway_heartbeats`/`delivery_obligations` out of the profile's `state.db`. The base `gateway` group is root-scoped but ambiguous (see above). |
+| `ConfigSummary` | Three provenances in one model: root `config.yaml`; `PROCESS-ENV` values from hermesd's own environment (below); and `kanban_dispatch_in_gateway`-style keys that describe a root-anchored subsystem. The code already comments "these values come from the dashboard process environment, not Hermes runtime state" — but no field distinguishes them, so a reader cannot tell a Hermes setting from a hermesd one. |
+
+### Process-environment values (`PROCESS-ENV`)
+
+Read in `collector.py::_collect_config` / `_collect_tool_gateway_routes` from
+`self._env` (hermesd's own process environment, injectable for tests). These are
+not Hermes state and never come from `~/.hermes`. Checked against the code by
+`test_source_ownership_doc_covers_every_process_env_read`.
+
+| env var | ConfigSummary field |
+| --- | --- |
+| `TOOL_GATEWAY_DOMAIN` | `tool_gateway_domain` |
+| `TOOL_GATEWAY_SCHEME` | `tool_gateway_scheme` |
+| `FIRECRAWL_GATEWAY_URL` | `firecrawl_gateway_url` (URL-redacted) |
+| `TOOL_GATEWAY_USER_TOKEN` | `tool_gateway_routes[].token_present` (presence only) |
+| `HERMES_DASHBOARD_AUTH_PROVIDER` | `dashboard_auth_provider` (fallback after `dashboard.auth_provider`) |
+| `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` | `dashboard_basic_auth_configured` (presence only) |
+| `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD` | `dashboard_basic_auth_configured` (presence only) |
+
+Two further environment variables are read at the CLI layer, not by the collector,
+and select the home itself rather than a source inside it: `HERMES_HOME`
+(`__main__.py:105`) and `HERMES_PROFILE` (`__main__.py:115`).
+
+## Sources hermesd does not read
+
+Recorded so the next reader does not have to re-derive the scope from scratch.
+
+| path | upstream scope | note |
+| --- | --- | --- |
+| `~/.hermes/shared-state.db` | ROOT | `gateway/hosted_rooms.py:398-413`. Deliberately **not** the master `state.db`: hosted-room coordination is kept in its own file so profile gateways never become long-lived writers on the session store (the multi-writer corruption vector described in that docstring). |
+| `~/.hermes/runs_idempotency.db` | PROFILE | `gateway/platforms/api_server_run_idempotency.py:67`. |
+| `~/.hermes/active_profile` | ROOT | `hermes_constants.py:80`. hermesd deliberately does **not** follow it — pinned by `test_default_collector_ignores_active_profile_file`. |
+| `~/.hermes/profiles/<name>/profile.yaml` | PROFILE | `hermes_cli/profile_describer.py:191`; read for `ui_meta` by `tools/bot_mode_probe.py:103,131`. |
+| `~/.hermes/.env` (and per-profile `.env`) | PROFILE | `hermes_constants.py:1142-1145` (`get_env_path()`). Secrets; hermesd has no business reading it. |
+| `~/.hermes/skins/` | PROFILE | `hermes_cli/skin_engine.py:365`. hermesd reads the skin *name* from root `config.yaml` and resolves colours itself. |

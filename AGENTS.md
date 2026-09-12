@@ -87,7 +87,7 @@ Canonical contributor workflow lives in [`CONTRIBUTING.md`](CONTRIBUTING.md). Th
 
 1. **Write the failing test first** — this project mandates TDD/ATDD (see `.codex/skills/py-rig/SKILL.md`).
 2. Add data model fields to `models.py`.
-3. Populate them in the matching `collect/*.py` reader and wire it into `collector.py`.
+3. Populate them in the matching `collect/*.py` reader and wire it into `collector.py`. Resolve every path through `shared_path()`/`profile_path()` per [`.codex/rules/source-ownership.md`](.codex/rules/source-ownership.md), and add the new `source_name` to that file's ownership table (a test enforces it).
 4. Render in `panels/*.py` (both `_render_compact` and `_render_detail`).
 5. Make tests pass with the minimum change; refactor while green.
 6. Update `app.py` layout if adding new panels; add a `_render_*_panel(ctx: PanelRenderContext)` wrapper in `panels/__init__.py`, register it in `_RENDERERS` and `PANEL_NAMES`, then add its panel number to `_WIDE_LAYOUT_SPEC`, `_COMPACT_LAYOUT_SPEC`, and `_TALL_NARROW_LAYOUT_SPEC` in `app.py` as needed.
@@ -98,4 +98,5 @@ See also:
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — branch/PR workflow and per-panel instructions.
 - [`.codex/rules/python-idioms.md`](.codex/rules/python-idioms.md) — version-tagged modern Python syntax.
 - [`.codex/rules/python-patterns.md`](.codex/rules/python-patterns.md) — style, types, errors, tests.
+- [`.codex/rules/source-ownership.md`](.codex/rules/source-ownership.md) — which Hermes home (root vs. profile) owns each source; read it before adding a reader.
 - [`.codex/skills/py-rig/SKILL.md`](.codex/skills/py-rig/SKILL.md) — design/TDD/ATDD/DI/review discipline.

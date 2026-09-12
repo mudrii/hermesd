@@ -1,8 +1,10 @@
 """Profile-scoped collection: discovery, path containment, session counts,
-and soul excerpts."""
+soul excerpts, per-source scope ownership, and the rule document that pins it."""
 
 from __future__ import annotations
 
+import ast
+import json
 import os
 import sqlite3
 import time
@@ -14,12 +16,20 @@ from hermesd.collector import (
     Collector,
     _read_soul_excerpt,
 )
+from hermesd.models import LogStream, OperationsState, SourceScope
+from hermesd.paths import HermesPaths
 from tests.conftest import (
     _assert_cached_until_changed,
     _count_opens,
     _skip_if_root,
     _unreadable,
+    _write_minimal_state_db,
+    create_kanban_db_tables,
     create_state_db_tables,
+)
+from tests.test_collector_operations import (
+    create_projects_db_tables,
+    create_verification_evidence_db_tables,
 )
 
 
@@ -489,3 +499,526 @@ def test_collector_rejects_profile_traversal_outside_profiles_dir(hermes_home: P
 
     with pytest.raises(ValueError, match="Invalid profile name"):
         Collector(hermes_home, profile_name="../../outside")
+
+
+# ---------------------------------------------------------------------------
+# Source-scope ownership: which resolver owns which on-disk source.
+# See .codex/rules/source-ownership.md — the document is checked against the
+# code by test_source_ownership_doc_matches_resolver_call_sites below.
+# ---------------------------------------------------------------------------
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_PACKAGE_ROOT = _PROJECT_ROOT / "hermesd"
+_RULE_FILE = _PROJECT_ROOT / ".codex" / "rules" / "source-ownership.md"
+_RESOLVERS = frozenset({"shared_path", "profile_path"})
+_SCOPES = frozenset({"ROOT", "PROFILE", "MIXED"})
+_DERIVED_MARKER = "(derived)"
+# state.db is resolved exactly once, in Collector.__init__, and every later read
+# goes through the HermesDB it built there. The two sources that consume those
+# rows therefore need __init__ in their walk to see the resolver call at all.
+_EXTRA_ENTRYPOINTS: dict[str, tuple[str, ...]] = {
+    "sessions": ("Collector.__init__",),
+    "session_models": ("Collector.__init__",),
+}
+
+
+def _write_log(path: Path, message: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"2026-04-09 15:41:58,123 - hermes - INFO - {message}\n")
+
+
+def _make_projects_db(path: Path) -> None:
+    conn = sqlite3.connect(str(path))
+    try:
+        create_projects_db_tables(conn, optional=False)
+        conn.execute(
+            "INSERT INTO projects VALUES ("
+            "'p1', 'other', 'Other', '', '', '', '', '/repo/other',"
+            " '2026-07-10T00:00:00Z', 0)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _make_verification_db(path: Path) -> None:
+    conn = sqlite3.connect(str(path))
+    try:
+        create_verification_evidence_db_tables(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_profiled_collector_labels_log_stream_scope(profiled_hermes_home: Path):
+    profile_logs = profiled_hermes_home / "profiles" / "coding" / "logs"
+    root_logs = profiled_hermes_home / "logs"
+    _write_log(profile_logs / "gateway.log", "profile gateway log")
+    _write_log(profile_logs / "errors.log", "profile error log")
+    _write_log(root_logs / "desktop.log", "root desktop log")
+    _write_log(root_logs / "gui.log", "root gui log")
+    # Same base name in both scopes: the profile-owned stream must stay
+    # profile-scoped and must be the one that was read.
+    _write_log(root_logs / "gateway.log", "root gateway log")
+    cron_output = profiled_hermes_home / "cron" / "output" / "job-1"
+    cron_output.mkdir(parents=True)
+    (cron_output / "latest.md").write_text("root cron output\n")
+
+    c = Collector(profiled_hermes_home, profile_name="coding")
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    scopes = {stream.name: stream.scope for stream in state.logs.streams}
+    assert scopes["agent"] is SourceScope.PROFILE
+    assert scopes["gateway"] is SourceScope.PROFILE
+    assert scopes["errors"] is SourceScope.PROFILE
+    assert scopes["desktop"] is SourceScope.ROOT
+    assert scopes["gui"] is SourceScope.ROOT
+    assert scopes["cron"] is SourceScope.ROOT
+    gateway = next(stream for stream in state.logs.streams if stream.name == "gateway")
+    assert gateway.lines[0].message == "profile gateway log"
+
+
+def test_root_collector_keeps_ownership_labels_on_log_streams(profiled_hermes_home: Path):
+    """Scope names the resolver that owns a stream, not the dir it resolved to.
+
+    In root mode ``profile_home is root_home``, so a profile-owned stream reads
+    the root copy — but it must still be labeled PROFILE, otherwise the label
+    would stop telling an operator where the file lives once a profile is
+    selected.
+    """
+    _write_log(profiled_hermes_home / "logs" / "desktop.log", "root desktop log")
+
+    c = Collector(profiled_hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    scopes = {stream.name: stream.scope for stream in state.logs.streams}
+    assert scopes["agent"] is SourceScope.PROFILE
+    assert scopes["desktop"] is SourceScope.ROOT
+    assert state.logs.agent_lines[0].message == "root agent log"
+
+
+def test_log_stream_scope_defaults_to_root():
+    assert LogStream(name="agent").scope is SourceScope.ROOT
+
+
+def test_profiled_collector_reads_root_scoped_cron_kanban_and_gateway(
+    profiled_hermes_home: Path,
+):
+    """Root-owned sources keep reading the root copy while a profile is selected.
+
+    Extends the config.yaml/auth.json pin to the three root-owned sources an
+    operator is most likely to mistake for profile data: cron (upstream scopes
+    it per profile), kanban (root BY DESIGN upstream) and the gateway pid/state
+    record (root-anchored for the multiplexed default gateway).
+    """
+    home = profiled_hermes_home
+    profile_home = home / "profiles" / "coding"
+
+    (home / "cron" / "jobs.json").write_text(
+        json.dumps({"jobs": [{"id": "root_job", "name": "root-job"}]})
+    )
+    profile_cron = profile_home / "cron"
+    profile_cron.mkdir(parents=True)
+    (profile_cron / "jobs.json").write_text(
+        json.dumps({"jobs": [{"id": "profile_job", "name": "profile-job"}]})
+    )
+
+    root_kanban = sqlite3.connect(str(home / "kanban.db"))
+    create_kanban_db_tables(root_kanban)
+    root_kanban.execute(
+        "INSERT INTO tasks (id, title, status, created_at, started_at) VALUES (?, ?, ?, ?, ?)",
+        ("t_root", "root task", "in_progress", int(time.time()), int(time.time())),
+    )
+    root_kanban.commit()
+    root_kanban.close()
+    profile_kanban = sqlite3.connect(str(profile_home / "kanban.db"))
+    create_kanban_db_tables(profile_kanban)
+    profile_kanban.execute(
+        "INSERT INTO tasks (id, title, status, created_at, started_at) VALUES (?, ?, ?, ?, ?)",
+        ("t_profile", "profile task", "in_progress", int(time.time()), int(time.time())),
+    )
+    profile_kanban.commit()
+    profile_kanban.close()
+
+    (profile_home / "gateway_state.json").write_text(
+        json.dumps(
+            {
+                "pid": 999,
+                "gateway_state": "stopped",
+                "platforms": {"discord": {"state": "connected", "updated_at": ""}},
+            }
+        )
+    )
+
+    c = Collector(home, profile_name="coding")
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert [job.name for job in state.cron.jobs] == ["root-job"]
+    assert state.cron.job_count == 1
+    assert state.kanban.db_present is True
+    assert state.kanban.task_count == 1
+    assert [task.task_id for task in state.kanban.active_tasks] == ["t_root"]
+    # gateway_state.json comes from the root copy written by the fixture.
+    assert state.gateway.pid == 12345
+    assert state.gateway.state == "running"
+    assert [platform.name for platform in state.gateway.platforms] == ["telegram"]
+    # The profile-scoped runtime data in the same home is still profile-scoped.
+    assert state.sessions[0].session_id == "profile_session"
+
+
+def test_profiled_collector_does_not_read_root_scoped_profile_sources(
+    profiled_hermes_home: Path,
+):
+    """A profile-owned source must not fall back to the root copy."""
+    home = profiled_hermes_home
+    (home / "memories" / "ROOT.md").write_text("root memory\n")
+    (home / "checkpoints").mkdir()
+    (home / "runtime").mkdir()
+    (home / "runtime" / "active_sessions.json").write_text(
+        json.dumps({"entries": [{"session_id": "root_surface", "surface": "cli", "pid": 0}]})
+    )
+    profile_runtime = home / "profiles" / "coding" / "runtime"
+    profile_runtime.mkdir(parents=True)
+    (profile_runtime / "active_sessions.json").write_text(
+        json.dumps({"entries": [{"session_id": "profile_surface", "surface": "cli", "pid": 0}]})
+    )
+
+    c = Collector(home, profile_name="coding")
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.memory.memory_files == ["PROFILE.md"]
+    assert state.memory.memory_file_count == 1
+    assert state.checkpoints == []
+    assert [surface.session_id for surface in state.active_surfaces] == ["profile_surface"]
+    assert [skill.name for skill in state.skills_memory.skills] == ["profile-skill"]
+    assert state.logs.agent_lines[0].message == "profile agent log"
+
+
+class _CrossProfilePaths(HermesPaths):
+    """Resolver that hands back a *sibling* profile's paths.
+
+    Stands in for the failure mode the confinement check exists to catch: a
+    ``profile_path()`` result that is still under ``root_home`` but belongs to
+    another profile. Confining against ``root_home`` accepts it; confining
+    against ``profile_home`` does not.
+    """
+
+    def profile_path(self, *parts: str) -> Path:
+        return self.root_home.joinpath("profiles", "other", *parts)
+
+
+def _make_sibling_profile(home: Path) -> Path:
+    other = home / "profiles" / "other"
+    other.mkdir(parents=True)
+    _make_projects_db(other / "projects.db")
+    _make_verification_db(other / "verification_evidence.db")
+    _write_minimal_state_db(other / "state.db", "other_session", "other")
+    return other
+
+
+def test_profiled_operations_readers_confine_to_selected_profile_home(
+    profiled_hermes_home: Path,
+):
+    """The three profile_path()-resolved operations readers confine to profile_home."""
+    _make_sibling_profile(profiled_hermes_home)
+    c = Collector(profiled_hermes_home, profile_name="coding")
+    try:
+        c._paths = _CrossProfilePaths(profiled_hermes_home, "coding")
+        operations = OperationsState()
+        assert c._with_projects(operations).projects_db_present is False
+        assert c._with_verification_evidence(operations).verification_db_present is False
+        assert c._read_state_db() is None
+    finally:
+        c.close()
+
+
+def test_root_mode_operations_confinement_is_unchanged(hermes_home: Path):
+    """Root mode confines against root_home because profile_home *is* root_home."""
+    assert HermesPaths(hermes_home).profile_home == hermes_home
+    _make_projects_db(hermes_home / "projects.db")
+    _make_verification_db(hermes_home / "verification_evidence.db")
+
+    c = Collector(hermes_home)
+    try:
+        operations = OperationsState()
+        assert c._with_projects(operations).projects_db_present is True
+        assert c._with_verification_evidence(operations).verification_db_present is True
+    finally:
+        c.close()
+
+
+def test_profiled_collector_rejects_cross_profile_symlinked_projects_db(
+    profiled_hermes_home: Path,
+):
+    """A symlink into a sibling profile is refused, not followed."""
+    other = _make_sibling_profile(profiled_hermes_home)
+    linked = profiled_hermes_home / "profiles" / "coding" / "projects.db"
+    linked.symlink_to(other / "projects.db")
+
+    c = Collector(profiled_hermes_home, profile_name="coding")
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.operations.projects_db_present is False
+    assert state.operations.project_count == 0
+
+
+def test_profiled_collector_reports_cross_profile_symlink_as_a_lost_source(
+    profiled_hermes_home: Path,
+):
+    """Once read successfully, a cross-profile swap fails the source (last-good kept)."""
+    coding = profiled_hermes_home / "profiles" / "coding"
+    _make_projects_db(coding / "projects.db")
+    other = _make_sibling_profile(profiled_hermes_home)
+
+    c = Collector(profiled_hermes_home, profile_name="coding")
+    try:
+        first = c.collect()
+        assert first.operations.projects_db_present is True
+
+        good_db = coding / "projects.db"
+        good_db.unlink()
+        good_db.symlink_to(other / "projects.db")
+        second = c.collect()
+    finally:
+        c.close()
+
+    assert second.operations == first.operations
+    assert "operations" in second.health.failed_sources
+
+
+# ---------------------------------------------------------------------------
+# Doc-is-truth: the ownership table must match the resolver call sites.
+# ---------------------------------------------------------------------------
+
+
+def _parsed_modules() -> dict[str, ast.AST]:
+    sources = [_PACKAGE_ROOT / "collector.py", *sorted((_PACKAGE_ROOT / "collect").glob("*.py"))]
+    assert sources, "expected to find collector sources to scan"
+    return {
+        str(path.relative_to(_PROJECT_ROOT)): ast.parse(path.read_text(), filename=str(path))
+        for path in sources
+    }
+
+
+def _function_index(trees: dict[str, ast.AST]) -> dict[str, list[ast.AST]]:
+    """Callable name -> body.
+
+    Module-level functions are indexed bare; methods are indexed *only* as
+    ``Class.method``. Keeping the two apart is what stops an attribute call on
+    some other object (``health.collect(...)``) from resolving to an unrelated
+    method (``Collector.collect``) and dragging the whole class into the walk.
+    """
+    index: dict[str, list[ast.AST]] = {}
+    for tree in trees.values():
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                index.setdefault(node.name, []).append(node)
+            elif isinstance(node, ast.ClassDef):
+                for child in node.body:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        index.setdefault(f"{node.name}.{child.name}", []).append(child)
+    return index
+
+
+def _resolve(index: dict[str, list[ast.AST]], name: str) -> list[ast.AST]:
+    if name.startswith("self."):
+        suffix = f".{name.removeprefix('self.')}"
+        return [node for key, nodes in index.items() if key.endswith(suffix) for node in nodes]
+    return index.get(name, [])
+
+
+def _called_names(node: ast.AST) -> set[str]:
+    """Callees this index can resolve: bare names and ``self.<method>``."""
+    names: set[str] = set()
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call):
+            continue
+        func = child.func
+        if isinstance(func, ast.Name):
+            names.add(func.id)
+        elif (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "self"
+        ):
+            names.add(f"self.{func.attr}")
+    return names
+
+
+def _resolver_kinds(index: dict[str, list[ast.AST]], entrypoints: set[str]) -> set[str]:
+    """Which resolvers are reachable from these entrypoints (transitively)."""
+    seen: set[int] = set()
+    kinds: set[str] = set()
+    pending = sorted(entrypoints)
+    while pending:
+        for node in _resolve(index, pending.pop()):
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            for child in ast.walk(node):
+                if (
+                    isinstance(child, ast.Call)
+                    and isinstance(child.func, ast.Attribute)
+                    and child.func.attr in _RESOLVERS
+                ):
+                    kinds.add(child.func.attr)
+            pending.extend(_called_names(node))
+    return kinds
+
+
+def _collected_sources(trees: dict[str, ast.AST]) -> dict[str, set[str]]:
+    """Every ``source_name`` that can land in ``health.failed_sources`` -> entrypoints."""
+    sources: dict[str, set[str]] = {}
+    collector_tree = trees["hermesd/collector.py"]
+    for node in ast.walk(collector_tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+            continue
+        if node.func.id != "_SourceSpec" or len(node.args) < 3:
+            continue
+        name_node = node.args[1]
+        if not (isinstance(name_node, ast.Constant) and isinstance(name_node.value, str)):
+            continue
+        entrypoints = sources.setdefault(name_node.value, set())
+        for child in ast.walk(node.args[2]):
+            if not (isinstance(child, ast.Attribute) and child.attr.startswith("_")):
+                continue
+            if isinstance(child.value, ast.Name) and child.value.id == "self":
+                entrypoints.add(f"self.{child.attr}")
+
+    index = _function_index(trees)
+    for name, nodes in index.items():
+        for node in nodes:
+            for child in ast.walk(node):
+                # health.collect(fallback, "<source_name>", fn, default)
+                if not (isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)):
+                    continue
+                if child.func.attr != "collect" or len(child.args) < 3:
+                    continue
+                literal = child.args[1]
+                if isinstance(literal, ast.Constant) and isinstance(literal.value, str):
+                    sources.setdefault(literal.value, set()).add(name)
+    return sources
+
+
+def _table_rows(text: str) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if cells and set(cells[0]) <= {"-", ":", " "}:
+            continue
+        rows.append(cells)
+    return rows
+
+
+def _documented_scopes(text: str) -> dict[str, tuple[str, bool]]:
+    """source_name -> (scope class, is-derived) from the ownership table."""
+    documented: dict[str, tuple[str, bool]] = {}
+    for cells in _table_rows(text):
+        if len(cells) < 2:
+            continue
+        name = cells[0].strip("`")
+        if not name or not name.replace("_", "").isalnum() or not name.islower():
+            continue
+        scope_cell = cells[1]
+        scope = scope_cell.split()[0].strip("`") if scope_cell.split() else ""
+        if scope not in _SCOPES:
+            continue
+        assert name not in documented, f"{name} is documented twice in {_RULE_FILE.name}"
+        documented[name] = (scope, _DERIVED_MARKER in scope_cell)
+    return documented
+
+
+def _documented_env_keys(text: str) -> set[str]:
+    keys: set[str] = set()
+    for cells in _table_rows(text):
+        if not cells:
+            continue
+        name = cells[0].strip("`")
+        if name and name.isupper() and name.replace("_", "").isalnum():
+            keys.add(name)
+    return keys
+
+
+def _collector_env_keys(trees: dict[str, ast.AST]) -> set[str]:
+    keys: set[str] = set()
+    for tree in trees.values():
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            if node.func.attr != "get" or not node.args:
+                continue
+            holder = node.func.value
+            if not (isinstance(holder, ast.Attribute) and holder.attr == "_env"):
+                continue
+            literal = node.args[0]
+            if isinstance(literal, ast.Constant) and isinstance(literal.value, str):
+                keys.add(literal.value)
+    return keys
+
+
+def test_source_ownership_doc_matches_resolver_call_sites():
+    trees = _parsed_modules()
+    index = _function_index(trees)
+    documented = _documented_scopes(_RULE_FILE.read_text())
+    assert documented, f"no ownership rows parsed from {_RULE_FILE}"
+
+    problems: list[str] = []
+    for source_name, entrypoints in sorted(_collected_sources(trees).items()):
+        if source_name not in documented:
+            problems.append(f"{source_name}: collected but not documented")
+            continue
+        scope, derived = documented[source_name]
+        kinds = _resolver_kinds(
+            index, set(entrypoints) | set(_EXTRA_ENTRYPOINTS.get(source_name, ()))
+        )
+        if not kinds:
+            # No path resolution of its own: the row must say so, and name the
+            # scope it inherits (the session rows it consumes).
+            if not derived:
+                problems.append(
+                    f"{source_name}: resolves nothing but is not marked {_DERIVED_MARKER}"
+                )
+            continue
+        if derived:
+            problems.append(f"{source_name}: marked {_DERIVED_MARKER} but calls {sorted(kinds)}")
+            continue
+        expected = {
+            frozenset({"shared_path"}): "ROOT",
+            frozenset({"profile_path"}): "PROFILE",
+            frozenset(_RESOLVERS): "MIXED",
+        }[frozenset(kinds)]
+        if scope != expected:
+            problems.append(
+                f"{source_name}: documented {scope} but calls {sorted(kinds)} -> {expected}"
+            )
+
+    stale = sorted(set(documented) - set(_collected_sources(trees)))
+    problems.extend(f"{name}: documented but no longer collected" for name in stale)
+    assert problems == [], "source-ownership.md disagrees with the code:\n" + "\n".join(problems)
+
+
+def test_source_ownership_doc_covers_every_process_env_read():
+    trees = _parsed_modules()
+    documented = _documented_env_keys(_RULE_FILE.read_text())
+    assert _collector_env_keys(trees) <= documented, (
+        "PROCESS-ENV keys missing from "
+        f"{_RULE_FILE.name}: {sorted(_collector_env_keys(trees) - documented)}"
+    )

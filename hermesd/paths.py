@@ -1,3 +1,27 @@
+"""Path resolution for every on-disk Hermes source.
+
+Two resolvers, two scopes — and only two:
+
+* ``shared_path(*parts)`` always resolves under ``root_home`` (``~/.hermes``).
+  ``shared_home`` is a hard alias for ``root_home``, so "shared" is not a third
+  scope; use it only where hermes-agent itself anchors at
+  ``get_default_hermes_root()``, or for a machine-global source.
+* ``profile_path(*parts)`` resolves under the selected profile's home, or under
+  ``root_home`` when no profile is selected. Use it for anything hermes-agent
+  resolves through ``get_hermes_home()``, which is the *profile* home whenever a
+  profile is active.
+
+Which scope owns which source is recorded per ``source_name`` in
+``.codex/rules/source-ownership.md``; that table is checked against these call
+sites by ``tests/test_collector_profiles.py``.
+
+Scope is re-derived on every call, never cached: ``profile_path`` runs
+``_validate_profile_home`` each time so a symlink swapped in after construction
+cannot redirect a read outside ``root_home/profiles``. Do not hoist a resolved
+path into ``__init__`` as an "optimization" — that is the attack the revalidation
+defeats.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

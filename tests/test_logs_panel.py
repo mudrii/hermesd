@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from rich.console import Console
 
-from hermesd.models import DashboardState, LogLine, LogState, LogStream
+from hermesd.models import DashboardState, LogLine, LogState, LogStream, SourceScope
 from hermesd.panels.logs import render_logs
 from hermesd.theme import Theme
 from tests.conftest import render_to_str
@@ -82,3 +82,46 @@ def test_logs_detail_negative_scroll_offset_renders_from_the_top() -> None:
     assert "line 00" in negative
     assert "line 29" not in negative
     assert "[1-10/30]" in negative
+
+
+def _detail_text(state: DashboardState, sub_view: str) -> str:
+    """Render the detail view for one stream, style-stripped."""
+    console = Console(width=120, height=80, record=True)
+    console.print(render_logs(state, Theme(), detail=True, sub_view=sub_view))
+    return console.export_text()
+
+
+def test_logs_detail_labels_the_selected_stream_scope() -> None:
+    """The detail view says which home the stream you are reading lives under."""
+    state = DashboardState(
+        selected_profile="coding",
+        profile_mode_label="profile:coding",
+        logs=LogState(
+            streams=[
+                LogStream(
+                    name="agent",
+                    scope=SourceScope.PROFILE,
+                    lines=[LogLine(message="profile agent log")],
+                ),
+                LogStream(
+                    name="desktop",
+                    scope=SourceScope.ROOT,
+                    lines=[LogLine(message="root desktop log")],
+                ),
+            ]
+        ),
+    )
+
+    agent = _detail_text(state, "agent")
+    desktop = _detail_text(state, "desktop")
+
+    assert "Scope: profile" in agent
+    assert "Scope: root" not in agent
+    assert "Scope: root" in desktop
+    assert "Scope: profile" not in desktop
+
+
+def test_logs_detail_scope_defaults_to_root_without_streams() -> None:
+    state = DashboardState(logs=LogState(agent_lines=[LogLine(message="legacy agent line")]))
+
+    assert "Scope: root" in _detail_text(state, "agent")

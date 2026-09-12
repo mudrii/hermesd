@@ -37,7 +37,7 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 | 5 | **Config** | Model, provider, personality, MoA, Tool Search, dashboard auth, kanban, code execution, gateway, routing and memory/session settings, agent limits (delegation concurrency/depth/orchestrator, goal turn budget, tool-loop guardrails, live sessions, streaming, logging) and integrations (MCP, plugins, updates, proxy presence) |
 | 6 | **Cron** | Scheduler tick/provider, ticker health, open incidents, Chronos config presence, suggestion count, job table with schedule, delivery target, 24 h run counters, error count, latest error, and output metadata |
 | 7 | **Skills / Integrations** | Provider auth status/freshness, credential pools, hooks/plugins/MCP inventory, plugin configured-activation gate, MCP schema cache with no-cache-entry hint, prompted-skill snapshot, BOOT.md presence, skills with descriptions |
-| 8 | **Logs** | Tailed agent, gateway, errors, cron, desktop, dashboard, GUI, update, gateway-error, crash, audit, MCP-stderr, and workspace logs with Tab switching and inline filtering |
+| 8 | **Logs** | Tailed agent, gateway, errors, cron, desktop, dashboard, GUI, update, gateway-error, crash, audit, MCP-stderr, and workspace logs with Tab switching, inline filtering, and a per-stream scope label (root vs. profile) |
 | 9 | **Profiles** | Read-only profile discovery with session counts, log freshness, skill counts, DB size, and SOUL excerpts |
 | 10 | **Memory** | Memory provider, MEMORY.md/USER.md word counts, learning summary, SOUL.md size/excerpt, and memory file inventory |
 | 11 | **Kanban** | Read-only kanban task/run/event/comment counts, multi-board summaries, stale claims, dispatch config, active workers, blocked/failing tasks, and recent runs |
@@ -147,6 +147,8 @@ An **MCP** section summarises `~/.hermes/cache/mcp_schema_cache.json`: how many 
 ### [8] Logs — What Just Happened?
 
 Press `8` for the full log viewer with discovered streams such as **agent**, **gateway**, **errors**, **cron**, **desktop**, **dashboard**, **gui**, **update**, **gateway.error**, **tui crash**, **workspace**, **workspace.error**, **audit**, and **mcp.stderr** (each shown only when its file exists). Press `Tab` to switch between them, `/` to filter the current log stream by `level:`, `minlevel:`, `component:`, `session:`, or free text, `j`/`k` to move the viewport, and `g`/`G` to jump to the top or bottom.
+
+The stream list is not one directory: **agent**, **gateway** and **errors** come from the selected profile's `logs/`, while the rest come from `~/.hermes/logs/`. Since a stream's file name alone cannot tell `profiles/coding/logs/agent.log` apart from `logs/agent.log`, the detail view prints a `Scope: profile` / `Scope: root` line under the tab bar for the stream you are reading, and `--snapshot-format json` carries the same value as `logs.streams[].scope`. The label names the resolver that *owns* the stream, not the directory it happened to resolve to — with no profile selected everything lives under `~/.hermes/`, but the profile-owned streams still read `profile`. Which scope owns every other source is recorded in [`.codex/rules/source-ownership.md`](.codex/rules/source-ownership.md).
 
 ![Logs Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-08-logs.png)
 
@@ -449,7 +451,8 @@ hermesd/
   db.py                Read-only SQLite with data_version caching
   file_cache.py        mtime-keyed JSON/YAML cache
   models.py            Pydantic models for dashboard state
-  paths.py             HermesPaths profile-scoped path resolution
+  paths.py             HermesPaths root/profile path resolution (source
+                       ownership: .codex/rules/source-ownership.md)
   theme.py             Skin/color system matching Hermes Agent
   panels/
     __init__.py        Panel dispatch and registry

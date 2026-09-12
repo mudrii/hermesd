@@ -684,9 +684,29 @@ class LogLine(BaseModel):
     message: str = ""
 
 
+class SourceScope(StrEnum):
+    """Which Hermes home a source is resolved against.
+
+    ``ROOT`` is ``~/.hermes`` (``HermesPaths.shared_path``); ``PROFILE`` is
+    ``~/.hermes/profiles/<name>`` when a profile is selected and the root
+    otherwise (``HermesPaths.profile_path``). The value names the resolver that
+    *owns* the source, not the directory it happened to resolve to, so a
+    profile-owned source reads ``PROFILE`` even in root mode.
+
+    There is deliberately no ``SHARED`` member: ``shared_home is root_home``.
+    Values that come from hermesd's own process environment rather than from
+    disk are documented as ``PROCESS-ENV`` in
+    ``.codex/rules/source-ownership.md`` and have no model consumer yet.
+    """
+
+    ROOT = "root"
+    PROFILE = "profile"
+
+
 class LogStream(BaseModel):
     name: str
     path: str = ""
+    scope: SourceScope = SourceScope.ROOT
     size_bytes: int = 0
     mtime: float | None = None
     lines: list[LogLine] = Field(default_factory=list)

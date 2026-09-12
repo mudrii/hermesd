@@ -210,6 +210,7 @@ from hermesd.models import (
     SkillInfo,
     SkillsMemory,
     SkillsPromptSnapshot,
+    SourceScope,
     TokenAnalytics,
     TokenSummary,
     ToolGatewayRoute,
@@ -1973,7 +1974,10 @@ class Collector:
             if last is not None and last.verification_db_present:
                 raise RuntimeError("verification_evidence.db disappeared")
             return operations
-        if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
+        # Confined to profile_home, not root_home: a path that resolves into a
+        # *sibling* profile is still under the root, and this source is
+        # profile-scoped (see .codex/rules/source-ownership.md).
+        if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.profile_home):
             if last is not None and last.verification_db_present:
                 raise RuntimeError("verification_evidence.db replaced by unsafe path")
             return operations
@@ -2031,7 +2035,9 @@ class Collector:
             if last is not None and last.projects_db_present:
                 raise RuntimeError("projects.db disappeared")
             return operations
-        if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
+        # Confined to profile_home, not root_home: a sibling profile's projects.db
+        # is still under the root, and this source is profile-scoped.
+        if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.profile_home):
             if last is not None and last.projects_db_present:
                 raise RuntimeError("projects.db replaced by unsafe path")
             return operations
@@ -2077,7 +2083,10 @@ class Collector:
         if (
             not _exists_strict(db_path)
             or db_path.is_symlink()
-            or not _path_resolves_under(db_path, self._paths.root_home)
+            # Confined to profile_home, not root_home: a sibling profile's
+            # state.db is still under the root, and this source is
+            # profile-scoped. In root mode profile_home is root_home.
+            or not _path_resolves_under(db_path, self._paths.profile_home)
         ):
             return None
         mtime = _db_source_mtime_ns(db_path)
@@ -2560,36 +2569,56 @@ class Collector:
         return entries
 
     def _collect_logs(self) -> LogState:
+        # Each entry carries the scope that owns it: `profile_path` streams live
+        # under the selected profile, `shared_path` streams under the root. The
+        # two cannot be told apart from `LogStream.path` (a bare file name), so
+        # the scope travels with the stream — see
+        # .codex/rules/source-ownership.md.
+        root = SourceScope.ROOT
+        profile = SourceScope.PROFILE
         stream_specs = [
-            ("agent", self._paths.profile_path("logs", "agent.log"), _LOG_TAIL_LINES),
-            ("gateway", self._paths.profile_path("logs", "gateway.log"), _LOG_TAIL_LINES),
-            ("errors", self._paths.profile_path("logs", "errors.log"), _ERROR_LOG_TAIL_LINES),
-            ("desktop", self._paths.shared_path("logs", "desktop.log"), _LOG_TAIL_LINES),
-            ("dashboard", self._paths.shared_path("logs", "dashboard.log"), _LOG_TAIL_LINES),
-            ("gui", self._paths.shared_path("logs", "gui.log"), _LOG_TAIL_LINES),
-            ("update", self._paths.shared_path("logs", "update.log"), _LOG_TAIL_LINES),
+            ("agent", self._paths.profile_path("logs", "agent.log"), _LOG_TAIL_LINES, profile),
+            ("gateway", self._paths.profile_path("logs", "gateway.log"), _LOG_TAIL_LINES, profile),
+            (
+                "errors",
+                self._paths.profile_path("logs", "errors.log"),
+                _ERROR_LOG_TAIL_LINES,
+                profile,
+            ),
+            ("desktop", self._paths.shared_path("logs", "desktop.log"), _LOG_TAIL_LINES, root),
+            ("dashboard", self._paths.shared_path("logs", "dashboard.log"), _LOG_TAIL_LINES, root),
+            ("gui", self._paths.shared_path("logs", "gui.log"), _LOG_TAIL_LINES, root),
+            ("update", self._paths.shared_path("logs", "update.log"), _LOG_TAIL_LINES, root),
             (
                 "gateway.error",
                 self._paths.shared_path("logs", "gateway.error.log"),
                 _LOG_TAIL_LINES,
+                root,
             ),
             (
                 "tui crash",
                 self._paths.shared_path("logs", "tui_gateway_crash.log"),
                 _LOG_TAIL_LINES,
+                root,
             ),
-            ("audit", self._paths.shared_path("logs", "audit.log"), _LOG_TAIL_LINES),
-            ("mcp.stderr", self._paths.shared_path("logs", "mcp-stderr.log"), _LOG_TAIL_LINES),
-            ("workspace", self._paths.shared_path("logs", "workspace.log"), _LOG_TAIL_LINES),
+            ("audit", self._paths.shared_path("logs", "audit.log"), _LOG_TAIL_LINES, root),
+            (
+                "mcp.stderr",
+                self._paths.shared_path("logs", "mcp-stderr.log"),
+                _LOG_TAIL_LINES,
+                root,
+            ),
+            ("workspace", self._paths.shared_path("logs", "workspace.log"), _LOG_TAIL_LINES, root),
             (
                 "workspace.error",
                 self._paths.shared_path("logs", "workspace.error.log"),
                 _LOG_TAIL_LINES,
+                root,
             ),
         ]
         streams = [
-            self._tail_log_stream(name, path, max_lines)
-            for name, path, max_lines in stream_specs
+            self._tail_log_stream(name, path, max_lines, scope)
+            for name, path, max_lines, scope in stream_specs
             if _exists_strict(path) or str(path) in self._log_cache
         ]
         cron_lines = self._tail_latest_cron_output(
@@ -2600,6 +2629,7 @@ class Collector:
                 LogStream(
                     name="cron",
                     path="cron/output",
+                    scope=SourceScope.ROOT,
                     lines=cron_lines,
                 )
             )
@@ -2698,10 +2728,14 @@ class Collector:
         self._profile_count_cache[name] = (mtime, session_count)
         return session_count
 
-    def _tail_log_stream(self, name: str, path: Path, max_lines: int) -> LogStream:
+    def _tail_log_stream(
+        self, name: str, path: Path, max_lines: int, scope: SourceScope
+    ) -> LogStream:
         key = str(path)
         if not _path_resolves_under(path, self._paths.root_home) or not path.exists():
-            return LogStream(name=name, path=path.name, lines=self._log_cache.get(key, []))
+            return LogStream(
+                name=name, path=path.name, scope=scope, lines=self._log_cache.get(key, [])
+            )
         size_bytes = _file_size(path)
         mtime = _mtime(path)
         cached_stream = self._log_stream_cache.get(key)
@@ -2737,6 +2771,7 @@ class Collector:
             stream = LogStream(
                 name=name,
                 path=path.name,
+                scope=scope,
                 size_bytes=size_bytes,
                 mtime=mtime,
                 lines=result if result else self._log_cache.get(key, []),
@@ -2744,7 +2779,9 @@ class Collector:
             self._log_stream_cache[key] = (mtime, size_bytes, stream)
             return stream
         except OSError:
-            return LogStream(name=name, path=path.name, lines=self._log_cache.get(key, []))
+            return LogStream(
+                name=name, path=path.name, scope=scope, lines=self._log_cache.get(key, [])
+            )
 
     def _tail_latest_cron_output(self, output_root: Path, max_lines: int) -> list[LogLine]:
         key = f"cron:{output_root}"
