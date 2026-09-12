@@ -7,6 +7,7 @@ import json
 import math
 import sqlite3
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -42,9 +43,11 @@ from hermesd.models import (
     LogLine,
 )
 
-# executions.db grows without bound (1k rows on a month-old home), so every
-# read is capped: the newest _EXECUTIONS_SCAN_LIMIT rows feed the 24h counters
-# and the newest _EXECUTIONS_RECENT_LIMIT of those feed the detail list.
+# executions.db grows without bound (1k rows on a month-old home). The 24h
+# counters aggregate the full window in SQL and each job's last run comes from
+# a per-job MAX(claimed_at) grouping, so a busy job cannot crowd another job
+# out of either; only the display history is capped at _EXECUTIONS_SCAN_LIMIT
+# (the newest _EXECUTIONS_RECENT_LIMIT of those are shown).
 _EXECUTIONS_SCAN_LIMIT = 500
 _EXECUTIONS_RECENT_LIMIT = 10
 _EXECUTIONS_WINDOW_SECONDS = 24 * 60 * 60.0
@@ -256,30 +259,38 @@ def _execution_from_row(
 
 
 def _job_execution_stats(
-    rows: list[dict[str, Any]],
+    window_rows: list[dict[str, Any]],
+    last_rows: list[dict[str, Any]],
     *,
     now: float,
 ) -> list[CronJobExecutionStats]:
-    """Per-job 24h status counters and last-run detail from newest-first rows."""
+    """Per-job 24h counters from the full-window rows plus last-run detail.
+
+    `last_rows` carries each job's newest execution from the full table, so a
+    busy job cannot crowd another job's last-run status off the panel.
+    """
     window_start = now - _EXECUTIONS_WINDOW_SECONDS
     stats: dict[str, CronJobExecutionStats] = {}
-    for row in rows:
+    for row in sorted(last_rows, key=_claimed_sort_key, reverse=True):
         job_id = str(row.get("job_id") or "")
-        status = str(row.get("status") or "")
-        if job_id not in stats:
-            started_at = str(row.get("started_at") or "")
-            stats[job_id] = CronJobExecutionStats(
-                job_id=job_id,
-                last_status=status,
-                last_duration_seconds=_execution_duration(
-                    started_at, str(row.get("finished_at") or "")
-                ),
-                last_error_excerpt=_cron_error_excerpt(str(row.get("error") or "")),
-            )
+        started_at = str(row.get("started_at") or "")
+        stats[job_id] = CronJobExecutionStats(
+            job_id=job_id,
+            last_status=str(row.get("status") or ""),
+            last_duration_seconds=_execution_duration(
+                started_at, str(row.get("finished_at") or "")
+            ),
+            last_error_excerpt=_cron_error_excerpt(str(row.get("error") or "")),
+        )
+    for row in window_rows:
         claimed = _iso_to_epoch(str(row.get("claimed_at") or ""))
         if claimed is None or claimed < window_start:
             continue
+        job_id = str(row.get("job_id") or "")
+        if job_id not in stats:
+            stats[job_id] = CronJobExecutionStats(job_id=job_id)
         entry = stats[job_id]
+        status = str(row.get("status") or "")
         if status == "completed":
             entry.completed_24h += 1
         elif status == "failed":
@@ -325,6 +336,45 @@ def _recent_execution_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         "FROM executions ORDER BY claimed_at DESC, id DESC "
         f"LIMIT {_EXECUTIONS_SCAN_LIMIT}",
     )
+
+
+def _execution_window_rows(conn: sqlite3.Connection, *, now: float) -> list[dict[str, Any]]:
+    """job_id/status/claimed_at for the whole 24h window, never capped.
+
+    The WHERE clause is only a lexicographic pre-filter (claimed_at is ISO
+    text); _job_execution_stats re-parses every row so garbage stamps never
+    reach the counters.
+    """
+    if not _executions_schema_compatible(conn):
+        return []
+    cutoff = datetime.fromtimestamp(now - _EXECUTIONS_WINDOW_SECONDS, tz=UTC).isoformat()
+    return _query_rows(
+        conn,
+        "SELECT job_id, status, claimed_at FROM executions WHERE claimed_at >= ?",
+        (cutoff,),
+    )
+
+
+def _last_execution_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Each job's newest execution (claimed_at, then id), one row per job."""
+    if not _executions_schema_compatible(conn):
+        return []
+    rows = _query_rows(
+        conn,
+        "SELECT e.id, e.job_id, e.status, e.claimed_at, e.started_at, e.finished_at, e.error "
+        "FROM executions e "
+        "JOIN (SELECT COALESCE(job_id, '') AS job_id, MAX(claimed_at) AS max_claimed "
+        "FROM executions GROUP BY COALESCE(job_id, '')) latest "
+        "ON latest.job_id = COALESCE(e.job_id, '') AND latest.max_claimed = e.claimed_at "
+        "ORDER BY e.job_id ASC, e.id DESC",
+    )
+    # Rows tied on claimed_at arrive highest-id first; keep one row per job.
+    latest: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        job_id = str(row.get("job_id") or "")
+        if job_id not in latest:
+            latest[job_id] = row
+    return list(latest.values())
 
 
 def _incident_from_row(
@@ -383,7 +433,7 @@ def _read_cron_executions_state(
     now: float,
     root: Path,
 ) -> CronExecutionsState:
-    """Bounded read of cron/executions.db: 24h counters, recent runs, incidents.
+    """Cron/executions.db: full-window 24h counters, capped recent runs, incidents.
 
     `root` confines the database: checking only ``db_path.is_symlink()`` misses
     a symlinked ``cron/`` directory pointing outside the Hermes home.
@@ -393,10 +443,12 @@ def _read_cron_executions_state(
     with _connect_readonly_sqlite(db_path) as conn:
         conn.row_factory = sqlite3.Row
         ordered = sorted(_recent_execution_rows(conn), key=_claimed_sort_key, reverse=True)
+        window_rows = _execution_window_rows(conn, now=now)
+        last_rows = _last_execution_rows(conn)
         open_count, unacked_count, incidents = _read_cron_incidents(conn, job_names, now=now)
         return CronExecutionsState(
             db_present=True,
-            job_stats=_job_execution_stats(ordered, now=now),
+            job_stats=_job_execution_stats(window_rows, last_rows, now=now),
             recent=[
                 _execution_from_row(row, job_names, now=now)
                 for row in ordered[:_EXECUTIONS_RECENT_LIMIT]

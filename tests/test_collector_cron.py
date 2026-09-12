@@ -15,7 +15,6 @@ import yaml
 import hermesd.collect.cron as cron_module
 from hermesd.collect.cron import (
     _EXECUTIONS_RECENT_LIMIT,
-    _EXECUTIONS_SCAN_LIMIT,
     _INCIDENTS_LIMIT,
 )
 from hermesd.collect.logs import _MAX_LOG_LINE_CHARS
@@ -1037,11 +1036,18 @@ def test_collect_cron_executions_tolerates_null_and_garbage_timestamps(hermes_ho
     assert unparsed.duration_seconds is None
 
 
-def test_collect_cron_executions_query_is_bounded(hermes_home: Path):
+@pytest.mark.parametrize("indexed", [False, True], ids=["unindexed", "indexed"])
+def test_collect_cron_executions_counters_count_beyond_the_display_cap(
+    hermes_home: Path, indexed: bool
+):
+    """600 in-window executions must report 600, not the 500-row display cap."""
     db_path = hermes_home / "cron" / "executions.db"
     conn = sqlite3.connect(str(db_path))
     create_cron_executions_tables(conn)
-    # More recent rows than the scan cap: the reader must not read the whole table.
+    if indexed:
+        conn.execute("CREATE INDEX idx_executions_claimed ON executions (claimed_at)")
+    # More recent rows than the scan cap: the detail list stays capped but the
+    # 24h counters aggregate the full window, with or without an index.
     for index in range(600):
         insert_cron_execution(
             conn,
@@ -1062,8 +1068,144 @@ def test_collect_cron_executions_query_is_bounded(hermes_home: Path):
         c.close()
 
     stats = _stats_by_job(state)
-    assert stats["job-bulk"].completed_24h == _EXECUTIONS_SCAN_LIMIT
+    assert stats["job-bulk"].completed_24h == 600
     assert len(state.cron_executions.recent) == _EXECUTIONS_RECENT_LIMIT
+
+
+def test_collect_cron_executions_busy_job_cannot_crowd_out_a_quiet_job(hermes_home: Path):
+    """A chatty job's flood must not hide another job's counters or last run."""
+    db_path = hermes_home / "cron" / "executions.db"
+    conn = sqlite3.connect(str(db_path))
+    create_cron_executions_tables(conn)
+    # The 550 newest rows all belong to job-noisy, pushing every job-quiet row
+    # past the display cap.
+    for index in range(550):
+        insert_cron_execution(
+            conn,
+            f"noisy_{index:04d}",
+            "job-noisy",
+            "completed",
+            claimed_at=iso_ago(index),
+            started_at=iso_ago(index),
+            finished_at=iso_ago(index),
+        )
+    for index in range(5):
+        insert_cron_execution(
+            conn,
+            f"quiet_{index}",
+            "job-quiet",
+            "failed",
+            claimed_at=iso_ago(1000 + index * 60),
+            started_at=iso_ago(1000 + index * 60),
+            finished_at=iso_ago(990 + index * 60),
+            error="quiet boom",
+        )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    stats = _stats_by_job(state)
+    assert stats["job-noisy"].completed_24h == 550
+    quiet = stats["job-quiet"]
+    assert quiet.failed_24h == 5
+    assert quiet.last_status == "failed"
+    assert quiet.last_error_excerpt == "quiet boom"
+
+
+def test_collect_cron_executions_window_boundary_is_inclusive(hermes_home: Path):
+    """claimed_at exactly at now-24h counts; one second earlier does not."""
+    now = 1_788_800_000.0
+    db_path = hermes_home / "cron" / "executions.db"
+    conn = sqlite3.connect(str(db_path))
+    create_cron_executions_tables(conn)
+    insert_cron_execution(
+        conn,
+        "exec_on_boundary",
+        "job-edge",
+        "completed",
+        claimed_at=iso_ago(86400, now=now),
+        started_at=iso_ago(86400, now=now),
+        finished_at=iso_ago(86399, now=now),
+    )
+    insert_cron_execution(
+        conn,
+        "exec_just_outside",
+        "job-edge",
+        "completed",
+        claimed_at=iso_ago(86401, now=now),
+        started_at=iso_ago(86401, now=now),
+        finished_at=iso_ago(86400, now=now),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: now)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    stats = _stats_by_job(state)
+    assert stats["job-edge"].completed_24h == 1
+    # The boundary row is the newer one, so it is also the job's last run.
+    assert stats["job-edge"].last_duration_seconds == pytest.approx(1.0)
+
+
+def test_cron_window_aggregation_query_error_fails_source_and_keeps_last_good(
+    hermes_home: Path, sample_cron_executions_db: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A failing 24h-window aggregation read is a source failure, not zero counts."""
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert first.cron_executions.job_stats
+        assert "cron_executions" not in first.health.failed_sources
+
+        real_query_rows = cron_module._query_rows
+
+        def flaky_query_rows(conn, sql, *args):
+            if "WHERE claimed_at >=" in sql:
+                raise sqlite3.OperationalError("simulated window aggregation failure")
+            return real_query_rows(conn, sql, *args)
+
+        monkeypatch.setattr(cron_module, "_query_rows", flaky_query_rows)
+        second = c.collect()
+        assert "cron_executions" in second.health.failed_sources
+        assert second.cron_executions == first.cron_executions
+
+        monkeypatch.setattr(cron_module, "_query_rows", real_query_rows)
+        third = c.collect()
+        assert "cron_executions" not in third.health.failed_sources
+        assert third.cron_executions.job_stats
+    finally:
+        c.close()
+
+
+def test_job_execution_stats_skips_out_of_window_and_garbage_rows():
+    """Direct counter unit: garbage stamps, old rows, and unknown statuses
+    never reach the 24h counters, even without a last-run row."""
+    now = 1_788_800_000.0
+    window_rows = [
+        {"job_id": "job-x", "status": "completed", "claimed_at": iso_ago(60, now=now)},
+        {"job_id": "job-x", "status": "completed", "claimed_at": iso_ago(2 * 86400, now=now)},
+        {"job_id": "job-x", "status": "failed", "claimed_at": "not-a-timestamp"},
+        {"job_id": "job-x", "status": "queued", "claimed_at": iso_ago(30, now=now)},
+    ]
+
+    stats = cron_module._job_execution_stats(window_rows, [], now=now)
+
+    assert len(stats) == 1
+    entry = stats[0]
+    assert entry.job_id == "job-x"
+    assert entry.completed_24h == 1
+    assert entry.failed_24h == 0
+    assert entry.running_24h == 0
+    assert entry.last_status == ""
 
 
 def test_collect_cron_incidents_counts_open_and_unacked(

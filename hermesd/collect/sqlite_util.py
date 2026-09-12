@@ -75,8 +75,10 @@ def _checked_table(table_name: str) -> str:
     return table_name
 
 
-def _query_rows(conn: sqlite3.Connection, sql: str) -> list[dict[str, Any]]:
-    cur = conn.execute(sql)
+def _query_rows(
+    conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = ()
+) -> list[dict[str, Any]]:
+    cur = conn.execute(sql, params)
     return [dict(row) for row in cur.fetchall()]
 
 
