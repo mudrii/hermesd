@@ -1079,6 +1079,53 @@ def test_redact_secret_text_leaves_non_secret_key_with_spaces_visible():
     assert _redact_secret_text("note=my secret pass") == "note=my secret pass"
 
 
+def test_redact_secret_text_deeply_nested_json_fails_closed_without_raising():
+    deep_array = '["x",' * 500 + '"S"' + "]" * 500
+    redacted = _redact_secret_text(deep_array)
+    assert isinstance(redacted, str)
+
+    deep_secret_object = '{"password":' * 500 + '"SYNTHETIC_SECRET"' + "}" * 500
+    redacted_object = _redact_secret_text(deep_secret_object)
+    assert "SYNTHETIC_SECRET" not in redacted_object
+
+
+def test_redact_secret_text_moderately_nested_json_redacts_via_structured_path():
+    payload: dict = {"password": "sk-secret-123"}
+    for _ in range(50):
+        payload = {"wrap": payload}
+    # Non-canonical spacing only normalizes when the structured path re-serializes.
+    value = json.dumps(payload).replace('"wrap": ', '"wrap":  ')
+
+    redacted = _redact_secret_text(value)
+
+    expected: dict = {"password": "[REDACTED]"}
+    for _ in range(50):
+        expected = {"wrap": expected}
+    assert redacted == json.dumps(expected, ensure_ascii=False)
+
+
+def test_redact_secret_text_never_raises_on_malformed_or_nested_inputs():
+    inputs = [
+        '["x",' * 500 + '"S"' + "]" * 500,
+        '{"k":' * 500 + "1" + "}" * 500,
+        '{"password":' * 500 + '"S"' + "}" * 500,
+        "[[[" * 300,
+        "[",
+        "{",
+        '{"a":',
+        '["unclosed',
+        '{"token": "abc",',
+        "[]" * 300,
+        "{}" * 300,
+        "not json at all",
+        '{"a": null}',
+        "[1, 2, 3]",
+    ]
+    for value in inputs:
+        result = _redact_secret_text(value)
+        assert isinstance(result, str)
+
+
 def test_redact_secret_args_non_list_returns_empty():
     assert _redact_secret_args("--token secret") == []
     assert _redact_secret_args(None) == []

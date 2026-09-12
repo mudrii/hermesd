@@ -9,6 +9,7 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ### Fixed
 
+- Secret-text redaction no longer propagates `RecursionError` (or any other structured-path failure) on deeply nested JSON log lines: parse, redact, and re-serialize are guarded as one unit and fail closed to the line-oriented redactor, keeping the sanitizer-never-raises guarantee at its collector and cron call sites.
 - Unquoted multi-word secret values in log text (e.g. `password=my secret pass`) no longer leak their tail: the bare-value form is redacted to the next top-level `,`, `}`, `]`, or end-of-line (failing closed on space-separated prose), while an already-redacted URL following the value stays visible.
 - Argv redaction now covers `key=<url>` forms (e.g. `url=https://user:pw@host/x?token=t1` and `--url=https://…`): the URL value has its userinfo and secret query parameters masked instead of passing through byte-identical because the `key=` prefix defeated whole-argument URL detection.
 - Snapshot export (`--snapshot-file`) now writes to a temporary file that is atomically renamed into place: a destination hard-linked to a file inside `~/.hermes/` can no longer truncate the protected file, and failed or interrupted writes clean up their partial temporary output.

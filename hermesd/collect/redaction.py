@@ -287,10 +287,13 @@ def _redact_secret_text(value: str) -> str:
     if value.lstrip().startswith(("{", "[")):
         try:
             structured = json.loads(value)
-        except (ValueError, RecursionError):
-            pass
-        else:
             return json.dumps(_redact_secret_structure(structured), ensure_ascii=False)
+        except Exception:
+            # Sanitization must never raise (deeply nested structures exceed the
+            # recursion limit during redact/re-serialize even when parsing was
+            # guarded): fail closed to the line-oriented path below, which
+            # bounds its own structured reads.
+            pass
     redacted = re.sub(r"https?://[^,\s]+", lambda match: _redact_secret_url(match.group(0)), value)
     redacted = re.sub(r"(?i)(bearer)\s+[^,\s]+", r"\1 [REDACTED]", redacted)
     return _redact_text_fields(redacted)
