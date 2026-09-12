@@ -917,6 +917,25 @@ def test_redact_secret_url_hides_userinfo_and_secret_query_values():
     assert "abc123" not in redacted
 
 
+def test_redact_secret_url_hides_secret_suffixed_query_keys():
+    redacted = _redact_secret_url(
+        "https://example.com/mcp?private_token=abc&session_key=def&sessionid=ghi&apikey=jkl&page=1"
+    )
+
+    assert "abc" not in redacted
+    assert "def" not in redacted
+    assert "ghi" not in redacted
+    assert "jkl" not in redacted
+    assert redacted.count("[REDACTED]") == 4
+    assert "page=1" in redacted
+
+
+def test_redact_secret_url_keeps_near_miss_query_keys():
+    url = "https://example.com/mcp?monkey=1&keyboard=us&tokenize=true"
+
+    assert _redact_secret_url(url) == url
+
+
 def test_redact_secret_url_tolerates_invalid_port():
     redacted = _redact_secret_url("https://user:password@example.com:bad/mcp?token=abc123")
 

@@ -59,6 +59,23 @@ _SECRET_URL_QUERY_KEYS = {
 }
 
 
+_SECRET_URL_QUERY_SUFFIXES = ("token", "key", "secret")
+
+
+_SECRET_URL_QUERY_FUSED_KEYS = {"apikey", "sessionid"}
+
+
+def _is_secret_url_query_key(key: str) -> bool:
+    normalized = key.lower()
+    if normalized in _SECRET_URL_QUERY_KEYS or normalized in _SECRET_URL_QUERY_FUSED_KEYS:
+        return True
+    # Composed names match only at a `_`/`-` boundary (private_token, session-key),
+    # so fused words like monkey or tokenize stay visible.
+    return any(
+        normalized.endswith(("_" + suffix, "-" + suffix)) for suffix in _SECRET_URL_QUERY_SUFFIXES
+    )
+
+
 _SECRET_OPTION_NAMES = {
     "access-token",
     "api-key",
@@ -119,7 +136,7 @@ def _redact_secret_url(value: str) -> str:
     if not query_pairs:
         return urlunsplit(parts._replace(netloc=netloc))
     redacted_query = "&".join(
-        f"{key}={'[REDACTED]' if key.lower() in _SECRET_URL_QUERY_KEYS else item_value}"
+        f"{key}={'[REDACTED]' if _is_secret_url_query_key(key) else item_value}"
         for key, item_value in query_pairs
     )
     return urlunsplit(parts._replace(netloc=netloc, query=redacted_query))
