@@ -238,6 +238,38 @@ def test_detail_age_uses_collected_at_not_wall_clock() -> None:
     assert "1h" in rendered
 
 
+def test_recent_sort_prefers_latest_activity_over_start_time() -> None:
+    """A resumed old session sorts above a less-active newer one, matching the age column."""
+    old_resumed = _session(
+        session_id="sess_oldres", started_at=_NOW - 7200, last_activity_at=_NOW - 30
+    )
+    new_idle = _session(
+        session_id="sess_newidl", started_at=_NOW - 300, last_activity_at=_NOW - 240
+    )
+
+    ordered = sessions_module._sort_sessions([new_idle, old_resumed], "recent")
+
+    assert [session.session_id for session in ordered] == ["sess_oldres", "sess_newidl"]
+
+
+def test_recent_sort_falls_back_to_started_at_without_activity() -> None:
+    older = _session(session_id="sess_older", started_at=_NOW - 7200)
+    newer = _session(session_id="sess_newer", started_at=_NOW - 300)
+
+    ordered = sessions_module._sort_sessions([older, newer], "recent")
+
+    assert [session.session_id for session in ordered] == ["sess_newer", "sess_older"]
+
+
+def test_recent_sort_tiebreaks_on_session_id() -> None:
+    sess_b = _session(session_id="sess_b", started_at=_NOW - 300, last_activity_at=_NOW - 60)
+    sess_a = _session(session_id="sess_a", started_at=_NOW - 100, last_activity_at=_NOW - 60)
+
+    ordered = sessions_module._sort_sessions([sess_a, sess_b], "recent")
+
+    assert [session.session_id for session in ordered] == ["sess_b", "sess_a"]
+
+
 def _counting_sort_spy(monkeypatch: pytest.MonkeyPatch) -> list[int]:
     calls = [0]
     real_sort = sessions_module._sort_sessions

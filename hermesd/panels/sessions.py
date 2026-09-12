@@ -404,7 +404,7 @@ def _sort_sessions(sessions: list[SessionInfo], session_sort: str) -> list[Sessi
         )
     return sorted(
         sessions,
-        key=lambda session: (session.started_at, session.session_id),
+        key=lambda session: (_activity_at(session), session.session_id),
         reverse=True,
     )
 
