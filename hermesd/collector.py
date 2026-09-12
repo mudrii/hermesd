@@ -1149,7 +1149,7 @@ class Collector:
                 model=r.get("model") or "",
                 parent_session_id=r.get("parent_session_id") or "",
                 billing_provider=r.get("billing_provider") or "",
-                billing_base_url=r.get("billing_base_url") or "",
+                billing_base_url=_redact_secret_url(r.get("billing_base_url") or ""),
                 billing_mode=r.get("billing_mode") or "",
                 end_reason=r.get("end_reason") or "",
                 context_limit=_context_limit_for(

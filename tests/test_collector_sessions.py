@@ -584,6 +584,86 @@ def test_session_parent_session_id_mapped(hermes_home: Path):
     c.close()
 
 
+def test_billing_base_url_credentials_redacted_from_state_and_snapshot(hermes_home: Path):
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, billing_base_url) VALUES (?, ?, ?, ?)",
+        (
+            "cred_sess",
+            "cli",
+            time.time(),
+            "https://user:glpat-abc123@billing.example.com/v1?token=sk-secret-123&safe=1",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    session = state.sessions[0]
+    assert session.billing_base_url == (
+        "https://[REDACTED]@billing.example.com/v1?token=[REDACTED]&safe=1"
+    )
+    endpoint_labels = [breakdown.label for breakdown in state.token_analytics.by_endpoint]
+    assert "https://[REDACTED]@billing.example.com/v1?token=[REDACTED]&safe=1" in endpoint_labels
+
+    snapshot = json.dumps(state.model_dump(mode="json"))
+    assert "glpat-abc123" not in snapshot
+    assert "sk-secret-123" not in snapshot
+    assert "billing.example.com" in snapshot
+    c.close()
+
+
+def test_billing_base_url_non_url_value_passes_through_unchanged(hermes_home: Path):
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, billing_base_url) VALUES (?, ?, ?, ?)",
+        ("plain_sess", "cli", time.time(), "internal-billing"),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.sessions[0].billing_base_url == "internal-billing"
+    labels = [breakdown.label for breakdown in state.token_analytics.by_endpoint]
+    assert "internal-billing" in labels
+    c.close()
+
+
+def test_billing_base_url_invalid_port_does_not_raise(hermes_home: Path):
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, billing_base_url) VALUES (?, ?, ?, ?)",
+        (
+            "badport_sess",
+            "cli",
+            time.time(),
+            "https://user:glpat-abc123@billing.example.com:bad/v1?token=sk-secret-123",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    state = c.collect()
+
+    assert state.sessions[0].billing_base_url == (
+        "https://[REDACTED]@billing.example.com/v1?token=[REDACTED]"
+    )
+    snapshot = json.dumps(state.model_dump(mode="json"))
+    assert "glpat-abc123" not in snapshot
+    assert "sk-secret-123" not in snapshot
+    c.close()
+
+
 def test_estimate_cost_basic():
     # 1M input tokens at $2.50/M = $2.50
     cost = _estimate_cost(1_000_000, 0, 0, 0)

@@ -7,73 +7,58 @@ import shlex
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
-_SECRET_FIELD_NAMES = {
-    "api_key",
-    "id_token",
-    "access_token",
-    "authorization",
-    "bearer",
-    "client_secret",
-    "credential",
-    "pass",
-    "passwd",
-    "pin",
-    "pwd",
-    "refresh_token",
-    "secret",
-    "token",
-    "x_api_key",
-    "x-api-key",
-    "user_token",
-}
-
-
 _OAUTH_FIELD_NAMES = {"id_token", "access_token", "refresh_token"}
 
 
 _API_KEY_FIELD_NAMES = {"api_key", "secret", "token", "user_token"}
 
 
-_SECRET_URL_QUERY_KEYS = {
-    "access_token",
-    "api_key",
+# Canonical secret-key vocabulary, matched against normalized names
+# (lowercase, `_` folded to `-` — see _secret_key_name).
+_SECRET_KEY_NAMES = {
+    "access-token",
+    "api-key",
     "auth",
-    "auth_token",
+    "auth-token",
     "authorization",
     "bearer",
-    "client_secret",
+    "client-secret",
     "credential",
-    "id_token",
+    "id-token",
     "key",
     "pass",
     "passwd",
     "password",
     "pin",
     "pwd",
-    "refresh_token",
+    "refresh-token",
     "secret",
     "token",
-    "x_api_key",
     "x-api-key",
-    "user_token",
+    "user-token",
 }
 
 
-_SECRET_URL_QUERY_SUFFIXES = ("token", "key", "secret")
+_SECRET_KEY_SUFFIXES = ("token", "key", "secret")
 
 
-_SECRET_URL_QUERY_FUSED_KEYS = {"apikey", "sessionid"}
+_SECRET_KEY_FUSED = {"apikey", "sessionid"}
+
+
+def _secret_key_name(value: object) -> str:
+    return str(value).strip().lower().replace("_", "-")
+
+
+def _is_secret_key(normalized_key: str) -> bool:
+    # Composed names match only at a `-` boundary (private-token, session-key),
+    # so fused words like monkey or tokenize stay visible.
+    if normalized_key in _SECRET_KEY_NAMES or normalized_key in _SECRET_KEY_FUSED:
+        return True
+    return any(normalized_key.endswith("-" + suffix) for suffix in _SECRET_KEY_SUFFIXES)
 
 
 def _is_secret_url_query_key(key: str) -> bool:
-    normalized = key.lower()
-    if normalized in _SECRET_URL_QUERY_KEYS or normalized in _SECRET_URL_QUERY_FUSED_KEYS:
-        return True
-    # Composed names match only at a `_`/`-` boundary (private_token, session-key),
-    # so fused words like monkey or tokenize stay visible.
-    return any(
-        normalized.endswith(("_" + suffix, "-" + suffix)) for suffix in _SECRET_URL_QUERY_SUFFIXES
-    )
+    return _is_secret_key(_secret_key_name(key))
 
 
 _SECRET_OPTION_NAMES = {
@@ -110,8 +95,9 @@ def _normalize_secret_option_name(option: str) -> str:
     return option.lstrip("-").lower().replace("_", "-")
 
 
-def _secret_key_name(value: object) -> str:
-    return str(value).strip().lower().replace("_", "-")
+def _is_secret_option(option: str) -> bool:
+    normalized = _normalize_secret_option_name(option)
+    return normalized in _SECRET_OPTION_NAMES or _is_secret_key(normalized)
 
 
 def _redact_secret_url(value: str) -> str:
@@ -155,19 +141,19 @@ def _redact_secret_args(args: object) -> list[str]:
         if isinstance(raw_arg, list):
             redacted.extend(_redact_secret_args(raw_arg))
             continue
-        if isinstance(raw_arg, dict) and _has_secret_material(raw_arg):
-            redacted.append("[REDACTED]")
+        if isinstance(raw_arg, dict):
+            redacted.append(str(_redact_secret_structure(raw_arg)))
             continue
         arg = _redact_secret_url(str(raw_arg))
         if "=" in arg:
             option, _value = arg.split("=", 1)
-            if _normalize_secret_option_name(option) in _SECRET_OPTION_NAMES:
+            if _is_secret_option(option):
                 redacted.append(f"{option}=[REDACTED]")
                 continue
             if option.startswith(("http://", "https://")):
                 redacted.append(_redact_secret_url(arg))
                 continue
-        if arg.startswith("-") and _normalize_secret_option_name(arg) in _SECRET_OPTION_NAMES:
+        if arg.startswith("-") and _is_secret_option(arg):
             redacted.append(arg)
             redact_next = True
             continue
@@ -175,14 +161,24 @@ def _redact_secret_args(args: object) -> list[str]:
     return redacted
 
 
+def _redact_secret_structure(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]"
+            if _is_secret_key(_secret_key_name(key)) and item not in (None, "")
+            else _redact_secret_structure(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_secret_structure(item) for item in value]
+    if isinstance(value, str):
+        return _redact_secret_text(value)
+    return value
+
+
 def _has_secret_material(data: dict[str, Any]) -> bool:
     for key, value in data.items():
-        key_name = _secret_key_name(key)
-        if (
-            key_name in _SECRET_FIELD_NAMES
-            or key_name in _SECRET_OPTION_NAMES
-            or key_name in _SECRET_URL_QUERY_KEYS
-        ) and value not in (None, ""):
+        if _is_secret_key(_secret_key_name(key)) and value not in (None, ""):
             return True
         if isinstance(value, str) and _looks_like_secret_value(value):
             return True
@@ -206,16 +202,35 @@ def _looks_like_secret_value(value: str) -> bool:
     return "bearer " in lowered or "authorization:" in lowered or "x-api-key" in lowered
 
 
+_SECRET_TEXT_FIELD_RE = re.compile(
+    r"(?P<key_quote>[\"']?)(?P<key>[A-Za-z0-9][A-Za-z0-9_-]*)(?P<key_end_quote>[\"']?)"
+    r"(?P<sep>\s*[=:]\s*)"
+    # Quoted values consume to the closing quote (spaces included); JSON arrays
+    # to the closing bracket; bare scalars must not start with `{` so a nested
+    # object's own key is matched on its own instead of being swallowed.
+    r"(?P<value>\"[^\"]*\"|'[^']*'|\[[^\]]*\]|[^\s,{]+)",
+    re.IGNORECASE,
+)
+
+
+def _redact_text_field(match: re.Match[str]) -> str:
+    key = match.group("key")
+    if not _is_secret_key(_secret_key_name(key)):
+        return match.group(0)
+    value = match.group("value")
+    if len(value) >= 2 and value[0] in ('"', "'") and value[-1] == value[0]:
+        value = f"{value[0]}[REDACTED]{value[0]}"
+    else:
+        value = "[REDACTED]"
+    return (
+        f"{match.group('key_quote')}{key}{match.group('key_end_quote')}{match.group('sep')}{value}"
+    )
+
+
 def _redact_secret_text(value: str) -> str:
     redacted = re.sub(r"https?://[^,\s]+", lambda match: _redact_secret_url(match.group(0)), value)
     redacted = re.sub(r"(?i)(bearer)\s+[^,\s]+", r"\1 [REDACTED]", redacted)
-    return re.sub(
-        r"(?i)(access[-_]?token|api[-_]?key|authorization|client[-_]?secret|credential|"
-        r"pass(?:word|wd)?|pwd|pin|refresh[-_]?token|secret|token|x[-_]?api[-_]?key)"
-        r"([=:]\s*)[^,\s]+",
-        r"\1\2[REDACTED]",
-        redacted,
-    )
+    return _SECRET_TEXT_FIELD_RE.sub(_redact_text_field, redacted)
 
 
 def _safe_exception_text(exc: Exception) -> str:

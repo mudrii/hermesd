@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from hermesd.collect.common import _as_list, _coerce_float, _coerce_int
+from hermesd.collect.redaction import _redact_secret_url
 from hermesd.file_cache import _read_capped
 from hermesd.models import (
     AUTHORITATIVE_COST_STATUSES,
@@ -91,7 +92,9 @@ def _count_cost_statuses(rows: list[dict[str, Any]]) -> dict[str, int]:
 def _summarize_breakdown(rows: list[dict[str, Any]], key_name: str) -> list[TokenBreakdown]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        label = str(row.get(key_name) or "unknown")
+        # Breakdown labels are rendered and serialized; URL-shaped values such
+        # as billing_base_url may carry userinfo or secret query params.
+        label = _redact_secret_url(str(row.get(key_name) or "unknown"))
         grouped.setdefault(label, []).append(row)
 
     summaries = []

@@ -22,6 +22,7 @@ from hermesd.collector import (
     _path_resolves_under,
     _redact_command_string,
     _redact_secret_args,
+    _redact_secret_text,
     _redact_secret_url,
 )
 from hermesd.models import DashboardState
@@ -981,6 +982,61 @@ def test_redact_command_string_with_unbalanced_quotes_falls_back_to_text_redacti
     redacted = _redact_command_string("run --token=secret-value 'unbalanced")
     assert "secret-value" not in redacted
     assert "[REDACTED]" in redacted
+
+
+def test_redact_secret_text_redacts_json_style_pairs():
+    redacted = _redact_secret_text('{"api_key": "sk-secret-123"}')
+
+    assert "sk-secret-123" not in redacted
+    assert "[REDACTED]" in redacted
+
+
+def test_redact_secret_text_redacts_nested_json_objects():
+    redacted = _redact_secret_text('{"outer": {"private_token": "glpat-abc123", "page": 1}}')
+
+    assert "glpat-abc123" not in redacted
+    assert "[REDACTED]" in redacted
+    assert "page" in redacted
+
+
+def test_redact_secret_text_masks_quoted_values_with_spaces():
+    assert _redact_secret_text('password="my secret pass"') == 'password="[REDACTED]"'
+
+    spaced = _redact_secret_text('password = "x y"')
+    assert "x y" not in spaced
+    assert "[REDACTED]" in spaced
+
+
+def test_redact_secret_text_preserves_unquoted_and_non_secret_forms():
+    assert _redact_secret_text("api_key=sk-secret-123") == "api_key=[REDACTED]"
+    assert _redact_secret_text("token: abc123") == "token: [REDACTED]"
+    assert _redact_secret_text("page=1") == "page=1"
+    assert _redact_secret_text("monkey=1") == "monkey=1"
+
+
+def test_redact_secret_args_redacts_nested_dicts_and_lists():
+    redacted = _redact_secret_args(
+        [
+            "--config",
+            {"private_token": "glpat-abc123"},
+            [{"items": [{"session_key": "sk-secret-123"}, "plain"]}],
+            {"page": 1},
+        ]
+    )
+
+    text = " ".join(redacted)
+    assert "glpat-abc123" not in text
+    assert "sk-secret-123" not in text
+    assert "[REDACTED]" in text
+    assert "plain" in text
+    assert "page" in text
+
+
+def test_has_secret_material_matches_composed_secret_keys():
+    assert _has_secret_material({"private_token": "glpat-abc123"}) is True
+    assert _has_secret_material({"x-api-key": "sk-secret-123"}) is True
+    assert _has_secret_material({"monkey": "1"}) is False
+    assert _has_secret_material({"keyboard": "us"}) is False
 
 
 def test_collect_available_tools_from_session_json(hermes_home: Path):
