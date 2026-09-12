@@ -123,7 +123,17 @@ class LastGoodFileCache:
                 return self._stale(key, values, default_factory)
             try:
                 value = load()
-            except load_errors:
+            except load_errors as exc:
+                # Transient I/O failures (permission, lock, file vanished
+                # between stat and open) must NOT poison the mtime: the file
+                # may be readable again on the next refresh with the same
+                # mtime, and bad-marking would serve the stale value forever.
+                # Deterministic content failures (decode, parse) keep the
+                # bad-mtime cache so the file is not re-parsed every refresh.
+                # _OversizedFileError subclasses OSError but is a deterministic
+                # size rejection, so it is excluded from the transient branch.
+                if isinstance(exc, OSError) and not isinstance(exc, _OversizedFileError):
+                    return self._stale(key, values, default_factory)
                 bad_mtimes[key] = mtime
                 return self._stale(key, values, default_factory)
             if not is_valid(value):

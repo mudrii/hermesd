@@ -387,3 +387,101 @@ def test_file_just_under_the_cap_still_loads(tmp_path):
     assert path.stat().st_size < _MAX_PARSED_FILE_BYTES
 
     assert cache.read_json_mapping(path)["pad"].startswith("p")
+
+
+@pytest.mark.parametrize("kind", ["json", "yaml"])
+def test_transient_open_failure_recovers_without_mtime_change(tmp_path, monkeypatch, kind):
+    """A PermissionError mid-load must not poison the mtime as permanently bad.
+
+    The file's content changes (new mtime) while the open fails: the cache
+    serves the last-good value and marks the read stale, but — unlike a parse
+    error — it must NOT record the new mtime as bad. Once access is restored
+    with the SAME mtime, the very next refresh returns the new value without
+    any mtime change, and the stale flag clears.
+    """
+    cache = LastGoodFileCache()
+    path = tmp_path / f"data.{kind}"
+    if kind == "json":
+        path.write_text('{"v": 1}')
+        read = cache.read_json_mapping
+    else:
+        path.write_text("v: 1\n")
+        read = cache.read_yaml_mapping
+    assert read(path) == {"v": 1}
+
+    # Swap in new content (new mtime), then make open fail.
+    if kind == "json":
+        path.write_text('{"v": 2}')
+    else:
+        path.write_text("v: 2\n")
+
+    real_open = Path.open
+    open_calls = 0
+
+    def failing_open(self: Path, *args, **kwargs):
+        nonlocal open_calls
+        if self == path:
+            open_calls += 1
+            raise PermissionError("file locked by another process")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+
+    assert read(path) == {"v": 1}
+    assert cache.last_read_was_stale(path) is True
+    # Not bad-mtime cached: a second failed read retries the open instead of
+    # short-circuiting on the poisoned mtime (parse errors stay cached — see
+    # the *_invalid_shape_reuses_bad_mtime tests).
+    assert read(path) == {"v": 1}
+    assert open_calls == 2
+
+    monkeypatch.undo()
+    assert read(path) == {"v": 2}
+    assert cache.last_read_was_stale(path) is False
+
+
+def test_transient_oserror_on_never_readable_file_returns_default(tmp_path, monkeypatch):
+    """A transient I/O failure with no cached value yields the default and no stale flag."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "data.json"
+    path.write_text(json.dumps({"v": 1}))
+
+    real_open = Path.open
+
+    def failing_open(self: Path, *args, **kwargs):
+        if self == path:
+            raise OSError("transient read failure")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+
+    assert cache.read_json_mapping(path) == {}
+    assert cache.last_read_was_stale(path) is False
+
+
+def test_invalid_utf8_keeps_bad_mtime_caching(tmp_path, monkeypatch):
+    """UnicodeDecodeError is a content (decode) failure, not transient I/O.
+
+    The same bytes always fail to decode, so — like a parse error — the mtime
+    is remembered as bad and the file is not re-opened every refresh.
+    """
+    cache = LastGoodFileCache()
+    path = tmp_path / "data.json"
+    path.write_text('{"ok": 1}')
+    assert cache.read_json_mapping(path) == {"ok": 1}
+
+    path.write_bytes(b"\xff")
+    open_calls = 0
+    real_open = Path.open
+
+    def counting_open(self: Path, *args, **kwargs):
+        nonlocal open_calls
+        if self == path:
+            open_calls += 1
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+
+    assert cache.read_json_mapping(path) == {"ok": 1}
+    assert cache.read_json_mapping(path) == {"ok": 1}
+    assert open_calls == 1
