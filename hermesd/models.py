@@ -398,6 +398,16 @@ class CronExecutionsState(BaseModel):
     open_incident_count: int = 0
     unacked_incident_count: int = 0
     open_incidents: list[CronIncident] = Field(default_factory=list)
+    # Retention. Upstream prunes terminal history to a fixed record cap, so every
+    # aggregate above describes *recorded* attempts rather than every attempt that
+    # happened. ``retention_cap`` is 0 when the table could not be read, which is
+    # not the same as a cap of zero.
+    retained_total_count: int = 0
+    retained_terminal_count: int = 0
+    retention_cap: int = 0
+    at_retention_cap: bool = False
+    oldest_claimed_age_seconds: float | None = None
+    newest_claimed_age_seconds: float | None = None
 
 
 class CronState(BaseModel):

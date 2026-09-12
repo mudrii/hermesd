@@ -405,6 +405,87 @@ def test_cron_detail_omits_delivery_when_the_schema_does_not_track_it() -> None:
     assert "delivered" not in text
 
 
+# F08 — aggregates cover *recorded* attempts, not every attempt that happened.
+
+
+def _retention_state(**kwargs) -> DashboardState:
+    fields = {
+        "db_present": True,
+        "retained_total_count": 40,
+        "retained_terminal_count": 40,
+        "retention_cap": 1000,
+        "oldest_claimed_age_seconds": 7200.0,
+        "newest_claimed_age_seconds": 60.0,
+        "recent": [
+            CronExecution(execution_id="e1", job_id="job-a", job_name="alpha", status="completed")
+        ],
+    }
+    fields.update(kwargs)
+    return DashboardState(
+        cron=CronState(job_count=1, jobs=[CronJob(job_id="job-a", name="alpha")]),
+        cron_executions=_executions_state(**fields),
+    )
+
+
+def test_cron_detail_labels_counts_as_recorded_attempts() -> None:
+    text = render_to_str(
+        render_cron(_retention_state(), Theme(), detail=True), width=160, no_color=True
+    )
+
+    assert "Recorded attempts" in text
+    assert "40 retained" in text
+    assert "40 terminal" in text
+
+
+def test_cron_detail_shows_the_observed_history_span() -> None:
+    text = render_to_str(
+        render_cron(_retention_state(), Theme(), detail=True), width=160, no_color=True
+    )
+
+    assert "spanning" in text
+
+
+def test_cron_detail_warns_when_history_reaches_the_retention_cap() -> None:
+    state = _retention_state(
+        retained_total_count=1000, retained_terminal_count=1000, at_retention_cap=True
+    )
+
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "1000-record retention cap" in text
+    assert "recorded attempts only" in text
+
+
+def test_cron_retention_warning_does_not_claim_the_window_is_incomplete() -> None:
+    """Reaching the cap is not evidence about any particular 24h window."""
+    state = _retention_state(
+        retained_total_count=1000, retained_terminal_count=1000, at_retention_cap=True
+    )
+
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=400, no_color=True)
+
+    assert "does not by itself make the 24h window incomplete" in text
+
+
+def test_cron_detail_omits_the_cap_warning_below_the_cap() -> None:
+    text = render_to_str(
+        render_cron(_retention_state(), Theme(), detail=True), width=160, no_color=True
+    )
+
+    assert "retention cap" not in text
+
+
+def test_cron_detail_omits_recorded_attempts_without_a_database() -> None:
+    state = DashboardState(
+        cron=CronState(job_count=1, jobs=[CronJob(job_id="job-a", name="alpha")]),
+        cron_executions=_executions_state(),
+    )
+
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "Recorded attempts" not in text
+
+
 def test_cron_detail_job_without_execution_history_shows_dash() -> None:
     state = DashboardState(
         cron=CronState(job_count=1, jobs=[CronJob(job_id="job-a", name="alpha")]),

@@ -343,6 +343,13 @@ _EXECUTIONS_OPTIONAL_COLUMNS = ("delivery_outcome", "handoff_pending", "schedule
 # never bounded, only the vocabulary, so an untrusted value cannot grow the map.
 _DELIVERY_OUTCOME_KIND_LIMIT = 8
 
+# Upstream's MAX_TERMINAL_EXECUTIONS: terminal history is pruned to this many
+# records, keeping the newest by finished_at. In-flight rows are never pruned.
+_MAX_TERMINAL_EXECUTIONS = 1000
+# The statuses upstream treats as terminal for that pruning. 'unknown' counts,
+# which is why it has to be a reported bucket rather than a discarded one.
+_EXECUTIONS_TERMINAL_STATUSES = ("completed", "failed", "unknown")
+
 
 def _executions_columns(conn: sqlite3.Connection) -> set[str]:
     """Column names of the executions table, introspected once per read pass.
@@ -457,6 +464,40 @@ def _execution_delivery_rows(
     )
 
 
+def _execution_retention_fields(
+    conn: sqlite3.Connection, *, now: float, columns: set[str]
+) -> dict[str, Any]:
+    """Recorded-attempt counts plus the observed span of retained history.
+
+    Upstream prunes terminal executions to ``_MAX_TERMINAL_EXECUTIONS`` records,
+    so these qualify every aggregate as *recorded* attempts. Reaching the cap
+    proves older terminal rows were dropped; it does not prove any particular 24h
+    window is incomplete, and staying under it does not prove full coverage.
+    """
+    terminal_statuses = ", ".join(f"'{status}'" for status in _EXECUTIONS_TERMINAL_STATUSES)
+    rows = _execution_rows(
+        conn,
+        "SELECT COUNT(*) AS total, "
+        f"SUM(CASE WHEN status IN ({terminal_statuses}) THEN 1 ELSE 0 END) AS terminal, "
+        "MIN(hermes_epoch(claimed_at)) AS oldest_epoch, "
+        "MAX(hermes_epoch(claimed_at)) AS newest_epoch "
+        "FROM executions",
+        columns=columns,
+    )
+    if not rows:
+        return {}
+    row = rows[0]
+    terminal = int(row.get("terminal") or 0)
+    return {
+        "retained_total_count": int(row.get("total") or 0),
+        "retained_terminal_count": terminal,
+        "retention_cap": _MAX_TERMINAL_EXECUTIONS,
+        "at_retention_cap": terminal >= _MAX_TERMINAL_EXECUTIONS,
+        "oldest_claimed_age_seconds": _age_seconds(row.get("oldest_epoch"), now),
+        "newest_claimed_age_seconds": _age_seconds(row.get("newest_epoch"), now),
+    }
+
+
 def _last_execution_rows(conn: sqlite3.Connection, *, columns: set[str]) -> list[dict[str, Any]]:
     """Each job's newest execution (claimed_at, then id), one row per job."""
     select = _execution_select_columns(columns)
@@ -561,6 +602,7 @@ def _read_cron_executions_state(
             open_incident_count=open_count,
             unacked_incident_count=unacked_count,
             open_incidents=incidents,
+            **_execution_retention_fields(conn, now=now, columns=columns),
         )
 
 

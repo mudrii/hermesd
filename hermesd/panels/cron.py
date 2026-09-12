@@ -297,6 +297,9 @@ def _executions_sections(executions: CronExecutionsState, theme: Theme) -> list[
     if not executions.recent and not executions.open_incidents:
         return [Text("\n  No execution history\n", style=theme.banner_dim)]
     sections: list[RenderableType] = []
+    retention = _retention_line(executions, theme)
+    if retention is not None:
+        sections.append(retention)
     if executions.recent:
         sections.append(section_heading("Recent Executions", theme))
         sections.append(_recent_executions_table(executions, theme))
@@ -310,6 +313,38 @@ def _executions_sections(executions: CronExecutionsState, theme: Theme) -> list[
         )
         sections.append(_incidents_table(executions, theme))
     return sections
+
+
+def _retention_line(executions: CronExecutionsState, theme: Theme) -> Text | None:
+    """Qualify the aggregates as *recorded* attempts, with the observed span.
+
+    Upstream prunes terminal history to a fixed record cap. Reaching the cap
+    proves older terminal runs were dropped; it does not prove any particular 24h
+    window is incomplete, and staying under it does not prove full coverage. The
+    wording states only what the retained table can support.
+    """
+    if not executions.db_present or not executions.retained_total_count:
+        return None
+    line = Text("\n  ")
+    line.append("Recorded attempts: ", style=theme.ui_label)
+    line.append(f"{executions.retained_total_count} retained", style=theme.banner_text)
+    line.append(f" ({executions.retained_terminal_count} terminal)", style=theme.banner_dim)
+    if executions.oldest_claimed_age_seconds is not None:
+        line.append(
+            f"  spanning {_fmt_age(executions.newest_claimed_age_seconds)}"
+            f" to {_fmt_age(executions.oldest_claimed_age_seconds)} ago",
+            style=theme.banner_dim,
+        )
+    if executions.at_retention_cap:
+        line.append(
+            f"\n  ⚠ at the {executions.retention_cap}-record retention cap — older terminal runs"
+            " are pruned, so these counts cover recorded attempts only. A capped history does"
+            " not by itself make the 24h window incomplete.\n",
+            style=theme.ui_warn,
+        )
+    else:
+        line.append("\n")
+    return line
 
 
 def _recent_executions_table(executions: CronExecutionsState, theme: Theme) -> Table:

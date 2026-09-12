@@ -1208,6 +1208,115 @@ def test_recent_execution_rows_carry_delivery_and_schedule(hermes_home: Path):
     assert state.cron_executions.job_stats[0].last_status == "completed"
 
 
+# F08 — upstream prunes terminal history to MAX_TERMINAL_EXECUTIONS records, so
+# every aggregate describes *recorded* attempts. Reaching the cap does not prove
+# a given 24h window is incomplete, and staying under it does not prove complete
+# coverage either; the qualification has to say what is actually known.
+
+
+def _write_history(home: Path, rows: list[tuple[str, str]], *, offset: float = 60.0) -> Path:
+    db_path = home / "cron" / "executions.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        create_cron_executions_tables(conn)
+        for index, (job_id, status) in enumerate(rows):
+            insert_cron_execution(
+                conn,
+                f"e{index}",
+                job_id,
+                status,
+                claimed_at=iso_ago(offset + index),
+                started_at=iso_ago(offset + index),
+                finished_at=iso_ago(offset + index - 1) if status != "running" else None,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def _collect_executions(home: Path):
+    c = Collector(home)
+    try:
+        return c.collect().cron_executions
+    finally:
+        c.close()
+
+
+def test_retention_exposes_recorded_counts_and_observed_bounds(hermes_home: Path):
+    _write_history(hermes_home, [("job-a", "completed")] * 3 + [("job-a", "failed")])
+
+    executions = _collect_executions(hermes_home)
+
+    assert executions.retained_total_count == 4
+    assert executions.retained_terminal_count == 4
+    assert executions.retention_cap == 1000
+    assert executions.at_retention_cap is False
+    assert executions.newest_claimed_age_seconds is not None
+    assert executions.oldest_claimed_age_seconds is not None
+    assert executions.oldest_claimed_age_seconds > executions.newest_claimed_age_seconds
+
+
+def test_long_running_attempts_are_recorded_but_not_terminal(hermes_home: Path):
+    """Upstream prunes only terminal rows, so an in-flight attempt is never capped out."""
+    _write_history(
+        hermes_home,
+        [("job-a", "completed"), ("job-a", "running"), ("job-a", "claimed"), ("job-a", "unknown")],
+    )
+
+    executions = _collect_executions(hermes_home)
+
+    assert executions.retained_total_count == 4
+    assert executions.retained_terminal_count == 2
+
+
+def test_history_at_the_retention_cap_is_flagged(hermes_home: Path):
+    _write_history(hermes_home, [("job-a", "completed")] * 1000, offset=1.0)
+
+    executions = _collect_executions(hermes_home)
+
+    assert executions.retained_terminal_count == 1000
+    assert executions.at_retention_cap is True
+
+
+def test_history_just_below_the_retention_cap_is_not_flagged(hermes_home: Path):
+    _write_history(hermes_home, [("job-a", "completed")] * 999, offset=1.0)
+
+    executions = _collect_executions(hermes_home)
+
+    assert executions.retained_terminal_count == 999
+    assert executions.at_retention_cap is False
+
+
+def test_absent_executions_db_reports_no_retention_evidence(hermes_home: Path):
+    executions = _collect_executions(hermes_home)
+
+    assert executions.db_present is False
+    assert executions.retained_total_count == 0
+    assert executions.retention_cap == 0
+    assert executions.at_retention_cap is False
+    assert executions.oldest_claimed_age_seconds is None
+
+
+def test_retention_bounds_ignore_unparseable_timestamps(hermes_home: Path):
+    db_path = hermes_home / "cron" / "executions.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        create_cron_executions_tables(conn)
+        insert_cron_execution(conn, "e1", "job-a", "completed", claimed_at="not-a-timestamp")
+        insert_cron_execution(conn, "e2", "job-a", "completed", claimed_at=iso_ago(120))
+        conn.commit()
+    finally:
+        conn.close()
+
+    executions = _collect_executions(hermes_home)
+
+    assert executions.retained_total_count == 2
+    assert executions.newest_claimed_age_seconds == pytest.approx(120.0, abs=5.0)
+
+
 def test_collect_cron_executions_last_run_status_duration_and_error(
     hermes_home: Path, sample_cron_executions_db: Path
 ):
