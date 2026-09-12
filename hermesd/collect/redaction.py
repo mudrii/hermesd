@@ -240,8 +240,11 @@ def _looks_like_secret_value(value: str) -> bool:
     return "bearer " in lowered or "authorization:" in lowered or "x-api-key" in lowered
 
 
+# The key run is length-bounded: an unbounded [A-Za-z0-9_-]* backtracks at
+# every letter position over long runs (base64 blobs, minified JS), turning
+# this per-log-line finditer scan quadratic.
 _SECRET_TEXT_FIELD_RE = re.compile(
-    r"(?P<key_quote>[\"']?)(?P<key>[A-Za-z0-9][A-Za-z0-9_-]*)(?P<key_end_quote>[\"']?)"
+    r"(?P<key_quote>[\"']?)(?P<key>[A-Za-z0-9][A-Za-z0-9_-]{0,63})(?P<key_end_quote>[\"']?)"
     r"(?P<sep>\s*[=:]\s*)",
     re.IGNORECASE,
 )
@@ -250,7 +253,7 @@ _SECRET_TEXT_FIELD_RE = re.compile(
 # value stays visible: URLs are sanitized by the pre-pass in _redact_secret_text
 # before field redaction runs.
 _SECRET_TEXT_VALUE_RE = re.compile(
-    r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:(?!\s+(?i:[a-z][a-z0-9+.-]*)://)[^,}\]\r\n])+"""
+    r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:(?!\s+(?i:[a-z][a-z0-9+.-]{0,31})://)[^,}\]\r\n])+"""
 )
 
 
@@ -294,8 +297,13 @@ def _redact_secret_text(value: str) -> str:
             # guarded): fail closed to the line-oriented path below, which
             # bounds its own structured reads.
             pass
+    # The scheme run is length-bounded: an unbounded [a-z0-9+.-]* backtracks at
+    # every start position over long letter runs (base64 blobs, minified JS),
+    # turning this per-log-line scan quadratic.
     redacted = re.sub(
-        r"(?i)[a-z][a-z0-9+.-]*://[^,\s]+", lambda match: _redact_secret_url(match.group(0)), value
+        r"(?i)[a-z][a-z0-9+.-]{0,31}://[^,\s]+",
+        lambda match: _redact_secret_url(match.group(0)),
+        value,
     )
     redacted = re.sub(r"(?i)(bearer)\s+[^,\s]+", r"\1 [REDACTED]", redacted)
     return _redact_text_fields(redacted)

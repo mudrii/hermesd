@@ -1084,6 +1084,14 @@ def test_redact_secret_text_multi_word_bare_value_preserves_following_ftp_url():
     assert redacted == "password=[REDACTED] ftp://[REDACTED]@host/x"
 
 
+def test_redact_secret_text_long_letter_run_stays_linear():
+    # 30k scheme-charset letters without "://": the unbounded scheme pattern
+    # backtracked per start position (seconds); the bounded one is linear.
+    redacted = _redact_secret_text("x" * 30_000)
+
+    assert redacted == "x" * 30_000
+
+
 def test_redact_command_string_redacts_url_credentials_in_key_value_form():
     redacted = _redact_command_string("mcp-server url=https://user:pw@host/x?token=t1")
 
