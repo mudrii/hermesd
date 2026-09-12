@@ -14,6 +14,7 @@ from subprocess import CompletedProcess
 import pytest
 import yaml
 
+import hermesd.collect.operations as operations_module
 import hermesd.collect.sqlite_util as sqlite_util_module
 import hermesd.collector as collector_module
 import hermesd.db as db_module
@@ -1975,3 +1976,46 @@ def test_symlinked_build_stamps_outside_home_read_as_absent(hermes_home: Path, t
     assert state.operations.web_ui_build_hash == ""
     assert state.operations.web_ui_built_age_seconds is None
     assert "operations" not in state.health.failed_sources
+
+
+def test_delegation_rows_read_error_fails_source_and_keeps_last_good(
+    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A failing async_delegations read is a source failure, not an empty list."""
+    conn = _open_state_db(hermes_home)
+    create_state_db_tables(conn)
+    create_async_delegations_table(conn)
+    insert_delegation(conn, "deleg_keep")
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=_fixed_clock)
+    try:
+        first = c.collect()
+        assert [d.delegation_id for d in first.operations.delegations] == ["deleg_keep"]
+        assert "operations" not in first.health.failed_sources
+
+        real_query_rows = operations_module._query_rows
+
+        def flaky_query_rows(conn, sql, *args):
+            if "FROM async_delegations ORDER BY" in sql:
+                raise sqlite3.OperationalError("simulated delegation read failure")
+            return real_query_rows(conn, sql, *args)
+
+        # The state.db readout is cached by mtime; bump it to force a re-read.
+        bumped = (hermes_home / "state.db").stat().st_mtime + 10
+        os.utime(hermes_home / "state.db", (bumped, bumped))
+
+        monkeypatch.setattr(operations_module, "_query_rows", flaky_query_rows)
+        second = c.collect()
+        assert "operations" in second.health.failed_sources
+        assert second.operations == first.operations
+
+        monkeypatch.setattr(operations_module, "_query_rows", real_query_rows)
+        bumped = (hermes_home / "state.db").stat().st_mtime + 10
+        os.utime(hermes_home / "state.db", (bumped, bumped))
+        third = c.collect()
+        assert "operations" not in third.health.failed_sources
+        assert [d.delegation_id for d in third.operations.delegations] == ["deleg_keep"]
+    finally:
+        c.close()

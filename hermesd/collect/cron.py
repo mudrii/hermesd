@@ -27,6 +27,7 @@ from hermesd.collect.common import (
 from hermesd.collect.logs import _MAX_LOG_LINE_CHARS
 from hermesd.collect.redaction import _redact_secret_text
 from hermesd.collect.sqlite_util import (
+    _column_exists,
     _connect_readonly_sqlite,
     _count_rows,
     _query_rows,
@@ -288,19 +289,42 @@ def _job_execution_stats(
     return list(stats.values())
 
 
+# Columns every executions read relies on; an executions table without them is
+# a foreign schema (older/newer agent), which degrades to empty instead of
+# failing the source.
+_EXECUTIONS_REQUIRED_COLUMNS = (
+    "id",
+    "job_id",
+    "status",
+    "claimed_at",
+    "started_at",
+    "finished_at",
+    "error",
+)
+
+
+def _executions_schema_compatible(conn: sqlite3.Connection) -> bool:
+    """True when the executions table exists with every column the reads use."""
+    return _table_exists(conn, "executions") and all(
+        _column_exists(conn, "executions", column) for column in _EXECUTIONS_REQUIRED_COLUMNS
+    )
+
+
 def _recent_execution_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    """The newest _EXECUTIONS_SCAN_LIMIT executions, or [] when the table is absent."""
-    if not _table_exists(conn, "executions"):
+    """The newest _EXECUTIONS_SCAN_LIMIT executions, [] on a missing/foreign schema.
+
+    Operational read errors propagate so the cron_executions source fails to
+    its last-good value instead of reporting a false empty history.
+    """
+    if not _executions_schema_compatible(conn):
         return []
-    with contextlib.suppress(sqlite3.Error):
-        # The LIMIT is a module-level int constant, never caller-supplied text.
-        return _query_rows(
-            conn,
-            "SELECT id, job_id, status, claimed_at, started_at, finished_at, error "
-            "FROM executions ORDER BY claimed_at DESC, id DESC "
-            f"LIMIT {_EXECUTIONS_SCAN_LIMIT}",
-        )
-    return []
+    # The LIMIT is a module-level int constant, never caller-supplied text.
+    return _query_rows(
+        conn,
+        "SELECT id, job_id, status, claimed_at, started_at, finished_at, error "
+        "FROM executions ORDER BY claimed_at DESC, id DESC "
+        f"LIMIT {_EXECUTIONS_SCAN_LIMIT}",
+    )
 
 
 def _incident_from_row(
@@ -330,7 +354,11 @@ def _read_cron_incidents(
     *,
     now: float,
 ) -> tuple[int, int, list[CronIncident]]:
-    """Open/unacked incident counts plus the latest few open incidents."""
+    """Open/unacked incident counts plus the latest few open incidents.
+
+    A missing cron_incidents table (older agents) reads as zeros; operational
+    read errors propagate so the source fails to its last-good value.
+    """
     if not _table_exists(conn, "cron_incidents"):
         return 0, 0, []
     open_clause = "WHERE COALESCE(state, '') != 'closed' AND closed_at IS NULL"
@@ -339,14 +367,12 @@ def _read_cron_incidents(
         conn,
         f"SELECT COUNT(*) FROM cron_incidents {open_clause} AND acked_at IS NULL",
     )
-    rows: list[dict[str, Any]] = []
-    with contextlib.suppress(sqlite3.Error):
-        rows = _query_rows(
-            conn,
-            "SELECT id, job_id, state, failure_type, first_seen_at, last_seen_at, error "
-            f"FROM cron_incidents {open_clause} ORDER BY last_seen_at DESC, id DESC "
-            f"LIMIT {_INCIDENTS_LIMIT}",
-        )
+    rows = _query_rows(
+        conn,
+        "SELECT id, job_id, state, failure_type, first_seen_at, last_seen_at, error "
+        f"FROM cron_incidents {open_clause} ORDER BY last_seen_at DESC, id DESC "
+        f"LIMIT {_INCIDENTS_LIMIT}",
+    )
     return open_count, unacked_count, [_incident_from_row(row, job_names, now=now) for row in rows]
 
 

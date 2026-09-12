@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -147,34 +146,56 @@ def _stale_claim_count_from_tasks(
 
 
 def _read_task_links(conn: sqlite3.Connection) -> list[KanbanTaskLink]:
-    with contextlib.suppress(sqlite3.Error):
-        rows = _query_rows(
-            conn,
-            "SELECT parent_id, child_id FROM task_links "
-            "ORDER BY COALESCE(parent_id, ''), COALESCE(child_id, '') LIMIT 20",
+    """Parent/child links, [] on a pre-links schema; read errors propagate so the
+    kanban source fails to its last-good value instead of reporting false empty."""
+    if not _table_exists(conn, "task_links"):
+        return []
+    rows = _query_rows(
+        conn,
+        "SELECT parent_id, child_id FROM task_links "
+        "ORDER BY COALESCE(parent_id, ''), COALESCE(child_id, '') LIMIT 20",
+    )
+    return [
+        KanbanTaskLink(
+            parent_id=str(row.get("parent_id") or ""),
+            child_id=str(row.get("child_id") or ""),
         )
-        return [
-            KanbanTaskLink(
-                parent_id=str(row.get("parent_id") or ""),
-                child_id=str(row.get("child_id") or ""),
-            )
-            for row in rows
-        ]
-    return []
+        for row in rows
+    ]
+
+
+# Text columns that postdate the original kanban tasks schema; each one is
+# optional, so only columns confirmed present may appear in the query.
+_ENRICHED_TASK_TEXT_COLUMNS = ("workspace_path", "goal_mode", "current_step_key", "branch_name")
 
 
 def _read_recent_enriched_tasks(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    with contextlib.suppress(sqlite3.Error):
-        return _query_rows(
-            conn,
-            "SELECT * FROM tasks "
-            "WHERE completed_at IS NOT NULL OR COALESCE(workspace_path, '') != '' "
-            "OR COALESCE(goal_mode, '') != '' OR COALESCE(current_step_key, '') != '' "
-            "OR COALESCE(branch_name, '') != '' "
-            "ORDER BY COALESCE(completed_at, last_heartbeat_at, started_at, created_at, 0) "
-            "DESC LIMIT 10",
-        )
-    return []
+    """Recent tasks with completion/workspace enrichment, [] when no enrichment
+    column exists; read errors propagate to the kanban source's last-good fallback.
+
+    The heartbeat/start/created sort keys are guaranteed present: the active-
+    and problem-task reads above this call already reference them unguarded.
+    """
+    conditions = []
+    order_columns = []
+    if _column_exists(conn, "tasks", "completed_at"):
+        conditions.append("completed_at IS NOT NULL")
+        order_columns.append("completed_at")
+    conditions.extend(
+        f"COALESCE({column}, '') != ''"
+        for column in _ENRICHED_TASK_TEXT_COLUMNS
+        if _column_exists(conn, "tasks", column)
+    )
+    if not conditions:
+        return []
+    order_columns.extend(("last_heartbeat_at", "started_at", "created_at"))
+    # Column names are module-level constants, never caller-supplied text.
+    return _query_rows(
+        conn,
+        "SELECT * FROM tasks WHERE "
+        + " OR ".join(conditions)
+        + f" ORDER BY COALESCE({', '.join(order_columns)}, 0) DESC LIMIT 10",
+    )
 
 
 def _kanban_task_from_row(row: dict[str, Any]) -> KanbanTaskSummary:

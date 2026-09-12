@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+import hermesd.collect.cron as cron_module
 from hermesd.collect.cron import (
     _EXECUTIONS_RECENT_LIMIT,
     _EXECUTIONS_SCAN_LIMIT,
@@ -1499,6 +1500,66 @@ def test_symlinked_executions_db_after_a_good_read_keeps_last_good(
 
     assert second.cron_executions == first.cron_executions
     assert "cron_executions" in second.health.failed_sources
+
+
+def test_cron_executions_query_error_fails_source_and_keeps_last_good(
+    hermes_home: Path, sample_cron_executions_db: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A failing executions read is a source failure, not an empty history."""
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert first.cron_executions.recent
+        assert "cron_executions" not in first.health.failed_sources
+
+        real_query_rows = cron_module._query_rows
+
+        def flaky_query_rows(conn, sql, *args):
+            if "FROM executions ORDER BY" in sql:
+                raise sqlite3.OperationalError("simulated executions read failure")
+            return real_query_rows(conn, sql, *args)
+
+        monkeypatch.setattr(cron_module, "_query_rows", flaky_query_rows)
+        second = c.collect()
+        assert "cron_executions" in second.health.failed_sources
+        assert second.cron_executions == first.cron_executions
+
+        monkeypatch.setattr(cron_module, "_query_rows", real_query_rows)
+        third = c.collect()
+        assert "cron_executions" not in third.health.failed_sources
+        assert third.cron_executions.recent
+    finally:
+        c.close()
+
+
+def test_cron_incidents_query_error_fails_source_and_keeps_last_good(
+    hermes_home: Path, sample_cron_executions_db: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A failing cron_incidents read is a source failure, not an empty list."""
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert first.cron_executions.open_incidents
+        assert "cron_executions" not in first.health.failed_sources
+
+        real_query_rows = cron_module._query_rows
+
+        def flaky_query_rows(conn, sql, *args):
+            if "FROM cron_incidents" in sql and "ORDER BY" in sql:
+                raise sqlite3.OperationalError("simulated incidents read failure")
+            return real_query_rows(conn, sql, *args)
+
+        monkeypatch.setattr(cron_module, "_query_rows", flaky_query_rows)
+        second = c.collect()
+        assert "cron_executions" in second.health.failed_sources
+        assert second.cron_executions == first.cron_executions
+
+        monkeypatch.setattr(cron_module, "_query_rows", real_query_rows)
+        third = c.collect()
+        assert "cron_executions" not in third.health.failed_sources
+        assert third.cron_executions.open_incidents
+    finally:
+        c.close()
 
 
 def test_cron_ticker_stamps_ignore_symlinks_outside_home(hermes_home: Path, tmp_path: Path):

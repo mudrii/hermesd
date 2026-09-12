@@ -8,6 +8,8 @@ from pathlib import Path
 
 import yaml
 
+import hermesd.collect.kanban as kanban_module
+from hermesd.collect.kanban import _read_recent_enriched_tasks
 from hermesd.collector import (
     Collector,
     _read_kanban_state,
@@ -570,3 +572,156 @@ def test_kanban_skips_board_when_wal_snapshot_fails(
     slugs = [board.slug for board in state.kanban.boards]
     assert "healthy" in slugs
     assert "broken" not in slugs
+
+
+# ---------------------------------------------------------------------------
+# Optional-table reads: absent is empty, read errors fail the source
+# ---------------------------------------------------------------------------
+
+
+def test_kanban_task_links_missing_table_is_an_empty_success(hermes_home: Path):
+    """A pre-links schema has no task_links table: empty result, healthy source."""
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    create_kanban_db_tables(conn)
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "kanban" not in state.health.failed_sources
+    assert state.kanban.db_present is True
+    assert state.kanban.task_links == []
+    assert state.kanban.link_count == 0
+
+
+def test_kanban_task_links_read_error_fails_source_and_keeps_last_good(
+    hermes_home: Path, monkeypatch
+):
+    """A failing task_links read is a source failure, not an empty list."""
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    create_kanban_db_tables(conn)
+    conn.execute("CREATE TABLE task_links (parent_id TEXT, child_id TEXT)")
+    conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES ('t_parent', 't_child')")
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert len(first.kanban.task_links) == 1
+        assert "kanban" not in first.health.failed_sources
+
+        real_query_rows = kanban_module._query_rows
+
+        def flaky_query_rows(conn, sql, *args):
+            if "FROM task_links" in sql:
+                raise sqlite3.OperationalError("simulated task_links read failure")
+            return real_query_rows(conn, sql, *args)
+
+        monkeypatch.setattr(kanban_module, "_query_rows", flaky_query_rows)
+        second = c.collect()
+        assert "kanban" in second.health.failed_sources
+        assert second.kanban == first.kanban
+
+        monkeypatch.setattr(kanban_module, "_query_rows", real_query_rows)
+        third = c.collect()
+        assert "kanban" not in third.health.failed_sources
+        assert len(third.kanban.task_links) == 1
+    finally:
+        c.close()
+
+
+def test_kanban_pre_enrichment_schema_has_no_recent_tasks(hermes_home: Path):
+    """A tasks table without the enrichment columns yields an empty recent list."""
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('t1', 'Task', 'done', 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "kanban" not in state.health.failed_sources
+    assert state.kanban.recent_tasks == []
+
+
+def test_kanban_enriched_tasks_read_error_fails_source_and_keeps_last_good(
+    hermes_home: Path, monkeypatch
+):
+    """A failing enriched-tasks read is a source failure, not an empty list."""
+    now = int(time.time())
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    create_kanban_db_tables(conn)
+    conn.execute("ALTER TABLE tasks ADD COLUMN workspace_path TEXT")
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, completed_at, workspace_path) "
+        "VALUES ('t_done', 'Done task', 'done', ?, ?, '/work/repo')",
+        (now - 100, now),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert [task.task_id for task in first.kanban.recent_tasks] == ["t_done"]
+        assert "kanban" not in first.health.failed_sources
+
+        real_query_rows = kanban_module._query_rows
+
+        def flaky_query_rows(conn, sql, *args):
+            if "completed_at IS NOT NULL" in sql:
+                raise sqlite3.OperationalError("simulated enriched-tasks read failure")
+            return real_query_rows(conn, sql, *args)
+
+        monkeypatch.setattr(kanban_module, "_query_rows", flaky_query_rows)
+        second = c.collect()
+        assert "kanban" in second.health.failed_sources
+        assert second.kanban == first.kanban
+
+        monkeypatch.setattr(kanban_module, "_query_rows", real_query_rows)
+        third = c.collect()
+        assert "kanban" not in third.health.failed_sources
+        assert [task.task_id for task in third.kanban.recent_tasks] == ["t_done"]
+    finally:
+        c.close()
+
+
+def test_read_recent_enriched_tasks_without_completed_at_column():
+    """completed_at is optional: the condition and its sort key drop out."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE tasks (id TEXT, status TEXT, workspace_path TEXT, "
+        "last_heartbeat_at INTEGER, started_at INTEGER, created_at INTEGER)"
+    )
+    conn.execute("INSERT INTO tasks VALUES ('t1', 'done', '/work/repo', 3, 2, 1)")
+
+    rows = _read_recent_enriched_tasks(conn)
+    conn.close()
+
+    assert [row["id"] for row in rows] == ["t1"]
+
+
+def test_read_recent_enriched_tasks_without_any_enrichment_columns_returns_empty():
+    """A tasks table with no enrichment columns has no enriched rows to show."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE tasks (id TEXT, status TEXT, last_heartbeat_at INTEGER, "
+        "started_at INTEGER, created_at INTEGER)"
+    )
+    conn.execute("INSERT INTO tasks VALUES ('t1', 'done', 3, 2, 1)")
+
+    assert _read_recent_enriched_tasks(conn) == []
+    conn.close()

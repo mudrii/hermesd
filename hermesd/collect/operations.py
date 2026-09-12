@@ -193,15 +193,17 @@ def _state_db_update(
 
 
 def _delegation_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    """The 10 newest async_delegations rows; the table is absent on old agents."""
+    """The 10 newest async_delegations rows; the table is absent on old agents.
+
+    Once the table exists, read errors propagate so the operations source fails
+    to its last-good value instead of reporting a false empty list.
+    """
     if not _table_exists(conn, "async_delegations"):
         return []
-    with contextlib.suppress(sqlite3.Error):
-        return _query_rows(
-            conn,
-            "SELECT * FROM async_delegations ORDER BY dispatched_at DESC LIMIT 10",
-        )
-    return []
+    return _query_rows(
+        conn,
+        "SELECT * FROM async_delegations ORDER BY dispatched_at DESC LIMIT 10",
+    )
 
 
 def _delegation_counts(conn: sqlite3.Connection) -> dict[str, int]:

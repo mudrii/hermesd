@@ -48,8 +48,10 @@ _KNOWN_TABLES = frozenset(
     {
         "async_delegations",
         "conversations",
+        "cron_incidents",
         "delivery_obligations",
         "discovered_repos",
+        "executions",
         "gateway_heartbeats",
         "project_folders",
         "projects",
