@@ -1421,6 +1421,32 @@ def test_available_tools_cache_hit_skips_reread(hermes_home: Path, monkeypatch):
         c.close()
 
 
+def test_available_tools_oversize_session_file_fails_soft(hermes_home: Path):
+    """A session file past the parsed-file byte cap is never parsed whole; the
+    tools source fails and the last-good inventory survives."""
+    sessions_dir = hermes_home / "sessions"
+    (sessions_dir / "sessions.json").write_text(json.dumps({"a": {"session_id": "s1"}}))
+    session_file = sessions_dir / "session_s1.json"
+    session_file.write_text(json.dumps({"tools": [{"name": "safe_tool"}]}))
+
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert first.available_tool_names == ["safe_tool"]
+
+        oversized = (
+            '{"tools": [{"name": "oversize_tool"}], "bulk": "' + "x" * (9 * 1024 * 1024) + '"}'
+        )
+        session_file.write_text(oversized)
+        second = c.collect()
+    finally:
+        c.close()
+
+    assert second.available_tool_names == ["safe_tool"]
+    assert "oversize_tool" not in second.available_tool_names
+    assert "tools_index" in second.health.failed_sources
+
+
 def test_path_resolves_under_false_when_resolve_raises(tmp_path: Path, monkeypatch):
     # On Linux/older CPython a symlink-loop makes Path.resolve raise OSError
     # (ELOOP) or RuntimeError; on macOS/CPython 3.13 resolve(strict=False) is

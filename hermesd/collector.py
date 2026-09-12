@@ -1335,9 +1335,10 @@ class Collector:
         # invalidate the cache even when the index itself is not rewritten;
         # track each path with nanosecond mtime and size (not just the max) so
         # equal/coarse mtimes and filename swaps still invalidate correctly.
-        session_file_signatures = tuple(
-            sorted((_file_signature(path) for path in session_files), key=str)
-        )
+        # The directory mtime cannot replace these per-file stats: on POSIX it
+        # only changes on create/delete/rename, never on a content-only edit.
+        signatures = {str(path): _file_signature(path) for path in session_files}
+        session_file_signatures = tuple(sorted(signatures.values(), key=str))
         cache_key = (sessions_signature, session_file_signatures)
         if sessions_signature is not None and self._available_tools_cache_key == cache_key:
             return self._available_tools_cache_value
@@ -1352,7 +1353,7 @@ class Collector:
         fresh_name_cache: dict[str, tuple[tuple[str, int, int] | None, tuple[str, ...]]] = {}
         for session_file in session_files:
             key = str(session_file)
-            signature = _file_signature(session_file)
+            signature = signatures[key]
             cached = self._session_tool_names_cache.get(key)
             if cached is not None and signature is not None and cached[0] == signature:
                 file_names = cached[1]

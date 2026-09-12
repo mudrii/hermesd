@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from hermesd.collect.common import _as_list, _coerce_float, _coerce_int
+from hermesd.file_cache import _read_capped
 from hermesd.models import (
     AUTHORITATIVE_COST_STATUSES,
     BackgroundProcessInfo,
@@ -39,11 +40,11 @@ def _summarize_tokens(
         contributing_rows += 1
         if _session_cost_is_reported(row):
             reported_rows += 1
-        input_tokens += row.get("input_tokens") or 0
-        output_tokens += row.get("output_tokens") or 0
-        cache_read_tokens += row.get("cache_read_tokens") or 0
-        cache_write_tokens += row.get("cache_write_tokens") or 0
-        reasoning_tokens += row.get("reasoning_tokens") or 0
+        input_tokens += _coerce_int(row.get("input_tokens"))
+        output_tokens += _coerce_int(row.get("output_tokens"))
+        cache_read_tokens += _coerce_int(row.get("cache_read_tokens"))
+        cache_write_tokens += _coerce_int(row.get("cache_write_tokens"))
+        reasoning_tokens += _coerce_int(row.get("reasoning_tokens"))
         total_cost_usd += _resolved_session_cost(row)
     return TokenSummary(
         input_tokens=input_tokens,
@@ -168,11 +169,11 @@ def _resolved_session_cost(row: dict[str, Any]) -> float:
     if cost:
         return cost
     return _estimate_cost(
-        row.get("input_tokens") or 0,
-        row.get("output_tokens") or 0,
-        row.get("cache_read_tokens") or 0,
-        row.get("reasoning_tokens") or 0,
-        row.get("cache_write_tokens") or 0,
+        _coerce_int(row.get("input_tokens")),
+        _coerce_int(row.get("output_tokens")),
+        _coerce_int(row.get("cache_read_tokens")),
+        _coerce_int(row.get("reasoning_tokens")),
+        _coerce_int(row.get("cache_write_tokens")),
     )
 
 
@@ -229,15 +230,16 @@ def _tool_names_from_entries(value: object, *, allow_bare_names: bool = False) -
 def _read_session_tools(path: Path) -> object:
     """Return the raw ``tools`` value of a session file without caching it.
 
-    A session file the index names but that no longer exists simply has no
-    tools. A file that exists but cannot be decoded raises instead: silently
-    treating it as empty shrinks the reported tool inventory, where raising
-    fails the tools source and keeps the last-good inventory — the same
-    handling a symlinked session file already gets.
+    The read is capped at the shared parsed-file byte limit: session files hold
+    full transcripts and can be tens of MB, so an oversize file raises OSError
+    instead of being parsed whole. A session file the index names but that no
+    longer exists simply has no tools. A file that exists but cannot be decoded
+    raises instead: silently treating it as empty shrinks the reported tool
+    inventory, where raising fails the tools source and keeps the last-good
+    inventory — the same handling a symlinked session file already gets.
     """
     try:
-        with path.open(encoding="utf-8") as handle:
-            data = json.load(handle)
+        data = json.loads(_read_capped(path))
     except FileNotFoundError:
         return None
     except (UnicodeError, json.JSONDecodeError) as exc:

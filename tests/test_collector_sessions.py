@@ -719,6 +719,43 @@ def test_summarize_tokens_coerces_null_columns_to_zero():
     assert totals.total_cost_usd == 0.0
 
 
+def test_summarize_tokens_coerces_text_columns_to_zero():
+    # SQLite columns are untyped: a TEXT token value must not TypeError the +=.
+    rows = [
+        {
+            "input_tokens": "abc",
+            "output_tokens": "12",
+            "cache_read_tokens": "",
+            "cache_write_tokens": None,
+            "reasoning_tokens": "1.5",
+            "estimated_cost_usd": 0.0,
+            "cost_status": "exact",
+        }
+    ]
+
+    totals = _summarize_tokens(rows)
+
+    assert totals.input_tokens == 0
+    assert totals.output_tokens == 12
+    assert totals.cache_read_tokens == 0
+    assert totals.cache_write_tokens == 0
+    assert totals.reasoning_tokens == 0
+
+
+def test_resolved_session_cost_coerces_text_token_columns():
+    row = {
+        "estimated_cost_usd": None,
+        "cost_status": "estimated",
+        "input_tokens": "abc",
+        "output_tokens": None,
+        "cache_read_tokens": "",
+        "cache_write_tokens": "xyz",
+        "reasoning_tokens": float("inf"),
+    }
+
+    assert _resolved_session_cost(row) == 0.0
+
+
 def test_summarize_tokens_excludes_rows_before_started_at_min():
     rows = [
         {"input_tokens": 10, "started_at": 50.0},  # before cutoff — excluded
