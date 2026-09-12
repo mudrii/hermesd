@@ -2053,3 +2053,151 @@ def test_delegation_rows_read_error_fails_source_and_keeps_last_good(
         assert [d.delegation_id for d in third.operations.delegations] == ["deleg_keep"]
     finally:
         c.close()
+
+
+def test_state_meta_read_error_fails_source_and_keeps_last_good(
+    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A failing state_meta maintenance read is a source failure, not empty meta."""
+    conn = _open_state_db(hermes_home)
+    create_state_db_tables(conn)
+    create_state_meta_table(conn, {"db_file_generation": "3"})
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=_fixed_clock)
+    try:
+        first = c.collect()
+        assert first.operations.state_db_file_generation == "3"
+        assert "operations" not in first.health.failed_sources
+
+        real_query_rows = operations_module._query_rows
+
+        def flaky_query_rows(conn, sql, *args):
+            if "FROM state_meta WHERE key IN" in sql:
+                raise sqlite3.OperationalError("simulated state_meta read failure")
+            return real_query_rows(conn, sql, *args)
+
+        # The state.db readout is cached by mtime; bump it to force a re-read.
+        bumped = (hermes_home / "state.db").stat().st_mtime + 10
+        os.utime(hermes_home / "state.db", (bumped, bumped))
+
+        monkeypatch.setattr(operations_module, "_query_rows", flaky_query_rows)
+        second = c.collect()
+        assert "operations" in second.health.failed_sources
+        assert second.operations == first.operations
+
+        monkeypatch.setattr(operations_module, "_query_rows", real_query_rows)
+        bumped = (hermes_home / "state.db").stat().st_mtime + 10
+        os.utime(hermes_home / "state.db", (bumped, bumped))
+        third = c.collect()
+        assert "operations" not in third.health.failed_sources
+        assert third.operations.state_db_file_generation == "3"
+    finally:
+        c.close()
+
+
+def test_schema_version_introspection_error_propagates():
+    """A PRAGMA failure on a present schema_version table must not read as 0."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+        conn.set_authorizer(
+            lambda action, *_: (
+                sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_PRAGMA else sqlite3.SQLITE_OK
+            )
+        )
+        with pytest.raises(sqlite3.DatabaseError):
+            operations_module._read_schema_version(conn)
+    finally:
+        conn.close()
+
+
+def test_schema_version_absent_table_reads_zero():
+    """A genuinely absent schema_version table legitimately reports 0."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        assert operations_module._read_schema_version(conn) == 0
+    finally:
+        conn.close()
+
+
+def test_project_summaries_read_error_fails_source_and_keeps_last_good(
+    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A failing projects read is a source failure, not an empty project list."""
+    conn = sqlite3.connect(str(hermes_home / "projects.db"))
+    create_projects_db_tables(conn)
+    conn.execute(
+        """
+        INSERT INTO projects VALUES (
+            'p1', 'hermesd', 'hermesd', '', '', '', 'board-a', '/repo/hermesd',
+            '2026-07-10T00:00:00Z', 0
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert [p.slug for p in first.operations.projects] == ["hermesd"]
+        assert "operations" not in first.health.failed_sources
+
+        real_query_rows = operations_module._query_rows
+
+        def flaky_query_rows(conn, sql, *args):
+            if "FROM projects ORDER BY" in sql:
+                raise sqlite3.OperationalError("simulated projects read failure")
+            return real_query_rows(conn, sql, *args)
+
+        monkeypatch.setattr(operations_module, "_query_rows", flaky_query_rows)
+        second = c.collect()
+        assert "operations" in second.health.failed_sources
+        assert second.operations == first.operations
+
+        monkeypatch.setattr(operations_module, "_query_rows", real_query_rows)
+        third = c.collect()
+        assert "operations" not in third.health.failed_sources
+        assert [p.slug for p in third.operations.projects] == ["hermesd"]
+    finally:
+        c.close()
+
+
+def test_discovered_repos_read_error_fails_source_and_keeps_last_good(
+    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A failing discovered_repos read is a source failure, not an empty list."""
+    conn = sqlite3.connect(str(hermes_home / "projects.db"))
+    create_projects_db_tables(conn)
+    conn.execute(
+        "INSERT INTO discovered_repos VALUES ('/repo/hermesd', 'hermesd', '2026-07-12T00:00:00Z')"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert [r.root for r in first.operations.discovered_repos] == ["/repo/hermesd"]
+        assert "operations" not in first.health.failed_sources
+
+        real_query_rows = operations_module._query_rows
+
+        def flaky_query_rows(conn, sql, *args):
+            if "FROM discovered_repos" in sql:
+                raise sqlite3.OperationalError("simulated discovered_repos read failure")
+            return real_query_rows(conn, sql, *args)
+
+        monkeypatch.setattr(operations_module, "_query_rows", flaky_query_rows)
+        second = c.collect()
+        assert "operations" in second.health.failed_sources
+        assert second.operations == first.operations
+
+        monkeypatch.setattr(operations_module, "_query_rows", real_query_rows)
+        third = c.collect()
+        assert "operations" not in third.health.failed_sources
+        assert [r.root for r in third.operations.discovered_repos] == ["/repo/hermesd"]
+    finally:
+        c.close()

@@ -32,6 +32,7 @@ and this project uses date-based versions in `YYYY.M.D` form.
 - The Docker image includes Git for checkpoint summaries, normalizes runtime package readability for its non-root user, and has a CI acceptance check using a synthetic checkpoint repository.
 - "Recent" session ordering now sorts by latest activity (matching the displayed age column and the collection ordering), so recently resumed sessions no longer appear below less-active newer ones.
 - Transient SQLite read errors (locked db, torn snapshot) in the kanban, gateway, cron, operations, and response-store row-count readers now fail the affected source so the panels keep their last-good counts, instead of being swallowed into a false `0`. A genuinely absent table still legitimately reports zero, and a `conn.close()` failure on the WAL snapshot path no longer leaks its temporary directory.
+- SQLite read errors in the remaining operations readers — `state_meta` maintenance metadata, `schema_version` introspection, project summaries, and discovered repos — now propagate to source health so the panels keep their last-good data, instead of being swallowed into empty metadata, a false schema version `0`, or empty lists. Genuinely absent optional tables (`state_meta`, `schema_version`, `discovered_repos`) still legitimately report empty.
 
 ### Changed
 

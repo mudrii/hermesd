@@ -296,33 +296,37 @@ def _clip_single_line(value: str) -> str:
 
 
 def _state_meta_entries(conn: sqlite3.Connection) -> dict[str, str]:
+    """Maintenance key/value pairs, {} on agents without state_meta.
+
+    Once the table exists, read errors propagate so the operations source fails
+    to its last-good value instead of reporting false empty metadata.
+    """
     if not _table_exists(conn, "state_meta"):
         return {}
     keys = ", ".join(f"'{key}'" for key in _STATE_META_MAINTENANCE_KEYS)
-    with contextlib.suppress(sqlite3.Error):
-        rows = _query_rows(
-            conn,
-            f"SELECT key, value FROM state_meta WHERE key IN ({keys}) LIMIT 8",
-        )
-        return {str(row.get("key") or ""): str(row.get("value") or "") for row in rows}
-    return {}
+    rows = _query_rows(
+        conn,
+        f"SELECT key, value FROM state_meta WHERE key IN ({keys}) LIMIT 8",
+    )
+    return {str(row.get("key") or ""): str(row.get("value") or "") for row in rows}
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
-    """Max integer in schema_version's version-like column, 0 when absent."""
+    """Max integer in schema_version's version-like column, 0 when the table is
+    absent; once the table exists, introspection/read errors propagate so the
+    operations source fails to its last-good value instead of a false 0."""
     if not _table_exists(conn, "schema_version"):
         return 0
     best = 0
-    with contextlib.suppress(sqlite3.Error):
-        columns = [str(row[1] or "") for row in conn.execute("PRAGMA table_info(schema_version)")]
-        for column in columns:
-            if "version" not in column.lower():
-                continue
-            # Identifier comes from PRAGMA output, not from user input.
-            row = conn.execute(
-                f'SELECT MAX(CAST("{column}" AS INTEGER)) FROM schema_version'
-            ).fetchone()
-            best = max(best, int(row[0] or 0) if row is not None else 0)
+    columns = [str(row[1] or "") for row in conn.execute("PRAGMA table_info(schema_version)")]
+    for column in columns:
+        if "version" not in column.lower():
+            continue
+        # Identifier comes from PRAGMA output, not from user input.
+        row = conn.execute(
+            f'SELECT MAX(CAST("{column}" AS INTEGER)) FROM schema_version'
+        ).fetchone()
+        best = max(best, int(row[0] or 0) if row is not None else 0)
     return best
 
 
@@ -455,51 +459,56 @@ def _read_project_summaries(
     verification_roots: list[VerificationRootSummary],
     paths: HermesPaths,
 ) -> list[ProjectSummary]:
-    with contextlib.suppress(sqlite3.Error):
-        rows = _query_rows(
-            conn,
-            "SELECT slug, name, board_slug, primary_path, archived "
-            "FROM projects ORDER BY archived ASC, created_at DESC, slug ASC LIMIT 8",
+    """Newest project rows; read errors propagate so the operations source
+    fails to its last-good value instead of reporting a false empty list.
+
+    ``projects`` is the core table of projects.db: `_read_projects_state`
+    already counts it unguarded before this runs, so an absent table is an
+    error there, not an empty success here.
+    """
+    rows = _query_rows(
+        conn,
+        "SELECT slug, name, board_slug, primary_path, archived "
+        "FROM projects ORDER BY archived ASC, created_at DESC, slug ASC LIMIT 8",
+    )
+    return [
+        ProjectSummary(
+            slug=str(row.get("slug") or ""),
+            name=str(row.get("name") or ""),
+            board_slug=str(row.get("board_slug") or ""),
+            primary_path=str(row.get("primary_path") or ""),
+            archived=bool(row.get("archived")),
+            verification_root_count=_project_verification_root_count(
+                str(row.get("primary_path") or ""),
+                verification_roots,
+            ),
+            kanban_board_present=_kanban_board_present(
+                paths,
+                str(row.get("board_slug") or ""),
+            ),
         )
-        return [
-            ProjectSummary(
-                slug=str(row.get("slug") or ""),
-                name=str(row.get("name") or ""),
-                board_slug=str(row.get("board_slug") or ""),
-                primary_path=str(row.get("primary_path") or ""),
-                archived=bool(row.get("archived")),
-                verification_root_count=_project_verification_root_count(
-                    str(row.get("primary_path") or ""),
-                    verification_roots,
-                ),
-                kanban_board_present=_kanban_board_present(
-                    paths,
-                    str(row.get("board_slug") or ""),
-                ),
-            )
-            for row in rows
-        ]
-    return []
+        for row in rows
+    ]
 
 
 def _read_discovered_repos(conn: sqlite3.Connection) -> list[DiscoveredRepoSummary]:
+    """Newest discovered repos, [] on agents without the table; once it exists,
+    read errors propagate to the operations source's last-good fallback."""
     if not _table_exists(conn, "discovered_repos"):
         return []
-    with contextlib.suppress(sqlite3.Error):
-        rows = _query_rows(
-            conn,
-            "SELECT root, label, last_seen FROM discovered_repos "
-            "ORDER BY COALESCE(last_seen, '') DESC, root ASC LIMIT 5",
+    rows = _query_rows(
+        conn,
+        "SELECT root, label, last_seen FROM discovered_repos "
+        "ORDER BY COALESCE(last_seen, '') DESC, root ASC LIMIT 5",
+    )
+    return [
+        DiscoveredRepoSummary(
+            root=str(row.get("root") or ""),
+            label=str(row.get("label") or ""),
+            last_seen=str(row.get("last_seen") or ""),
         )
-        return [
-            DiscoveredRepoSummary(
-                root=str(row.get("root") or ""),
-                label=str(row.get("label") or ""),
-                last_seen=str(row.get("last_seen") or ""),
-            )
-            for row in rows
-        ]
-    return []
+        for row in rows
+    ]
 
 
 def _project_verification_root_count(
