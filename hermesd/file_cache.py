@@ -19,6 +19,10 @@ JsonObjectList = list[JsonMapping]
 _MAX_PARSED_FILE_BYTES = 8 * 1024 * 1024
 
 
+class _OversizedFileError(OSError):
+    """A file read crossed _MAX_PARSED_FILE_BYTES after the stat-based check."""
+
+
 class LastGoodFileCache:
     def __init__(self) -> None:
         # Guards the mtime/value/bad-mtime cache dicts below shared across threads.
@@ -125,6 +129,16 @@ class LastGoodFileCache:
             if not is_valid(value):
                 bad_mtimes[key] = mtime
                 return self._stale(key, values, default_factory)
+            try:
+                post_read_mtime = path.stat().st_mtime_ns
+            except OSError:
+                post_read_mtime = mtime
+            if post_read_mtime != mtime:
+                # The file was swapped mid-read: the parsed bytes may not match
+                # the pre-read stat, so drop them uncached and let the next
+                # refresh re-read a stable file. Not recorded as a bad mtime —
+                # the file is changing, not malformed.
+                return self._stale(key, values, default_factory)
             self._stale_reads[key] = False
             mtimes[key] = mtime
             bad_mtimes.pop(key, None)
@@ -153,11 +167,19 @@ def _is_json_object_list(value: object) -> TypeGuard[JsonObjectList]:
     return isinstance(value, list) and all(isinstance(entry, dict) for entry in value)
 
 
+def _read_capped(path: Path) -> str:
+    # The stat-based size check races with a growing or swapped file, so the
+    # read itself is capped and anything past the cap is never decoded/parsed.
+    with path.open("rb") as handle:
+        data = handle.read(_MAX_PARSED_FILE_BYTES + 1)
+    if len(data) > _MAX_PARSED_FILE_BYTES:
+        raise _OversizedFileError(f"{path} grew past {_MAX_PARSED_FILE_BYTES} bytes")
+    return data.decode("utf-8")
+
+
 def _load_json(path: Path) -> object:
-    with path.open(encoding="utf-8") as handle:
-        return json.load(handle)
+    return json.loads(_read_capped(path))
 
 
 def _load_yaml(path: Path) -> object:
-    with path.open(encoding="utf-8") as handle:
-        return yaml.safe_load(handle) or {}
+    return yaml.safe_load(_read_capped(path)) or {}

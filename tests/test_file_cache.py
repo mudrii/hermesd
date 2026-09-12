@@ -200,7 +200,13 @@ def test_invalid_utf8_preserves_last_good_value(tmp_path, kind):
     assert read(path) == {"value": 1}
 
 
-def _clone_stat(result: os.stat_result, *, st_mtime: float, st_mtime_ns: int) -> os.stat_result:
+def _clone_stat(
+    result: os.stat_result,
+    *,
+    st_mtime: float,
+    st_mtime_ns: int,
+    st_size: int | None = None,
+) -> os.stat_result:
     """Rebuild a stat result with a controlled mtime granularity.
 
     Simulates a filesystem whose float st_mtime has 1-second granularity while
@@ -214,7 +220,7 @@ def _clone_stat(result: os.stat_result, *, st_mtime: float, st_mtime_ns: int) ->
             result.st_nlink,
             result.st_uid,
             result.st_gid,
-            result.st_size,
+            result.st_size if st_size is None else st_size,
             result.st_atime,
             st_mtime,
             result.st_ctime,
@@ -312,6 +318,65 @@ def test_oversized_json_is_not_reparsed_on_every_read(tmp_path, monkeypatch):
 
     assert cache.read_json_mapping(path) == {}
     assert cache.read_json_mapping(path) == {}
+
+
+def test_file_grown_past_cap_between_stat_and_read_is_rejected(tmp_path, monkeypatch):
+    """A stat that under-reports size must not let an oversized document parse."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "data.json"
+    path.write_text(json.dumps({"v": 1}))
+    assert cache.read_json_mapping(path) == {"v": 1}
+
+    path.write_text(json.dumps({"v": 2, "pad": "p" * (_MAX_PARSED_FILE_BYTES + 1)}))
+    real_stat = Path.stat
+
+    def small_size_stat(self: Path, *args, **kwargs) -> os.stat_result:
+        result = real_stat(self, *args, **kwargs)
+        if self == path:
+            return _clone_stat(
+                result,
+                st_mtime=result.st_mtime,
+                st_mtime_ns=result.st_mtime_ns,
+                st_size=1,
+            )
+        return result
+
+    monkeypatch.setattr(Path, "stat", small_size_stat)
+
+    assert cache.read_json_mapping(path) == {"v": 1}
+    assert cache.last_read_was_stale(path) is True
+
+
+def test_file_swapped_mid_read_is_not_cached_under_stale_mtime(tmp_path, monkeypatch):
+    """A post-read mtime mismatch must drop the read instead of caching it."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "data.json"
+    path.write_text(json.dumps({"v": 1}))
+    assert cache.read_json_mapping(path) == {"v": 1}
+
+    path.write_text(json.dumps({"v": 2}))
+    real_stat = Path.stat
+    stat_calls = 0
+
+    def swapped_stat(self: Path, *args, **kwargs) -> os.stat_result:
+        nonlocal stat_calls
+        result = real_stat(self, *args, **kwargs)
+        if self == path:
+            stat_calls += 1
+            if stat_calls == 2:
+                return _clone_stat(
+                    result,
+                    st_mtime=result.st_mtime,
+                    st_mtime_ns=result.st_mtime_ns + 1_000_000,
+                )
+        return result
+
+    monkeypatch.setattr(Path, "stat", swapped_stat)
+    assert cache.read_json_mapping(path) == {"v": 1}
+    assert cache.last_read_was_stale(path) is True
+
+    monkeypatch.undo()
+    assert cache.read_json_mapping(path) == {"v": 2}
 
 
 def test_file_just_under_the_cap_still_loads(tmp_path):
