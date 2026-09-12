@@ -317,6 +317,8 @@ def _execution_rows(
         return []
     # Keep SQL ordering and cutoffs identical to the shared ISO parser, including
     # offsets, naive UTC timestamps, fractional seconds, and malformed values.
+    # The UDF defeats any index on claimed_at (full scan per poll); acceptable at
+    # the expected executions.db scale, revisit if the table grows large.
     conn.create_function("hermes_epoch", 1, _iso_to_epoch, deterministic=True)
     return _query_rows(conn, sql, params)
 
