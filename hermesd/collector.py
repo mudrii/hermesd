@@ -272,6 +272,10 @@ _LEDGER_FIELDS = (
     "failed_delivery_count",
     "pending_deliveries",
 )
+# Bucket for the time-dependent part of derived-cache keys: sliding 7d/30d
+# window cutoffs recompute at most this often when nothing else changed
+# (matches the 60s cutoff bucketing in db.py's model-usage reads).
+_DERIVED_WINDOW_BUCKET_SECONDS = 60
 
 
 class _SourceSpec(NamedTuple):
@@ -509,9 +513,10 @@ class Collector:
         # MEMORY.md / USER.md / SOUL.md is not re-read on every tick.
         self._derived_file_cache: dict[str, tuple[tuple[str, int, int] | None, Any]] = {}
         self._kanban_board_errors: list[str] = []
-        self._derived_rows: list[dict[str, Any]] | None = None
-        self._derived_date = ""
-        self._derived_cache: dict[str, Any] = {}
+        # Session-row-derived values, one entry per derived name, keyed on
+        # (rows identity, local date, entry-specific deps) — see
+        # _derived_from_rows.
+        self._derived_cache: dict[str, tuple[tuple[object, ...], Any]] = {}
         self._closed = False
         # Set by close() before it queues for _lock; an in-flight collect pass
         # checks it between sources and stops doing new work.
@@ -561,13 +566,20 @@ class Collector:
         session_rows_stale = "sessions" in health.failed_sources
         results: dict[str, Any] = {}
 
-        def derived(name: str, compute: Callable[[list[dict[str, Any]]], T]) -> Callable[[], T]:
+        def derived(
+            name: str,
+            compute: Callable[[list[dict[str, Any]]], T],
+            deps: Callable[[], tuple[object, ...]] | None = None,
+        ) -> Callable[[], T]:
             # Shared shape for every session-row-derived source: memoized via
-            # _derived_from_rows on fresh (non-stale) rows.
+            # _derived_from_rows on fresh (non-stale) rows. `deps` supplies the
+            # extra per-entry key parts (config file signatures, time buckets)
+            # beyond rows identity and the local date.
             return lambda: self._derived_from_rows(
                 name,
                 self._fresh_session_rows(session_rows, session_rows_stale),
                 compute,
+                deps=deps() if deps is not None else (),
             )
 
         def last_good(source_name: str, default_factory: Callable[[], Any]) -> Callable[[], Any]:
@@ -580,7 +592,17 @@ class Collector:
         # background processes).
         specs = (
             _SourceSpec(
-                "sessions", "session_models", derived("sessions", self._collect_sessions), list
+                "sessions",
+                "session_models",
+                # Session rows join context_length_cache.yaml, so that file's
+                # signature is part of the derived-entry key: editing it must
+                # not wait on a SQLite data_version change.
+                derived(
+                    "sessions",
+                    self._collect_sessions,
+                    deps=self._context_length_signature,
+                ),
+                list,
             ),
             _SourceSpec(
                 "available_tools",
@@ -652,7 +674,13 @@ class Collector:
             _SourceSpec(
                 "token_analytics",
                 "token_analytics",
-                derived("token_analytics", self._collect_token_analytics),
+                # The 7d/30d windows slide with the clock; the time bucket lets
+                # a session age out of a window without waiting for midnight.
+                derived(
+                    "token_analytics",
+                    self._collect_token_analytics,
+                    deps=self._window_time_bucket,
+                ),
                 TokenAnalytics,
             ),
             _SourceSpec(
@@ -838,25 +866,37 @@ class Collector:
             raise RuntimeError("session rows are stale")
         return rows
 
+    def _context_length_signature(self) -> tuple[object, ...]:
+        return (_file_signature(self._paths.shared_path("context_length_cache.yaml")),)
+
+    def _window_time_bucket(self) -> tuple[object, ...]:
+        return (int(self._clock() // _DERIVED_WINDOW_BUCKET_SECONDS),)
+
     def _derived_from_rows(
         self,
         name: str,
         rows: list[dict[str, Any]],
         compute: Callable[[list[dict[str, Any]]], T],
+        *,
+        deps: tuple[object, ...] = (),
     ) -> T:
         # HermesDB returns the same cached list object while data_version is
-        # unchanged, so row identity is a cheap invalidation key. The local
-        # date is part of the key because "today" aggregates shift at midnight.
-        today = _local_date(self._clock())
-        if rows is not self._derived_rows or today != self._derived_date:
-            self._derived_cache = {}
-            self._derived_rows = rows
-            self._derived_date = today
-        if name not in self._derived_cache:
-            self._derived_cache[name] = compute(rows)
-        # type-ignore[no-any-return]: heterogeneous per-name cache; each call
-        # site pins T via its compute callable.
-        return self._derived_cache[name]  # type: ignore[no-any-return]
+        # unchanged, so row identity is a cheap invalidation key (the collector
+        # holds the list alive via _last_session_rows, so the id cannot be
+        # recycled). The local date is part of every key because "today"
+        # aggregates shift at midnight; deps carry the entry-specific
+        # dependencies (config file signatures, time buckets for the sliding
+        # windows) so a change there recomputes only the entries that consume
+        # it instead of invalidating the whole cache.
+        key = (id(rows), _local_date(self._clock()), deps)
+        cached = self._derived_cache.get(name)
+        if cached is not None and cached[0] == key:
+            # type-ignore[no-any-return]: heterogeneous per-name cache; each
+            # call site pins T via its compute callable.
+            return cached[1]  # type: ignore[no-any-return]
+        value = compute(rows)
+        self._derived_cache[name] = (key, value)
+        return value
 
     def _collect_session_rows(
         self,

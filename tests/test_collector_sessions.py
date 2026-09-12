@@ -1550,3 +1550,105 @@ def test_active_surface_pid_coercion_never_raises(
     assert surface.pid == expected
     assert surface.alive is False
     assert "active_sessions" not in state.health.failed_sources
+
+
+def test_context_length_cache_edit_refreshes_session_context_limit(hermes_home: Path):
+    """Editing context_length_cache.yaml must not wait on a DB data_version change."""
+    _insert_session_with_endpoint(
+        hermes_home / "state.db", "MiniMax-M3", "https://api.minimax.io/v1"
+    )
+    cache_path = hermes_home / "context_length_cache.yaml"
+    cache_path.write_text("context_lengths:\n  MiniMax-M3@https://api.minimax.io/v1: 100\n")
+    c = Collector(hermes_home)
+    try:
+        assert c.collect().sessions[0].context_limit == 100
+        # No DB write, same day: only the config file changed.
+        cache_path.write_text("context_lengths:\n  MiniMax-M3@https://api.minimax.io/v1: 200\n")
+        assert c.collect().sessions[0].context_limit == 200
+    finally:
+        c.close()
+
+
+def test_context_length_edit_does_not_invalidate_unrelated_derived_entries(
+    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _insert_session_with_endpoint(
+        hermes_home / "state.db", "MiniMax-M3", "https://api.minimax.io/v1"
+    )
+    cache_path = hermes_home / "context_length_cache.yaml"
+    cache_path.write_text("context_lengths:\n  MiniMax-M3@https://api.minimax.io/v1: 100\n")
+    c = Collector(hermes_home)
+    calls = {"sessions": 0, "tokens_total": 0}
+    original_sessions = c._collect_sessions
+    original_total = c._collect_tokens_total
+
+    def counted_sessions(rows: list | None = None) -> list:
+        calls["sessions"] += 1
+        return original_sessions(rows)
+
+    def counted_total(rows: list | None = None):
+        calls["tokens_total"] += 1
+        return original_total(rows)
+
+    try:
+        c.collect()
+        monkeypatch.setattr(c, "_collect_sessions", counted_sessions)
+        monkeypatch.setattr(c, "_collect_tokens_total", counted_total)
+        cache_path.write_text("context_lengths:\n  MiniMax-M3@https://api.minimax.io/v1: 200\n")
+        c.collect()
+        assert calls["sessions"] == 1
+        assert calls["tokens_total"] == 0
+    finally:
+        c.close()
+
+
+def test_session_aging_out_of_7d_window_drops_out_within_the_same_day(hermes_home: Path):
+    """The sliding 7d cutoff moves with the clock even when rows and date don't."""
+    base = _today_epoch(time.time()) + 43200  # local noon: +61s stays same-day
+    fake_now = [base]
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, input_tokens) VALUES (?, ?, ?, ?)",
+        ("s1", "cli", base - 7 * 86400 + 30, 100),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: fake_now[0])
+    try:
+        first = c.collect()
+        windows = {window.label: window for window in first.token_analytics.windows}
+        assert windows["7d"].session_count == 1
+
+        fake_now[0] = base + 61
+        second = c.collect()
+        windows = {window.label: window for window in second.token_analytics.windows}
+        assert windows["7d"].session_count == 0
+        assert windows["30d"].session_count == 1
+    finally:
+        c.close()
+
+
+def test_frozen_clock_collects_are_deterministic(hermes_home: Path):
+    fake_now = 1_000_000.0
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, input_tokens) VALUES (?, ?, ?, ?)",
+        ("s1", "cli", fake_now - 10 * 86400, 100),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: fake_now)
+    try:
+        first = c.collect()
+        second = c.collect()
+        assert first.token_analytics == second.token_analytics
+        assert first.tokens_total == second.tokens_total
+        assert first.sessions == second.sessions
+    finally:
+        c.close()
