@@ -1740,7 +1740,9 @@ CREATE TABLE executions (
     finished_at TEXT,
     error TEXT,
     handoff_pending INTEGER NOT NULL DEFAULT 0,
-    handoff_started_at REAL
+    handoff_started_at REAL,
+    scheduled_instant TEXT,
+    delivery_outcome TEXT
 );
 CREATE INDEX idx_executions_job_claimed ON executions(job_id, claimed_at DESC, id DESC);
 CREATE INDEX idx_executions_status_claimed ON executions(status, claimed_at DESC, id DESC);
@@ -1787,13 +1789,28 @@ def insert_cron_execution(
     started_at: str | None = None,
     finished_at: str | None = None,
     error: str | None = None,
+    delivery_outcome: str | None = None,
+    scheduled_instant: str | None = None,
+    handoff_pending: int = 0,
 ) -> None:
     """Insert one executions row, defaulting the columns panels never read."""
     conn.execute(
         "INSERT INTO executions (id, job_id, source, process_id, pid, process_started_at, "
-        "status, claimed_at, started_at, finished_at, error) "
-        "VALUES (?, ?, 'builtin', 'proc', 1234, 99, ?, ?, ?, ?, ?)",
-        (execution_id, job_id, status, claimed_at, started_at, finished_at, error),
+        "status, claimed_at, started_at, finished_at, error, "
+        "handoff_pending, scheduled_instant, delivery_outcome) "
+        "VALUES (?, ?, 'builtin', 'proc', 1234, 99, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            execution_id,
+            job_id,
+            status,
+            claimed_at,
+            started_at,
+            finished_at,
+            error,
+            handoff_pending,
+            scheduled_instant,
+            delivery_outcome,
+        ),
     )
 
 

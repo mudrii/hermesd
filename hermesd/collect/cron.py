@@ -253,17 +253,25 @@ def _execution_from_row(
         started_age_seconds=_age_seconds(_iso_to_epoch(started_at), now),
         duration_seconds=_execution_duration(started_at, str(row.get("finished_at") or "")),
         error_excerpt=_cron_error_excerpt(str(row.get("error") or "")),
+        delivery_outcome=str(row.get("delivery_outcome") or ""),
+        scheduled_instant=str(row.get("scheduled_instant") or ""),
+        handoff_pending=bool(row.get("handoff_pending") or 0),
     )
 
 
 def _job_execution_stats(
     window_rows: list[dict[str, Any]],
     last_rows: list[dict[str, Any]],
+    delivery_rows: list[dict[str, Any]],
+    *,
+    delivery_tracked: bool,
 ) -> list[CronJobExecutionStats]:
     """Per-job 24h counters from SQL aggregates plus last-run detail.
 
     `last_rows` carries each job's newest execution from the full table, so a
     busy job cannot crowd another job's last-run status off the panel.
+    `delivery_rows` keeps delivery in its own counters, because a completed
+    execution whose notification was suppressed was not delivered.
     """
     stats: dict[str, CronJobExecutionStats] = {}
     for row in sorted(last_rows, key=_claimed_sort_key, reverse=True):
@@ -287,7 +295,26 @@ def _job_execution_stats(
         entry.failed_24h = int(row.get("failed_24h") or 0)
         entry.running_24h = int(row.get("running_24h") or 0)
         entry.unknown_24h = int(row.get("unknown_24h") or 0)
-    return list(stats.values())
+    for row in delivery_rows:
+        job_id = str(row.get("job_id") or "")
+        if job_id not in stats:
+            stats[job_id] = CronJobExecutionStats(job_id=job_id)
+        entry = stats[job_id]
+        entry.handoff_pending_24h += int(row.get("handoff_pending") or 0)
+        outcome = str(row.get("delivery_outcome") or "")
+        count = int(row.get("row_count") or 0)
+        if not outcome:
+            entry.delivery_unrecorded_24h += count
+        elif (
+            outcome in entry.delivery_outcomes_24h
+            or len(entry.delivery_outcomes_24h) < _DELIVERY_OUTCOME_KIND_LIMIT
+        ):
+            outcomes = entry.delivery_outcomes_24h
+            outcomes[outcome] = outcomes.get(outcome, 0) + count
+    result = list(stats.values())
+    for entry in result:
+        entry.delivery_tracked = delivery_tracked
+    return result
 
 
 # Columns every executions read relies on; an executions table without them is
@@ -308,19 +335,47 @@ _EXECUTIONS_REQUIRED_COLUMNS = (
 # counted as unknown rather than dropped or guessed at.
 _EXECUTIONS_KNOWN_STATUSES = ("completed", "failed", "running", "claimed")
 
+# Delivery, handoff and scheduled-occurrence columns were added to the executions
+# schema after the base ones. An older agent has none of them, so every read that
+# touches them is column-aware and degrades to "not recorded" rather than failing.
+_EXECUTIONS_OPTIONAL_COLUMNS = ("delivery_outcome", "handoff_pending", "scheduled_instant")
+# Bound on the distinct delivery outcomes retained per job; the count of rows is
+# never bounded, only the vocabulary, so an untrusted value cannot grow the map.
+_DELIVERY_OUTCOME_KIND_LIMIT = 8
 
-def _executions_schema_compatible(conn: sqlite3.Connection) -> bool:
-    """True when the executions table exists with every column the reads use."""
+
+def _executions_columns(conn: sqlite3.Connection) -> set[str]:
+    """Column names of the executions table, introspected once per read pass.
+
+    An absent table legitimately yields no columns; a present-but-unreadable one
+    raises so the source fails to its last-good value instead of silently
+    degrading every column-aware query to empty results.
+    """
     if not _table_exists(conn, "executions"):
-        return False
-    columns = {str(row[1] or "") for row in conn.execute("PRAGMA table_info(executions)")}
+        return set()
+    return {str(row[1] or "") for row in conn.execute("PRAGMA table_info(executions)")}
+
+
+def _executions_schema_compatible(columns: set[str]) -> bool:
+    """True when every column the base reads rely on is present."""
     return set(_EXECUTIONS_REQUIRED_COLUMNS).issubset(columns)
 
 
+def _execution_select_columns(columns: set[str]) -> str:
+    """The execution columns to select, adding the newer optional ones present."""
+    selected = list(_EXECUTIONS_REQUIRED_COLUMNS)
+    selected.extend(name for name in _EXECUTIONS_OPTIONAL_COLUMNS if name in columns)
+    return ", ".join(selected)
+
+
 def _execution_rows(
-    conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = ()
+    conn: sqlite3.Connection,
+    sql: str,
+    params: tuple[Any, ...] = (),
+    *,
+    columns: set[str],
 ) -> list[dict[str, Any]]:
-    if not _executions_schema_compatible(conn):
+    if not _executions_schema_compatible(columns):
         return []
     # Keep SQL ordering and cutoffs identical to the shared ISO parser, including
     # offsets, naive UTC timestamps, fractional seconds, and malformed values.
@@ -330,7 +385,7 @@ def _execution_rows(
     return _query_rows(conn, sql, params)
 
 
-def _recent_execution_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def _recent_execution_rows(conn: sqlite3.Connection, *, columns: set[str]) -> list[dict[str, Any]]:
     """The newest _EXECUTIONS_SCAN_LIMIT executions, [] on a missing/foreign schema.
 
     Operational read errors propagate so the cron_executions source fails to
@@ -339,13 +394,16 @@ def _recent_execution_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     # The LIMIT is a module-level int constant, never caller-supplied text.
     return _execution_rows(
         conn,
-        "SELECT id, job_id, status, claimed_at, started_at, finished_at, error "
+        f"SELECT {_execution_select_columns(columns)} "
         "FROM executions ORDER BY hermes_epoch(claimed_at) DESC, id DESC "
         f"LIMIT {_EXECUTIONS_SCAN_LIMIT}",
+        columns=columns,
     )
 
 
-def _execution_window_rows(conn: sqlite3.Connection, *, now: float) -> list[dict[str, Any]]:
+def _execution_window_rows(
+    conn: sqlite3.Connection, *, now: float, columns: set[str]
+) -> list[dict[str, Any]]:
     """Aggregate the complete 24h window, returning one row per job.
 
     ``unknown_24h`` is the complement of the three recognized buckets, so an
@@ -366,18 +424,50 @@ def _execution_window_rows(conn: sqlite3.Connection, *, now: float) -> list[dict
         "FROM executions WHERE hermes_epoch(claimed_at) BETWEEN ? AND ? "
         "GROUP BY COALESCE(job_id, '')",
         (now - _EXECUTIONS_WINDOW_SECONDS, now),
+        columns=columns,
     )
 
 
-def _last_execution_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    """Each job's newest execution (claimed_at, then id), one row per job."""
+def _execution_delivery_rows(
+    conn: sqlite3.Connection, *, now: float, columns: set[str]
+) -> list[dict[str, Any]]:
+    """Per-job delivery outcomes and pending handoffs inside the 24h window.
+
+    Delivery is a separate question from execution: a run can complete and still
+    have its notification suppressed, so a completed counter must never be read
+    as "delivered". A schema without either column yields no rows, which the
+    caller reports as untracked rather than as a window of unrecorded deliveries.
+    """
+    has_outcome = "delivery_outcome" in columns
+    has_handoff = "handoff_pending" in columns
+    if not has_outcome and not has_handoff:
+        return []
+    outcome = "COALESCE(delivery_outcome, '')" if has_outcome else "''"
+    handoff = "SUM(COALESCE(handoff_pending, 0))" if has_handoff else "0"
     return _execution_rows(
         conn,
-        "SELECT id, job_id, status, claimed_at, started_at, finished_at, error FROM ("
-        "SELECT id, job_id, status, claimed_at, started_at, finished_at, error, "
+        "SELECT COALESCE(job_id, '') AS job_id, "
+        f"{outcome} AS delivery_outcome, "
+        f"{handoff} AS handoff_pending, "
+        "COUNT(*) AS row_count "
+        "FROM executions WHERE hermes_epoch(claimed_at) BETWEEN ? AND ? "
+        f"GROUP BY COALESCE(job_id, ''), {outcome}",
+        (now - _EXECUTIONS_WINDOW_SECONDS, now),
+        columns=columns,
+    )
+
+
+def _last_execution_rows(conn: sqlite3.Connection, *, columns: set[str]) -> list[dict[str, Any]]:
+    """Each job's newest execution (claimed_at, then id), one row per job."""
+    select = _execution_select_columns(columns)
+    return _execution_rows(
+        conn,
+        f"SELECT {select} FROM ("
+        f"SELECT {select}, "
         "ROW_NUMBER() OVER (PARTITION BY COALESCE(job_id, '') "
         "ORDER BY hermes_epoch(claimed_at) DESC, id DESC) AS run_rank "
         "FROM executions) WHERE run_rank = 1",
+        columns=columns,
     )
 
 
@@ -446,13 +536,24 @@ def _read_cron_executions_state(
         return CronExecutionsState()
     with _connect_readonly_sqlite(db_path) as conn:
         conn.row_factory = sqlite3.Row
-        ordered = sorted(_recent_execution_rows(conn), key=_claimed_sort_key, reverse=True)
-        window_rows = _execution_window_rows(conn, now=now)
-        last_rows = _last_execution_rows(conn)
+        columns = _executions_columns(conn)
+        ordered = sorted(
+            _recent_execution_rows(conn, columns=columns),
+            key=_claimed_sort_key,
+            reverse=True,
+        )
+        window_rows = _execution_window_rows(conn, now=now, columns=columns)
+        delivery_rows = _execution_delivery_rows(conn, now=now, columns=columns)
+        last_rows = _last_execution_rows(conn, columns=columns)
         open_count, unacked_count, incidents = _read_cron_incidents(conn, job_names, now=now)
         return CronExecutionsState(
             db_present=True,
-            job_stats=_job_execution_stats(window_rows, last_rows),
+            job_stats=_job_execution_stats(
+                window_rows,
+                last_rows,
+                delivery_rows,
+                delivery_tracked="delivery_outcome" in columns,
+            ),
             recent=[
                 _execution_from_row(row, job_names, now=now)
                 for row in ordered[:_EXECUTIONS_RECENT_LIMIT]

@@ -1023,6 +1023,191 @@ def test_sample_fixture_window_totals_reconcile(hermes_home: Path, sample_cron_e
     assert stats["job-alpha"].total_24h == 4
 
 
+# F06 — execution success and delivery outcome are different questions: a run can
+# complete and still have its notification suppressed, so a completed counter
+# must never be readable as "delivered".
+
+
+def _write_delivery_db(home: Path, rows: list[tuple[str, str, str | None, int]]) -> Path:
+    """Build an executions.db from (job_id, status, delivery_outcome, handoff_pending)."""
+    db_path = home / "cron" / "executions.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        create_cron_executions_tables(conn)
+        for index, (job_id, status, outcome, handoff) in enumerate(rows):
+            insert_cron_execution(
+                conn,
+                f"e{index}",
+                job_id,
+                status,
+                claimed_at=iso_ago(600 + index),
+                started_at=iso_ago(599 + index),
+                finished_at=iso_ago(598 + index),
+                delivery_outcome=outcome,
+                handoff_pending=handoff,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def _collect_stats(home: Path) -> dict:
+    c = Collector(home)
+    try:
+        return _stats_by_job(c.collect())
+    finally:
+        c.close()
+
+
+def test_completed_with_suppressed_delivery_is_not_counted_as_delivered(hermes_home: Path):
+    _write_delivery_db(hermes_home, [("job-a", "completed", "suppressed", 0)])
+
+    stats = _collect_stats(hermes_home)["job-a"]
+
+    assert stats.completed_24h == 1
+    assert stats.delivery_tracked is True
+    assert stats.delivery_outcomes_24h == {"suppressed": 1}
+    assert "delivered" not in stats.delivery_outcomes_24h
+
+
+def test_every_recorded_delivery_outcome_is_counted_verbatim(hermes_home: Path):
+    _write_delivery_db(
+        hermes_home,
+        [
+            ("job-a", "completed", "delivered", 0),
+            ("job-a", "completed", "delivered", 0),
+            ("job-a", "completed", "suppressed", 0),
+            ("job-a", "completed", "suppressed_acked", 0),
+            ("job-a", "completed", "queued", 0),
+            ("job-a", "completed", "not_configured", 0),
+            ("job-a", "failed", "failed", 0),
+        ],
+    )
+
+    stats = _collect_stats(hermes_home)["job-a"]
+
+    assert stats.delivery_outcomes_24h == {
+        "delivered": 2,
+        "suppressed": 1,
+        "suppressed_acked": 1,
+        "queued": 1,
+        "not_configured": 1,
+        "failed": 1,
+    }
+
+
+def test_unrecorded_delivery_is_counted_separately_from_recorded(hermes_home: Path):
+    _write_delivery_db(
+        hermes_home,
+        [("job-a", "completed", None, 0), ("job-a", "completed", "delivered", 0)],
+    )
+
+    stats = _collect_stats(hermes_home)["job-a"]
+
+    assert stats.delivery_unrecorded_24h == 1
+    assert stats.delivery_outcomes_24h == {"delivered": 1}
+    assert stats.total_24h == stats.delivery_unrecorded_24h + sum(
+        stats.delivery_outcomes_24h.values()
+    )
+
+
+def test_unknown_delivery_outcome_is_preserved_not_bucketed(hermes_home: Path):
+    _write_delivery_db(hermes_home, [("job-a", "completed", "teleported", 0)])
+
+    assert _collect_stats(hermes_home)["job-a"].delivery_outcomes_24h == {"teleported": 1}
+
+
+def test_pending_handoff_is_its_own_indicator(hermes_home: Path):
+    _write_delivery_db(
+        hermes_home,
+        [("job-a", "completed", "delivered", 1), ("job-a", "completed", "delivered", 0)],
+    )
+
+    stats = _collect_stats(hermes_home)["job-a"]
+
+    assert stats.handoff_pending_24h == 1
+    assert stats.completed_24h == 2
+
+
+def test_delivery_outcome_vocabulary_is_bounded(hermes_home: Path):
+    rows = [("job-a", "completed", f"outcome-{index}", 0) for index in range(40)]
+    _write_delivery_db(hermes_home, rows)
+
+    stats = _collect_stats(hermes_home)["job-a"]
+
+    assert len(stats.delivery_outcomes_24h) <= 8
+    assert stats.total_24h == 40
+    assert stats.delivery_unrecorded_24h == 0
+
+
+def test_schema_without_delivery_columns_reports_untracked(hermes_home: Path):
+    """An older agent has no delivery_outcome column: untracked, not all-unrecorded."""
+    db_path = hermes_home / "cron" / "executions.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute(
+            "CREATE TABLE executions (id TEXT PRIMARY KEY, job_id TEXT NOT NULL, "
+            "source TEXT NOT NULL, process_id TEXT NOT NULL, pid INTEGER NOT NULL, "
+            "process_started_at INTEGER, status TEXT NOT NULL, claimed_at TEXT NOT NULL, "
+            "started_at TEXT, finished_at TEXT, error TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO executions (id, job_id, source, process_id, pid, status, claimed_at) "
+            "VALUES ('e1', 'job-a', 'builtin', 'proc', 1, 'completed', ?)",
+            (iso_ago(600),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    stats = _collect_stats(hermes_home)["job-a"]
+
+    assert stats.completed_24h == 1
+    assert stats.delivery_tracked is False
+    assert stats.delivery_outcomes_24h == {}
+    assert stats.delivery_unrecorded_24h == 0
+    assert stats.handoff_pending_24h == 0
+
+
+def test_recent_execution_rows_carry_delivery_and_schedule(hermes_home: Path):
+    db_path = hermes_home / "cron" / "executions.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        create_cron_executions_tables(conn)
+        insert_cron_execution(
+            conn,
+            "e1",
+            "job-a",
+            "completed",
+            claimed_at=iso_ago(600),
+            started_at=iso_ago(599),
+            finished_at=iso_ago(590),
+            delivery_outcome="suppressed",
+            scheduled_instant=iso_ago(600),
+            handoff_pending=1,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    recent = state.cron_executions.recent[0]
+    assert recent.delivery_outcome == "suppressed"
+    assert recent.handoff_pending is True
+    assert recent.scheduled_instant
+    assert state.cron_executions.job_stats[0].last_status == "completed"
+
+
 def test_collect_cron_executions_last_run_status_duration_and_error(
     hermes_home: Path, sample_cron_executions_db: Path
 ):
@@ -1293,13 +1478,18 @@ def test_cron_execution_timestamps_are_compared_chronologically(hermes_home: Pat
     assert state.cron_executions.recent[0].execution_id == "newer-offset"
 
 
+def _columns(conn) -> set[str]:
+    """The executions column set the readers thread through their queries."""
+    return cron_module._executions_columns(conn)
+
+
 def test_cron_window_query_returns_aggregates_not_execution_history():
     with contextlib.closing(sqlite3.connect(":memory:")) as conn:
         conn.row_factory = sqlite3.Row
         create_cron_executions_tables(conn)
         for index in range(600):
             insert_cron_execution(conn, str(index), "job", "completed", claimed_at=iso_ago(index))
-        rows = cron_module._execution_window_rows(conn, now=time.time())
+        rows = cron_module._execution_window_rows(conn, now=time.time(), columns=_columns(conn))
 
     assert len(rows) == 1
     assert rows[0]["completed_24h"] == 600
@@ -1314,12 +1504,13 @@ def test_cron_last_run_uses_id_to_break_equal_instants():
             ("b", "2026-09-12T11:30:00Z"),
         ]:
             insert_cron_execution(conn, execution_id, "job", "failed", claimed_at=claimed_at)
-        rows = cron_module._last_execution_rows(conn)
+        rows = cron_module._last_execution_rows(conn, columns=_columns(conn))
 
     assert [row["id"] for row in rows] == ["b"]
 
 
 def test_cron_schema_inspection_errors_propagate():
+    """A denied PRAGMA must raise, not read as "every optional column is absent"."""
     with contextlib.closing(sqlite3.connect(":memory:")) as conn:
         create_cron_executions_tables(conn)
         conn.set_authorizer(
@@ -1328,7 +1519,7 @@ def test_cron_schema_inspection_errors_propagate():
             )
         )
         with pytest.raises(sqlite3.DatabaseError):
-            cron_module._recent_execution_rows(conn)
+            cron_module._executions_columns(conn)
 
 
 def test_cron_window_aggregation_query_error_fails_source_and_keeps_last_good(
@@ -1362,8 +1553,9 @@ def test_cron_window_aggregation_query_error_fails_source_and_keeps_last_good(
 
 
 def test_job_execution_stats_skips_out_of_window_and_garbage_rows():
-    """Direct counter unit: garbage stamps, old rows, and unknown statuses
-    never reach the 24h counters, even without a last-run row."""
+    """Direct counter unit: garbage stamps and out-of-window rows never reach the
+    24h counters, even without a last-run row — but an ``unknown`` status does,
+    because it is a real terminal outcome rather than an unparseable one."""
     now = 1_788_800_000.0
     with contextlib.closing(sqlite3.connect(":memory:")) as conn:
         conn.row_factory = sqlite3.Row
@@ -1378,8 +1570,8 @@ def test_job_execution_stats_skips_out_of_window_and_garbage_rows():
             ]
         ):
             insert_cron_execution(conn, str(index), "job-x", status, claimed_at=claimed_at)
-        window_rows = cron_module._execution_window_rows(conn, now=now)
-    stats = cron_module._job_execution_stats(window_rows, [])
+        window_rows = cron_module._execution_window_rows(conn, now=now, columns=_columns(conn))
+    stats = cron_module._job_execution_stats(window_rows, [], [], delivery_tracked=True)
 
     assert len(stats) == 1
     entry = stats[0]
@@ -1387,6 +1579,10 @@ def test_job_execution_stats_skips_out_of_window_and_garbage_rows():
     assert entry.completed_24h == 1
     assert entry.failed_24h == 0
     assert entry.running_24h == 0
+    # An 'unknown' status is a real terminal outcome and must be counted, not
+    # dropped; only the garbage stamp and the out-of-window rows are excluded.
+    assert entry.unknown_24h == 1
+    assert entry.total_24h == 2
     assert entry.last_status == ""
 
 

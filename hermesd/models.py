@@ -344,6 +344,11 @@ class CronExecution(BaseModel):
     started_age_seconds: float | None = None
     duration_seconds: float | None = None
     error_excerpt: str = ""
+    # Delivery is a separate question from execution: "" means the schema or the
+    # row records no outcome, which is not the same as a failed delivery.
+    delivery_outcome: str = ""
+    scheduled_instant: str = ""
+    handoff_pending: bool = False
 
 
 class CronJobExecutionStats(BaseModel):
@@ -353,6 +358,11 @@ class CronJobExecutionStats(BaseModel):
     window can be checked for arithmetic that silently dropped a row. ``unknown``
     is a real upstream terminal status and also catches any value hermesd has not
     seen; it is never folded into ``failed``, which would imply a retry is safe.
+
+    Delivery counters are kept apart from execution counters for the same reason:
+    a completed run whose notification was suppressed was not delivered.
+    ``delivery_tracked`` is False when this schema has no ``delivery_outcome``
+    column at all, which is different from a column that is present but NULL.
     """
 
     job_id: str = ""
@@ -361,6 +371,10 @@ class CronJobExecutionStats(BaseModel):
     failed_24h: int = 0
     running_24h: int = 0
     unknown_24h: int = 0
+    delivery_tracked: bool = False
+    delivery_outcomes_24h: dict[str, int] = Field(default_factory=dict)
+    delivery_unrecorded_24h: int = 0
+    handoff_pending_24h: int = 0
     last_status: str = ""
     last_duration_seconds: float | None = None
     last_error_excerpt: str = ""

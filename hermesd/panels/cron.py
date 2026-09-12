@@ -7,6 +7,7 @@ from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import (
+    CronExecution,
     CronExecutionsState,
     CronJob,
     CronJobExecutionStats,
@@ -123,6 +124,14 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         if flag_lines:
             sections.append(section_heading("Job Detail", theme))
             sections.extend(flag_lines)
+        delivery_lines = [
+            line
+            for line in (_job_delivery_line(j, stats_by_job.get(j.job_id), theme) for j in c.jobs)
+            if line
+        ]
+        if delivery_lines:
+            sections.append(section_heading("Delivery Outcomes (24h)", theme))
+            sections.extend(delivery_lines)
         if any(j.next_run_at or j.latest_output_excerpt or j.silent_run for j in c.jobs):
             sections.append(section_heading("Latest Output", theme))
             sections.extend(_latest_output_line(j, theme) for j in c.jobs)
@@ -304,23 +313,70 @@ def _executions_sections(executions: CronExecutionsState, theme: Theme) -> list[
 
 
 def _recent_executions_table(executions: CronExecutionsState, theme: Theme) -> Table:
+    # An older schema records no delivery outcome at all. Only widen the table
+    # when there is something to say, and never let an empty column imply that a
+    # completed run was delivered.
+    show_delivery = any(run.delivery_outcome or run.handoff_pending for run in executions.recent)
     table = Table(box=None, show_header=True, padding=(0, 2))
     table.add_column("Job", style=theme.banner_text)
     table.add_column("Status", style=theme.ui_label)
+    if show_delivery:
+        table.add_column("Delivery", style=theme.ui_label)
     table.add_column("Started", style=theme.banner_dim)
     table.add_column("Duration", style=theme.banner_dim)
     table.add_column("Error", style=theme.ui_error)
 
     for run in executions.recent:
         status_color = theme.ui_error if run.status == "failed" else theme.banner_text
+        delivery = [_delivery_cell(run, theme)] if show_delivery else []
         table.add_row(
             escape(run.job_name or run.job_id or "—"),
             Text(sanitize_terminal_text(run.status) or "—", style=status_color),
+            *delivery,
             _fmt_age(run.started_age_seconds),
             _fmt_age(run.duration_seconds),
             escape(run.error_excerpt) if run.error_excerpt else "—",
         )
     return table
+
+
+def _delivery_cell(run: CronExecution, theme: Theme) -> Text:
+    """One run's recorded delivery outcome, kept visibly apart from its status."""
+    cell = Text()
+    if run.delivery_outcome:
+        cell.append(sanitize_terminal_text(run.delivery_outcome))
+    else:
+        cell.append("unrecorded", style=theme.banner_dim)
+    if run.handoff_pending:
+        cell.append(" ⤵ handoff", style=f"bold {theme.ui_warn}")
+    return cell
+
+
+def _job_delivery_line(
+    j: CronJob, stats: CronJobExecutionStats | None, theme: Theme
+) -> Text | None:
+    """Per-job 24h delivery outcomes, separate from the execution counters.
+
+    A completed execution is not a delivered notification: hermes-agent suppresses
+    delivery for silent runs and records the outcome apart from the run status, so
+    the two are never collapsed into one number.
+    """
+    if stats is None or not stats.delivery_tracked:
+        return None
+    parts = [f"{outcome} {count}" for outcome, count in sorted(stats.delivery_outcomes_24h.items())]
+    if stats.delivery_unrecorded_24h:
+        parts.append(f"unrecorded {stats.delivery_unrecorded_24h}")
+    if stats.handoff_pending_24h:
+        parts.append(f"handoff pending {stats.handoff_pending_24h}")
+    if not parts:
+        return None
+    line = Text()
+    line.append(
+        f"  {sanitize_terminal_text(j.name or j.job_id[:8] or '—')}: ",
+        style=theme.ui_label,
+    )
+    line.append("  ".join(escape(part) for part in parts) + "\n", style=theme.banner_text)
+    return line
 
 
 def _incidents_table(executions: CronExecutionsState, theme: Theme) -> Table:

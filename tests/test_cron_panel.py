@@ -311,6 +311,100 @@ def test_cron_detail_unknown_only_window_is_not_rendered_as_a_dash() -> None:
     assert "3?" in text
 
 
+# F06 — a completed execution is not a delivered notification.
+
+
+def test_cron_detail_separates_delivery_outcome_from_execution_status() -> None:
+    state = DashboardState(
+        cron=CronState(job_count=1, jobs=[CronJob(job_id="job-a", name="alpha")]),
+        cron_executions=_executions_state(
+            db_present=True,
+            job_stats=[
+                CronJobExecutionStats(
+                    job_id="job-a",
+                    total_24h=4,
+                    completed_24h=4,
+                    delivery_tracked=True,
+                    delivery_outcomes_24h={"delivered": 1, "suppressed": 2},
+                    delivery_unrecorded_24h=1,
+                )
+            ],
+            recent=[
+                CronExecution(
+                    execution_id="e1",
+                    job_id="job-a",
+                    job_name="alpha",
+                    status="completed",
+                    delivery_outcome="suppressed",
+                )
+            ],
+        ),
+    )
+
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "Delivery Outcomes" in text
+    assert "delivered 1" in text
+    assert "suppressed 2" in text
+    assert "unrecorded 1" in text
+    assert "suppressed" in text
+
+
+def test_cron_detail_marks_a_pending_handoff() -> None:
+    state = DashboardState(
+        cron=CronState(job_count=1, jobs=[CronJob(job_id="job-a", name="alpha")]),
+        cron_executions=_executions_state(
+            db_present=True,
+            job_stats=[
+                CronJobExecutionStats(
+                    job_id="job-a",
+                    total_24h=1,
+                    completed_24h=1,
+                    delivery_tracked=True,
+                    delivery_outcomes_24h={"delivered": 1},
+                    handoff_pending_24h=1,
+                )
+            ],
+            recent=[
+                CronExecution(
+                    execution_id="e1",
+                    job_id="job-a",
+                    job_name="alpha",
+                    status="completed",
+                    delivery_outcome="delivered",
+                    handoff_pending=True,
+                )
+            ],
+        ),
+    )
+
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "handoff pending 1" in text
+    assert "handoff" in text
+
+
+def test_cron_detail_omits_delivery_when_the_schema_does_not_track_it() -> None:
+    """An older agent records no outcome; a blank column must not read as delivered."""
+    state = DashboardState(
+        cron=CronState(job_count=1, jobs=[CronJob(job_id="job-a", name="alpha")]),
+        cron_executions=_executions_state(
+            db_present=True,
+            job_stats=[CronJobExecutionStats(job_id="job-a", total_24h=2, completed_24h=2)],
+            recent=[
+                CronExecution(
+                    execution_id="e1", job_id="job-a", job_name="alpha", status="completed"
+                )
+            ],
+        ),
+    )
+
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "Delivery Outcomes" not in text
+    assert "delivered" not in text
+
+
 def test_cron_detail_job_without_execution_history_shows_dash() -> None:
     state = DashboardState(
         cron=CronState(job_count=1, jobs=[CronJob(job_id="job-a", name="alpha")]),
