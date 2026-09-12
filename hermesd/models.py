@@ -97,6 +97,13 @@ class GatewayState(BaseModel):
     last_update_to_version: str = ""
     last_update_failed_step: str = ""
     runtime_code_skew: bool = False
+    # Which recorded evidence decided skew: "fleet" (post-restart matrix),
+    # "plan" (pre-update inventory, only for a run that never finished), or ""
+    # when skew was not assessable at all.
+    runtime_code_skew_source: str = ""
+    update_receipt_unfinished: bool = False
+    update_fleet_states: dict[str, int] = Field(default_factory=dict)
+    update_fleet_runtime_count: int = 0
     # Restart history and delivery obligations (state.db)
     gateway_incarnation_count: int = 0
     gateway_restarts_24h: int = 0

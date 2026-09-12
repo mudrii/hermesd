@@ -91,7 +91,9 @@ def test_gateway_compact_shows_loop_status_and_warnings() -> None:
     state = _liveness_state(
         config_stale=True,
         runtime_code_skew=True,
+        runtime_code_skew_source="fleet",
         last_update_outcome="failed",
+        update_receipt_unfinished=True,
         pending_delivery_count=2,
         failed_delivery_count=1,
     )
@@ -99,10 +101,19 @@ def test_gateway_compact_shows_loop_status_and_warnings() -> None:
 
     assert "loop:ticking" in rendered
     assert "config changed, restart needed" in rendered
-    assert "update failed" in rendered
+    assert "update unfinished" in rendered
     assert "code skew" in rendered
     assert "2 pending" in rendered
     assert "1 failed" in rendered
+
+
+def test_gateway_compact_does_not_call_a_successful_update_failed() -> None:
+    """Upstream writes outcome="success"; only an unfinished run deserves a warning."""
+    state = _liveness_state(last_update_outcome="success", update_receipt_unfinished=False)
+    rendered = render_to_str(render_gateway(state, Theme()), no_color=True)
+
+    assert "update failed" not in rendered
+    assert "update unfinished" not in rendered
 
 
 def test_gateway_compact_omits_warnings_when_healthy() -> None:
@@ -114,17 +125,73 @@ def test_gateway_compact_omits_warnings_when_healthy() -> None:
     assert "Deliveries" not in rendered
 
 
+def test_gateway_detail_labels_skew_from_recorded_fleet() -> None:
+    state = _liveness_state(
+        last_update_outcome="success",
+        runtime_code_skew=True,
+        runtime_code_skew_source="fleet",
+        update_fleet_runtime_count=2,
+        update_fleet_states={"current": 1, "stale": 1},
+    )
+    rendered = render_to_str(render_gateway(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "recorded post-restart fleet" in rendered
+    assert "pre-update plan" not in rendered
+    assert "Recorded fleet: 2" in rendered
+    assert "current 1" in rendered
+    assert "stale 1" in rendered
+
+
+def test_gateway_detail_labels_skew_from_unfinished_plan() -> None:
+    state = _liveness_state(
+        last_update_outcome="partial",
+        update_receipt_unfinished=True,
+        runtime_code_skew=True,
+        runtime_code_skew_source="plan",
+    )
+    rendered = render_to_str(render_gateway(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "update never finished" in rendered
+    assert "pre-update plan" in rendered
+    assert "recorded post-restart fleet" not in rendered
+
+
+def test_gateway_detail_notes_when_skew_is_unassessable() -> None:
+    """A receipt with no fleet matrix and a clean finish proves nothing about skew."""
+    state = _liveness_state(
+        last_update_outcome="success",
+        runtime_code_skew=False,
+        runtime_code_skew_source="",
+    )
+    rendered = render_to_str(render_gateway(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "skew not assessable" in rendered
+
+
+def test_gateway_detail_escapes_hostile_fleet_state_names() -> None:
+    state = _liveness_state(
+        last_update_outcome="success",
+        update_fleet_runtime_count=1,
+        update_fleet_states={HOSTILE: 1},
+    )
+    rendered = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "\x1b[2J" not in rendered
+
+
 def test_gateway_detail_shows_liveness_lifecycle_updates_and_deliveries() -> None:
     state = _liveness_state(
         config_stale=True,
         unclean_previous_exit=True,
         exit_reason="crashed on boot",
         last_update_outcome="failed",
+        update_receipt_unfinished=True,
         last_update_finished_age_seconds=600.0,
         last_update_from_version="2026.8.1",
         last_update_to_version="2026.9.1",
         last_update_failed_step="install",
         runtime_code_skew=True,
+        runtime_code_skew_source="fleet",
         pending_delivery_count=2,
         failed_delivery_count=1,
         pending_deliveries=[

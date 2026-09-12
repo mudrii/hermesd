@@ -34,12 +34,13 @@ def test_gateway_preserves_last_good_state_when_state_json_is_corrupt(hermes_hom
     c.close()
 
 
-def _write_running_gateway(home: Path) -> None:
+def _write_running_gateway(home: Path, *, code_sha: str = "") -> None:
     (home / "gateway_state.json").write_text(
         json.dumps(
             {
                 "pid": 4242,
                 "gateway_state": "running",
+                "code_sha": code_sha,
                 "platforms": {"telegram": {"state": "connected", "updated_at": ""}},
             }
         )
@@ -89,20 +90,40 @@ def test_corrupt_lifecycle_keeps_last_good_and_marks_source_failed(hermes_home: 
 
 
 def test_corrupt_update_receipt_keeps_last_good_and_marks_source_failed(hermes_home: Path):
-    _write_running_gateway(hermes_home)
+    _write_running_gateway(hermes_home, code_sha="current-sha")
     receipts = hermes_home / "logs" / "update_receipts"
     receipts.mkdir(parents=True)
     receipt = receipts / "latest.json"
-    receipt.write_text(json.dumps({"outcome": "ok", "post_update": {"version": "2026.9.1"}}))
+    receipt.write_text(
+        json.dumps(
+            {
+                "outcome": "success",
+                "exit_code": 0,
+                "post_update": {"version": "2026.9.1"},
+                "fleet": [
+                    {"profile": "root", "code_sha": "stale-sha", "state": "stale"},
+                    {"profile": "coding", "code_sha": None, "state": "unknown"},
+                ],
+            }
+        )
+    )
 
     c = Collector(hermes_home, pid_exists=lambda pid: True)
     first = c.collect()
-    assert first.gateway.last_update_outcome == "ok"
+    assert first.gateway.last_update_outcome == "success"
+    assert first.gateway.runtime_code_skew is True
     receipt.write_text("{{{")
     second = c.collect()
 
-    assert second.gateway.last_update_outcome == "ok"
+    assert second.gateway.last_update_outcome == "success"
     assert second.gateway.last_update_to_version == "2026.9.1"
+    # Skew verdict, its evidence source, and the recorded fleet matrix are all
+    # part of the last-good payload: a failed read must not silently clear them.
+    assert second.gateway.runtime_code_skew is True
+    assert second.gateway.runtime_code_skew_source == first.gateway.runtime_code_skew_source
+    assert second.gateway.update_receipt_unfinished is False
+    assert second.gateway.update_fleet_runtime_count == 2
+    assert second.gateway.update_fleet_states == {"stale": 1, "unknown": 1}
     assert "update_receipt" in second.health.failed_sources
     c.close()
 

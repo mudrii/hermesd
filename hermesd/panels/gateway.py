@@ -195,8 +195,8 @@ def _append_compact_warnings(lines: Text, gw: GatewayState, theme: Theme) -> Non
     warnings = []
     if gw.config_stale:
         warnings.append("⚠ config changed, restart needed")
-    if gw.last_update_outcome and gw.last_update_outcome != "ok":
-        warnings.append("⚠ update failed")
+    if gw.update_receipt_unfinished:
+        warnings.append("⚠ update unfinished")
     if gw.runtime_code_skew:
         warnings.append("⚠ code skew")
     if warnings:
@@ -249,14 +249,14 @@ def _append_lifecycle(text: Text, gw: GatewayState, theme: Theme) -> None:
 
 
 def _updates_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
-    if not (gw.last_update_outcome or gw.runtime_code_skew):
+    if not (gw.last_update_outcome or gw.runtime_code_skew or gw.runtime_code_skew_source):
         return []
     text = Text()
     text.append("\nUpdates\n", style=f"bold {theme.ui_label}")
     text.append("  Outcome: ", style=theme.ui_label)
     text.append(
         _or_dash(gw.last_update_outcome),
-        style=theme.ui_ok if gw.last_update_outcome == "ok" else theme.ui_warn,
+        style=theme.ui_warn if gw.update_receipt_unfinished else theme.ui_ok,
     )
     text.append(
         f"  finished {_duration_label(gw.last_update_finished_age_seconds)} ago",
@@ -269,12 +269,38 @@ def _updates_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
     )
     if gw.last_update_failed_step:
         text.append(f"\n  Failed step: {escape(gw.last_update_failed_step)}", style=theme.ui_error)
-    if gw.runtime_code_skew:
-        text.append(
-            "\n  ⚠ runtime code skew — a runtime is on a different build",
-            style=theme.ui_warn,
-        )
+    _append_fleet_evidence(text, gw, theme)
+    _append_skew_verdict(text, gw, theme)
     return [text]
+
+
+def _append_fleet_evidence(text: Text, gw: GatewayState, theme: Theme) -> None:
+    """The receipt's fleet matrix is a snapshot taken at update time, not a live probe."""
+    if not gw.update_fleet_runtime_count:
+        return
+    states = "  ".join(
+        f"{escape(state)} {count}" for state, count in sorted(gw.update_fleet_states.items())
+    )
+    text.append(f"\n  Recorded fleet: {gw.update_fleet_runtime_count}", style=theme.banner_dim)
+    if states:
+        text.append(f"  {states}", style=theme.banner_dim)
+
+
+def _append_skew_verdict(text: Text, gw: GatewayState, theme: Theme) -> None:
+    """Name the evidence behind a skew verdict; silence is not a clean bill of health."""
+    if gw.runtime_code_skew:
+        if gw.runtime_code_skew_source == "fleet":
+            text.append(
+                "\n  ⚠ runtime code skew — recorded post-restart fleet is on a different build",
+                style=theme.ui_warn,
+            )
+        else:
+            text.append(
+                "\n  ⚠ update never finished — pre-update plan is on a different build",
+                style=theme.ui_warn,
+            )
+    elif gw.last_update_outcome and not gw.runtime_code_skew_source:
+        text.append("\n  code skew not assessable from this receipt", style=theme.banner_dim)
 
 
 def _deliveries_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:

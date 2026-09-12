@@ -264,6 +264,10 @@ _UPDATE_RECEIPT_FIELDS = (
     "last_update_to_version",
     "last_update_failed_step",
     "runtime_code_skew",
+    "runtime_code_skew_source",
+    "update_receipt_unfinished",
+    "update_fleet_states",
+    "update_fleet_runtime_count",
 )
 _LEDGER_FIELDS = (
     "gateway_incarnation_count",
@@ -1149,6 +1153,10 @@ class Collector:
                 "last_update_to_version": receipt.to_version,
                 "last_update_failed_step": receipt.failed_step,
                 "runtime_code_skew": receipt.runtime_code_skew,
+                "runtime_code_skew_source": receipt.runtime_code_skew_source,
+                "update_receipt_unfinished": receipt.update_receipt_unfinished,
+                "update_fleet_states": receipt.update_fleet_states,
+                "update_fleet_runtime_count": receipt.update_fleet_runtime_count,
             }
         )
 

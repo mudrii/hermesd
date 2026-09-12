@@ -53,6 +53,13 @@ _OPEN_DELIVERY_LIMIT = 5
 # window of now. The live gateway_state.json carries a monotonic-clock value
 # (178874708938, i.e. the year 7638), which must never be read as an epoch.
 _PLAUSIBLE_EPOCH_WINDOW_SECONDS = 50 * 365 * _DAY_SECONDS
+# Outcomes that mean the update never reached a clean finish. Upstream also
+# stamps a ``stop_reason`` on successful receipts, so that field alone is not
+# evidence of failure and is only read alongside a missing success marker.
+_UNFINISHED_OUTCOMES = frozenset({"failed", "partial", "running"})
+# The receipt's fleet matrix holds one row per profile. Cap the retained state
+# vocabulary so an untrusted file cannot grow the map; never cap the skew scan.
+_FLEET_STATE_KIND_LIMIT = 8
 
 
 def _optional_int(value: object) -> int | None:
@@ -203,6 +210,19 @@ def _config_stale(config_path: Path, root: Path, start_epoch: float | None) -> b
 
 
 @dataclass(frozen=True, slots=True)
+class _SkewEvidence:
+    """Which recorded evidence decided skew, so the panel can say so honestly.
+
+    An empty ``source`` means skew was *not assessable* — no fleet matrix and no
+    unfinished run to fall back on, or no gateway sha to compare against. That is
+    distinct from "assessed and found consistent".
+    """
+
+    skewed: bool = False
+    source: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class _UpdateReceipt:
     outcome: str = ""
     finished_age_seconds: float | None = None
@@ -210,19 +230,29 @@ class _UpdateReceipt:
     to_version: str = ""
     failed_step: str = ""
     runtime_code_skew: bool = False
+    runtime_code_skew_source: str = ""
+    update_receipt_unfinished: bool = False
+    update_fleet_states: dict[str, int] = field(default_factory=dict)
+    update_fleet_runtime_count: int = 0
 
 
 def _update_receipt_status(data: JsonMapping, now: float, code_sha: str) -> _UpdateReceipt:
     if not data:
         return _UpdateReceipt()
-    plan = _as_dict(data.get("plan"))
+    unfinished = _receipt_looks_unfinished(data)
+    fleet = _as_list(data.get("fleet"))
+    evidence = _skew_evidence(fleet, data, code_sha, unfinished)
     return _UpdateReceipt(
         outcome=str(data.get("outcome") or ""),
         finished_age_seconds=_age_seconds(_iso_to_epoch(data.get("finished_at")), now),
         from_version=str(_as_dict(data.get("pre_update")).get("version") or ""),
         to_version=str(_as_dict(data.get("post_update")).get("version") or ""),
         failed_step=_first_failed_step(data.get("steps")),
-        runtime_code_skew=_runtime_code_skew(plan.get("runtimes"), code_sha),
+        runtime_code_skew=evidence.skewed,
+        runtime_code_skew_source=evidence.source,
+        update_receipt_unfinished=unfinished,
+        update_fleet_states=_fleet_state_counts(fleet),
+        update_fleet_runtime_count=len(fleet),
     )
 
 
@@ -235,14 +265,72 @@ def _first_failed_step(steps: object) -> str:
     return ""
 
 
-def _runtime_code_skew(runtimes: object, code_sha: str) -> bool:
-    """A runtime pinned to a different non-empty sha than the gateway is skewed."""
+def _receipt_looks_unfinished(data: JsonMapping) -> bool:
+    """True when the receipt is from an update that never reached a clean finish.
+
+    Mirrors upstream ``_receipt_looks_unfinished``. The command boundary stamps a
+    ``stop_reason`` on clean receipts too, so that field only counts when nothing
+    else vouched for success — otherwise a successful update looks unfinished and
+    its pre-pull plan SHAs retrigger a restart forever.
+    """
+    exit_code = data.get("exit_code")
+    outcome = data.get("outcome")
+    if exit_code not in (0, None) or outcome in _UNFINISHED_OUTCOMES:
+        return True
+    if _as_dict(data.get("gateway_restart")).get("incomplete"):
+        return True
+    succeeded = exit_code == 0 or outcome == "success"
+    return bool(data.get("stop_reason")) and not succeeded
+
+
+def _skew_evidence(
+    fleet: list[object], data: JsonMapping, code_sha: str, unfinished: bool
+) -> _SkewEvidence:
+    """Prefer the post-restart fleet matrix; the plan only explains an unfinished run.
+
+    ``plan.runtimes[].code_sha`` is captured *before* the pull, so a finished
+    update's plan always disagrees with the running tree. Treating that as skew
+    both cries wolf on healthy fleets and hides a fleet that genuinely came back
+    on the wrong build, which is why the plan is consulted only when there is no
+    fleet matrix and the receipt shows the update never finished.
+    """
     if not code_sha:
-        return False
+        return _SkewEvidence()
+    if fleet:
+        return _SkewEvidence(_any_fleet_skew(fleet, code_sha), "fleet")
+    if not unfinished:
+        return _SkewEvidence()
+    plan_runtimes = _as_list(_as_dict(data.get("plan")).get("runtimes"))
+    return _SkewEvidence(_any_sha_mismatch(plan_runtimes, code_sha), "plan")
+
+
+def _any_fleet_skew(fleet: list[object], code_sha: str) -> bool:
+    """A recorded ``stale`` state is skew even when its sha was never stamped."""
     return any(
-        (sha := str(_as_dict(entry).get("code_sha") or "")) and sha != code_sha
-        for entry in _as_list(runtimes)
+        _as_dict(entry).get("state") == "stale" or _entry_sha_differs(entry, code_sha)
+        for entry in fleet
     )
+
+
+def _any_sha_mismatch(runtimes: list[object], code_sha: str) -> bool:
+    return any(_entry_sha_differs(entry, code_sha) for entry in runtimes)
+
+
+def _entry_sha_differs(entry: object, code_sha: str) -> bool:
+    """A runtime pinned to a different non-empty sha than the gateway is skewed."""
+    sha = str(_as_dict(entry).get("code_sha") or "")
+    return bool(sha) and sha != code_sha
+
+
+def _fleet_state_counts(fleet: list[object]) -> dict[str, int]:
+    """Recorded fleet matrix states, vocabulary-capped. Counts every row scanned."""
+    counts: dict[str, int] = {}
+    for entry in fleet:
+        state = str(_as_dict(entry).get("state") or "unknown")
+        if state not in counts and len(counts) >= _FLEET_STATE_KIND_LIMIT:
+            continue
+        counts[state] = counts.get(state, 0) + 1
+    return counts
 
 
 @dataclass(frozen=True, slots=True)

@@ -1177,7 +1177,7 @@ def _receipt(**extra: object) -> dict[str, object]:
         "finished_at": _iso(NOW - 600),
         "argv": ["hermes", "update"],
         "pid": 999,
-        "outcome": "ok",
+        "outcome": "success",
         "pre_update": {"sha": "aaaa", "short_sha": "aaaa", "version": "2026.8.1"},
         "post_update": {"sha": "bbbb", "short_sha": "bbbb", "version": "2026.9.1"},
         "steps": [{"name": "pull", "ok": True, "detail": "", "at": _iso(NOW - 800)}],
@@ -1193,7 +1193,7 @@ def test_update_receipt_happy_path(hermes_home: Path):
 
     gateway = _collect(hermes_home).gateway
 
-    assert gateway.last_update_outcome == "ok"
+    assert gateway.last_update_outcome == "success"
     assert gateway.last_update_finished_age_seconds == pytest.approx(600.0)
     assert gateway.last_update_from_version == "2026.8.1"
     assert gateway.last_update_to_version == "2026.9.1"
@@ -1226,17 +1226,197 @@ def test_update_receipt_detects_runtime_code_skew(hermes_home: Path):
     _write_receipt(
         hermes_home,
         _receipt(
-            plan={
-                "runtimes": [
-                    {"kind": "gateway", "code_sha": "bbbb"},
-                    {"kind": "worker", "code_sha": "cccc"},
-                ]
-            }
+            fleet=[
+                {"profile": "default", "code_sha": "bbbb", "state": "current"},
+                {"profile": "coding", "code_sha": "cccc", "state": "stale"},
+            ]
         ),
     )
 
     gateway = _collect(hermes_home).gateway
 
+    assert gateway.runtime_code_skew is True
+
+
+# F18: plan.runtimes[].code_sha is captured *before* the pull, so a finished
+# update's plan always looks stale. The post-restart fleet matrix is the
+# authoritative evidence; the plan only explains a run that never finished.
+
+
+def test_update_receipt_finished_with_current_fleet_ignores_stale_plan(hermes_home: Path):
+    _write_gateway_state(hermes_home, code_sha="bbbb")
+    _write_receipt(
+        hermes_home,
+        _receipt(
+            outcome="success",
+            exit_code=0,
+            plan={"runtimes": [{"kind": "gateway", "code_sha": "aaaa"}]},
+            fleet=[{"profile": "default", "pid": 7, "code_sha": "bbbb", "state": "current"}],
+        ),
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.runtime_code_skew is False
+    assert gateway.runtime_code_skew_source == "fleet"
+    assert gateway.update_receipt_unfinished is False
+
+
+def test_update_receipt_fleet_mismatch_wins_over_matching_plan(hermes_home: Path):
+    _write_gateway_state(hermes_home, code_sha="bbbb")
+    _write_receipt(
+        hermes_home,
+        _receipt(
+            outcome="success",
+            exit_code=0,
+            plan={"runtimes": [{"kind": "gateway", "code_sha": "bbbb"}]},
+            fleet=[{"profile": "default", "pid": 7, "code_sha": "cccc", "state": "stale"}],
+        ),
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.runtime_code_skew is True
+    assert gateway.runtime_code_skew_source == "fleet"
+
+
+def test_update_receipt_fleet_explicit_stale_state_without_sha_is_skew(hermes_home: Path):
+    _write_gateway_state(hermes_home, code_sha="bbbb")
+    _write_receipt(
+        hermes_home,
+        _receipt(fleet=[{"profile": "default", "pid": 7, "code_sha": None, "state": "stale"}]),
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.runtime_code_skew is True
+
+
+def test_update_receipt_finished_without_fleet_does_not_use_pre_update_plan(hermes_home: Path):
+    _write_gateway_state(hermes_home, code_sha="bbbb")
+    _write_receipt(
+        hermes_home,
+        _receipt(
+            outcome="success",
+            exit_code=0,
+            plan={"runtimes": [{"kind": "gateway", "code_sha": "cccc"}]},
+        ),
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.runtime_code_skew is False
+    assert gateway.runtime_code_skew_source == ""
+    assert gateway.update_receipt_unfinished is False
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"outcome": "failed"},
+        {"outcome": "partial"},
+        {"outcome": "running"},
+        {"exit_code": 1},
+        {"gateway_restart": {"incomplete": True}},
+        {"outcome": "refused", "stop_reason": "update_contract refusal"},
+    ],
+)
+def test_update_receipt_unfinished_falls_back_to_plan_evidence(
+    hermes_home: Path, extra: dict[str, object]
+):
+    _write_gateway_state(hermes_home, code_sha="bbbb")
+    _write_receipt(
+        hermes_home,
+        _receipt(plan={"runtimes": [{"kind": "gateway", "code_sha": "cccc"}]}, **extra),
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.update_receipt_unfinished is True
+    assert gateway.runtime_code_skew is True
+    assert gateway.runtime_code_skew_source == "plan"
+
+
+def test_update_receipt_success_with_stop_reason_is_not_unfinished(hermes_home: Path):
+    """Upstream stamps stop_reason on clean receipts too; it must not look unfinished."""
+    _write_gateway_state(hermes_home, code_sha="bbbb")
+    _write_receipt(
+        hermes_home,
+        _receipt(
+            outcome="success",
+            exit_code=0,
+            stop_reason="completed at command boundary",
+            plan={"runtimes": [{"kind": "gateway", "code_sha": "cccc"}]},
+        ),
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.update_receipt_unfinished is False
+    assert gateway.runtime_code_skew is False
+
+
+def test_update_receipt_skew_unassessable_without_gateway_sha(hermes_home: Path):
+    _write_gateway_state(hermes_home, code_sha="")
+    _write_receipt(
+        hermes_home,
+        _receipt(fleet=[{"profile": "default", "pid": 7, "code_sha": "cccc", "state": "stale"}]),
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.runtime_code_skew is False
+    assert gateway.runtime_code_skew_source == ""
+
+
+def test_update_receipt_records_fleet_state_counts(hermes_home: Path):
+    _write_gateway_state(hermes_home, code_sha="bbbb")
+    _write_receipt(
+        hermes_home,
+        _receipt(
+            fleet=[
+                {"profile": "default", "code_sha": "bbbb", "state": "current"},
+                {"profile": "coding", "code_sha": "aaaa", "state": "stale"},
+                {"profile": "ops", "code_sha": None, "state": "unknown"},
+                {"profile": "web", "code_sha": None, "state": "down"},
+            ]
+        ),
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.update_fleet_runtime_count == 4
+    assert gateway.update_fleet_states == {"current": 1, "stale": 1, "unknown": 1, "down": 1}
+
+
+def test_update_receipt_fleet_row_beyond_state_kinds_is_still_scanned(hermes_home: Path):
+    """Bounding the state vocabulary must not bound the skew scan."""
+    _write_gateway_state(hermes_home, code_sha="bbbb")
+    fleet: list[dict[str, object]] = [
+        {"profile": f"p{i}", "code_sha": "bbbb", "state": f"state{i}"} for i in range(200)
+    ]
+    fleet[-1] = {"profile": "p199", "code_sha": "aaaa", "state": "stale"}
+    _write_receipt(hermes_home, _receipt(fleet=fleet))
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.update_fleet_runtime_count == 200
+    assert gateway.runtime_code_skew is True
+    assert len(gateway.update_fleet_states) <= 8
+
+
+def test_update_receipt_ignores_wrong_typed_fleet(hermes_home: Path):
+    _write_gateway_state(hermes_home, code_sha="bbbb")
+    _write_receipt(
+        hermes_home,
+        _receipt(outcome="failed", fleet="nope", plan={"runtimes": [{"code_sha": "cccc"}]}),
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.update_fleet_runtime_count == 0
+    assert gateway.update_receipt_unfinished is True
+    assert gateway.runtime_code_skew_source == "plan"
     assert gateway.runtime_code_skew is True
 
 

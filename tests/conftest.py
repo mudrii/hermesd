@@ -689,7 +689,8 @@ def sample_update_receipt(hermes_home: Path) -> Path:
                 "finished_at": datetime.fromtimestamp(now - 600, tz=UTC).isoformat(),
                 "argv": ["hermes", "update"],
                 "pid": 4242,
-                "outcome": "ok",
+                "outcome": "success",
+                "exit_code": 0,
                 "pre_update": {
                     "sha": "0" * 40,
                     "short_sha": "000000000000",
@@ -711,11 +712,23 @@ def sample_update_receipt(hermes_home: Path) -> Path:
                     }
                 ],
                 "skips": [],
-                "gateway_restart": {"requested": True},
+                "gateway_restart": {"requested": True, "incomplete": False},
+                # The post-restart matrix is the authoritative skew evidence; the
+                # plan below is captured *before* the pull and always looks stale.
+                "fleet": [
+                    {
+                        "profile": "root",
+                        "pid": 23456,
+                        "code_sha": "abcdef0123456789abcdef0123456789abcdef01",
+                        "code_version": "2026.9.1",
+                        "state": "current",
+                        "source": "socket",
+                    }
+                ],
                 "plan": {
                     "install_method": "uv",
-                    "expected_sha": "abcdef0123456789abcdef0123456789abcdef01",
-                    "expected_version": "2026.9.1",
+                    "expected_sha": "0" * 40,
+                    "expected_version": "2026.8.1",
                     "profiles": ["root"],
                     "runtimes": [
                         {
@@ -723,8 +736,8 @@ def sample_update_receipt(hermes_home: Path) -> Path:
                             "profile": "root",
                             "pid": 12345,
                             "supervisor": "launchd",
-                            "code_sha": "abcdef0123456789abcdef0123456789abcdef01",
-                            "code_version": "2026.9.1",
+                            "code_sha": "0" * 40,
+                            "code_version": "2026.8.1",
                             "restart_via": "launchctl",
                             "detail": "",
                         }
