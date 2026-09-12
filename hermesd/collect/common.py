@@ -106,7 +106,8 @@ def _read_tail_text(path: Path, max_bytes: int) -> str:
         handle.seek(0, 2)
         size = handle.tell()
         handle.seek(max(0, size - max_bytes))
-        return handle.read().decode("utf-8", errors="replace")
+        # Bound the read so bytes appended after the size check are excluded.
+        return handle.read(size - handle.tell()).decode("utf-8", errors="replace")
 
 
 def _mtime(path: Path) -> float | None:
