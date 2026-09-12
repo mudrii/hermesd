@@ -101,6 +101,10 @@ from hermesd.collect.logs import (
     _extract_session_id,
     _latest_log_mtime,
 )
+from hermesd.collect.migration import (
+    _MANIFEST_NAME,
+    _migration_state,
+)
 from hermesd.collect.operations import (
     StateDbRead,
     _count_delegation_live_logs,
@@ -196,6 +200,7 @@ from hermesd.models import (
     MCPSchemaCache,
     MCPServerInfo,
     MemoryOverview,
+    MigrationState,
     ModelCacheSummary,
     ModelUsage,
     OperationsState,
@@ -680,6 +685,15 @@ class Collector:
                     "gateway_ledgers", results["gateway"], _LEDGER_FIELDS
                 ),
             ),
+            # Own source_name so a torn gateway_migration.json (upstream writes it
+            # with a plain write_text) degrades only the migration verdict and keeps
+            # its own last-good value, leaving the gateway beside it fresh.
+            _SourceSpec(
+                "migration",
+                "migration",
+                lambda: self._collect_migration(results["gateway"]),
+                MigrationState,
+            ),
             _SourceSpec(
                 "tokens_today",
                 "tokens_today",
@@ -1032,11 +1046,6 @@ class Collector:
             return GatewayState()
         now = self._clock()
         writer = _record_writer(data)
-        platforms = [
-            _platform_status(str(name), info, now, writer)
-            for name, raw_info in _as_dict(data.get("platforms")).items()
-            if (info := _as_dict(raw_info))
-        ]
         # A non-positive PID is absent, never a target: os.kill(0)/os.kill(-1)
         # would signal a process group or every process the user owns.
         pid = max(0, _coerce_int(data.get("pid")))
@@ -1058,6 +1067,20 @@ class Collector:
                     pid = launchd_pid
                 else:
                     running = False
+        # Built after `running` because a platform entry's recorded ingress URL is
+        # only surfaced while the gateway that recorded it is live.
+        platforms = [
+            _platform_status(str(name), info, now, writer, running=running)
+            for name, raw_info in _as_dict(data.get("platforms")).items()
+            if (info := _as_dict(raw_info))
+        ]
+        # Tri-state: an absent or non-list `served_profiles` is no record at all,
+        # while a real list (even []) from a live gateway is authoritative — the
+        # distinction upstream's recorded_served_profiles() makes by returning
+        # None instead of []. The names are kept either way; only the marker is
+        # gated on liveness, so a dead gateway's record reads as preserved.
+        raw_served = data.get("served_profiles")
+        served_recorded = running and isinstance(raw_served, list)
         version, behind = self._collect_hermes_version()
         cfg = self._read_yaml_reporting_stale()
         gateway_cfg = _as_dict(cfg.get("gateway"))
@@ -1090,9 +1113,8 @@ class Collector:
                 drain_request.get("principal") or drain_request.get("requested_by") or ""
             ),
             drain_suppress_notification=bool(drain_request.get("suppress_notification")),
-            served_profiles=[
-                str(profile) for profile in _as_list(data.get("served_profiles")) if profile
-            ],
+            served_profiles=[str(profile) for profile in _as_list(raw_served) if profile],
+            served_profiles_recorded=served_recorded,
             scale_to_zero_idle_timeout_minutes=_coerce_int(scale_cfg.get("idle_timeout_minutes")),
             scale_to_zero_relay_only=_scale_to_zero_relay_only(scale_cfg, platforms),
         )
@@ -1181,6 +1203,38 @@ class Collector:
                 raise RuntimeError("state.db gateway ledgers disappeared or became unsafe")
             return gateway
         return gateway.model_copy(update=_gateway_ledger_fields(readout.ledgers, self._clock()))
+
+    def _collect_migration(self, gateway: GatewayState) -> MigrationState:
+        """Read ``gateway_migration.json`` and judge it against the live artifacts.
+
+        ROOT-scoped: upstream anchors the manifest at the *default* profile home
+        (``hermes_cli/gateway_migrate.py:467-468``), never a secondary's, so a
+        served profile has no copy of its own to read.
+
+        Presence is checked separately from parseability because the two carry
+        different meanings: absent is "never migrated OR successfully rolled back",
+        while present-but-unparseable is a torn ``write_text`` mid-flight. A file
+        that was readable and then vanished or turned unsafe *raises*, so the source
+        is marked failed and its last-good verdict stays on display instead of
+        silently reporting "no migration".
+        """
+        path = self._paths.shared_path(_MANIFEST_NAME)
+        last = self._last_good_by_source.get("migration")
+        had_last_good = bool(last is not None and last.manifest_present)
+        if not _safe_child_path(path, self._paths.root_home):
+            if had_last_good:
+                raise RuntimeError(f"{path.name} became unsafe")
+            return MigrationState()
+        if not _exists_strict(path):
+            if had_last_good:
+                raise RuntimeError(f"{path.name} disappeared")
+            return MigrationState()
+        return _migration_state(
+            self._read_json_reporting_stale(path),
+            now=self._clock(),
+            cfg=self._read_yaml_reporting_stale(),
+            gateway=gateway,
+        )
 
     def _find_gateway_launchd_pid(self) -> int | None:
         """Check if launchd has a live hermes gateway process."""

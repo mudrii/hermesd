@@ -675,6 +675,78 @@ def test_profiled_collector_reads_root_scoped_cron_kanban_and_gateway(
     assert state.sessions[0].session_id == "profile_session"
 
 
+def test_profiled_collector_reads_the_root_migration_manifest(
+    profiled_hermes_home: Path,
+):
+    """The migration manifest belongs to the DEFAULT home, never to a secondary's.
+
+    Upstream anchors it at ``get_default_hermes_root()``
+    (``gateway_migrate.py:144-146`` + ``_manifest_path`` ``:467-468``), and a served
+    profile owns no ``gateway_state.json`` of its own, so under ``--profile coding``
+    the root manifest is the only one that can exist. A copy dropped inside the
+    profile home must be ignored rather than read.
+    """
+    home = profiled_hermes_home
+    profile_home = home / "profiles" / "coding"
+    manifest = {
+        "version": 1,
+        "migrated_at": "2026-09-13T00:52:11+0200",
+        "flag_was": False,
+        "default": {"profile": "default", "home": str(home), "pid": 12345, "service": None},
+        "secondaries": [
+            {"profile": "coding", "home": str(profile_home), "pid": None, "service": None}
+        ],
+    }
+    (home / "gateway_migration.json").write_text(json.dumps(manifest))
+    (profile_home / "gateway_migration.json").write_text(
+        json.dumps({**manifest, "migrated_at": "2020-01-01T00:00:00+0000"})
+    )
+    (home / "config.yaml").write_text("gateway:\n  multiplex_profiles: true\n")
+    (home / "gateway_state.json").write_text(
+        json.dumps(
+            {
+                "pid": 12345,
+                "gateway_state": "running",
+                "served_profiles": ["default", "coding"],
+                "platforms": {},
+            }
+        )
+    )
+
+    c = Collector(home, profile_name="coding", pid_exists=lambda pid: pid == 12345)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.migration.manifest_present is True
+    assert state.migration.migrated_at == "2026-09-13T00:52:11+0200"
+    assert state.migration.multiplex_flag_on is True
+    assert state.migration.migration_verified is True
+    assert "migration" not in state.health.failed_sources
+
+
+def test_profiled_collector_ignores_a_profile_local_migration_manifest(
+    profiled_hermes_home: Path,
+):
+    """Only the root manifest counts: a profile-local copy is not a migration record."""
+    home = profiled_hermes_home
+    profile_home = home / "profiles" / "coding"
+    (profile_home / "gateway_migration.json").write_text(
+        json.dumps({"version": 1, "migrated_at": "2026-09-13T00:52:11+0200", "flag_was": False})
+    )
+
+    c = Collector(home, profile_name="coding", pid_exists=lambda pid: pid == 12345)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.migration.manifest_present is False
+    assert state.migration.migration_verified is False
+    assert "migration" not in state.health.failed_sources
+
+
 def test_profiled_collector_does_not_read_root_scoped_profile_sources(
     profiled_hermes_home: Path,
 ):

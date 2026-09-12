@@ -9,6 +9,8 @@ from hermesd.models import (
     DeliveryObligationSummary,
     GatewayLoopHealth,
     GatewayState,
+    MigrationProfileRecord,
+    MigrationState,
     PlatformOwnership,
     PlatformStatus,
 )
@@ -381,3 +383,358 @@ def test_gateway_never_renders_raw_writer_identity_stamps(detail: bool) -> None:
         assert "preserved" in rendered
     else:
         assert "outlived their writer" in rendered
+
+
+# F10 — shared-listener routing: profile column, served-record labelling, ingress.
+
+
+def _routing_state(**gateway_overrides) -> DashboardState:
+    gateway = GatewayState(running=True, pid=4242, state="running")
+    return DashboardState(gateway=gateway.model_copy(update=gateway_overrides))
+
+
+def test_gateway_detail_shows_a_profile_column_for_namespaced_platforms() -> None:
+    state = _routing_state(
+        platforms=[
+            PlatformStatus(name="telegram", profile="dev", state="connected"),
+            PlatformStatus(name="telegram", state="connected"),
+        ]
+    )
+
+    rendered = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Profile" in rendered
+    assert "dev" in rendered
+
+
+def test_gateway_compact_labels_a_served_profile_platform() -> None:
+    """A plain platform name would be ambiguous once two profiles serve the same platform."""
+    state = _routing_state(
+        platforms=[PlatformStatus(name="telegram", profile="dev", state="connected")]
+    )
+
+    rendered = render_to_str(render_gateway(state, Theme()), no_color=True)
+
+    assert "dev/telegram:" in rendered
+
+
+def test_gateway_detail_lists_recorded_ingress_urls_without_claiming_a_probe() -> None:
+    state = _routing_state(
+        platforms=[
+            PlatformStatus(
+                name="telegram",
+                profile="dev",
+                state="connected",
+                ingress_url="https://gw.example/p/dev/telegram/webhook",
+            )
+        ]
+    )
+
+    rendered = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Shared-Listener Ingress" in rendered
+    assert "https://gw.example/p/dev/telegram/webhook" in rendered
+    assert "recorded by the gateway — hermesd never requests these URLs" in rendered
+    # The section must not read as an endpoint-availability claim.
+    for claim in ("reachable", "responding", "available", "probe"):
+        assert claim not in rendered.lower()
+
+
+def test_gateway_detail_marks_a_path_only_ingress_record() -> None:
+    """A bare path is what upstream records when no default listener was live yet."""
+    state = _routing_state(
+        platforms=[
+            PlatformStatus(
+                name="telegram",
+                profile="dev",
+                state="connected",
+                ingress_url="/p/dev/telegram/webhook",
+            )
+        ]
+    )
+
+    rendered = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "/p/dev/telegram/webhook" in rendered
+    assert "no live listener" in rendered
+
+
+def test_gateway_detail_omits_the_ingress_section_without_a_recorded_url() -> None:
+    state = _routing_state(platforms=[PlatformStatus(name="telegram", state="connected")])
+
+    rendered = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Shared-Listener Ingress" not in rendered
+
+
+def test_gateway_detail_reports_a_live_served_record() -> None:
+    state = _routing_state(served_profiles=["default", "coding"], served_profiles_recorded=True)
+
+    rendered = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Served Profiles: default, coding" in rendered
+    assert "gateway not live" not in rendered
+
+
+def test_gateway_detail_reports_an_authoritative_empty_served_set() -> None:
+    """An empty list from a live gateway means "serves nobody else", not "unknown"."""
+    state = _routing_state(served_profiles=[], served_profiles_recorded=True)
+
+    rendered = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "none (the live gateway serves no other profile)" in rendered
+
+
+def test_gateway_detail_labels_a_served_record_that_outlived_its_writer() -> None:
+    state = _routing_state(
+        running=False,
+        state="stopped",
+        served_profiles=["default", "coding"],
+        served_profiles_recorded=False,
+    )
+
+    rendered = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Served Profiles (record, gateway not live): default, coding" in rendered
+
+
+def test_gateway_detail_stays_quiet_without_any_served_record() -> None:
+    state = _routing_state(served_profiles=[], served_profiles_recorded=False)
+
+    rendered = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Served Profiles" not in rendered
+
+
+# F19 — a migration manifest is progress evidence, never proof of success.
+
+
+def _migration_record(profile: str, *, served: bool, home: str = "/h/.hermes") -> object:
+    return MigrationProfileRecord(profile=profile, home=home, service_kind="launchd", served=served)
+
+
+def _migration_dashboard(**overrides) -> DashboardState:
+    """A verified multiplex topology, with any clause knocked out by ``overrides``."""
+    migration = MigrationState(
+        manifest_present=True,
+        manifest_parsed=True,
+        manifest_version=1,
+        migrated_at="2026-09-13T00:52:11+0200",
+        migrated_at_age_seconds=10_800.0,
+        flag_was=False,
+        default_profile=MigrationProfileRecord(
+            profile="default", home="/h/.hermes", service_kind="launchd", served=True
+        ),
+        secondaries=[
+            _migration_record("dev", served=True),
+            _migration_record("coding", served=True, home="/h/.hermes/profiles/coding"),
+        ],
+        secondary_count=2,
+        multiplex_flag_on=True,
+        default_gateway_live=True,
+        served_recorded=True,
+    )
+    gateway = GatewayState(
+        running=True,
+        pid=4242,
+        state="running",
+        served_profiles=["default", "dev", "coding"],
+        served_profiles_recorded=True,
+    )
+    return DashboardState(gateway=gateway, migration=migration.model_copy(update=overrides))
+
+
+def _render_migration(state: DashboardState, *, detail: bool = True) -> str:
+    return render_to_str(render_gateway(state, Theme(), detail=detail), width=220, no_color=True)
+
+
+def test_gateway_detail_reports_a_verified_multiplex_topology() -> None:
+    rendered = _render_migration(_migration_dashboard())
+
+    assert "Multiplex Migration" in rendered
+    assert "multiplexed (verified)" in rendered
+    assert "as recorded in config" in rendered
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"served_recorded": False}, "no live gateway recorded a served-profile set"),
+        ({"default_gateway_live": False}, "the default gateway is not live"),
+        ({"multiplex_flag_on": False}, "gateway.multiplex_profiles is off as recorded in config"),
+        ({"manifest_parsed": False}, "gateway_migration.json is present but unreadable"),
+    ],
+)
+def test_gateway_detail_names_the_missing_evidence(
+    overrides: dict[str, object], expected: str
+) -> None:
+    """Unverified says *what* could not be verified, never that the migration failed."""
+    rendered = _render_migration(_migration_dashboard(**overrides))
+
+    assert "migration unverified" in rendered
+    assert expected in rendered
+    assert "multiplexed (verified)" not in rendered
+
+
+def test_gateway_detail_names_the_profiles_the_live_set_does_not_cover() -> None:
+    state = _migration_dashboard(
+        served_recorded=True,
+        secondaries=[
+            _migration_record("dev", served=True),
+            _migration_record("coding", served=False),
+        ],
+    )
+
+    rendered = _render_migration(state)
+
+    assert "migration unverified" in rendered
+    assert "not in the live served set: coding" in rendered
+    assert "dev" in rendered
+
+
+def test_gateway_detail_reports_a_truncated_secondary_list() -> None:
+    state = _migration_dashboard(
+        secondary_count=60,
+        secondaries_truncated=True,
+        secondaries=[_migration_record("dev", served=True)],
+    )
+
+    rendered = _render_migration(state)
+
+    assert "migration unverified" in rendered
+    assert "only the first 1 of 60 recorded secondaries were retained" in rendered
+
+
+@pytest.mark.parametrize("detail", [False, True])
+def test_the_panel_never_claims_a_migration_finished(detail: bool) -> None:
+    """Banned wording: the manifest is written before verification ever runs."""
+    verified = _render_migration(_migration_dashboard(), detail=detail)
+    unverified = _render_migration(_migration_dashboard(served_recorded=False), detail=detail)
+
+    for rendered in (verified, unverified):
+        lowered = rendered.lower()
+        assert "migrated" not in lowered
+        assert "migration complete" not in lowered
+        assert "migration succeeded" not in lowered
+
+
+def test_gateway_detail_labels_the_manifest_stamp_as_a_start() -> None:
+    rendered = _render_migration(_migration_dashboard())
+
+    assert "Started: 2026-09-13T00:52:11+0200" in rendered
+    assert "local time" in rendered
+    assert "3h ago" in rendered
+
+
+def test_gateway_detail_does_not_render_an_unparseable_stamp_as_an_age() -> None:
+    state = _migration_dashboard(migrated_at="yesterday", migrated_at_age_seconds=None)
+
+    rendered = _render_migration(state)
+
+    assert "Started: yesterday" in rendered
+    assert "could not be parsed" in rendered
+
+
+def test_gateway_detail_omits_the_start_line_without_a_recorded_stamp() -> None:
+    """A manifest with no ``migrated_at`` must not invent one, or an age for it."""
+    state = _migration_dashboard(migrated_at="", migrated_at_age_seconds=None)
+
+    rendered = _render_migration(state)
+
+    assert "Started:" not in rendered
+    assert "Config flag:" in rendered
+
+
+def test_gateway_detail_separates_recorded_intent_from_progress() -> None:
+    """The flag flip and the restart are intermediate progress, not the verdict."""
+    rendered = _render_migration(_migration_dashboard())
+
+    assert "Progress:" in rendered
+    assert "flag flipped" in rendered
+    assert "default gateway live" in rendered
+    assert "served record live" in rendered
+    assert "every recorded profile is in the live served set" in rendered
+
+
+def test_gateway_detail_lists_the_recorded_profiles_and_their_coverage() -> None:
+    state = _migration_dashboard(
+        secondaries=[
+            _migration_record("dev", served=True),
+            _migration_record("coding", served=False, home="/h/.hermes/profiles/coding"),
+        ],
+    )
+
+    rendered = _render_migration(state)
+
+    assert "Recorded profiles" in rendered
+    assert "/h/.hermes/profiles/coding" in rendered
+    assert "launchd" in rendered
+    assert "not served" in rendered
+
+
+def test_gateway_detail_does_not_claim_coverage_it_has_no_record_for() -> None:
+    """Without a live served record the coverage cell is unknown, not "not served"."""
+    state = _migration_dashboard(
+        served_recorded=False,
+        default_profile=MigrationProfileRecord(profile="default", served=False),
+        secondaries=[_migration_record("dev", served=False)],
+    )
+
+    rendered = _render_migration(state)
+
+    assert "not served" not in rendered
+
+
+def test_gateway_detail_shows_multiplex_config_without_a_manifest() -> None:
+    """A hand-configured multiplexer was never migrated: no manifest, no verdict."""
+    state = _migration_dashboard(manifest_present=False, manifest_parsed=False)
+
+    rendered = _render_migration(state)
+
+    assert "Multiplex Migration" in rendered
+    assert "no migration manifest" in rendered
+    assert "migration unverified" not in rendered
+    assert "multiplexed (verified)" not in rendered
+
+
+def test_gateway_detail_omits_the_section_without_a_manifest_or_a_flag() -> None:
+    state = _migration_dashboard(
+        manifest_present=False, manifest_parsed=False, multiplex_flag_on=False
+    )
+
+    rendered = _render_migration(state)
+
+    assert "Multiplex Migration" not in rendered
+
+
+def test_gateway_compact_warns_about_an_unverified_migration() -> None:
+    rendered = _render_migration(_migration_dashboard(served_recorded=False), detail=False)
+
+    assert "migration unverified" in rendered
+
+
+def test_gateway_compact_stays_quiet_about_a_verified_migration() -> None:
+    rendered = _render_migration(_migration_dashboard(), detail=False)
+
+    assert "migration" not in rendered.lower()
+
+
+def test_gateway_compact_stays_quiet_without_a_manifest() -> None:
+    state = _migration_dashboard(manifest_present=False, manifest_parsed=False)
+
+    rendered = _render_migration(state, detail=False)
+
+    assert "migration" not in rendered.lower()
+
+
+def test_gateway_detail_survives_markup_hostile_migration_values() -> None:
+    state = _migration_dashboard(
+        migrated_at=HOSTILE,
+        default_profile=MigrationProfileRecord(profile=HOSTILE, home=HOSTILE, served=True),
+        secondaries=[_migration_record(HOSTILE, served=True, home=HOSTILE)],
+    )
+
+    rendered = _render_migration(state)
+
+    assert "\x1b[2J" not in rendered
+    assert "[/] boom" in rendered

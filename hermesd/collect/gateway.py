@@ -1,4 +1,5 @@
-"""Gateway liveness: heartbeat, lifecycle, config generation, updates, ledgers.
+"""Gateway liveness and platform records: heartbeat, lifecycle, config generation,
+updates, ledgers, and the shared-listener routing/ingress each platform entry carries.
 
 Every reader here is pure: it takes already-loaded JSON (via the collector's
 last-good file cache), an injected clock, and — where liveness depends on the
@@ -8,6 +9,7 @@ writing or imports hermes-agent.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -22,6 +24,7 @@ from hermesd.collect.common import (
     _coerce_int,
     _iso_to_epoch,
 )
+from hermesd.collect.redaction import _redact_secret_url
 from hermesd.collect.sqlite_util import (
     _count_by,
     _query_rows,
@@ -61,6 +64,18 @@ _UNFINISHED_OUTCOMES = frozenset({"failed", "partial", "running"})
 # The receipt's fleet matrix holds one row per profile. Cap the retained state
 # vocabulary so an untrusted file cannot grow the map; never cap the skew scan.
 _FLEET_STATE_KIND_LIMIT = 8
+# The multiplexer keys a served profile's adapter ``<profile>:<platform>``
+# (gateway/run_adapters.py:1048). Upstream validates that grammar
+# *unconditionally* before projecting a status key anywhere
+# (hermes_cli/web_routers/status.py:122-127), with the stated reason that a
+# failed config-set load must not fail open into projecting arbitrary keys from a
+# process-local JSON file. hermesd mirrors the grammar: a key that fails it stays
+# opaque, so nothing in gateway_state.json can invent a profile name.
+_PROFILE_PLATFORM_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}:[a-z0-9][a-z0-9_-]{0,63}$")
+# Adapter states whose recorded ingress URL upstream never surfaces
+# (hermes_cli/gateway_multiplex_served.py:66-68): the route belonged to an
+# adapter that is not serving, so the URL is history rather than an endpoint.
+_INGRESS_SUPPRESSED_STATES = frozenset({"fatal", "disconnected", "stopped"})
 
 
 def _optional_int(value: object) -> int | None:
@@ -118,13 +133,49 @@ def _platform_ownership(info: dict[str, Any], writer: _RecordWriter) -> Platform
     return PlatformOwnership.PRESERVED
 
 
+def _split_platform_key(key: str) -> tuple[str, str]:
+    """``(profile, platform)`` for a grammar-valid namespaced key, else ``("", key)``.
+
+    A key that contains ``:`` but fails the grammar is deliberately *not* split:
+    it stays verbatim as the platform name and records no profile, so an arbitrary
+    string in a process-local JSON file can never be projected onto a profile.
+    """
+    if ":" not in key or not _PROFILE_PLATFORM_KEY_RE.fullmatch(key):
+        return "", key
+    profile, _, platform = key.partition(":")
+    return profile, platform
+
+
+def _recorded_ingress_url(info: dict[str, Any], *, state: str, running: bool) -> str:
+    """The entry's ingress URL, or ``""`` wherever upstream would suppress it.
+
+    Mirrors ``served_profile_ingress_urls`` (``hermes_cli/gateway_multiplex_served.py:46-70``):
+    nothing is surfaced when the default gateway pid is not live (``running`` here,
+    which the collector resolves from the recorded pid plus ``gateway.pid``), when
+    the recorded URL is falsy, or when the adapter state is fatal, disconnected or
+    stopped. ``hermes_cli/web_routers/messaging.py:263`` applies the same liveness
+    rule to plain platform keys, which is why this is not restricted to namespaced
+    ones. The value is redacted *here*, at the data boundary: an ingress URL is
+    exactly the shape that carries userinfo or a secret query parameter, and a
+    panel must never be the first thing to see it.
+    """
+    if not running or state in _INGRESS_SUPPRESSED_STATES:
+        return ""
+    url = str(info.get("ingress_url") or "")
+    return _redact_secret_url(url) if url else ""
+
+
 def _platform_status(
-    name: str, info: dict[str, Any], now: float, writer: _RecordWriter
+    key: str, info: dict[str, Any], now: float, writer: _RecordWriter, *, running: bool
 ) -> PlatformStatus:
+    profile, name = _split_platform_key(key)
+    state = str(info.get("state") or "unknown")
     retrying_since = str(info.get("retrying_since") or "")
     return PlatformStatus(
         name=name,
-        state=str(info.get("state") or "unknown"),
+        profile=profile,
+        ingress_url=_recorded_ingress_url(info, state=state, running=running),
+        state=state,
         updated_at=str(info.get("updated_at") or ""),
         error_code=str(info.get("error_code") or ""),
         error_message=str(info.get("error_message") or ""),

@@ -141,7 +141,13 @@ def _assert_hermes_home_has_no_drifted_blank_fields(home: Path) -> None:
     # C1 — platform names must match when the source has platform entries.
     raw_platform_names = _raw_gateway_platform_names(home / "gateway_state.json")
     if raw_platform_names:
-        collected_platform_names = {platform.name for platform in state.gateway.platforms}
+        # A grammar-valid ``<profile>:<platform>`` key is surfaced as two fields, so
+        # the raw key is rebuilt before comparing; an invalid one stays verbatim in
+        # `name` with an empty `profile` and rebuilds to itself.
+        collected_platform_names = {
+            f"{platform.profile}:{platform.name}" if platform.profile else platform.name
+            for platform in state.gateway.platforms
+        }
         assert raw_platform_names <= collected_platform_names, (
             "gateway_state.json platform entries were not surfaced (see C1)"
         )

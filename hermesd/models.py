@@ -41,6 +41,17 @@ class PlatformOwnership(StrEnum):
 
 class PlatformStatus(BaseModel):
     name: str
+    # Profile segment of a grammar-valid ``<profile>:<platform>`` status key —
+    # how the multiplexer keys a served profile's adapter
+    # (``gateway/run_adapters.py:1048``). Empty for a plain platform key, and
+    # empty for a namespaced key that failed upstream's key grammar
+    # (``hermes_cli/web_routers/status.py:122-136``), which stays verbatim in
+    # ``name``: splitting an arbitrary key would project it onto a profile.
+    profile: str = ""
+    # Shared-listener ingress URL as recorded by the gateway, already redacted
+    # and already suppressed where upstream suppresses it. Recorded information,
+    # never a probe result: hermesd does not request these URLs.
+    ingress_url: str = ""
     state: str = "unknown"
     updated_at: str = ""
     error_code: str = ""
@@ -53,6 +64,19 @@ class PlatformStatus(BaseModel):
     writer_pid: int | None = None
     writer_start_time: int | None = None
     ownership: PlatformOwnership = PlatformOwnership.UNVERIFIABLE
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ingress_url_is_path_only(self) -> bool:
+        """A recorded bare path rather than a URL.
+
+        ``publish_shared_ingress`` records ``f"{base}/p/{profile}{ingress_path}"``
+        when the default profile has a live listener, and a bare
+        ``f"/p/{profile}{ingress_path}"`` when it does not
+        (``gateway/platforms/shared_ingress.py:72-95``). The bare form names a
+        route that had no host to be reached at when it was recorded.
+        """
+        return bool(self.ingress_url) and "://" not in self.ingress_url
 
 
 class ConfigSourceStamp(BaseModel):
@@ -91,6 +115,14 @@ class GatewayState(BaseModel):
     drain_principal: str = ""
     drain_suppress_notification: bool = False
     served_profiles: list[str] = Field(default_factory=list)
+    # Tri-state marker over ``served_profiles``, mirroring upstream's
+    # ``recorded_served_profiles()`` (``hermes_cli/gateway_multiplex_served.py:28-38``):
+    # True only when the file carries a real list *and* the gateway that recorded
+    # it is live. An absent key, an unparseable value and a dead writer all leave
+    # it False, so an authoritative "serves nobody else" (a live ``[]``) stays
+    # distinguishable from "no live record" — while ``served_profiles`` still keeps
+    # the names a dead gateway left behind, as preserved rather than current.
+    served_profiles_recorded: bool = False
     scale_to_zero_idle_timeout_minutes: int = 0
     scale_to_zero_relay_only: bool = False
     # Event-loop liveness (state/gateway.heartbeat)
@@ -131,6 +163,149 @@ class GatewayState(BaseModel):
     pending_delivery_count: int = 0
     failed_delivery_count: int = 0
     pending_deliveries: list[DeliveryObligationSummary] = Field(default_factory=list)
+
+
+class MigrationVerificationGap(StrEnum):
+    """Which clause of the verified predicate hermesd could not satisfy.
+
+    ``NONE`` is the only value that licenses a "multiplexed (verified)" claim.
+    Every other value names *missing evidence*, never an outcome: upstream writes
+    the manifest before it flips the multiplex flag and restarts the default
+    gateway, and never updates it afterwards, so the file cannot tell a migration
+    still in flight from one that was applied and never verified — and neither can
+    hermesd. ``NO_MANIFEST`` is likewise ambiguous: rollback deletes the manifest on
+    success, so absence means "never migrated OR successfully rolled back".
+    """
+
+    NONE = ""
+    NO_MANIFEST = "no_manifest"
+    MANIFEST_UNREADABLE = "manifest_unreadable"
+    FLAG_OFF = "flag_off"
+    GATEWAY_NOT_LIVE = "gateway_not_live"
+    SERVED_NOT_RECORDED = "served_not_recorded"
+    PROFILES_UNSERVED = "profiles_unserved"
+    SECONDARIES_TRUNCATED = "secondaries_truncated"
+
+
+class MigrationProfileRecord(BaseModel):
+    """One profile's standalone-gateway footprint as recorded in the manifest.
+
+    ``home`` is display data that hermesd never resolves: upstream's rollback builds
+    ``Path(rec["home"])`` straight from this file (``gateway_migrate.py:594``), and
+    an untrusted manifest must not be able to steer a hermesd read. ``served`` is
+    coverage by the *live* default gateway's recorded ``served_profiles``, so it is
+    always False when nothing live was recorded.
+    """
+
+    profile: str = ""
+    home: str = ""
+    service_kind: str = ""
+    service_system: bool = False
+    served: bool = False
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def service_label(self) -> str:
+        """Upstream's own ``ProfileGateway.service_label()`` wording (``:48-52``)."""
+        if not self.service_kind:
+            return "none"
+        if self.service_kind == "systemd":
+            return f"systemd ({'system' if self.service_system else 'user'})"
+        return self.service_kind
+
+
+class MigrationState(BaseModel):
+    """``gateway_migration.json``: recorded intent, progress, and one verified verdict.
+
+    Three things are kept apart on purpose, because the manifest conflates them:
+
+    * **recorded intent** — the manifest contents. ``migrated_at`` means "the attempt
+      began at": upstream builds the dict and writes it *inside* the per-secondary
+      loop (``gateway_migrate.py:528-544``), before ``_write_multiplex_flag``
+      (``:545``) and before ``_restart_default`` (``:549``), rewrites it
+      byte-identically at ``:546``, and then never touches it again on either the
+      verified (``:553-557``) or the unverified (``:558-561``) path. There is no
+      ``completed``/``verified``/``outcome`` field, so the file is a start marker.
+    * **intermediate progress** — ``flag_flipped``, ``default_gateway_live``,
+      ``served_recorded`` and each record's ``served``: re-read every pass, and each
+      one true of a migration that crashed halfway.
+    * **verified current topology** — ``migration_verified``, derived from a
+      predicate over artifacts hermesd can actually read.
+
+    ``multiplex_flag_on`` mirrors upstream's *reader* (``:203-215``), which ORs a
+    stale top-level ``multiplex_profiles`` alias with ``gateway.multiplex_profiles``
+    after an environment override hermesd cannot see — so every verdict built on it
+    is labelled "as recorded in config".
+
+    Known limit: upstream verifies against every profile in its plan
+    (``expected = {p.name for p in plan.profiles}``, ``:551-552``), which includes
+    profiles that never had a standalone gateway and so are *not* in the manifest.
+    hermesd can only see the manifest, so its expected set is a subset of upstream's
+    and its verdict is correspondingly weaker.
+    """
+
+    # Recorded intent (the manifest, never rewritten after the attempt began)
+    manifest_present: bool = False
+    # A present manifest hermesd could not parse: upstream writes it with a plain
+    # write_text, so a torn file is observable mid-write. Distinct from absent.
+    manifest_parsed: bool = False
+    manifest_version: int = 0
+    migrated_at: str = ""
+    migrated_at_age_seconds: float | None = None
+    flag_was: bool = False
+    default_profile: MigrationProfileRecord = Field(default_factory=MigrationProfileRecord)
+    secondaries: list[MigrationProfileRecord] = Field(default_factory=list)
+    secondary_count: int = 0
+    secondaries_truncated: bool = False
+    # Intermediate progress, re-read every pass
+    multiplex_flag_on: bool = False
+    default_gateway_live: bool = False
+    served_recorded: bool = False
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def flag_flipped(self) -> bool:
+        """Progress, not success: the config now differs from the recorded prior value."""
+        return self.manifest_parsed and self.multiplex_flag_on != self.flag_was
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def unserved_profiles(self) -> list[str]:
+        """Recorded profiles the live served set does not cover, default first.
+
+        The expected set is ``{"default"} | {manifest secondaries}``: upstream always
+        names the default profile ``default`` (``ProfileGateway.is_default``), and
+        ``_record_served_profiles`` puts the active profile at index 0.
+        """
+        missing = [] if self.default_profile.served else ["default"]
+        missing.extend(record.profile or "?" for record in self.secondaries if not record.served)
+        return missing
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def verification_gap(self) -> MigrationVerificationGap:
+        """The first clause of the predicate that hermesd-readable artifacts refute."""
+        if not self.manifest_present:
+            return MigrationVerificationGap.NO_MANIFEST
+        if not self.manifest_parsed:
+            return MigrationVerificationGap.MANIFEST_UNREADABLE
+        if not self.multiplex_flag_on:
+            return MigrationVerificationGap.FLAG_OFF
+        if not self.default_gateway_live:
+            return MigrationVerificationGap.GATEWAY_NOT_LIVE
+        if not self.served_recorded:
+            return MigrationVerificationGap.SERVED_NOT_RECORDED
+        if self.secondaries_truncated:
+            return MigrationVerificationGap.SECONDARIES_TRUNCATED
+        if self.unserved_profiles:
+            return MigrationVerificationGap.PROFILES_UNSERVED
+        return MigrationVerificationGap.NONE
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def migration_verified(self) -> bool:
+        """Derived, never stored: the gap is the single source of truth."""
+        return self.verification_gap is MigrationVerificationGap.NONE
 
 
 class SessionInfo(BaseModel):
@@ -1009,6 +1184,7 @@ class DashboardState(BaseModel):
     health: HealthSummary = Field(default_factory=HealthSummary)
     runtime: RuntimeStatus = Field(default_factory=RuntimeStatus)
     gateway: GatewayState = Field(default_factory=GatewayState)
+    migration: MigrationState = Field(default_factory=MigrationState)
     sessions: list[SessionInfo] = Field(default_factory=list)
     active_surfaces: list[ActiveSurface] = Field(default_factory=list)
     active_surface_count: int = 0

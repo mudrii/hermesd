@@ -2160,3 +2160,252 @@ def test_mixed_owner_platforms_are_reported_per_entry(hermes_home: Path):
 def test_platform_ownership_defaults_to_unverifiable():
     """A PlatformStatus built without provenance must not claim ownership."""
     assert PlatformStatus(name="telegram").ownership is PlatformOwnership.UNVERIFIABLE
+
+
+# --------------------------------------------------------------------------
+# F10 — shared-listener routing: <profile>:<platform> keys, the served-profile
+# tri-state, and the recorded ingress URL
+# --------------------------------------------------------------------------
+
+
+def _collect_dead(home: Path):
+    """Collect with no live gateway pid: recorded data is preserved, not live."""
+    return _collect(home, live_pid=0)
+
+
+def test_namespaced_platform_key_is_split_into_profile_and_platform(hermes_home: Path):
+    """``run_adapters.py:1048`` keys a served profile's adapter ``<profile>:<platform>``."""
+    _write_gateway_state(hermes_home, platforms={"dev:telegram": _platform_entry()})
+
+    platform = _collect(hermes_home).gateway.platforms[0]
+
+    assert platform.profile == "dev"
+    assert platform.name == "telegram"
+
+
+def test_plain_platform_key_has_no_profile(hermes_home: Path):
+    _write_gateway_state(hermes_home, platforms={"telegram": _platform_entry()})
+
+    platform = _collect(hermes_home).gateway.platforms[0]
+
+    assert platform.profile == ""
+    assert platform.name == "telegram"
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "DEV:telegram",  # uppercase profile
+        "dev:Telegram",  # uppercase platform
+        "dev:telegram:extra",  # two separators
+        ":telegram",  # empty profile
+        "dev:",  # empty platform
+        "_dev:telegram",  # leading underscore
+        "dev:_telegram",  # leading underscore
+        "dev telegram:web",  # space in the profile segment
+        f"{'d' * 65}:telegram",  # profile past the 64-char bound
+        f"dev:{'t' * 65}",  # platform past the 64-char bound
+    ],
+)
+def test_a_key_that_fails_the_grammar_stays_opaque(hermes_home: Path, key: str):
+    """Upstream validates the key grammar unconditionally (``web_routers/status.py:122-136``).
+
+    A namespaced key that fails it must never be split: splitting would project an
+    arbitrary key from a process-local JSON file onto a profile name.
+    """
+    _write_gateway_state(hermes_home, platforms={key: _platform_entry()})
+
+    platform = _collect(hermes_home).gateway.platforms[0]
+
+    assert platform.profile == ""
+    assert platform.name == key
+
+
+def test_valid_grammar_boundaries_split(hermes_home: Path):
+    """One char, 64 chars, digits, hyphens and underscores are all inside the grammar."""
+    expected = {
+        ("a", "b"),
+        ("0-dev_1", "foo-bar_2"),
+        ("d" * 64, "t" * 64),
+    }
+    _write_gateway_state(
+        hermes_home,
+        platforms={
+            "a:b": _platform_entry(),
+            "0-dev_1:foo-bar_2": _platform_entry(),
+            f"{'d' * 64}:{'t' * 64}": _platform_entry(),
+        },
+    )
+
+    collected = {(p.profile, p.name) for p in _collect(hermes_home).gateway.platforms}
+
+    assert collected == expected
+
+
+def test_served_profiles_absent_is_not_an_empty_record(hermes_home: Path):
+    """Absent and explicitly empty must stay distinguishable (multiplex_served.py:28-38)."""
+    _write_gateway_state(hermes_home)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.served_profiles == []
+    assert gateway.served_profiles_recorded is False
+
+
+def test_an_explicitly_empty_served_profiles_list_is_an_authoritative_record(hermes_home: Path):
+    """An empty list from a live gateway means "serves nobody else", not "no record"."""
+    _write_gateway_state(hermes_home, served_profiles=[])
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.served_profiles == []
+    assert gateway.served_profiles_recorded is True
+
+
+@pytest.mark.parametrize("value", ["coding", {"profile": "coding"}, 3, None, True])
+def test_a_non_list_served_profiles_value_is_not_a_record(hermes_home: Path, value: object):
+    _write_gateway_state(hermes_home, served_profiles=value)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.served_profiles == []
+    assert gateway.served_profiles_recorded is False
+
+
+def test_served_profiles_of_a_live_gateway_are_recorded(hermes_home: Path):
+    _write_gateway_state(hermes_home, served_profiles=["default", "coding"])
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.served_profiles == ["default", "coding"]
+    assert gateway.served_profiles_recorded is True
+
+
+def test_served_profiles_of_a_dead_gateway_are_preserved_but_not_a_live_record(
+    hermes_home: Path,
+):
+    """Upstream gates the record on ``live_default_gateway_pid()``: a dead pid forces None.
+
+    hermesd keeps the recorded names — they are still what the file says — but marks
+    the record as not live, so a preserved record is never presented as current.
+    """
+    _write_gateway_state(hermes_home, served_profiles=["default", "coding"])
+
+    gateway = _collect_dead(hermes_home).gateway
+
+    assert gateway.running is False
+    assert gateway.served_profiles == ["default", "coding"]
+    assert gateway.served_profiles_recorded is False
+
+
+INGRESS_URL = "https://gw.example/p/dev/telegram/webhook"
+
+
+def test_ingress_url_is_recorded_for_a_served_profile_platform(hermes_home: Path):
+    _write_gateway_state(
+        hermes_home, platforms={"dev:telegram": _platform_entry(ingress_url=INGRESS_URL)}
+    )
+
+    platform = _collect(hermes_home).gateway.platforms[0]
+
+    assert platform.ingress_url == INGRESS_URL
+    assert platform.ingress_url_is_path_only is False
+
+
+def test_a_bare_ingress_path_is_recorded_verbatim(hermes_home: Path):
+    """``publish_shared_ingress`` records a bare path when no default listener is live."""
+    _write_gateway_state(
+        hermes_home,
+        platforms={"dev:telegram": _platform_entry(ingress_url="/p/dev/telegram/webhook")},
+    )
+
+    platform = _collect(hermes_home).gateway.platforms[0]
+
+    assert platform.ingress_url == "/p/dev/telegram/webhook"
+    assert platform.ingress_url_is_path_only is True
+
+
+@pytest.mark.parametrize("state", ["fatal", "disconnected", "stopped"])
+def test_ingress_url_is_suppressed_for_an_adapter_state_upstream_skips(
+    hermes_home: Path, state: str
+):
+    """``served_profile_ingress_urls`` skips fatal/disconnected/stopped entries."""
+    _write_gateway_state(
+        hermes_home,
+        platforms={"dev:telegram": _platform_entry(state=state, ingress_url=INGRESS_URL)},
+    )
+
+    platform = _collect(hermes_home).gateway.platforms[0]
+
+    assert platform.state == state
+    assert platform.ingress_url == ""
+
+
+def test_ingress_url_is_suppressed_when_the_gateway_is_not_live(hermes_home: Path):
+    """No live default gateway pid means no ingress, upstream (multiplex_served.py:46-70)."""
+    _write_gateway_state(
+        hermes_home, platforms={"dev:telegram": _platform_entry(ingress_url=INGRESS_URL)}
+    )
+
+    platform = _collect_dead(hermes_home).gateway.platforms[0]
+
+    assert platform.ingress_url == ""
+
+
+@pytest.mark.parametrize("value", ["", None, 0, False])
+def test_a_falsy_ingress_url_is_not_recorded(hermes_home: Path, value: object):
+    _write_gateway_state(
+        hermes_home, platforms={"dev:telegram": _platform_entry(ingress_url=value)}
+    )
+
+    assert _collect(hermes_home).gateway.platforms[0].ingress_url == ""
+
+
+def test_an_ingress_url_on_a_plain_platform_key_is_still_recorded(hermes_home: Path):
+    """``web_routers/messaging.py:204,263`` reads ingress_url for plain keys too."""
+    _write_gateway_state(
+        hermes_home, platforms={"telegram": _platform_entry(ingress_url=INGRESS_URL)}
+    )
+
+    platform = _collect(hermes_home).gateway.platforms[0]
+
+    assert platform.profile == ""
+    assert platform.ingress_url == INGRESS_URL
+
+
+def test_a_credential_bearing_ingress_url_never_reaches_dashboard_state(hermes_home: Path):
+    """Redaction happens at the data boundary, so the raw URL is never in the model."""
+    secret_url = "https://bot:hunter2@gw.example/p/dev/telegram/webhook?token=s3cr3t&chat=42"
+    _write_gateway_state(
+        hermes_home, platforms={"dev:telegram": _platform_entry(ingress_url=secret_url)}
+    )
+
+    state = _collect(hermes_home)
+    dumped = json.dumps(state.model_dump(mode="json"))
+
+    assert "hunter2" not in dumped
+    assert "s3cr3t" not in dumped
+    assert secret_url not in dumped
+    platform = state.gateway.platforms[0]
+    assert "[REDACTED]@gw.example" in platform.ingress_url
+    assert "token=[REDACTED]" in platform.ingress_url
+    assert "chat=42" in platform.ingress_url
+
+
+def test_a_malformed_ingress_url_fails_closed(hermes_home: Path):
+    """A URL urlsplit cannot parse must not pass its credentials through."""
+    _write_gateway_state(
+        hermes_home,
+        platforms={
+            "dev:telegram": _platform_entry(ingress_url="https://user:pw@[::1/p/dev?api_key=abc")
+        },
+    )
+
+    state = _collect(hermes_home)
+    dumped = json.dumps(state.model_dump(mode="json"))
+
+    assert "user:pw" not in dumped
+    assert "api_key=abc" not in dumped
+    assert state.gateway.platforms[0].ingress_url == (
+        "https://[REDACTED]@[::1/p/dev?api_key=[REDACTED]"
+    )
