@@ -6,6 +6,8 @@ from __future__ import annotations
 import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -310,6 +312,7 @@ def test_read_only_uri_is_immutable_and_does_not_create_sidecars(tmp_path: Path)
 
     db = HermesDB(db_path)
     assert db.read_sessions()[0]["id"] == "sess_001"
+    assert db._uri.endswith("?mode=ro&immutable=1")  # rollback-journal path unchanged
     assert not db_path.with_name("state.db-wal").exists()
     assert not db_path.with_name("state.db-shm").exists()
     db.close()
@@ -418,7 +421,7 @@ def test_wal_live_open_failure_falls_back_to_snapshot(tmp_path: Path, monkeypatc
 
     monkeypatch.setattr(db_module, "snapshot_wal_database", counting_snapshot)
 
-    live_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    live_uri = f"{db_path.resolve().as_uri()}?mode=ro&readonly_shm=1"
     live_attempts = 0
     original_connect = sqlite3.connect
 
@@ -439,6 +442,203 @@ def test_wal_live_open_failure_falls_back_to_snapshot(tmp_path: Path, monkeypatc
         writer.close()
 
     assert live_attempts == 1
+    assert snapshots == [db_path]
+
+
+_LIVE_WRITER_SCRIPT = """
+import sqlite3, sys, time
+from pathlib import Path
+
+db_path, ready_path = sys.argv[1], sys.argv[2]
+conn = sqlite3.connect(db_path)
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL)")
+conn.execute("INSERT INTO sessions VALUES ('sess_live', 'cli', 1.0)")
+conn.commit()
+Path(ready_path).write_text("ready")
+time.sleep(120)
+"""
+
+
+def _spawn_live_writer(db_path: Path, ready_path: Path) -> subprocess.Popen[bytes]:
+    """Hold a WAL writer open in a separate process so it keeps the -shm alive.
+
+    The writer must be cross-process: SQLite shares the -shm mapping between
+    connections inside one process, so an in-process writer would mask the
+    read-only-shm behavior being tested.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _LIVE_WRITER_SCRIPT, str(db_path), str(ready_path)]
+    )
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if ready_path.exists():
+            return proc
+        if proc.poll() is not None:
+            raise RuntimeError("writer subprocess exited before signaling readiness")
+        time.sleep(0.05)
+    proc.kill()
+    proc.wait()
+    raise RuntimeError("writer subprocess did not signal readiness in time")
+
+
+_REQUIRES_READONLY_SHM = pytest.mark.skipif(
+    sqlite3.sqlite_version_info < (3, 50, 0),
+    reason="readonly_shm URI support requires SQLite >= 3.50",
+)
+
+
+@_REQUIRES_READONLY_SHM
+def test_live_wal_read_with_readonly_shm_leaves_shm_untouched(tmp_path: Path):
+    """With a live cross-process writer, live reads must not write wal-index
+    read-marks (SQLite coordination bookkeeping) into the -shm sidecar."""
+    db_path = tmp_path / "state.db"
+    ready_path = tmp_path / "writer-ready"
+    proc = _spawn_live_writer(db_path, ready_path)
+    try:
+        shm_path = db_path.with_name("state.db-shm")
+        assert shm_path.exists()
+        bytes_before = shm_path.read_bytes()
+        mtime_before = shm_path.stat().st_mtime_ns
+
+        db = HermesDB(db_path)
+        try:
+            assert "readonly_shm=1" in db._uri  # live read path, not a snapshot
+            assert [row["id"] for row in db.read_sessions()] == ["sess_live"]
+            assert db.read_session_count() == 1
+        finally:
+            db.close()
+
+        assert shm_path.read_bytes() == bytes_before
+        assert shm_path.stat().st_mtime_ns == mtime_before
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+@_REQUIRES_READONLY_SHM
+def test_stale_shm_without_writer_reads_and_leaves_shm_untouched(tmp_path: Path):
+    """A stale -shm (no live writer holds it) must still read successfully
+    without mutation: SQLite >= 3.50 serves readonly_shm reads through a
+    heap-memory wal-index when the shm cannot be locked, and the snapshot
+    fallback covers any residual open failure."""
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source_db = source_dir / "state.db"
+    writer = sqlite3.connect(str(source_db))
+    writer.execute("PRAGMA journal_mode=WAL")
+    create_state_db_tables(writer, include_schema_version=False)
+    writer.execute("INSERT INTO sessions (id, source, started_at) VALUES ('sess_wal', 'cli', 1.0)")
+    writer.commit()
+
+    db_path = tmp_path / "state.db"
+    shutil.copy2(source_db, db_path)
+    for suffix in ("-wal", "-shm"):
+        shutil.copy2(
+            source_db.with_name(f"state.db{suffix}"),
+            db_path.with_name(f"state.db{suffix}"),
+        )
+    shm_path = db_path.with_name("state.db-shm")
+    bytes_before = shm_path.read_bytes()
+    mtime_before = shm_path.stat().st_mtime_ns
+
+    db = HermesDB(db_path)
+    try:
+        assert [row["id"] for row in db.read_sessions()] == ["sess_wal"]
+    finally:
+        db.close()
+        writer.close()
+
+    assert shm_path.read_bytes() == bytes_before
+    assert shm_path.stat().st_mtime_ns == mtime_before
+
+
+def test_readonly_shm_unsupported_sqlite_uses_snapshot(tmp_path: Path, monkeypatch):
+    """SQLite < 3.50 silently ignores unknown URI parameters, so readonly_shm
+    cannot be trusted there: skip the live path entirely and read the snapshot
+    copy instead of restoring the shm read-mark writes."""
+    db_path = tmp_path / "state.db"
+    writer = sqlite3.connect(str(db_path))
+    writer.execute("PRAGMA journal_mode=WAL")
+    create_state_db_tables(writer, include_schema_version=False)
+    writer.execute("INSERT INTO sessions (id, source, started_at) VALUES ('sess_1', 'cli', 1.0)")
+    writer.commit()
+    assert db_path.with_name("state.db-shm").exists()
+
+    monkeypatch.setattr(db_module, "_READONLY_SHM_SUPPORTED", False)
+
+    snapshots: list[Path] = []
+    original = db_module.snapshot_wal_database
+
+    def counting(target: Path, *, prefix: str):
+        snapshots.append(Path(target))
+        return original(target, prefix=prefix)
+
+    monkeypatch.setattr(db_module, "snapshot_wal_database", counting)
+
+    db = HermesDB(db_path)
+    try:
+        assert [row["id"] for row in db.read_sessions()] == ["sess_1"]
+        assert "readonly_shm" not in db._uri
+    finally:
+        db.close()
+        writer.close()
+
+    assert snapshots == [db_path]
+
+
+def test_wal_live_probe_failure_falls_back_to_snapshot(tmp_path: Path, monkeypatch):
+    """sqlite3.connect is lazy about WAL/shm setup: a -shm that cannot be used
+    read-only only fails on the first read (e.g. SQLITE_READONLY_CANTINIT). The
+    connect-time probe must surface that and route to the snapshot copy instead
+    of reconnect-looping on a doomed live handle."""
+    db_path = tmp_path / "state.db"
+    writer = sqlite3.connect(str(db_path))
+    writer.execute("PRAGMA journal_mode=WAL")
+    create_state_db_tables(writer, include_schema_version=False)
+    writer.execute("INSERT INTO sessions (id, source, started_at) VALUES ('sess_pr', 'cli', 1.0)")
+    writer.commit()
+    assert db_path.with_name("state.db-shm").exists()
+
+    snapshots: list[Path] = []
+    original_snapshot = db_module.snapshot_wal_database
+
+    def counting_snapshot(target: Path, *, prefix: str):
+        snapshots.append(Path(target))
+        return original_snapshot(target, prefix=prefix)
+
+    monkeypatch.setattr(db_module, "snapshot_wal_database", counting_snapshot)
+
+    live_uri = f"{db_path.resolve().as_uri()}?mode=ro&readonly_shm=1"
+    original_connect = sqlite3.connect
+
+    class _CantInitConnection:
+        """Connect 'succeeds', but the first real read raises READONLY_CANTINIT."""
+
+        def __init__(self, real: sqlite3.Connection):
+            self._real = real
+
+        def execute(self, *args: object, **kwargs: object):
+            raise sqlite3.OperationalError("attempt to write a readonly database")
+
+        def close(self) -> None:
+            self._real.close()
+
+    def fake_connect(target: object, *args: object, **kwargs: object):
+        conn = original_connect(target, *args, **kwargs)  # type: ignore[arg-type]
+        if target == live_uri:
+            return _CantInitConnection(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", fake_connect)
+
+    db = HermesDB(db_path)
+    try:
+        assert [row["id"] for row in db.read_sessions()] == ["sess_pr"]
+    finally:
+        db.close()
+        writer.close()
+
     assert snapshots == [db_path]
 
 

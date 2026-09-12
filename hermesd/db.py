@@ -21,6 +21,13 @@ _LIKE_SEARCH_LIMIT = 500
 # read-only viewer refreshing on a timer: fail fast and keep last-good data
 # rather than stall the render loop behind a writer.
 _SQLITE_TIMEOUT_SECONDS = 2
+# readonly_shm=1 (SQLite 3.50.0+) makes the WAL -shm sidecar open O_RDONLY:
+# read-marks are never written into it, and a -shm no write-capable connection
+# can vouch for is served through a heap-memory wal-index instead of failing.
+# Older libraries silently ignore unknown URI parameters, which would restore
+# the shm writes, so the live path is gated on the linked library version.
+_READONLY_SHM_MIN_SQLITE_VERSION = (3, 50, 0)
+_READONLY_SHM_SUPPORTED = sqlite3.sqlite_version_info >= _READONLY_SHM_MIN_SQLITE_VERSION
 _MODEL_USAGE_ROW_LIMIT = 50
 # Window cutoffs are rounded down to this bucket so repeated reads inside the
 # same bucket hit the cache instead of re-querying on every collector pass.
@@ -103,7 +110,17 @@ class HermesDB:
                     conn = sqlite3.connect(
                         uri, uri=True, timeout=_SQLITE_TIMEOUT_SECONDS, check_same_thread=False
                     )
-                except (OSError, sqlite3.OperationalError):
+                    # sqlite3_open_v2 is lazy about WAL/shm setup: a -shm that
+                    # cannot be used read-only (SQLITE_READONLY_CANTINIT) only
+                    # fails on the first real read. Probe the schema now so a
+                    # doomed live handle falls through to the snapshot target
+                    # instead of reconnect-looping on it forever.
+                    conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+                except (OSError, sqlite3.Error):
+                    if conn is not None:
+                        with contextlib.suppress(sqlite3.Error):
+                            conn.close()
+                        conn = None
                     continue
                 break
             if conn is None:
@@ -132,6 +149,15 @@ class HermesDB:
             self._consecutive_errors = 0
             self._connect_backoff_reads = _CONNECT_BACKOFF_READS
             self._mark_cached_reads_stale()
+            # The db exists but cannot be opened at all. A fresh reader has no
+            # initialized caches, so _mark_cached_reads_stale is a no-op there
+            # and callers would read the empty cache as a legitimate zero
+            # instead of a failed source; flag every read surface stale.
+            self._last_read_sessions_stale = True
+            self._last_read_session_count_stale = True
+            self._last_read_tool_stats_stale = True
+            self._last_message_search_stale = True
+            self._last_read_model_usage_stale = True
 
     def _close_connection(self) -> None:
         with self._connection_ref_lock:
@@ -149,10 +175,18 @@ class HermesDB:
 
         A live WAL database is opened read-only in place when its -shm sidecar
         exists: WAL readers see consistent data without blocking the writer, so
-        a reconnect no longer copies the whole database. Without -shm, opening
-        read-only would force WAL recovery with write access to the database
-        directory, which hermesd must not do; the snapshot copy handles that
-        case and is also the fallback when the live open itself fails.
+        a reconnect no longer copies the whole database. The live URI carries
+        readonly_shm=1 because a plain mode=ro connection still opens the -shm
+        O_RDWR and writes wal-index read-marks into it on every read
+        transaction — SQLite coordination bookkeeping, not application data,
+        but still a write into ~/.hermes that breaks the zero-write guarantee.
+        readonly_shm requires SQLite >= 3.50 (older libraries ignore the
+        parameter and silently keep writing), so without it the live path is
+        skipped entirely and the snapshot copy takes over: strict non-mutation
+        wins over the live-read fast path. Without -shm, opening read-only
+        would force WAL recovery with write access to the database directory,
+        which hermesd must not do; the snapshot copy handles that case and is
+        also the fallback when the live open itself fails.
         """
         if self._allowed_root is not None and not _safe_child_path(self._path, self._allowed_root):
             raise OSError(f"Refusing to open database outside allowed root: {self._path}")
@@ -163,8 +197,10 @@ class HermesDB:
         if not _exists_strict(wal_path):
             yield self._path, "mode=ro&immutable=1"
             return
-        if _exists_strict(self._path.with_name(f"{self._path.name}-shm")):
-            yield self._path, "mode=ro"
+        if _READONLY_SHM_SUPPORTED and _exists_strict(
+            self._path.with_name(f"{self._path.name}-shm")
+        ):
+            yield self._path, "mode=ro&readonly_shm=1"
         yield self._snapshot_wal_database(), "mode=ro"
 
     def _snapshot_wal_database(self) -> Path:
