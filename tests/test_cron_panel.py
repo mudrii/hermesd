@@ -276,6 +276,41 @@ def test_cron_detail_shows_per_job_24h_counters() -> None:
     assert "1▶" in text
 
 
+def test_cron_detail_shows_unknown_outcomes_as_their_own_bucket() -> None:
+    """F07: an unresolved outcome must be visible, not folded into ✓ or ✗."""
+    state = DashboardState(
+        cron=CronState(job_count=1, jobs=[CronJob(job_id="job-a", name="alpha")]),
+        cron_executions=_executions_state(
+            db_present=True,
+            job_stats=[
+                CronJobExecutionStats(
+                    job_id="job-a", total_24h=4, completed_24h=1, failed_24h=2, unknown_24h=1
+                )
+            ],
+        ),
+    )
+
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=140, no_color=True)
+
+    assert "1✓" in text
+    assert "2✗" in text
+    assert "1?" in text
+
+
+def test_cron_detail_unknown_only_window_is_not_rendered_as_a_dash() -> None:
+    state = DashboardState(
+        cron=CronState(job_count=1, jobs=[CronJob(job_id="job-a", name="alpha")]),
+        cron_executions=_executions_state(
+            db_present=True,
+            job_stats=[CronJobExecutionStats(job_id="job-a", total_24h=3, unknown_24h=3)],
+        ),
+    )
+
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=140, no_color=True)
+
+    assert "3?" in text
+
+
 def test_cron_detail_job_without_execution_history_shows_dash() -> None:
     state = DashboardState(
         cron=CronState(job_count=1, jobs=[CronJob(job_id="job-a", name="alpha")]),

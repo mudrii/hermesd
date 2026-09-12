@@ -282,9 +282,11 @@ def _job_execution_stats(
         if job_id not in stats:
             stats[job_id] = CronJobExecutionStats(job_id=job_id)
         entry = stats[job_id]
+        entry.total_24h = int(row.get("total_24h") or 0)
         entry.completed_24h = int(row.get("completed_24h") or 0)
         entry.failed_24h = int(row.get("failed_24h") or 0)
         entry.running_24h = int(row.get("running_24h") or 0)
+        entry.unknown_24h = int(row.get("unknown_24h") or 0)
     return list(stats.values())
 
 
@@ -300,6 +302,11 @@ _EXECUTIONS_REQUIRED_COLUMNS = (
     "finished_at",
     "error",
 )
+
+# The status vocabulary hermes-agent writes (its own schema CHECK constraint).
+# Anything outside it — including a NULL or a value added by a newer agent — is
+# counted as unknown rather than dropped or guessed at.
+_EXECUTIONS_KNOWN_STATUSES = ("completed", "failed", "running", "claimed")
 
 
 def _executions_schema_compatible(conn: sqlite3.Connection) -> bool:
@@ -339,13 +346,23 @@ def _recent_execution_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 def _execution_window_rows(conn: sqlite3.Connection, *, now: float) -> list[dict[str, Any]]:
-    """Aggregate the complete 24h window, returning one row per job."""
+    """Aggregate the complete 24h window, returning one row per job.
+
+    ``unknown_24h`` is the complement of the three recognized buckets, so an
+    ``unknown`` status — a real upstream terminal state — or any value hermesd has
+    not seen is reported instead of vanishing from the summary. ``total_24h`` is
+    the denominator the buckets must reconcile against.
+    """
+    known = ", ".join(f"'{status}'" for status in _EXECUTIONS_KNOWN_STATUSES)
     return _execution_rows(
         conn,
         "SELECT COALESCE(job_id, '') AS job_id, "
+        "COUNT(*) AS total_24h, "
         "SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed_24h, "
         "SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_24h, "
-        "SUM(CASE WHEN status IN ('running', 'claimed') THEN 1 ELSE 0 END) AS running_24h "
+        "SUM(CASE WHEN status IN ('running', 'claimed') THEN 1 ELSE 0 END) AS running_24h, "
+        f"SUM(CASE WHEN status IS NULL OR status NOT IN ({known}) "
+        "THEN 1 ELSE 0 END) AS unknown_24h "
         "FROM executions WHERE hermes_epoch(claimed_at) BETWEEN ? AND ? "
         "GROUP BY COALESCE(job_id, '')",
         (now - _EXECUTIONS_WINDOW_SECONDS, now),

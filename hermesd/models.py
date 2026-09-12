@@ -347,10 +347,20 @@ class CronExecution(BaseModel):
 
 
 class CronJobExecutionStats(BaseModel):
+    """One job's recorded executions inside the 24-hour window.
+
+    ``total_24h`` is the denominator the four buckets reconcile against, so a
+    window can be checked for arithmetic that silently dropped a row. ``unknown``
+    is a real upstream terminal status and also catches any value hermesd has not
+    seen; it is never folded into ``failed``, which would imply a retry is safe.
+    """
+
     job_id: str = ""
+    total_24h: int = 0
     completed_24h: int = 0
     failed_24h: int = 0
     running_24h: int = 0
+    unknown_24h: int = 0
     last_status: str = ""
     last_duration_seconds: float | None = None
     last_error_excerpt: str = ""

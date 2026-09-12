@@ -189,7 +189,11 @@ def _chronos_label(c: CronState) -> str:
 
 
 def _window_counters(stats: CronJobExecutionStats | None) -> str:
-    """`7✓ 2✗ 1▶` summary of a job's last 24 hours, or the placeholder."""
+    """`7✓ 2✗ 1▶ 1?` summary of a job's last 24 hours, or the placeholder.
+
+    The `?` bucket is deliberately visible: an unresolved outcome is neither a
+    success nor a failure, and hiding it would make the row look complete.
+    """
     if stats is None:
         return "—"
     parts = []
@@ -199,6 +203,8 @@ def _window_counters(stats: CronJobExecutionStats | None) -> str:
         parts.append(f"{stats.failed_24h}✗")
     if stats.running_24h:
         parts.append(f"{stats.running_24h}▶")
+    if stats.unknown_24h:
+        parts.append(f"{stats.unknown_24h}?")
     return " ".join(parts) if parts else "—"
 
 

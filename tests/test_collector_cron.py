@@ -919,6 +919,110 @@ def test_collect_cron_executions_counts_the_last_24h_window(
     assert stats["job-beta"].completed_24h == 0
 
 
+# F07 — 'unknown' is a real upstream terminal status (cron/executions.py prunes
+# status IN ('completed','failed','unknown')), and an unrecognized future value
+# must not silently vanish from the window either.
+
+
+def _write_permissive_executions_db(home: Path, rows: list[tuple[str, str, str]]) -> Path:
+    """An executions table without the status CHECK, so future values can be tested."""
+    db_path = home / "cron" / "executions.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute(
+            "CREATE TABLE executions (id TEXT PRIMARY KEY, job_id TEXT NOT NULL, "
+            "source TEXT NOT NULL, process_id TEXT NOT NULL, pid INTEGER NOT NULL, "
+            "process_started_at INTEGER, status TEXT, claimed_at TEXT NOT NULL, "
+            "started_at TEXT, finished_at TEXT, error TEXT, "
+            "handoff_pending INTEGER NOT NULL DEFAULT 0, handoff_started_at REAL)"
+        )
+        conn.executemany(
+            "INSERT INTO executions (id, job_id, source, process_id, pid, status, claimed_at) "
+            "VALUES (?, ?, 'builtin', 'proc', 1, ?, ?)",
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def test_unknown_status_is_counted_and_not_folded_into_failed(hermes_home: Path):
+    _write_permissive_executions_db(hermes_home, [("e1", "job-alpha", "unknown", iso_ago(600))])
+
+    c = Collector(hermes_home)
+    try:
+        stats = _stats_by_job(c.collect())["job-alpha"]
+    finally:
+        c.close()
+
+    assert stats.unknown_24h == 1
+    assert stats.completed_24h == 0
+    assert stats.failed_24h == 0
+    assert stats.running_24h == 0
+
+
+def test_window_counts_reconcile_against_the_total(hermes_home: Path):
+    _write_permissive_executions_db(
+        hermes_home,
+        [
+            ("e1", "job-alpha", "completed", iso_ago(100)),
+            ("e2", "job-alpha", "failed", iso_ago(200)),
+            ("e3", "job-alpha", "running", iso_ago(300)),
+            ("e4", "job-alpha", "unknown", iso_ago(400)),
+            ("e5", "job-alpha", "claimed", iso_ago(500)),
+        ],
+    )
+
+    c = Collector(hermes_home)
+    try:
+        stats = _stats_by_job(c.collect())["job-alpha"]
+    finally:
+        c.close()
+
+    assert stats.total_24h == 5
+    assert stats.total_24h == (
+        stats.completed_24h + stats.failed_24h + stats.running_24h + stats.unknown_24h
+    )
+    # 'claimed' is an in-flight status and belongs with running, not unknown.
+    assert stats.running_24h == 2
+    assert stats.unknown_24h == 1
+
+
+def test_unrecognized_future_status_counts_as_unknown(hermes_home: Path):
+    """A status hermesd has never heard of must be reported, not dropped."""
+    _write_permissive_executions_db(
+        hermes_home,
+        [("e1", "job-alpha", "quarantined", iso_ago(100)), ("e2", "job-alpha", None, iso_ago(200))],
+    )
+
+    c = Collector(hermes_home)
+    try:
+        stats = _stats_by_job(c.collect())["job-alpha"]
+    finally:
+        c.close()
+
+    assert stats.unknown_24h == 2
+    assert stats.total_24h == 2
+
+
+def test_sample_fixture_window_totals_reconcile(hermes_home: Path, sample_cron_executions_db: Path):
+    c = Collector(hermes_home)
+    try:
+        stats = _stats_by_job(c.collect())
+    finally:
+        c.close()
+
+    for entry in stats.values():
+        assert entry.total_24h == (
+            entry.completed_24h + entry.failed_24h + entry.running_24h + entry.unknown_24h
+        )
+    # The 3-day-old run is outside the window, so it is in neither total.
+    assert stats["job-alpha"].total_24h == 4
+
+
 def test_collect_cron_executions_last_run_status_duration_and_error(
     hermes_home: Path, sample_cron_executions_db: Path
 ):
