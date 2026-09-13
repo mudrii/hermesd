@@ -17,6 +17,7 @@ from hermesd.collect.common import (
     _age_seconds,
     _as_dict,
     _as_list,
+    _coerce_bool,
     _coerce_float,
     _coerce_int,
     _exists_strict,
@@ -981,7 +982,9 @@ def _skill_curation_hygiene(
             counts[state] += 1
         else:
             unknown += 1
-        is_pinned = bool(record.get("pinned"))
+        # ``.usage.json`` is a state payload with real booleans
+        # (``set_pinned`` stores ``bool(pinned)``): a string is corruption.
+        is_pinned = _coerce_bool(record.get("pinned"))
         if is_pinned:
             pinned += 1
         pending = _coerce_int(record.get("patch_generation")) > _coerce_int(

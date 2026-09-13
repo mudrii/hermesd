@@ -1260,3 +1260,34 @@ def test_curator_hygiene_ignores_non_mapping_records(hermes_home: Path):
 
     assert state.curator.managed_skill_count == 1
     assert state.curator.state_stale_count == 1
+
+
+def test_usage_pinned_flag_is_read_strictly(hermes_home: Path):
+    """`skills/.usage.json` is a state payload: `"false"` is not pinned.
+
+    Upstream writes a real boolean (`set_pinned` stores `bool(pinned)`), so a
+    string is corruption; `bool("false")` would report a skill as protected from
+    curation when it is not. The human-authored *frontmatter* flag is left
+    truthy on purpose — that one is a setting, read the way config values are.
+    """
+    _write_usage(
+        hermes_home,
+        {
+            "quoted-false": {"state": "active", "pinned": "false"},
+            "quoted-zero": {"state": "active", "pinned": "0"},
+            "really-pinned": {"state": "active", "pinned": True},
+        },
+    )
+
+    c = Collector(hermes_home)
+    try:
+        cur = c.collect().curator
+    finally:
+        c.close()
+
+    assert cur.managed_skill_count == 3
+    assert cur.pinned_count == 1
+    windows = {window.name: window for window in cur.skill_windows}
+    assert windows["really-pinned"].pinned is True
+    assert windows["quoted-false"].pinned is False
+    assert windows["quoted-zero"].pinned is False
