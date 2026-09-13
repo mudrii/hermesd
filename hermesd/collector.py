@@ -117,6 +117,7 @@ from hermesd.collect.migration import (
 from hermesd.collect.operations import (
     StateDbRead,
     _count_delegation_live_logs,
+    _curator_thresholds,
     _curator_with_scheduler_state,
     _is_dashboard_process,
     _iso_age_seconds,
@@ -125,6 +126,7 @@ from hermesd.collect.operations import (
     _read_projects_state,
     _read_state_snapshots,
     _read_verification_evidence,
+    _skill_curation_hygiene,
     _state_db_update,
     _state_transition_label,
 )
@@ -2519,7 +2521,27 @@ class Collector:
             self._paths.profile_path("skills", ".curator_state")
         )
         curator_cfg = _as_dict(self._read_yaml_reporting_stale().get("curator"))
-        base_run = _curator_with_scheduler_state(CuratorRun(), scheduler_state, curator_cfg)
+        stale_days, archive_days, thresholds_customized = _curator_thresholds(curator_cfg)
+        # skills/.usage.json is PROFILE-scoped (tools/skill_usage.py:50): the
+        # patch-reuse loop and per-skill threshold windows describe the
+        # selected profile's library, while the thresholds themselves are the
+        # ROOT config's curator overrides — the existing mixed `curator` row.
+        hygiene = _skill_curation_hygiene(
+            self._read_json_cached(self._paths.profile_path("skills", ".usage.json")),
+            now=self._clock(),
+            stale_after_days=stale_days,
+            archive_after_days=archive_days,
+        )
+        base_run = _curator_with_scheduler_state(
+            CuratorRun(), scheduler_state, curator_cfg
+        ).model_copy(
+            update={
+                "stale_after_days": stale_days,
+                "archive_after_days": archive_days,
+                "thresholds_customized": thresholds_customized,
+                **hygiene,
+            }
+        )
         curator_dir = self._paths.shared_path("logs", "curator")
         if (
             curator_dir.is_symlink()

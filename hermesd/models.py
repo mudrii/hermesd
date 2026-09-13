@@ -1946,6 +1946,24 @@ class OperationsState(BaseModel):
     api_runs: ApiRunReservationsState = Field(default_factory=ApiRunReservationsState)
 
 
+class SkillCurationWindow(BaseModel):
+    """One skill's distance to the curator's stale/archive thresholds.
+
+    The window runs from the skill's last real activity (use, view or patch);
+    ``created_at`` is deliberately excluded upstream
+    (``tools/skill_usage.py:106-111``), so a never-used skill has no window at
+    all rather than one that silently starts at its creation.
+    """
+
+    name: str
+    state: str = ""
+    pinned: bool = False
+    patch_pending_reuse: bool = False
+    last_activity_age_seconds: float | None = None
+    days_until_stale: float | None = None
+    days_until_archive: float | None = None
+
+
 class CuratorRun(BaseModel):
     run_present: bool = False
     stamp: str = ""
@@ -1971,6 +1989,23 @@ class CuratorRun(BaseModel):
     scheduler_last_run_at: str = ""
     scheduler_last_report_path: str = ""
     consolidate_enabled: bool = False
+    # Patch-reuse loop and threshold hygiene over skills/.usage.json, using the
+    # same effective thresholds the curator's transitions use
+    # (agent/curator.py:29,115-120): 14/30 days by default, overridable via
+    # curator.stale_after_days / curator.archive_after_days in config.yaml.
+    stale_after_days: int = 14
+    archive_after_days: int = 30
+    thresholds_customized: bool = False
+    managed_skill_count: int = 0
+    patch_pending_reuse_count: int = 0
+    state_active_count: int = 0
+    state_stale_count: int = 0
+    state_archived_count: int = 0
+    state_unknown_count: int = 0
+    pinned_count: int = 0
+    # Display-bounded slice of the per-skill windows, soonest deadline first;
+    # managed_skill_count is the complete number.
+    skill_windows: list[SkillCurationWindow] = Field(default_factory=list)
 
 
 class HealthSummary(BaseModel):

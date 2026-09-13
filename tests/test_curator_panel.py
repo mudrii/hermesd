@@ -154,3 +154,108 @@ def test_curator_compact_blank_stamp_falls_back_to_dash() -> None:
     rendered = render_to_str(render_curator(state, Theme()))
     assert "Last run:" in rendered
     assert "—" in rendered
+
+
+def _render(state: DashboardState, detail: bool) -> str:
+    return render_to_str(render_curator(state, Theme(), detail=detail), width=160)
+
+
+def _curator_state(**overrides: object) -> DashboardState:
+    from hermesd.models import CuratorRun, SkillCurationWindow
+
+    fields: dict[str, object] = {
+        "run_present": False,
+        "scheduler_state_present": True,
+        "managed_skill_count": 6,
+        "patch_pending_reuse_count": 1,
+        "state_active_count": 3,
+        "state_stale_count": 1,
+        "state_archived_count": 1,
+        "state_unknown_count": 1,
+        "pinned_count": 2,
+        "stale_after_days": 14,
+        "archive_after_days": 30,
+        "skill_windows": [
+            SkillCurationWindow(
+                name="research",
+                state="active",
+                patch_pending_reuse=True,
+                last_activity_age_seconds=86400.0,
+                days_until_stale=13.0,
+                days_until_archive=29.0,
+            ),
+            SkillCurationWindow(
+                name="never-used",
+                state="active",
+            ),
+        ],
+    }
+    fields.update(overrides)
+    return DashboardState(curator=CuratorRun(**fields))
+
+
+def test_curator_compact_shows_patch_reuse_and_state_counts() -> None:
+    text = _render(_curator_state(), detail=False)
+
+    assert "Patch reuse:" in text
+    assert "1 patched, not re-used" in text
+    assert "States:" in text
+    assert "3 active" in text
+    assert "1 stale" in text
+    assert "1 archived" in text
+    assert "2 pinned" in text
+
+
+def test_curator_compact_hides_hygiene_when_no_skills_managed() -> None:
+    text = _render(_curator_state(managed_skill_count=0, skill_windows=[]), detail=False)
+
+    assert "Patch reuse:" not in text
+    assert "States:" not in text
+
+
+def test_curator_detail_shows_hygiene_section_with_thresholds() -> None:
+    text = _render(_curator_state(), detail=True)
+
+    assert "Skill Hygiene" in text
+    assert "Managed" in text
+    assert "stale after 14d" in text
+    assert "archive after 30d" in text
+    assert "defaults" in text
+    assert "research" in text
+    assert "13d" in text
+    assert "29d" in text
+    assert "never" in text
+    assert "—" in text
+
+
+def test_curator_detail_marks_custom_thresholds() -> None:
+    text = _render(
+        _curator_state(stale_after_days=7, archive_after_days=21, thresholds_customized=True),
+        detail=True,
+    )
+
+    assert "stale after 7d" in text
+    assert "archive after 21d" in text
+    assert "curator.stale_after_days" in text
+
+
+def test_curator_detail_escapes_skill_names() -> None:
+    from hermesd.models import SkillCurationWindow
+
+    hostile = _curator_state(
+        skill_windows=[
+            SkillCurationWindow(name="[dim]evil [/] skill", state="active", days_until_stale=2.0)
+        ]
+    )
+    text = _render(hostile, detail=True)
+
+    assert "[dim]evil [/] skill" in text
+
+
+def test_curator_detail_marks_overdue_and_caps_windows() -> None:
+    from hermesd.models import SkillCurationWindow
+
+    overdue = SkillCurationWindow(name="past-due", state="active", days_until_stale=-3.0)
+    text = _render(_curator_state(skill_windows=[overdue]), detail=True)
+
+    assert "due" in text
