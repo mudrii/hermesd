@@ -30,9 +30,14 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "rich>=14.0.0",
-    "pyyaml>=6.0",
-    "pydantic>=2.0.0",
+    # Exact tested pins (audit CI-06): a fresh install must resolve to the same
+    # runtime versions exercised by the locked CI/dev/Docker environments, so
+    # an unpublished major cannot sneak into user installs. Bump these only
+    # together with uv.lock; scripts/check_wheel_pins.py enforces the match in
+    # CI by comparing wheel metadata against uv.lock.
+    "rich==14.3.3",
+    "pyyaml==6.0.3",
+    "pydantic==2.12.5",
 ]
 
 [project.optional-dependencies]

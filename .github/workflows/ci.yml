@@ -76,6 +76,8 @@ jobs:
         run: uv sync --locked --all-extras --dev
       - name: Build package
         run: uv build
+      - name: Verify wheel dependency pins match the lockfile
+        run: uv run python scripts/check_wheel_pins.py
       - name: Smoke test built wheel
         run: |
           uv run python -m venv .wheel-smoke

@@ -79,6 +79,8 @@ jobs:
           PY
       - name: Build release distributions
         run: uv build
+      - name: Verify wheel dependency pins match the lockfile
+        run: uv run python scripts/check_wheel_pins.py
       - name: Verify release distributions
         run: |
           uv run python - <<'PY'
