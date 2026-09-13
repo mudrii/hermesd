@@ -2522,6 +2522,23 @@ def test_delegation_live_manifest_task_list_is_capped(hermes_home: Path, sample_
     assert manifest.running_task_count == 12  # counted over every entry, not the cap
 
 
+def test_live_manifest_task_count_derives_from_the_entries(hermes_home: Path, sample_db: Path):
+    """The card's own count is the list it holds, not the file's self-report.
+
+    ``_truncation_label(shown, total)`` renders "showing 8 of 3" when the two
+    disagree, and upstream always writes ``task_count: len(task_list)``
+    (``tools/delegation_live_log.py:261``), so only a torn or doctored manifest
+    can differ — in which case the list is the trustworthy half.
+    """
+    live = hermes_home / "cache" / "delegation" / "live"
+    tasks = [{"index": index, "goal": f"g{index}", "status": "running"} for index in range(4)]
+    _write_live_delegation(live, "deleg_lying", _sample_manifest(task_count=3, tasks=tasks))
+
+    manifest = _collect_ops(hermes_home).operations.delegation_live_manifests[0]
+
+    assert manifest.task_count == 4
+
+
 def test_delegation_live_manifest_tails_only_the_displayed_tasks(
     hermes_home: Path, sample_db: Path, monkeypatch: pytest.MonkeyPatch
 ):

@@ -499,7 +499,11 @@ def _live_manifest_from_dir(
         completed=str(data.get("completed") or ""),
         manifest_present=True,
         dir_age_seconds=_age_seconds(mtime, now),
-        task_count=_coerce_int(data.get("task_count")) or len(entries),
+        # The card's total is its own entry list, not the manifest's
+        # self-reported count: upstream writes ``len(task_list)`` there, so a
+        # disagreement means a torn or doctored file, and the list is what the
+        # truncation label compares against.
+        task_count=len(entries),
         running_task_count=sum(
             1 for entry in entries if str(entry.get("status") or "") == "running"
         ),
