@@ -183,14 +183,48 @@ storm `0/5 in 120 s`; routes `13/13`; terminals 2 (not truncated); 9 live manife
 prune interval 24 h, not overdue; catalog cache absent → `usable=False` (no match claim);
 one `good` backup group. Panels 1, 2, 5, 7, 11, 12, 13 all render.
 
-### 8.4 Residual items (not part of this batch, left for a follow-up)
+### 8.4 Residual items — the flag sweep has since landed
 
-- Pre-existing truthy flag reads outside the reviewed six remain, e.g.
-  `collect/gateway.py:285` (`needs_attention`), `:509` (`exists`), `collect/config.py:36,
-  38, 45, 46, 49` (config booleans), `collect/skills.py:209, 222` (usage `pinned`). They
-  have the same `"false"`-is-truthy hazard and the shared `_coerce_bool` now makes them a
-  mechanical change, but they predate the batch and are not among its findings.
-  (`config.py:145` and `gateway.py:642` are string-presence tests, not flag reads.)
+The truthy flag reads flagged here were fixed in a follow-up sweep (§9): every
+machine-written payload read now goes through `_coerce_bool`, and the helper's
+docstring states the boundary (strict for state payloads and DB rows, truthy for
+human-authored settings, because upstream reads those truthily). What remains
+truthy is deliberate: `config.yaml`/env policy values and SKILL.md frontmatter,
+string/URL presence tests, and INTEGER-affinity SQLite columns.
 - The two skips are environmental: the opt-in live contract test and a TUI test that needs
   a free pty.
 - Panel-2 compact strings are asserted by substring, not in full.
+
+---
+
+## 9. Follow-up sweep: strict reads for every machine-written flag
+
+After the deep dive, the same `"false"`-is-truthy hazard was swept across the whole
+tree instead of just the batch's six sites. One commit per area, each with a test
+that reads a stringified flag through the real reader:
+
+| Commit | Payloads converted |
+| --- | --- |
+| `ccf16f1` | `gateway_state.json`: platform `needs_attention`, config-source `exists` |
+| `726bd86` | `channel_aliases.json`: `stale` / `is_stale` / `expired` |
+| `e28eaf7` | `skills/.usage.json`: `pinned` in the learned roll-up, the curator count and each window |
+| `838db66` | `skills/.curator_state`: `paused`; migration manifest: `flag_was`, `service.system` |
+| `96d05b1` | update receipt `restart_requested`; drain request `suppress_notification`; `active_sessions.json` `track_liveness`; `processes.json` `notify_on_complete` |
+| `dd21837` | `cron/jobs.json` `no_agent`, plus the policy boundary in `_coerce_bool`'s docstring |
+
+**Deliberately still truthy, with reasons recorded in code:**
+
+- *Human-authored settings* — `config.yaml` policy keys (agent limits, cron
+  `wrap_response`, kanban dispatch, MoA/streaming flags, `relay_only`,
+  `multiplex_profiles`, `consolidate`, `redact_secrets`) and SKILL.md frontmatter
+  `pinned`. Upstream reads these truthily when it decides what to do, so a strict read
+  would describe a policy the agent does not apply.
+- *Presence tests, not flags* — `stop_reason`, proxy/chronos URLs, env credentials,
+  `shared_runtime_url`.
+- *INTEGER-affinity columns* — `projects.archived`, `cron_executions.handoff_pending`,
+  the sessions `archived` pair. SQLite converts a TEXT `'0'` on insert, so `bool()`
+  already agrees; a test asserts this so the reasoning is not lost.
+
+Verification after the sweep: `2808 passed, 2 skipped`; coverage 98.29 %; ruff
+check/format, mypy and compileall clean; live snapshot unchanged
+(`failed_sources: []`).
