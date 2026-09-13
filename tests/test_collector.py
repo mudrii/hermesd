@@ -2221,3 +2221,49 @@ def test_collect_cron_stringified_preflight_flag_is_not_truthy(hermes_home: Path
     finally:
         c.close()
     assert state.cron.jobs[0].preflight_alerted is False
+
+
+def test_loop_tick_strikes_reset_when_the_gateway_stops_being_probed(hermes_home: Path):
+    """A non-probing pass clears the strikes instead of banking them."""
+    now = 1_800_000_000.0
+    _write_running_gateway(hermes_home, pid=4242, heartbeat_age=400.0, now=now)
+    c = Collector(
+        hermes_home,
+        pid_exists=lambda pid: pid == 4242,
+        clock=lambda: now,
+        loop_tick_probe=lambda pid, tcp_port: False,
+    )
+    try:
+        assert c.collect().gateway.loop_health is GatewayLoopHealth.STALE
+        assert c.collect().gateway.loop_health is GatewayLoopHealth.STALE
+
+        # The gateway stops: its witness is history, not a wedge, and the two
+        # banked strikes must not survive into the next life's first probe.
+        (hermes_home / "gateway_state.json").write_text(
+            json.dumps({"pid": 0, "gateway_state": "stopped", "platforms": {}})
+        )
+        c.collect()
+
+        _write_running_gateway(hermes_home, pid=4242, heartbeat_age=400.0, now=now)
+        assert c.collect().gateway.loop_health is GatewayLoopHealth.STALE
+    finally:
+        c.close()
+
+
+def test_terminal_breadcrumbs_outside_the_window_are_not_counted(hermes_home: Path):
+    """A 30-hour-old breadcrumb is not an open terminal; the window is 24h."""
+    directory = hermes_home / "terminal-sessions"
+    directory.mkdir()
+    stale = directory / "tty-old"
+    stale.write_text(json.dumps({"session_id": "s1", "cwd": "/tmp", "ts": time.time() - 30 * 3600}))
+    fresh = directory / "tty-new"
+    fresh.write_text(json.dumps({"session_id": "s2", "cwd": "/tmp", "ts": time.time() - 600}))
+
+    c = Collector(hermes_home)
+    try:
+        term = c.collect().terminal_sessions
+    finally:
+        c.close()
+
+    assert term.count == 1
+    assert [row.terminal for row in term.sessions] == ["tty-new"]

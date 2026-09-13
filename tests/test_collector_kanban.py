@@ -1068,7 +1068,15 @@ def test_kanban_notify_read_error_restores_only_notify_fields(hermes_home: Path,
         monkeypatch.setattr(kanban_module, "_query_rows", flaky_query_rows)
         second = c.collect()
         assert "kanban_notify" in second.health.failed_sources
-        assert second.kanban.notify_sub_count == 1
+        # Every field the source owns is restored, not just the headline count:
+        # a truncated fallback list would silently blank the rest of the panel.
+        assert second.kanban.notify_sub_count == first.kanban.notify_sub_count == 1
+        assert second.kanban.notify_platform_counts == first.kanban.notify_platform_counts
+        assert second.kanban.notify_backlog_total == first.kanban.notify_backlog_total
+        assert second.kanban.notify_max_backlog == first.kanban.notify_max_backlog
+        assert second.kanban.notify_backlog_subs == first.kanban.notify_backlog_subs
+        assert second.kanban.notify_orphan_profile_count == first.kanban.notify_orphan_profile_count
+        assert second.kanban.notify_orphan_profiles == first.kanban.notify_orphan_profiles
         assert second.kanban.task_count == 2
     finally:
         c.close()
@@ -1268,3 +1276,30 @@ def test_read_kanban_notify_fields_without_required_columns_returns_empty():
         )
     finally:
         conn.close()
+
+
+def test_kanban_notify_orphan_list_is_capped_while_the_count_is_exact(hermes_home: Path):
+    """Eight orphaned profiles must not all be listed, but all must be counted."""
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('t1', 'Task', 'todo', 1)"
+    )
+    for index in range(8):
+        _insert_notify_sub(
+            conn, "t1", "discord", chat_id=f"chat-{index}", notifier_profile=f"ghost-{index}"
+        )
+    conn.commit()
+    conn.close()
+    profiles = hermes_home / "profiles"
+    profiles.mkdir(exist_ok=True)
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.kanban.notify_orphan_profile_count == 8
+    assert len(state.kanban.notify_orphan_profiles) == 5
+    assert state.kanban.notify_orphan_profiles[0] == "ghost-0"

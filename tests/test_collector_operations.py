@@ -2928,3 +2928,27 @@ def test_delegation_live_manifest_caps_are_literal(hermes_home: Path, sample_db:
     ops = _collect_ops(hermes_home).operations
     assert ops.delegation_live_manifest_count == 1  # only the 70 KiB one qualifies
     assert ops.delegation_live_manifests == []
+
+
+def test_corrupt_ledger_marker_never_reads_the_parked_bytes(
+    hermes_home: Path, sample_db: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The parking bay is stat'd for its mtime; its contents are corrupt bytes."""
+    import hermesd.collect.operations as operations_module
+
+    path = hermes_home / "spawn-ledger.json.corrupt"
+    path.write_text("SECRET-PARKED-BYTES")
+
+    read_paths: list[str] = []
+    real_read = operations_module._read_text_capped
+
+    def spy(source: Path, *args: object, **kwargs: object) -> str:
+        read_paths.append(Path(source).name)
+        return real_read(source, *args, **kwargs)
+
+    monkeypatch.setattr(operations_module, "_read_text_capped", spy)
+    ops = _collect_ops(hermes_home).operations
+
+    assert ops.spawn_ledger_corrupt_present is True
+    assert ops.spawn_ledger_corrupt_age_seconds is not None
+    assert "spawn-ledger.json.corrupt" not in read_paths

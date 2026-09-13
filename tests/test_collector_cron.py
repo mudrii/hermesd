@@ -2992,3 +2992,24 @@ def test_collect_cron_fire_claim_unverifiable_owner_stays_live(hermes_home: Path
         c.close()
 
     assert state.cron.jobs[0].fire_claim_state is CronFireClaimState.RUNNING
+
+
+def test_collect_cron_small_future_skew_is_still_no_state(hermes_home: Path):
+    """The skew guard is "any future stamp", not "more than some margin".
+
+    The 600 s case above passes for any guard between 0 and 600 s; ten seconds
+    pins the boundary the reader documents (``age < 0``).
+    """
+    now = 1_800_000_000.0
+    _write_jobs_json(
+        hermes_home,
+        [{"id": "job-slight-skew", "fire_claim": {"at": iso_ago(-10, now=now)}}],
+    )
+
+    c = Collector(hermes_home, clock=lambda: now)
+    try:
+        job = c.collect().cron.jobs[0]
+    finally:
+        c.close()
+
+    assert job.fire_claim_state is None

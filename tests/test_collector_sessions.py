@@ -2738,3 +2738,25 @@ def test_gateway_route_suspended_flag_survives_the_decode_path(hermes_home: Path
     assert route.suspended is True
     assert route.needs_user_message is True
     assert route.dangling is False
+
+
+def test_gateway_route_display_name_is_clipped(hermes_home: Path) -> None:
+    """A remote display name is clipped, not merely redacted."""
+    conn = _make_coordination_db(hermes_home)
+    insert_gateway_route(
+        conn,
+        "telegram:505",
+        {"session_id": "sess-1", "platform": "telegram", "display_name": "N" * 200},
+        _COORD_NOW - 30,
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: False)
+    try:
+        route = c.collect().session_coordination.routes[0]
+    finally:
+        c.close()
+
+    assert len(route.display_name) == 40
+    assert route.display_name == "N" * 40
