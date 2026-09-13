@@ -2527,6 +2527,41 @@ def test_delegation_live_manifest_scan_is_bounded(hermes_home: Path, sample_db: 
     }
 
 
+def test_delegation_live_counts_older_unparsed_manifests_without_tailing_hidden_cards(
+    hermes_home: Path, sample_db: Path
+):
+    live = hermes_home / "cache" / "delegation" / "live"
+    for index in range(6):
+        run_dir = _write_live_delegation(
+            live,
+            f"deleg_valid_{index}",
+            _sample_manifest(tasks=[{"index": 0, "status": "completed"}]),
+            logs={"task-0.log": "done\n"},
+        )
+        stamp = _FIXED_NOW - index
+        os.utime(run_dir, (stamp, stamp))
+    for index in range(2):
+        run_dir = live / f"deleg_junk_{index}"
+        run_dir.mkdir()
+        (run_dir / "manifest.json").write_text("{not json")
+        stamp = _FIXED_NOW - 100 - index
+        os.utime(run_dir, (stamp, stamp))
+
+    tailed: list[Path] = []
+
+    def counting_tail(path: Path, home: Path) -> list[str]:
+        tailed.append(path)
+        return operations_module._live_log_tail(path, home)
+
+    state = _collect_ops(hermes_home, live_log_tail=counting_tail)
+    ops = state.operations
+
+    assert ops.delegation_live_manifest_count == 8
+    assert len(ops.delegation_live_manifests) == operations_module._MAX_LIVE_MANIFESTS
+    assert ops.delegation_live_unparsed_count == 2
+    assert len(tailed) == operations_module._MAX_LIVE_MANIFESTS
+
+
 def test_delegation_live_manifest_task_list_is_capped(hermes_home: Path, sample_db: Path):
     live = hermes_home / "cache" / "delegation" / "live"
     tasks = [{"index": index, "goal": f"g{index}", "status": "running"} for index in range(12)]
@@ -2919,6 +2954,26 @@ def test_checkpoint_prune_interval_ignores_unusable_config_values(
     (hermes_home / "config.yaml").write_text(f"checkpoints:\n  min_interval_hours: {value!r}\n")
     ops = _collect_ops(hermes_home).operations
     assert ops.checkpoint_prune_interval_seconds == pytest.approx(24 * 3600)
+
+
+@pytest.mark.parametrize(
+    "yaml_value",
+    [".nan", ".inf", "-.inf", "1.0e+308", str(10**400)],
+)
+def test_checkpoint_prune_interval_ignores_non_finite_values_when_rendering(
+    hermes_home: Path, sample_db: Path, yaml_value: str
+):
+    marker = hermes_home / "checkpoints" / ".last_prune"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(str(_FIXED_NOW - 3600))
+    (hermes_home / "config.yaml").write_text(f"checkpoints:\n  min_interval_hours: {yaml_value}\n")
+
+    state = _collect_ops(hermes_home)
+
+    assert state.operations.checkpoint_prune_interval_seconds == pytest.approx(24 * 3600)
+    text = render_to_str(render_panel(12, state, Theme(), detail=True), width=200, no_color=True)
+    assert "Checkpoint Prune" in text
+    assert "interval 1d" in text
 
 
 def test_process_receipts_symlinked_root_reads_as_absent(

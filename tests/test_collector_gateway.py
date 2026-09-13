@@ -3319,6 +3319,35 @@ def test_restart_storm_uses_the_configured_window(hermes_home: Path):
     assert gateway.in_respawn_backoff is False
 
 
+@pytest.mark.parametrize(
+    "window_yaml",
+    [
+        pytest.param(".nan", id="nan"),
+        pytest.param(".inf", id="positive-infinity"),
+        pytest.param("-.inf", id="negative-infinity"),
+        pytest.param(str(10**400), id="integer-overflow"),
+        pytest.param("0", id="zero"),
+        pytest.param("-1", id="negative"),
+    ],
+)
+def test_restart_storm_invalid_window_falls_back_and_detail_snapshot_renders(
+    hermes_home: Path, window_yaml: str
+):
+    _write_gateway_state(hermes_home)
+    (hermes_home / "config.yaml").write_text(
+        f"gateway:\n  respawn_storm:\n    max_starts: 9\n    window_seconds: {window_yaml}\n"
+    )
+    _write_starts_log(hermes_home, [NOW - 60, NOW - 150])
+
+    state = _collect(hermes_home)
+    detail = _gateway_detail(state)
+
+    assert state.gateway.restart_storm_cap == 9
+    assert state.gateway.restart_storm_window_seconds == pytest.approx(120.0)
+    assert state.gateway.gateway_starts_window == 1
+    assert "2m 1/9" in detail
+
+
 def test_restart_storm_disabled_writer_makes_no_claims(hermes_home: Path):
     """``max_starts <= 0`` disables the writer upstream, so the ledger is stale
     by construction and hermesd must not report a storm verdict from it."""

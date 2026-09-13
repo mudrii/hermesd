@@ -16,6 +16,7 @@ release scope grouped by dashboard area.
 
 ### Fixed
 
+- Gateway restart windows and checkpoint-prune intervals reject non-finite or overflowing configuration values and retain their defaults, so `.nan`, `.inf`, and oversized numbers cannot crash detail panels or text snapshots. Delegation manifest diagnostics count malformed entries across the bounded candidate scan even after five displayed cards are filled, without opening additional task logs.
 - Kanban can read a WAL-mode board with no sidecars through the immutable path, while still refusing an unreadable WAL sidecar instead of silently serving old data.
 - Cron incident copy now describes the detected incident without claiming that its existence proves alert delivery is broken. Fire-claim checks use an explicitly supplied hostname, and execution handoff flags use strict boolean parsing.
 - Delegation receipt tails and Kanban completion contracts are redacted before clipping or entering dashboard state.

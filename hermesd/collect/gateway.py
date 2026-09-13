@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import re
 import socket
 import sqlite3
@@ -766,11 +767,12 @@ def _respawn_storm_policy(cfg: JsonMapping) -> tuple[int, float]:
         else _RESTART_STORM_CAP
     )
     raw_window = respawn.get("window_seconds")
-    window = (
-        float(raw_window)
-        if isinstance(raw_window, int | float) and not isinstance(raw_window, bool)
-        else _RESTART_STORM_WINDOW_SECONDS
-    )
+    window = _RESTART_STORM_WINDOW_SECONDS
+    if isinstance(raw_window, int | float) and not isinstance(raw_window, bool):
+        with contextlib.suppress(OverflowError):
+            configured_window = float(raw_window)
+            if math.isfinite(configured_window) and configured_window > 0.0:
+                window = configured_window
     return cap, window
 
 

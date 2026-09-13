@@ -277,9 +277,8 @@ def _optional_epoch(value: object) -> float | None:
 
 # Bound on a JSON column read out of a database. The column itself can hold
 # megabytes (SQLite does not enforce a length), and the payload is rendered, so
-# anything past this reads as absent rather than being parsed.
-# and goal records). 64 KiB comfortably holds a real goal — which carries the
-# full contract and subgoal list — while still refusing a runaway blob.
+# anything past this reads as absent rather than being parsed. A 64 KiB cap
+# comfortably holds a real goal's full contract and subgoal list.
 _JSON_COLUMN_MAX_BYTES = 64 * 1024
 
 

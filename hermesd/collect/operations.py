@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import shlex
 import sqlite3
@@ -442,8 +443,9 @@ def _read_delegation_live_manifests(
     The bounded scan mirrors ``_count_delegation_live_logs``: symlinked run dirs
     and any path that resolves outside ``home`` are skipped. The count is
     presence-based (every run dir holding a capped ``manifest.json``), while
-    only the newest ``_MAX_LIVE_MANIFESTS`` directories are parsed into cards —
-    so the panel can say "showing N of M" instead of silently truncating. A card
+    only the newest ``_MAX_LIVE_MANIFESTS`` readable directories become cards —
+    so the panel can say "showing N of M" instead of silently truncating. Every
+    bounded candidate is still validated for the unparsed count. A card
     materialises at most ``_MAX_LIVE_TASKS`` tasks, so at most that many
     ``task-<index>.log`` files are opened per card regardless of how many
     entries the manifest lists; ``running_task_count`` and ``tasks_truncated``
@@ -479,16 +481,23 @@ def _read_delegation_live_manifests(
     manifests: list[DelegationLiveManifest] = []
     unparsed = 0
     for mtime, run_dir in candidates:
-        manifest = _live_manifest_from_dir(run_dir, home, mtime=mtime, now=now, log_tail=log_tail)
-        if manifest is not None:
-            manifests.append(manifest)
-            if len(manifests) >= _MAX_LIVE_MANIFESTS:
-                break
-        else:
+        data = _live_manifest_data(run_dir, home)
+        if data is None:
             # Counted by the presence-based scan, but no card: over the parse
             # cap, torn, or not JSON. Reported so the two numbers cannot
             # silently disagree.
             unparsed += 1
+        elif len(manifests) < _MAX_LIVE_MANIFESTS:
+            manifests.append(
+                _live_manifest_from_data(
+                    data,
+                    run_dir,
+                    home,
+                    mtime=mtime,
+                    now=now,
+                    log_tail=log_tail,
+                )
+            )
     return {
         "delegation_live_manifests": manifests,
         "delegation_live_manifest_count": count,
@@ -496,21 +505,23 @@ def _read_delegation_live_manifests(
     }
 
 
-def _live_manifest_from_dir(
+def _live_manifest_data(run_dir: Path, home: Path) -> dict[str, Any] | None:
+    return _json_object_capped(
+        _read_text_capped(run_dir / "manifest.json", home),
+        max_bytes=_LIVE_MANIFEST_MAX_BYTES,
+    )
+
+
+def _live_manifest_from_data(
+    data: dict[str, Any],
     run_dir: Path,
     home: Path,
     *,
     mtime: float,
     now: float,
     log_tail: Callable[[Path, Path], list[str]] = _live_log_tail,
-) -> DelegationLiveManifest | None:
-    """One delegation card, or None when the manifest is absent or unusable."""
-    data = _json_object_capped(
-        _read_text_capped(run_dir / "manifest.json", home),
-        max_bytes=_LIVE_MANIFEST_MAX_BYTES,
-    )
-    if data is None:
-        return None
+) -> DelegationLiveManifest:
+    """Materialize one readable manifest as a delegation card."""
     task_entries = _as_list(data.get("tasks"))
     # Only the displayed slice is materialised, so the per-task log tails stay
     # bounded by _MAX_LIVE_TASKS instead of the (unbounded) manifest size; the
@@ -649,7 +660,13 @@ def _checkpoint_prune_interval_seconds(cfg: Mapping[str, Any]) -> float:
     raw = _as_dict(cfg.get("checkpoints")).get("min_interval_hours")
     if isinstance(raw, bool) or not isinstance(raw, int | float) or raw <= 0:
         return float(CHECKPOINT_PRUNE_INTERVAL_SECONDS)
-    return float(raw) * 3600.0
+    try:
+        interval_seconds = float(raw) * 3600.0
+    except OverflowError:
+        return float(CHECKPOINT_PRUNE_INTERVAL_SECONDS)
+    if not math.isfinite(interval_seconds):
+        return float(CHECKPOINT_PRUNE_INTERVAL_SECONDS)
+    return interval_seconds
 
 
 def _read_checkpoint_prune_marker(
