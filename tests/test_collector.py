@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+import hermesd.collector as collector_module
 from hermesd.collector import (
     Collector,
     _coerce_float,
@@ -2141,3 +2142,42 @@ def test_loop_tick_silence_strikes_are_keyed_to_the_witness_pid(hermes_home: Pat
         assert c.collect().gateway.loop_health is GatewayLoopHealth.WEDGED
     finally:
         c.close()
+
+
+def test_terminal_breadcrumb_scan_is_bounded_and_flags_truncation(hermes_home: Path):
+    """A hostile breadcrumb directory must not be listed whole.
+
+    The sibling config-backups scan slices with ``islice`` *before* sorting for
+    exactly this reason; the terminal scan materialised and sorted the whole
+    directory first while its docstring claimed the listing was bounded, and a
+    truncated scan then reported its partial count as if it were complete.
+    """
+    directory = hermes_home / "terminal-sessions"
+    directory.mkdir()
+    for index in range(205):
+        (directory / f"tty-{index:03d}").write_text(
+            json.dumps({"session_id": f"s{index}", "cwd": "/tmp", "ts": time.time()})
+        )
+
+    reads = 0
+    real_read = collector_module._read_text_capped
+
+    def counting_read(path: Path, root: Path | None = None) -> str:
+        nonlocal reads
+        if Path(path).parent == directory:
+            reads += 1
+        return real_read(path, root)
+
+    c = Collector(hermes_home)
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(collector_module, "_read_text_capped", counting_read)
+            state = c.collect()
+    finally:
+        c.close()
+
+    term = state.terminal_sessions
+    assert reads <= 200, "the scanner read more files than its bound allows"
+    assert len(term.sessions) == 12
+    assert term.count == 200
+    assert term.truncated is True

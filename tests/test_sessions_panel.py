@@ -901,3 +901,26 @@ def test_reset_churn_and_terminals_render_heads_without_rows() -> None:
     assert "lifetime resets 21" in rendered
     assert "across 5 chat(s)" in rendered
     assert "2 open CLI terminals in the last 24 hours" in rendered
+
+
+def test_terminal_section_labels_a_truncated_scan_as_a_floor() -> None:
+    """A cut listing must not present its partial count as the total."""
+    term = TerminalSessionReadout(
+        sessions=[
+            TerminalBreadcrumb(terminal="tty-001", session_id="s1", cwd="/tmp", age_seconds=60.0)
+        ],
+        count=200,
+        truncated=True,
+    )
+    text = render_to_str(
+        render_sessions(DashboardState(terminal_sessions=term), Theme(), detail=True)
+    )
+    assert "at least 200 open CLI terminals" in text
+    assert "truncated" in text
+
+    complete = TerminalSessionReadout(sessions=term.sessions, count=1, truncated=False)
+    text = render_to_str(
+        render_sessions(DashboardState(terminal_sessions=complete), Theme(), detail=True)
+    )
+    assert "1 open CLI terminals in the last 24 hours" in text
+    assert "at least" not in text

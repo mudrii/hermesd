@@ -2057,9 +2057,12 @@ class Collector:
         now = self._clock()
         rows: list[TerminalBreadcrumb] = []
         count = 0
-        for entry in sorted(directory.iterdir(), key=lambda path: path.name)[
-            :_TERMINAL_SESSION_SCAN_LIMIT
-        ]:
+        # Bound the listing before sorting, like the config-backups scan: a
+        # hostile directory must not be materialised whole, and one extra entry
+        # is enough to know the scan was cut.
+        examined = list(islice(directory.iterdir(), _TERMINAL_SESSION_SCAN_LIMIT + 1))
+        truncated = len(examined) > _TERMINAL_SESSION_SCAN_LIMIT
+        for entry in sorted(examined[:_TERMINAL_SESSION_SCAN_LIMIT], key=lambda path: path.name):
             if entry.name.startswith(".") or not entry.is_file():
                 continue
             if entry.is_symlink() or not _path_resolves_under(entry, home):
@@ -2084,7 +2087,7 @@ class Collector:
                         age_seconds=age,
                     )
                 )
-        return TerminalSessionReadout(sessions=rows, count=count)
+        return TerminalSessionReadout(sessions=rows, count=count, truncated=truncated)
 
     def _last_model_usage(self) -> _ModelUsageBundle:
         bundle: _ModelUsageBundle = self._last_good_by_source.get(

@@ -1076,7 +1076,17 @@ _TERMINAL_NOTE = (
 
 def _terminal_section(term: TerminalSessionReadout, theme: Theme) -> RenderableType:
     lines = Text()
-    lines.append(f"  {term.count} open CLI terminals in the last 24 hours", style=theme.ui_accent)
+    if term.truncated:
+        # The directory exceeded the scan bound, so the figure is a floor.
+        lines.append(
+            f"  at least {term.count} open CLI terminals in the last 24 hours",
+            style=theme.ui_accent,
+        )
+        lines.append(" (directory scan truncated)", style=theme.ui_warn)
+    else:
+        lines.append(
+            f"  {term.count} open CLI terminals in the last 24 hours", style=theme.ui_accent
+        )
     lines.append(f" — {_TERMINAL_NOTE}\n", style=theme.banner_dim)
     if not term.sessions:
         return lines

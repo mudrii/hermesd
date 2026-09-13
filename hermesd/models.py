@@ -680,11 +680,14 @@ class TerminalSessionReadout(BaseModel):
     """Bounded recent terminal breadcrumbs plus the 24h file count.
 
     ``count`` covers every breadcrumb within the 24-hour window even when
-    ``sessions`` is truncated to the newest rows.
+    ``sessions`` is truncated to the newest rows. When the directory itself
+    exceeded the scan bound, ``truncated`` marks ``count`` as a lower bound and
+    the panel says so rather than presenting a partial scan as the total.
     """
 
     sessions: list[TerminalBreadcrumb] = Field(default_factory=list)
     count: int = 0
+    truncated: bool = False
 
 
 class SessionCoordinationState(BaseModel):
