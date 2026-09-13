@@ -132,6 +132,41 @@ def test_kanban_compact_omits_notify_lines_without_subscriptions() -> None:
     assert "Orphan Profiles:" not in text
 
 
+def test_kanban_compact_orphan_profile_renders_literal_brackets() -> None:
+    """Orphan profile names are appended to a Text buffer, which never parses
+    Rich markup, so escaping them would leak the escape backslashes."""
+    state = DashboardState(
+        kanban=KanbanState(
+            db_present=True,
+            task_count=1,
+            notify_sub_count=1,
+            notify_orphan_profile_count=1,
+            notify_orphan_profiles=["we[i]rd"],
+        )
+    )
+    text = render_to_str(render_kanban(state, Theme()), width=100, no_color=True)
+
+    assert "Orphan Profiles: we[i]rd" in text
+    assert "\\" not in text
+
+
+def test_kanban_compact_breaker_content_renders_literal_brackets() -> None:
+    """The compact breaker line appends task ids to the same Text buffer and
+    must stay unescaped too."""
+    tripped = KanbanTaskSummary(
+        task_id="we[i]rd",
+        status="blocked",
+        consecutive_failures=1,
+        breaker_limit=0,
+        breaker_tripped=True,
+    )
+    state = DashboardState(kanban=KanbanState(db_present=True, problem_tasks=[tripped]))
+    text = render_to_str(render_kanban(state, Theme()), width=100, no_color=True)
+
+    assert "Breaker Tripped: we[i]rd" in text
+    assert "\\" not in text
+
+
 def test_kanban_compact_warns_when_breaker_tripped() -> None:
     tripped = KanbanTaskSummary(
         task_id="t_trip",
