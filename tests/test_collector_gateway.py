@@ -3490,3 +3490,35 @@ def test_stale_alias_count_ignores_stringified_flags(hermes_home: Path):
 
     assert state.channels.alias_count == 3
     assert state.channels.stale_alias_count == 1
+
+
+def test_gateway_stringified_request_flags_are_read_strictly(hermes_home: Path):
+    """Update receipts and drain requests are machine-written booleans.
+
+    ``logs/update_receipts/latest.json`` records ``restart_requested`` and
+    ``.drain_request.json`` records ``suppress_notification`` as real JSON
+    booleans; a stringified ``"false"`` would claim a restart is pending and that
+    the drain notification was suppressed.
+    """
+    receipts = hermes_home / "logs" / "update_receipts"
+    receipts.mkdir(parents=True)
+    (receipts / "latest.json").write_text(
+        json.dumps({"outcome": "success", "restart_requested": "false"})
+    )
+    (hermes_home / ".drain_request.json").write_text(
+        json.dumps(
+            {
+                "requested_at": "2026-07-10T10:00:00Z",
+                "principal": "nas",
+                "suppress_notification": "false",
+            }
+        )
+    )
+    (hermes_home / "gateway_state.json").write_text(
+        json.dumps({"pid": 0, "gateway_state": "stopped", "platforms": {}})
+    )
+
+    gw = _collect(hermes_home).gateway
+
+    assert gw.restart_requested is False
+    assert gw.drain_suppress_notification is False

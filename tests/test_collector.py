@@ -2269,3 +2269,32 @@ def test_terminal_breadcrumbs_outside_the_window_are_not_counted(hermes_home: Pa
 
     assert term.count == 1
     assert [row.terminal for row in term.sessions] == ["tty-new"]
+
+
+def test_notify_on_complete_stringified_flag_is_not_truthy(hermes_home: Path):
+    """``processes.json`` is machine-written: `"false"` must not request a ping."""
+    (hermes_home / "processes.json").write_text(
+        json.dumps(
+            [
+                {
+                    "session_id": "proc_x",
+                    "command": "pytest -q",
+                    "pid": 4242,
+                    "pid_scope": "host",
+                    "cwd": "/tmp",
+                    "started_at": time.time() - 60,
+                    "notify_on_complete": "false",
+                    "watch_patterns": [],
+                }
+            ]
+        )
+    )
+
+    c = Collector(hermes_home, pid_exists=lambda pid: pid == 4242)
+    try:
+        processes = c.collect().background_processes
+    finally:
+        c.close()
+
+    assert len(processes) == 1
+    assert processes[0].notify_on_complete is False

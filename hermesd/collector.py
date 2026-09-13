@@ -1526,7 +1526,7 @@ class Collector:
             hermes_version=version,
             updates_behind=behind,
             active_agents=active_agents,
-            restart_requested=bool(data.get("restart_requested")),
+            restart_requested=_coerce_bool(data.get("restart_requested")),
             busy=running and active_agents > 0,
             drainable=running and active_agents == 0,
             drain_active=bool(drain_request),
@@ -1534,7 +1534,7 @@ class Collector:
             drain_principal=str(
                 drain_request.get("principal") or drain_request.get("requested_by") or ""
             ),
-            drain_suppress_notification=bool(drain_request.get("suppress_notification")),
+            drain_suppress_notification=_coerce_bool(drain_request.get("suppress_notification")),
             served_profiles=served_names,
             served_profiles_recorded=served_recorded,
             scale_to_zero_idle_timeout_minutes=_coerce_int(scale_cfg.get("idle_timeout_minutes")),
@@ -1963,7 +1963,7 @@ class Collector:
                     lease_id=str(entry.get("lease_id") or ""),
                     started_at_age_seconds=_lease_age_seconds(entry.get("started_at"), now),
                     updated_at_age_seconds=_lease_age_seconds(entry.get("updated_at"), now),
-                    track_liveness=bool(entry.get("track_liveness")),
+                    track_liveness=_coerce_bool(entry.get("track_liveness")),
                     joinable=bool(str(metadata.get("shared_runtime_url") or "")),
                 )
             )
@@ -2191,7 +2191,7 @@ class Collector:
                 started_at=_coerce_float(entry.get("started_at")),
                 task_id=str(entry.get("task_id") or ""),
                 session_key=str(entry.get("session_key") or ""),
-                notify_on_complete=bool(entry.get("notify_on_complete")),
+                notify_on_complete=_coerce_bool(entry.get("notify_on_complete")),
                 watcher_platform=str(entry.get("watcher_platform") or ""),
                 watcher_chat_id=str(entry.get("watcher_chat_id") or ""),
                 watcher_user_id=str(entry.get("watcher_user_id") or ""),

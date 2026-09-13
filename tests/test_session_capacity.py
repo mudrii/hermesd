@@ -545,3 +545,27 @@ def test_config_panel_capacity_note_keeps_the_resources_apart() -> None:
 
     assert "cross-process lease cap" in rendered
     assert "in-memory sessions" in rendered
+
+
+def test_active_surface_track_liveness_is_read_strictly(hermes_home: Path, tmp_path: Path):
+    """``runtime/active_sessions.json`` is machine-written: `"false"` is not tracked."""
+    _registry(
+        hermes_home,
+        [
+            {
+                "lease_id": "lease-quoted",
+                "session_id": "s1",
+                "surface": "desktop",
+                "pid": 111,
+                "process_start_time": _NOW - 100.0,
+                "started_at": _NOW - 90.0,
+                "updated_at": _NOW - 90.0,
+                "track_liveness": "false",
+            }
+        ],
+    )
+
+    surface = _collect(hermes_home, observed={111: _NOW - 100.0}, live=frozenset({111}))
+    lease = surface.active_surfaces[0]
+
+    assert lease.track_liveness is False
