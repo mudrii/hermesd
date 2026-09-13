@@ -162,24 +162,54 @@ jobs:
       - name: Smoke test Docker image
         run: docker run --rm hermesd-ci --version
       - name: Smoke test Docker checkpoint support
+        # Exercises the installed hermesd end to end through its public CLI
+        # with a synthetic checkpoint repo - no private collector imports
+        # (audit CI-22).
         run: |
           docker run --rm -i --network none --entrypoint python hermesd-ci - <<'PY'
           import subprocess
           import tempfile
           from pathlib import Path
-          from hermesd.collect.system import _git_checkpoint_summary
 
           with tempfile.TemporaryDirectory() as directory:
-              repo = Path(directory)
-              subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+              home = Path(directory) / ".hermes"
+              for name in ("logs", "sessions", "skills", "memories", "cron"):
+                  (home / name).mkdir(parents=True)
+
+              repo = home / "checkpoints" / "smoke000000000000"
+              workdir = Path(directory) / "workspaces" / "project-alpha"
+              workdir.mkdir(parents=True)
+              repo.mkdir(parents=True)
+              (repo / "HERMES_WORKDIR").write_text(str(workdir))
+
+              subprocess.run(["git", "init", "--quiet", "--bare", str(repo)], check=True)
+
+              def git(*args: str) -> None:
+                  subprocess.run(
+                      ["git", "--git-dir", str(repo), "--work-tree", str(workdir), *args],
+                      check=True,
+                  )
+
+              git("config", "user.email", "smoke@example.invalid")
+              git("config", "user.name", "Smoke Test")
+              (workdir / "notes.txt").write_text("checkpoint smoke\n")
               for number in range(2):
-                  subprocess.run([
-                      "git", "-C", str(repo), "-c", "user.name=Smoke Test",
-                      "-c", "user.email=smoke@example.invalid", "commit", "--quiet",
-                      "--allow-empty", "-m", f"checkpoint {number}",
-                  ], check=True)
-              count, timestamp, reason = _git_checkpoint_summary(repo / ".git")
-              assert count == 2 and timestamp is not None and reason == "checkpoint 1"
+                  if number:
+                      (workdir / "notes.txt").write_text(f"checkpoint smoke v{number}\n")
+                  git("add", "-A")
+                  git("commit", "--quiet", "-m", f"checkpoint {number}")
+
+              snapshot = subprocess.run(
+                  [
+                      "hermesd", "--hermes-home", str(home),
+                      "--snapshot-panel", "4", "--no-color",
+                  ],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+              assert "Checkpoints (1)" in snapshot.stdout, snapshot.stdout
+              assert "checkpoint 1" in snapshot.stdout, snapshot.stdout
           PY
 
   nix:

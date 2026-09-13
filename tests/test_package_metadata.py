@@ -18,7 +18,13 @@ def test_docker_includes_and_smokes_git_checkpoint_support():
     dockerfile = Path("Dockerfile").read_text()
     assert re.search(r"apt-get install[^\n]*\bgit\b", dockerfile)
     commands = "\n".join(_job_run_commands(_workflow(".github/workflows/ci.yml"), "docker"))
-    assert "_git_checkpoint_summary" in commands
+    # The checkpoint smoke goes through the public CLI boundary with a
+    # synthetic checkpoint repo - not a private collector helper (audit CI-22).
+    assert "_git_checkpoint_summary" not in commands
+    assert "hermesd.collect" not in commands
+    assert '--snapshot-panel", "4"' in commands or '"--snapshot-panel", "4"' in commands
+    assert '"Checkpoints (1)" in snapshot.stdout' in commands
+    assert '"checkpoint 1" in snapshot.stdout' in commands
 
 
 def _workflow(path: str) -> dict:
