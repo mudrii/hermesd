@@ -928,11 +928,14 @@ def _curator_threshold_days(cfg: dict[str, Any], key: str, default: int) -> int:
 
     Mirrors ``_config_number`` (``agent/curator.py:96-100``): an uncastable or
     absent value falls back to the default, while a present numeric value —
-    including ``0`` — is kept exactly as the curator would keep it.
+    including ``0`` — is kept exactly as the curator would keep it. YAML's
+    ``.inf`` reaches ``int()`` as a float infinity and raises ``OverflowError``
+    rather than ``ValueError``, so that is a cast failure too: the alternative
+    is losing the whole curator source over one token.
     """
     try:
         return int(cfg.get(key, default))
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return default
 
 

@@ -1130,6 +1130,28 @@ def test_curator_threshold_junk_override_falls_back_to_default(hermes_home: Path
     assert state.curator.thresholds_customized is True
 
 
+def test_curator_threshold_infinite_value_falls_back_to_default(hermes_home: Path):
+    """A YAML ``.inf`` must not take the whole curator source down.
+
+    ``int(float("inf"))`` raises ``OverflowError``, which is not a ``ValueError``
+    or ``TypeError``, so the cast guard let it escape: the source failed, the
+    whole CuratorRun fell back to last good, and the thresholds, the usage
+    rollup and the run history all disappeared for that refresh.
+    """
+    (hermes_home / "config.yaml").write_text(
+        yaml.dump({"curator": {"stale_after_days": float("inf")}})
+    )
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "curator" not in state.health.failed_sources
+    assert state.curator.stale_after_days == 14
+    assert state.curator.archive_after_days == 30
+
+
 def test_curator_usage_hygiene_counts(hermes_home: Path):
     now = time.time()
     _write_usage(
