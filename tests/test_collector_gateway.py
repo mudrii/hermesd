@@ -871,8 +871,10 @@ def test_heartbeat_garbage_timestamp_falls_back_to_file_mtime(hermes_home: Path)
 
     gateway = _collect(hermes_home).gateway
 
+    # The age comes from the file mtime; the verdict is the witness's call,
+    # and this payload is armed with no node to probe in a bare fixture home.
     assert gateway.heartbeat_age_seconds == pytest.approx(120.0)
-    assert gateway.loop_health is GatewayLoopHealth.STALE
+    assert gateway.loop_health is GatewayLoopHealth.UNKNOWN
 
 
 def test_heartbeat_wrong_types_do_not_crash(hermes_home: Path):
@@ -900,12 +902,15 @@ def test_heartbeat_future_timestamp_clamps_to_zero(hermes_home: Path):
     ("age", "gateway_state", "expected"),
     [
         (90.0, "running", GatewayLoopHealth.TICKING),
-        (91.0, "running", GatewayLoopHealth.STALE),
-        (300.0, "running", GatewayLoopHealth.STALE),
-        # Armed witness but no node to probe (the default probe finds none in a
-        # bare fixture home): upstream's classify calls that ambiguity, and a
-        # WEDGED verdict now requires sustained witness silence instead.
+        # Past the 90 s stale budget the witness decides — upstream escalates
+        # there, not at 300 s. This payload is armed but its node cannot be
+        # probed in a bare fixture home, which upstream classifies as
+        # ambiguity; a WEDGED verdict requires sustained witness silence.
+        (91.0, "running", GatewayLoopHealth.UNKNOWN),
+        (300.0, "running", GatewayLoopHealth.UNKNOWN),
         (301.0, "running", GatewayLoopHealth.UNKNOWN),
+        # A stopped gateway has no witness to consult: the heartbeat-only
+        # fallback keeps its ten-write cutoff.
         (301.0, "stopped", GatewayLoopHealth.STALE),
     ],
 )
@@ -2512,6 +2517,62 @@ def test_loop_tick_sustained_silence_escalates_to_wedged(hermes_home: Path):
     assert first.loop_health is GatewayLoopHealth.STALE
     assert second.loop_health is GatewayLoopHealth.STALE
     assert third.loop_health is GatewayLoopHealth.WEDGED
+
+
+def test_loop_tick_escalation_band_starts_at_the_stale_budget(hermes_home: Path):
+    """The 90 s stale budget opens upstream's escalation band, not 300 s.
+
+    ``probe_gateway_loop_liveness`` (hermes_cli/gateway.py:345,465-497) calls
+    anything older than ``DEFAULT_LOOP_LIVENESS_STALE_AFTER_S`` (three missed
+    30 s beats) decisive: with the witness armed and silent across strikes the
+    verdict is wedged, and with no witness key it is the legacy on-loop writer.
+    hermesd kept a 90-300 s "stale" band that no witness evidence could
+    escalate out of, so a gateway wedged for four minutes still read as a slow
+    heartbeat — the exact verdict upstream exists to avoid.
+    """
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(hermes_home, _armed_heartbeat(120.0))
+
+    collector = Collector(
+        hermes_home,
+        pid_exists=lambda pid: pid == 4242,
+        clock=_clock,
+        loop_tick_probe=lambda pid, tcp_port: False,  # type: ignore[arg-type,return-value]
+    )
+    try:
+        first = collector.collect().gateway
+        second = collector.collect().gateway
+        third = collector.collect().gateway
+    finally:
+        collector.close()
+
+    # The three-strike guard still stands inside the early band.
+    assert first.loop_health is GatewayLoopHealth.STALE
+    assert second.loop_health is GatewayLoopHealth.STALE
+    assert third.loop_health is GatewayLoopHealth.WEDGED
+
+
+def test_loop_tick_legacy_heartbeat_escalates_at_the_stale_budget(hermes_home: Path):
+    """A witness-less payload past 90 s is the legacy writer's absence of proof."""
+    legacy = {
+        key: value for key, value in _armed_heartbeat(120.0).items() if key != "loop_tick_socket"
+    }
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(hermes_home, legacy)
+
+    gateway = _collect_probed(hermes_home, lambda pid, tcp_port: None).gateway  # type: ignore[attr-defined]
+
+    assert gateway.loop_health is GatewayLoopHealth.LEGACY
+
+
+def test_loop_tick_disarmed_witness_past_the_budget_is_ambiguity(hermes_home: Path):
+    """An armed-failed witness past 90 s is ambiguity, never a wedge."""
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(hermes_home, _armed_heartbeat(120.0, loop_tick_socket=False))
+
+    gateway = _collect_probed(hermes_home, lambda pid, tcp_port: False).gateway  # type: ignore[attr-defined]
+
+    assert gateway.loop_health is GatewayLoopHealth.UNKNOWN
 
 
 def test_loop_tick_legacy_heartbeat_staleness_alone_is_proof(hermes_home: Path):

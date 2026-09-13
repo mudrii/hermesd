@@ -51,7 +51,10 @@ from hermesd.models import (
 )
 
 # The gateway watchdog rewrites state/gateway.heartbeat every 30s: three missed
-# writes is stale, ten is a wedged event loop.
+# writes is stale — and, for a witness-less writer, that budget is upstream's
+# decisive cutoff (`DEFAULT_LOOP_LIVENESS_STALE_AFTER_S`, hermes_cli/gateway.py:345).
+# The ten-write figure only survives in the heartbeat-only fallback below, where
+# nothing witnessed the loop and a long-silent file may just be a stopped gateway.
 _HEARTBEAT_TICKING_SECONDS = 90.0
 _HEARTBEAT_STALE_SECONDS = 300.0
 # Loop-tick witness probe (hermes_cli/gateway.py:363-424): one byte, one second.
@@ -400,8 +403,11 @@ def _loop_tick_verdict(
         return GatewayLoopHealth.ALIVE
     if age <= _HEARTBEAT_TICKING_SECONDS:
         return GatewayLoopHealth.UNKNOWN if probe_result is False else current
-    if age <= _HEARTBEAT_STALE_SECONDS:
-        return GatewayLoopHealth.STALE if probe_result is False else current
+    # Past the stale budget the witness decides, exactly as upstream escalates
+    # (``:465-497``): there is no milder band between the budget and the
+    # old on-loop 300 s cutoff, because a gateway wedged for four minutes is
+    # not a slow heartbeat. The three-strike guard still stands, so the first
+    # silent probes read STALE rather than WEDGED.
     if plan.armed is None:
         return GatewayLoopHealth.LEGACY
     if plan.armed is False:
