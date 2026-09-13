@@ -16,6 +16,7 @@ from hermesd.collect.common import (
     _MAX_TEXT_READ_BYTES,
     _age_seconds,
     _as_dict,
+    _coerce_bool,
     _coerce_float,
     _coerce_int,
     _exists_strict,
@@ -275,7 +276,9 @@ def _execution_from_row(
         error_excerpt=_cron_error_excerpt(str(row.get("error") or "")),
         delivery_outcome=str(row.get("delivery_outcome") or ""),
         scheduled_instant=str(row.get("scheduled_instant") or ""),
-        handoff_pending=bool(row.get("handoff_pending") or 0),
+        # Machine-written column: a text 'false' survives INTEGER affinity
+        # and bool() would call the handoff pending.
+        handoff_pending=_coerce_bool(row.get("handoff_pending")),
     )
 
 

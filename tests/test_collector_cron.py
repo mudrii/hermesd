@@ -965,6 +965,39 @@ def test_unknown_status_is_counted_and_not_folded_into_failed(hermes_home: Path)
     assert stats.running_24h == 0
 
 
+def test_cron_execution_handoff_pending_is_read_strictly(hermes_home: Path):
+    """A text ``'false'`` in the handoff column is not a pending handoff.
+
+    The column has INTEGER affinity, which converts a numeric spelling but
+    leaves ``'false'`` as TEXT — and ``bool('false')`` is True. The delivery
+    column beside it is copied verbatim, so only this flag needed the reader.
+    """
+    db_path = _write_permissive_executions_db(hermes_home, [])
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "INSERT INTO executions (id, job_id, source, process_id, pid, status, claimed_at, "
+        "handoff_pending) VALUES ('e1', 'job-alpha', 'builtin', 'proc', 1, 'completed', ?, ?)",
+        (iso_ago(60), "false"),
+    )
+    conn.execute(
+        "INSERT INTO executions (id, job_id, source, process_id, pid, status, claimed_at, "
+        "handoff_pending) VALUES ('e2', 'job-alpha', 'builtin', 'proc', 1, 'completed', ?, ?)",
+        (iso_ago(120), 1),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    by_id = {run.execution_id: run for run in state.cron_executions.recent}
+    assert by_id["e1"].handoff_pending is False
+    assert by_id["e2"].handoff_pending is True
+
+
 def test_window_counts_reconcile_against_the_total(hermes_home: Path):
     _write_permissive_executions_db(
         hermes_home,
