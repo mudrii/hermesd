@@ -670,6 +670,10 @@ class Collector:
         # never opens real sockets; the default probe is read-only by protocol.
         self._loop_tick_probe = loop_tick_probe or self._probed_loop_tick
         self._loop_tick_silent_strikes = 0
+        # Which witness those strikes belong to. The socket node is named after
+        # the gateway pid, so a restart means a new witness: carrying a dead
+        # life's strikes over would wedge a gateway on its first silent probe.
+        self._loop_tick_strike_pid: int | None = None
         self._log_tail_bytes = max(1, log_tail_bytes)
         self._paths = HermesPaths(hermes_home, profile_name)
         if db_factory is None:
@@ -1587,7 +1591,8 @@ class Collector:
         (``_LOOP_TICK_SILENCE_STRIKES``): one silent probe is never destructive
         evidence, mirroring upstream's sustained window without sleeping in the
         collector thread. Any answer, ambiguity, or non-probing pass resets the
-        strike count.
+        strike count, and so does a change of witness pid: the node is named after
+        the gateway process, so a restart starts a fresh count.
         """
         path = self._paths.shared_path("state", "gateway.heartbeat")
         heartbeat = (
@@ -1600,7 +1605,11 @@ class Collector:
         )
         if plan is None:
             self._loop_tick_silent_strikes = 0
+            self._loop_tick_strike_pid = None
             return gateway
+        if plan.pid != self._loop_tick_strike_pid:
+            self._loop_tick_strike_pid = plan.pid
+            self._loop_tick_silent_strikes = 0
         probe_result = self._loop_tick_probe(plan.pid, plan.tcp_port)
         if probe_result is False:
             self._loop_tick_silent_strikes += 1

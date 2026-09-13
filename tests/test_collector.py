@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -26,7 +27,7 @@ from hermesd.collector import (
     _redact_secret_url,
     _safe_exception_text,
 )
-from hermesd.models import DashboardState
+from hermesd.models import DashboardState, GatewayLoopHealth
 from tests.conftest import create_kanban_db_tables, create_state_db_tables
 
 
@@ -2080,5 +2081,63 @@ def test_shared_field_enrichment_keeps_latest_successful_contribution(
         assert "gateway_lifecycle" in third.health.failed_sources
         assert third.gateway.lifecycle_phase == "exited"
         assert third.gateway.last_exit_code == 3
+    finally:
+        c.close()
+
+
+def _write_running_gateway(home: Path, *, pid: int, heartbeat_age: float, now: float) -> None:
+    """A running gateway record plus an armed, stale heartbeat for ``pid``."""
+    (home / "gateway_state.json").write_text(
+        json.dumps(
+            {
+                "pid": pid,
+                "start_time": now - 5000,
+                "kind": "hermes-gateway",
+                "gateway_state": "running",
+                "platforms": {},
+            }
+        )
+    )
+    state_dir = home / "state"
+    state_dir.mkdir(exist_ok=True)
+    (state_dir / "gateway.heartbeat").write_text(
+        json.dumps(
+            {
+                "pid": pid,
+                "updated_at": datetime.fromtimestamp(now - heartbeat_age, tz=UTC).isoformat(),
+                "monotonic": 1234.5,
+                "start_time": now - 5000,
+                "loop_tick_socket": True,
+                "loop_tick_tcp_port": None,
+            }
+        )
+    )
+
+
+def test_loop_tick_silence_strikes_are_keyed_to_the_witness_pid(hermes_home: Path):
+    """A restarted gateway inherits no strikes: silence is counted per witness pid.
+
+    One shared counter let a dead life's two silent probes make a new gateway's
+    *first* miss the third strike, so the panel escalated to ``wedged`` on a
+    process that had only been silent once.
+    """
+    now = 1_800_000_000.0
+    stale_age = 400.0  # past the stale budget, so escalation is reachable
+    _write_running_gateway(hermes_home, pid=4242, heartbeat_age=stale_age, now=now)
+    c = Collector(
+        hermes_home,
+        pid_exists=lambda pid: pid in (4242, 5150),
+        clock=lambda: now,
+        loop_tick_probe=lambda pid, tcp_port: False,
+    )
+    try:
+        assert c.collect().gateway.loop_health is GatewayLoopHealth.STALE
+        assert c.collect().gateway.loop_health is GatewayLoopHealth.STALE
+
+        # Same stale ledger, new gateway life: strike one for pid 5150.
+        _write_running_gateway(hermes_home, pid=5150, heartbeat_age=stale_age, now=now)
+        assert c.collect().gateway.loop_health is GatewayLoopHealth.STALE
+        assert c.collect().gateway.loop_health is GatewayLoopHealth.STALE
+        assert c.collect().gateway.loop_health is GatewayLoopHealth.WEDGED
     finally:
         c.close()
