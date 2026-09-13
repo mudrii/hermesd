@@ -13,6 +13,11 @@ build/
 venv/
 env/
 
+# Package smoke-test environments (audit CI-21: keep them outside the
+# checkout; CI uses $RUNNER_TEMP, local runs should use mktemp -d)
+.wheel-smoke/
+.sdist-smoke/
+
 # Testing
 .pytest_cache/
 .coverage

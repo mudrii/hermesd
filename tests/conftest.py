@@ -6,10 +6,18 @@ import signal
 import sqlite3
 import subprocess
 import time
+from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from rich.console import Console
+
+from hermesd.collector import Collector
+
+if TYPE_CHECKING:
+    from hermesd.models import DashboardState
 
 _AMBIENT_RUNTIME_ENV = ("HERMES_HOME", "HERMES_PROFILE", "NO_COLOR", "FORCE_COLOR")
 
@@ -27,6 +35,19 @@ def isolate_runtime_environment(
     for name in _AMBIENT_RUNTIME_ENV:
         if name != "HERMES_HOME" or not preserve_live_home:
             monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def no_host_process_probing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the suite off the host process table.
+
+    The default start-time probe shells out to ``ps``, so a Collector built
+    without an injected ``process_start_times`` would make results depend on which
+    processes happen to be running — and would spawn a subprocess per pass. Tests
+    that exercise identity matching inject their own probe; everything else
+    observes no start time, which reads as unverifiable rather than dead.
+    """
+    monkeypatch.setattr("hermesd.collector._observed_process_start_times", lambda pids: {})
 
 
 def render_to_str(panel, width: int = 120, no_color: bool = False) -> str:
@@ -61,13 +82,126 @@ def hermes_home(tmp_path: Path) -> Path:
     return home
 
 
+SESSION_V021_COLUMNS_SQL = """,
+            git_branch TEXT,
+            chat_type TEXT,
+            display_name TEXT,
+            title_source TEXT,
+            profile_name TEXT,
+            pinned INTEGER DEFAULT 0,
+            hidden INTEGER DEFAULT 0,
+            last_activity_at REAL,
+            last_activity_description TEXT,
+            compression_failure_error TEXT"""
+
+# The durable half of the compressor's anti-thrash guard
+# (hermes_state_common.py:375-379). Split out from SESSION_V021_COLUMNS_SQL so a
+# fixture can build an early-0.21 database that has `compression_failure_error`
+# but none of these, exercising the availability filter's degraded path.
+SESSION_COMPRESSION_COLUMNS_SQL = """,
+            compression_failure_cooldown_until REAL,
+            compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
+            compression_ineffective_count INTEGER NOT NULL DEFAULT 0,
+            compression_recovery_deadline REAL"""
+
+SESSION_MODEL_USAGE_SQL = """
+        CREATE TABLE session_model_usage (
+            session_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            billing_provider TEXT NOT NULL DEFAULT '',
+            billing_base_url TEXT NOT NULL DEFAULT '',
+            billing_mode TEXT NOT NULL DEFAULT '',
+            task TEXT NOT NULL DEFAULT '',
+            api_call_count INTEGER NOT NULL DEFAULT 0,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cache_read_tokens INTEGER,
+            cache_write_tokens INTEGER,
+            reasoning_tokens INTEGER,
+            estimated_cost_usd REAL,
+            actual_cost_usd REAL,
+            cost_status TEXT,
+            cost_source TEXT,
+            first_seen REAL,
+            last_seen REAL,
+            PRIMARY KEY (
+                session_id, model, billing_provider, billing_base_url, billing_mode, task
+            )
+        );
+"""
+
+
+def insert_model_usage(
+    conn: sqlite3.Connection,
+    session_id: str,
+    model: str,
+    *,
+    provider: str = "",
+    task: str = "",
+    base_url: str = "",
+    billing_mode: str = "",
+    api_call_count: int = 0,
+    input_tokens: int | None = 0,
+    output_tokens: int | None = 0,
+    cache_read_tokens: int | None = 0,
+    cache_write_tokens: int | None = 0,
+    reasoning_tokens: int | None = 0,
+    estimated_cost_usd: float | None = 0.0,
+    actual_cost_usd: float | None = 0.0,
+    cost_status: str | None = None,
+    last_seen: float | None = None,
+) -> None:
+    """Insert one session_model_usage row (test helper)."""
+    seen = last_seen if last_seen is not None else time.time()
+    conn.execute(
+        "INSERT INTO session_model_usage ("
+        "session_id, model, billing_provider, billing_base_url, billing_mode, task, "
+        "api_call_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+        "reasoning_tokens, estimated_cost_usd, actual_cost_usd, cost_status, cost_source, "
+        "first_seen, last_seen"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            session_id,
+            model,
+            provider,
+            base_url,
+            billing_mode,
+            task,
+            api_call_count,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            reasoning_tokens,
+            estimated_cost_usd,
+            actual_cost_usd,
+            cost_status or ("exact" if actual_cost_usd else "estimated"),
+            "provider" if actual_cost_usd else "pricing",
+            seen,
+            seen,
+        ),
+    )
+
+
 def create_state_db_tables(
     conn: sqlite3.Connection,
     *,
     include_schema_version: bool = True,
     source_required: bool = True,
+    include_v021_columns: bool = False,
+    include_compression_columns: bool = True,
+    include_session_key: bool = False,
 ) -> None:
-    """Create the session/message tables used by collector and DB tests."""
+    """Create the session/message tables used by collector and DB tests.
+
+    ``include_v021_columns`` adds the hermes-agent 0.21 session columns and the
+    ``session_model_usage`` table; legacy-schema tests keep the default.
+    ``include_compression_columns`` adds the four durable anti-thrash columns on
+    top of the 0.21 set — set it False to build an early-0.21 database that has
+    ``compression_failure_error`` but no cooldown, streak, strike-count or
+    recovery-deadline column, which is the shape the availability filter has to
+    degrade over rather than fail on.
+    """
     schema_version_sql = (
         "CREATE TABLE schema_version (version INTEGER NOT NULL);\n"
         "INSERT INTO schema_version VALUES (6);\n"
@@ -75,6 +209,15 @@ def create_state_db_tables(
         else ""
     )
     source_column = "source TEXT NOT NULL" if source_required else "source TEXT"
+    extra_session_columns = SESSION_V021_COLUMNS_SQL if include_v021_columns else ""
+    if include_v021_columns and include_compression_columns:
+        extra_session_columns += SESSION_COMPRESSION_COLUMNS_SQL
+    if include_session_key:
+        # Gateway chats carry a rotation-stable session_key (written by the
+        # repair/recovery paths in hermes_state_gateway.py); the hygiene and
+        # routing tests join on it.
+        extra_session_columns += ",\n            session_key TEXT"
+    model_usage_table = SESSION_MODEL_USAGE_SQL if include_v021_columns else ""
     conn.executescript(
         f"""
         {schema_version_sql}
@@ -104,9 +247,9 @@ def create_state_db_tables(
             cost_status TEXT,
             cost_source TEXT,
             pricing_version TEXT,
-            title TEXT
+            title TEXT{extra_session_columns}
         );
-
+        {model_usage_table}
         CREATE TABLE messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -126,22 +269,259 @@ def create_state_db_tables(
     )
 
 
+def create_session_coordination_tables(conn: sqlite3.Connection) -> None:
+    """Create the state.db coordination tables hermesd's session-side sources read.
+
+    Column shapes mirror upstream ``hermes_state_common.py:447-518,482-487``
+    (gateway_routing, gateway_hygiene_state, conversation_generations,
+    compression_locks, session_turn_leases).
+    """
+    conn.executescript(
+        """
+        CREATE TABLE gateway_routing (
+            scope TEXT NOT NULL DEFAULT '',
+            session_key TEXT NOT NULL,
+            entry_json TEXT NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (scope, session_key)
+        );
+        CREATE TABLE gateway_hygiene_state (
+            session_key TEXT PRIMARY KEY,
+            failure_streak INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE conversation_generations (
+            source TEXT NOT NULL,
+            session_key TEXT NOT NULL,
+            generation INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (source, session_key)
+        );
+        CREATE TABLE compression_locks (
+            session_id TEXT PRIMARY KEY,
+            holder TEXT NOT NULL,
+            acquired_at REAL NOT NULL,
+            expires_at REAL NOT NULL
+        );
+        CREATE TABLE session_turn_leases (
+            conversation_id TEXT PRIMARY KEY,
+            holder TEXT NOT NULL,
+            acquired_at REAL NOT NULL,
+            expires_at REAL NOT NULL
+        );
+        """
+    )
+
+
+def insert_turn_lease(
+    conn: sqlite3.Connection,
+    conversation_id: str,
+    holder: str,
+    acquired_at: float,
+    expires_at: float,
+) -> None:
+    conn.execute(
+        "INSERT INTO session_turn_leases (conversation_id, holder, acquired_at, expires_at) "
+        "VALUES (?,?,?,?)",
+        (conversation_id, holder, acquired_at, expires_at),
+    )
+
+
+def insert_compression_lock(
+    conn: sqlite3.Connection,
+    session_id: str,
+    holder: str,
+    acquired_at: float,
+    expires_at: float,
+) -> None:
+    conn.execute(
+        "INSERT INTO compression_locks (session_id, holder, acquired_at, expires_at) "
+        "VALUES (?,?,?,?)",
+        (session_id, holder, acquired_at, expires_at),
+    )
+
+
+def insert_gateway_route(
+    conn: sqlite3.Connection, session_key: str, entry: dict, updated_at: float
+) -> None:
+    conn.execute(
+        "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) VALUES (?,?,?,?)",
+        ("/sessions/dir", session_key, json.dumps(entry), updated_at),
+    )
+
+
+def create_gateway_ledger_tables(conn: sqlite3.Connection) -> None:
+    """Create the gateway restart-history and delivery-obligation tables."""
+    conn.executescript(
+        """
+        CREATE TABLE gateway_heartbeats (
+            backend_id TEXT PRIMARY KEY,
+            pid INTEGER,
+            started_at REAL,
+            last_heartbeat REAL,
+            profile TEXT,
+            host TEXT
+        );
+        CREATE TABLE delivery_obligations (
+            obligation_id TEXT PRIMARY KEY,
+            session_key TEXT,
+            platform TEXT,
+            chat_id TEXT,
+            thread_id TEXT,
+            content TEXT,
+            state TEXT,
+            attempts INTEGER,
+            created_at REAL,
+            updated_at REAL,
+            owner_pid INTEGER,
+            owner_started_at INTEGER,
+            last_error TEXT,
+            adapter_profile TEXT
+        );
+        """
+    )
+
+
+def _insert_gateway_ledger_rows(conn: sqlite3.Connection, now: float) -> None:
+    conn.executemany(
+        "INSERT INTO gateway_heartbeats VALUES (?,?,?,?,?,?)",
+        [
+            ("backend-current", 12345, now - 7200, now - 15, "root", "localhost"),
+            ("backend-previous", 12000, now - 100_000, now - 99_000, "root", "localhost"),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO delivery_obligations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            (
+                "obl_pending",
+                "telegram:123",
+                "telegram",
+                "123",
+                None,
+                "outbound message body",
+                "pending",
+                2,
+                now - 400,
+                now - 300,
+                12345,
+                None,
+                "network unreachable",
+                "root",
+            ),
+            (
+                "obl_failed",
+                "discord:456",
+                "discord",
+                "456",
+                None,
+                "outbound message body",
+                "failed",
+                5,
+                now - 900,
+                now - 800,
+                12345,
+                None,
+                "adapter rejected message",
+                "root",
+            ),
+        ],
+    )
+
+
+def create_async_delegations_table(conn: sqlite3.Connection) -> None:
+    """Create the async_delegations table shipped by newer hermes-agent builds."""
+    conn.executescript(
+        """
+        CREATE TABLE async_delegations (
+            delegation_id TEXT PRIMARY KEY,
+            origin_session TEXT,
+            origin_ui_session_id TEXT,
+            parent_session_id TEXT,
+            state TEXT NOT NULL,
+            dispatched_at REAL NOT NULL,
+            completed_at REAL,
+            updated_at REAL NOT NULL,
+            event_json TEXT,
+            result_json TEXT,
+            delivery_state TEXT NOT NULL DEFAULT 'pending',
+            delivery_attempts INTEGER,
+            delivered_at REAL,
+            owner_pid INTEGER,
+            owner_started_at INTEGER,
+            task_json TEXT,
+            delivery_claim TEXT,
+            delivery_claimed_at REAL,
+            origin_session_id TEXT
+        );
+        """
+    )
+
+
+def insert_delegation(conn: sqlite3.Connection, delegation_id: str, **overrides: object) -> None:
+    """Insert one async_delegations row, defaulting every optional column."""
+    row: dict[str, object] = {
+        "delegation_id": delegation_id,
+        "origin_session": "sess_001",
+        "origin_ui_session_id": None,
+        "parent_session_id": None,
+        "state": "completed",
+        "dispatched_at": 1775791400.0,
+        "completed_at": 1775791460.0,
+        "updated_at": 1775791460.0,
+        "event_json": None,
+        "result_json": json.dumps(
+            {"results": [{"status": "ok", "summary": "did the thing", "error": ""}]}
+        ),
+        "delivery_state": "delivered",
+        "delivery_attempts": 1,
+        "delivered_at": 1775791461.0,
+        "owner_pid": 4242,
+        "owner_started_at": 1775791399,
+        "task_json": json.dumps({"goal": "ship the feature"}),
+        "delivery_claim": None,
+        "delivery_claimed_at": None,
+        "origin_session_id": None,
+    }
+    row.update(overrides)
+    columns = ", ".join(row)
+    placeholders = ", ".join("?" for _ in row)
+    conn.execute(
+        f"INSERT INTO async_delegations ({columns}) VALUES ({placeholders})",
+        tuple(row.values()),
+    )
+
+
+def create_state_meta_table(conn: sqlite3.Connection, entries: dict[str, str]) -> None:
+    """Create state_meta if absent and seed it with the given key/value pairs."""
+    conn.execute("CREATE TABLE IF NOT EXISTS state_meta (key TEXT, value TEXT)")
+    for key, value in entries.items():
+        conn.execute("INSERT INTO state_meta VALUES (?, ?)", (key, value))
+
+
 @pytest.fixture
 def sample_db(hermes_home: Path) -> Path:
     """Create a state.db with sample sessions and messages."""
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
-    create_state_db_tables(conn)
+    create_state_db_tables(conn, include_v021_columns=True)
+    create_gateway_ledger_tables(conn)
     now = time.time()
+    _insert_gateway_ledger_rows(conn, now)
+    session_insert = (
+        "INSERT INTO sessions ("
+        "id, source, user_id, model, parent_session_id, started_at, ended_at, end_reason, "
+        "message_count, tool_call_count, input_tokens, output_tokens, cache_read_tokens, "
+        "cache_write_tokens, reasoning_tokens, billing_provider, billing_base_url, "
+        "billing_mode, estimated_cost_usd, cost_status, git_branch, profile_name, "
+        "last_activity_at"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    )
     conn.execute(
-        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        session_insert,
         (
             "sess_001",
             "cli",
             None,
             "gpt-5.4",
-            None,
-            None,
             None,
             now - 3600,
             None,
@@ -157,22 +537,19 @@ def sample_db(hermes_home: Path) -> Path:
             "https://api.kimi.test/v1",
             "subscription_included",
             0.42,
-            None,
             "unknown",
-            None,
-            None,
-            None,
+            "feat/dashboard",
+            "coding",
+            now - 3600,
         ),
     )
     conn.execute(
-        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        session_insert,
         (
             "sess_002",
             "telegram",
             "user1",
             "gpt-5.4",
-            None,
-            None,
             None,
             now - 1800,
             None,
@@ -188,12 +565,38 @@ def sample_db(hermes_home: Path) -> Path:
             None,
             None,
             0.31,
-            None,
             "unknown",
             None,
             None,
             None,
         ),
+    )
+    insert_model_usage(
+        conn,
+        "sess_001",
+        "gpt-5.4",
+        provider="openai-codex",
+        api_call_count=40,
+        input_tokens=12400,
+        output_tokens=8200,
+        cache_read_tokens=28300,
+        cache_write_tokens=5000,
+        estimated_cost_usd=0.42,
+        actual_cost_usd=0.37,
+        last_seen=now - 120,
+    )
+    insert_model_usage(
+        conn,
+        "sess_002",
+        "gpt-5.4-mini",
+        provider="openai-codex",
+        task="title",
+        api_call_count=4,
+        input_tokens=900,
+        output_tokens=120,
+        estimated_cost_usd=0.01,
+        actual_cost_usd=0.0,
+        last_seen=now - 1800,
     )
     for i in range(5):
         conn.execute(
@@ -214,9 +617,116 @@ def sample_db(hermes_home: Path) -> Path:
                 None,
             ),
         )
+    create_async_delegations_table(conn)
+    insert_delegation(
+        conn,
+        "deleg_done",
+        dispatched_at=now - 300,
+        completed_at=now - 240,
+        updated_at=now - 240,
+    )
+    insert_delegation(
+        conn,
+        "deleg_failed",
+        state="error",
+        delivery_state="pending",
+        delivery_attempts=3,
+        dispatched_at=now - 200,
+        completed_at=now - 190,
+        updated_at=now - 190,
+        result_json=json.dumps(
+            {"results": [{"status": "error", "summary": "", "error": "boom in the worker"}]}
+        ),
+        task_json=json.dumps({"goal": "rebuild the index"}),
+    )
+    insert_delegation(
+        conn,
+        "deleg_running",
+        state="running",
+        delivery_state="pending",
+        completed_at=None,
+        delivered_at=None,
+        result_json=None,
+        dispatched_at=now - 60,
+        updated_at=now - 30,
+        task_json=json.dumps({"goal": "crawl the docs"}),
+    )
+    create_state_meta_table(
+        conn,
+        {
+            "last_auto_prune": str(now - 7200),
+            "last_auto_archive": str(now - 86400),
+            "db_file_generation": "3",
+            "fts_storage_version": "2",
+        },
+    )
     conn.commit()
     conn.close()
     return db_path
+
+
+@pytest.fixture
+def sample_state_snapshots(hermes_home: Path) -> Path:
+    """Create state-snapshots/ with one pre-update dir and one loose db file."""
+    root = hermes_home / "state-snapshots"
+    root.mkdir()
+    pre_update = root / "20260907-143350-pre-update"
+    pre_update.mkdir()
+    (pre_update / "state.db").write_bytes(b"x" * 2048)
+    (pre_update / "state.db-wal").write_bytes(b"y" * 512)
+    (root / "state-20260728-021943-pre-fts-opt.db").write_bytes(b"z" * 4096)
+    return root
+
+
+@pytest.fixture
+def sample_web_ui_stamp(hermes_home: Path) -> Path:
+    """Create web-ui-build-stamp.json next to the desktop build stamp."""
+    path = hermes_home / "web-ui-build-stamp.json"
+    path.write_text(
+        json.dumps(
+            {
+                "contentHash": "314422207985101a8473ac82fb0113c0565b2f04",
+                "builtAt": "2026-09-07T14:08:09.843444+00:00",
+            }
+        )
+    )
+    return path
+
+
+@pytest.fixture
+def sample_delegation_live_logs(hermes_home: Path) -> Path:
+    """Create cache/delegation/live/<id>/task-*.log subagent transcripts."""
+    live = hermes_home / "cache" / "delegation" / "live"
+    live.mkdir(parents=True)
+    for delegation_id in ("deleg_done", "deleg_running"):
+        run_dir = live / delegation_id
+        run_dir.mkdir()
+        (run_dir / "task-0.log").write_text("subagent transcript\n")
+    return live
+
+
+@pytest.fixture
+def sample_active_sessions(hermes_home: Path) -> Path:
+    """Create runtime/active_sessions.json with one live surface."""
+    runtime = hermes_home / "runtime"
+    runtime.mkdir(exist_ok=True)
+    path = runtime / "active_sessions.json"
+    path.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {
+                        "session_id": "sess_001",
+                        "surface": "cli",
+                        "pid": os.getpid(),
+                        "process_start_time": time.time() - 60,
+                        "started_at": "2026-09-07T10:00:00+00:00",
+                    }
+                ]
+            }
+        )
+    )
+    return path
 
 
 @pytest.fixture
@@ -232,11 +742,123 @@ def sample_gateway_state(hermes_home: Path) -> Path:
                 "start_time": None,
                 "gateway_state": "running",
                 "exit_reason": None,
+                "code_sha": "abcdef0123456789abcdef0123456789abcdef01",
+                "code_version": "2026.9.1",
+                "session_store": {"status": "ready"},
                 "platforms": {
                     "telegram": {"state": "connected", "updated_at": "2026-04-08T17:42:57+00:00"},
                     "discord": {"state": "disconnected", "updated_at": "2026-04-08T10:00:00+00:00"},
                 },
                 "updated_at": "2026-04-08T17:42:57+00:00",
+            }
+        )
+    )
+    return path
+
+
+@pytest.fixture
+def sample_gateway_heartbeat(hermes_home: Path) -> Path:
+    """Create state/gateway.heartbeat (watchdog event-loop liveness) and its lifecycle file."""
+    state_dir = hermes_home / "state"
+    state_dir.mkdir(exist_ok=True)
+    now = time.time()
+    path = state_dir / "gateway.heartbeat"
+    path.write_text(
+        json.dumps(
+            {
+                "pid": 12345,
+                "updated_at": datetime.fromtimestamp(now - 15, tz=UTC).isoformat(),
+                "monotonic": 8123.5,
+                "start_time": now - 7200,
+                "loop_tick_socket": "/tmp/hermes-gateway.sock",
+                "loop_tick_tcp_port": None,
+            }
+        )
+    )
+    (state_dir / "gateway.lifecycle.json").write_text(
+        json.dumps(
+            {
+                "phase": "running",
+                "pid": 12345,
+                "start_time": now - 7200,
+                "started_at": datetime.fromtimestamp(now - 7200, tz=UTC).isoformat(),
+                "exit_code": None,
+                "exit_reason": None,
+            }
+        )
+    )
+    return path
+
+
+@pytest.fixture
+def sample_update_receipt(hermes_home: Path) -> Path:
+    """Create logs/update_receipts/latest.json for the Updates detail section."""
+    receipts = hermes_home / "logs" / "update_receipts"
+    receipts.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    path = receipts / "latest.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "started_at": datetime.fromtimestamp(now - 900, tz=UTC).isoformat(),
+                "finished_at": datetime.fromtimestamp(now - 600, tz=UTC).isoformat(),
+                "argv": ["hermes", "update"],
+                "pid": 4242,
+                "outcome": "success",
+                "exit_code": 0,
+                "pre_update": {
+                    "sha": "0" * 40,
+                    "short_sha": "000000000000",
+                    "version": "2026.8.1",
+                    "source": "git",
+                },
+                "post_update": {
+                    "sha": "abcdef0123456789abcdef0123456789abcdef01",
+                    "short_sha": "abcdef012345",
+                    "version": "2026.9.1",
+                    "source": "git",
+                },
+                "steps": [
+                    {
+                        "name": "pull",
+                        "ok": True,
+                        "detail": "",
+                        "at": datetime.fromtimestamp(now - 800, tz=UTC).isoformat(),
+                    }
+                ],
+                "skips": [],
+                "gateway_restart": {"requested": True, "incomplete": False},
+                # The post-restart matrix is the authoritative skew evidence; the
+                # plan below is captured *before* the pull and always looks stale.
+                "fleet": [
+                    {
+                        "profile": "root",
+                        "pid": 23456,
+                        "code_sha": "abcdef0123456789abcdef0123456789abcdef01",
+                        "code_version": "2026.9.1",
+                        "state": "current",
+                        "source": "socket",
+                    }
+                ],
+                "plan": {
+                    "install_method": "uv",
+                    "expected_sha": "0" * 40,
+                    "expected_version": "2026.8.1",
+                    "profiles": ["root"],
+                    "runtimes": [
+                        {
+                            "kind": "gateway",
+                            "profile": "root",
+                            "pid": 12345,
+                            "supervisor": "launchd",
+                            "code_sha": "0" * 40,
+                            "code_version": "2026.8.1",
+                            "restart_via": "launchctl",
+                            "detail": "",
+                        }
+                    ],
+                },
             }
         )
     )
@@ -297,7 +919,10 @@ def sample_config(hermes_home: Path) -> Path:
                 },
                 "cron": {"max_parallel_jobs": 3, "wrap_response": True},
                 "auxiliary": {"session_search": "gpt-5.4", "skills_hub": "gpt-5.4"},
-                "plugins": {"disabled": ["disabled-plugin"]},
+                "plugins": {
+                    "enabled": ["weather", "notes"],
+                    "disabled": ["disabled-plugin"],
+                },
                 "mcp_servers": {
                     "playwright": {
                         "command": "npx",
@@ -310,12 +935,72 @@ def sample_config(hermes_home: Path) -> Path:
                         "enabled": False,
                     },
                 },
+                "delegation": {
+                    "max_concurrent_children": 10,
+                    "max_spawn_depth": 2,
+                    "orchestrator_enabled": True,
+                    "max_iterations": 250,
+                    "child_timeout_seconds": 0,
+                },
+                "goals": {"max_turns": 20},
+                "updates": {"check": True, "pre_update_backup": "quick", "backup_keep": 5},
+                "tool_loop_guardrails": {
+                    "warnings_enabled": True,
+                    "hard_stop_enabled": True,
+                    "non_interactive_hard_stop_enabled": True,
+                    "warn_after": {"exact_failure": 2, "same_tool_failure": 3},
+                    "hard_stop_after": {"exact_failure": 5, "same_tool_failure": 8},
+                },
+                "max_live_sessions": 8,
+                "streaming": {"enabled": True},
+                "logging": {"level": "INFO"},
+                "network": {"proxy": "http://user:pass@proxy.example.com:8080"},
                 "web": {"use_gateway": True},
                 "image_gen": {"use_gateway": False},
                 "tts": {"use_gateway": True},
                 "browser": {"use_gateway": False},
                 "display": {"skin": "default"},
                 "_config_version": 12,
+            }
+        )
+    )
+    return path
+
+
+@pytest.fixture
+def sample_mcp_schema_cache(hermes_home: Path) -> Path:
+    """Create a cache/mcp_schema_cache.json with opaque per-server payloads."""
+    path = hermes_home / "cache" / "mcp_schema_cache.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "playwright": {
+                    "tools": [{"name": "browser_navigate"}],
+                    "cached_at": "2026-09-06T12:00:00Z",
+                },
+                "sheets": {"tools": [], "api_key": "sk-should-never-render"},
+            }
+        )
+    )
+    return path
+
+
+@pytest.fixture
+def sample_skills_prompt_snapshot(hermes_home: Path) -> Path:
+    """Create a .skills_prompt_snapshot.json describing prompted skills."""
+    path = hermes_home / ".skills_prompt_snapshot.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "manifest": {"generated_at": "2026-09-06T12:00:00Z"},
+                "skills": [
+                    {"name": "dev-lint", "category": "dev"},
+                    {"name": "research-arxiv", "category": "research"},
+                    {"name": "ops-deploy", "category": "ops"},
+                ],
+                "category_descriptions": {"dev": "development", "ops": "operations"},
             }
         )
     )
@@ -444,6 +1129,39 @@ def sample_processes(hermes_home: Path) -> Path:
                     "watcher_interval": 0,
                     "notify_on_complete": False,
                     "watch_patterns": [],
+                },
+            ]
+        )
+    )
+    return path
+
+
+@pytest.fixture
+def sample_spawn_ledger(hermes_home: Path) -> Path:
+    """Create a spawn-ledger.json with purpose/port/profile entries."""
+    path = hermes_home / "spawn-ledger.json"
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "pid": 4242,
+                    "create_time": 1775791440.0,
+                    "purpose": "dashboard",
+                    "install": "cc907ccae096",
+                    "argv": "hermes dashboard --port 9119 --no-open",
+                    "host": "127.0.0.1",
+                    "port": 9119,
+                    "profile": "coding",
+                },
+                {
+                    "pid": 4343,
+                    "create_time": 1775791450.0,
+                    "purpose": "mcp-helper",
+                    "install": "cc907ccae096",
+                    "argv": "node codegraph.js serve --mcp",
+                    "host": "",
+                    "port": None,
+                    "profile": None,
                 },
             ]
         )
@@ -681,7 +1399,25 @@ def create_kanban_db_tables(conn: sqlite3.Connection) -> None:
             skills TEXT,
             model_override TEXT,
             branch_name TEXT,
-            session_id TEXT
+            session_id TEXT,
+            max_retries INTEGER,
+            completion_contract TEXT
+        );
+        CREATE TABLE kanban_notify_subs (
+            task_id TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL DEFAULT '',
+            user_id TEXT,
+            user_id_alt TEXT,
+            chat_type TEXT,
+            notifier_profile TEXT,
+            delivery_mode TEXT NOT NULL DEFAULT 'notify',
+            delivery_metadata TEXT,
+            created_at INTEGER NOT NULL,
+            last_event_id INTEGER NOT NULL DEFAULT 0,
+            last_ping_event_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (task_id, platform, chat_id, thread_id)
         );
         CREATE TABLE task_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -721,7 +1457,10 @@ def sample_kanban_db(hermes_home: Path) -> Path:
     create_kanban_db_tables(conn)
     now = int(time.time())
     conn.execute(
-        "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO tasks (id, title, assignee, status, priority, created_at, started_at, "
+        "completed_at, claim_expires, consecutive_failures, worker_pid, last_failure_error, "
+        "last_heartbeat_at, current_run_id, skills, model_override, branch_name, session_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             "t_active",
             "Implement dashboard auth visibility",
@@ -744,7 +1483,10 @@ def sample_kanban_db(hermes_home: Path) -> Path:
         ),
     )
     conn.execute(
-        "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO tasks (id, title, assignee, status, priority, created_at, started_at, "
+        "completed_at, claim_expires, consecutive_failures, worker_pid, last_failure_error, "
+        "last_heartbeat_at, current_run_id, skills, model_override, branch_name, session_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             "t_blocked",
             "Fix failed worker profile",
@@ -767,7 +1509,10 @@ def sample_kanban_db(hermes_home: Path) -> Path:
         ),
     )
     conn.execute(
-        "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO tasks (id, title, assignee, status, priority, created_at, started_at, "
+        "completed_at, claim_expires, consecutive_failures, worker_pid, last_failure_error, "
+        "last_heartbeat_at, current_run_id, skills, model_override, branch_name, session_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             "t_null",
             "Task with NULL nullable columns",
@@ -837,6 +1582,8 @@ def populated_hermes_home(
     hermes_home,
     sample_db,
     sample_gateway_state,
+    sample_gateway_heartbeat,
+    sample_update_receipt,
     sample_config,
     sample_auth,
     sample_skills_manifest,
@@ -852,6 +1599,16 @@ def populated_hermes_home(
     sample_model_caches,
     sample_pr_monitor,
     sample_kanban_db,
+    sample_mcp_schema_cache,
+    sample_skills_prompt_snapshot,
+    sample_cron_executions_db,
+    # sample_spawn_ledger is deliberately NOT included: the ledger *replaces*
+    # processes.json in _collect_background_processes, so the two registries
+    # cannot both be exercised by one populated home.
+    sample_state_snapshots,
+    sample_web_ui_stamp,
+    sample_delegation_live_logs,
+    sample_active_sessions,
 ) -> Path:
     """A fully populated mock ~/.hermes."""
     return hermes_home
@@ -971,3 +1728,347 @@ def profiled_hermes_home(hermes_home: Path) -> Path:
     (profile_home / "memories" / "PROFILE.md").write_text("profile memory\n")
 
     return hermes_home
+
+
+class FakeStdin:
+    """Minimal tty-like stdin stand-in for input-thread tests."""
+
+    def isatty(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        return 123
+
+
+@pytest.fixture
+def fake_terminal(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Stub termios/tty/select so `_input_loop` can run without a real terminal.
+
+    Returns the dict that records the `termios.tcsetattr` restore call.
+    """
+    import select
+    import termios
+    import tty
+
+    restored: dict[str, object] = {}
+    monkeypatch.setattr("sys.stdin", FakeStdin())
+    monkeypatch.setattr(termios, "tcgetattr", lambda fd: ["old-settings"])
+    monkeypatch.setattr(tty, "setcbreak", lambda fd: None)
+    monkeypatch.setattr(select, "select", lambda read, write, err, timeout: ([123], [], []))
+    monkeypatch.setattr(
+        termios,
+        "tcsetattr",
+        lambda fd, when, settings: restored.update(fd=fd, settings=settings),
+    )
+    return restored
+
+
+def build_skills_state(
+    count: int,
+    *,
+    category: str = "dev",
+    name_template: str = "skill-{i:02d}",
+    description_template: str = "",
+) -> DashboardState:
+    """A DashboardState holding `count` skills in a single category."""
+    from hermesd.models import DashboardState, SkillInfo, SkillsMemory
+
+    return DashboardState(
+        skills_memory=SkillsMemory(
+            skill_count=count,
+            skill_categories=1,
+            providers=[],
+            skills=[
+                SkillInfo(
+                    name=name_template.format(i=i),
+                    category=category,
+                    description=description_template.format(i=i),
+                )
+                for i in range(count)
+            ],
+        )
+    )
+
+
+_RUNNING_AS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+_skip_if_root = pytest.mark.skipif(
+    _RUNNING_AS_ROOT, reason="chmod 000 does not block reads when running as root"
+)
+
+
+def _unreadable(path: Path) -> bool:
+    """True only when the OS actually denies reads (guards root/odd FS)."""
+    try:
+        path.read_bytes()
+    except Exception:
+        return True
+    return False
+
+
+def _count_opens(monkeypatch: pytest.MonkeyPatch, target: Path) -> list[Path]:
+    """Record every real `Path.open` call on `target` and return the growing log."""
+    opens: list[Path] = []
+    real_open = Path.open
+
+    def counting_open(self: Path, *args: object, **kwargs: object) -> object:
+        if self == target:
+            opens.append(self)
+        return real_open(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    return opens
+
+
+@pytest.fixture
+def collector(hermes_home: Path) -> Iterator[Collector]:
+    """A Collector over a bare hermes home, closed on teardown."""
+    c = Collector(hermes_home)
+    try:
+        yield c
+    finally:
+        c.close()
+
+
+def _assert_cached_until_changed(
+    collector: Collector,
+    opens: list[Path],
+    source: Path,
+    rewrite: Callable[[], None],
+) -> None:
+    """Assert `source` is read cold, skipped while unchanged, and re-read after `rewrite`."""
+    collector.collect()
+    assert opens, f"cold collect never opened {source.name}"
+
+    opens.clear()
+    collector.collect()
+    assert opens == [], f"unchanged {source.name} was re-read on the second collect"
+
+    rewrite()
+    opens.clear()
+    collector.collect()
+    assert opens, f"changed {source.name} was not re-read"
+
+
+def create_state_db_with_session(path: Path) -> None:
+    """A state.db holding one session and one tool-call message."""
+    conn = sqlite3.connect(str(path))
+    create_state_db_tables(conn, include_schema_version=False)
+    now = time.time()
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, message_count, tool_call_count, "
+        "input_tokens, output_tokens) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("s1", "cli", now, 10, 5, 5000, 3000),
+    )
+    conn.execute(
+        "INSERT INTO messages (session_id, role, content, tool_name, timestamp) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("s1", "assistant", "used a tool", "shell_exec", now),
+    )
+    conn.commit()
+    conn.close()
+
+
+CRON_EXECUTIONS_SCHEMA = """
+CREATE TABLE executions (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    process_id TEXT NOT NULL,
+    pid INTEGER NOT NULL,
+    process_started_at INTEGER,
+    status TEXT NOT NULL CHECK(status IN
+        ('claimed','running','completed','failed','unknown')),
+    claimed_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    error TEXT,
+    handoff_pending INTEGER NOT NULL DEFAULT 0,
+    handoff_started_at REAL,
+    scheduled_instant TEXT,
+    delivery_outcome TEXT
+);
+CREATE INDEX idx_executions_job_claimed ON executions(job_id, claimed_at DESC, id DESC);
+CREATE INDEX idx_executions_status_claimed ON executions(status, claimed_at DESC, id DESC);
+CREATE TABLE cron_incidents (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    error_sig TEXT NOT NULL,
+    state TEXT NOT NULL,
+    failure_type TEXT NOT NULL DEFAULT 'unknown',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    acked_at TEXT,
+    closed_at TEXT,
+    error TEXT NOT NULL,
+    output_file TEXT
+);
+"""
+
+
+def iso_ago(seconds: float, *, now: float | None = None) -> str:
+    """ISO-8601 UTC timestamp `seconds` before `now`, as hermes-agent writes them."""
+    import datetime
+
+    moment = datetime.datetime.fromtimestamp(
+        (time.time() if now is None else now) - seconds,
+        tz=datetime.UTC,
+    )
+    return moment.isoformat()
+
+
+def create_cron_executions_tables(conn: sqlite3.Connection) -> None:
+    """Create the cron executions.db schema (journal_mode=delete, no WAL sidecar)."""
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.executescript(CRON_EXECUTIONS_SCHEMA)
+
+
+def insert_cron_execution(
+    conn: sqlite3.Connection,
+    execution_id: str,
+    job_id: str,
+    status: str,
+    *,
+    claimed_at: str,
+    started_at: str | None = None,
+    finished_at: str | None = None,
+    error: str | None = None,
+    delivery_outcome: str | None = None,
+    scheduled_instant: str | None = None,
+    handoff_pending: int = 0,
+) -> None:
+    """Insert one executions row, defaulting the columns panels never read."""
+    conn.execute(
+        "INSERT INTO executions (id, job_id, source, process_id, pid, process_started_at, "
+        "status, claimed_at, started_at, finished_at, error, "
+        "handoff_pending, scheduled_instant, delivery_outcome) "
+        "VALUES (?, ?, 'builtin', 'proc', 1234, 99, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            execution_id,
+            job_id,
+            status,
+            claimed_at,
+            started_at,
+            finished_at,
+            error,
+            handoff_pending,
+            scheduled_instant,
+            delivery_outcome,
+        ),
+    )
+
+
+@pytest.fixture
+def sample_cron_executions_db(hermes_home: Path) -> Path:
+    """A cron/executions.db with a 24h execution window and open/closed incidents."""
+    db_path = hermes_home / "cron" / "executions.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        create_cron_executions_tables(conn)
+        insert_cron_execution(
+            conn,
+            "exec_alpha_ok_1",
+            "job-alpha",
+            "completed",
+            claimed_at=iso_ago(300),
+            started_at=iso_ago(299),
+            finished_at=iso_ago(287),
+        )
+        insert_cron_execution(
+            conn,
+            "exec_alpha_ok_2",
+            "job-alpha",
+            "completed",
+            claimed_at=iso_ago(3600),
+            started_at=iso_ago(3599),
+            finished_at=iso_ago(3590),
+        )
+        insert_cron_execution(
+            conn,
+            "exec_alpha_fail",
+            "job-alpha",
+            "failed",
+            claimed_at=iso_ago(7200),
+            started_at=iso_ago(7199),
+            finished_at=iso_ago(7100),
+            error="Script exited with code 1\nstderr: connection refused",
+        )
+        insert_cron_execution(
+            conn,
+            "exec_alpha_running",
+            "job-alpha",
+            "running",
+            claimed_at=iso_ago(30),
+            started_at=iso_ago(29),
+        )
+        # Older than the 24h window: must not reach any counter.
+        insert_cron_execution(
+            conn,
+            "exec_alpha_ancient",
+            "job-alpha",
+            "completed",
+            claimed_at=iso_ago(3 * 86400),
+            started_at=iso_ago(3 * 86400),
+            finished_at=iso_ago(3 * 86400 - 5),
+        )
+        insert_cron_execution(
+            conn,
+            "exec_beta_fail",
+            "job-beta",
+            "failed",
+            claimed_at=iso_ago(600),
+            started_at=iso_ago(599),
+            finished_at=iso_ago(560),
+            error="timeout waiting for the agent\nsecond line ignored",
+        )
+        conn.execute(
+            "INSERT INTO cron_incidents VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "inc_open_unacked",
+                "job-alpha",
+                "sig-a",
+                "detected",
+                "timeout",
+                iso_ago(7200),
+                iso_ago(600),
+                None,
+                None,
+                "Script exited with code 1\nstderr: connection refused",
+                None,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO cron_incidents VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "inc_open_acked",
+                "job-beta",
+                "sig-b",
+                "alerted",
+                "delivery",
+                iso_ago(10800),
+                iso_ago(1200),
+                iso_ago(900),
+                None,
+                "delivery failed",
+                None,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO cron_incidents VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "inc_closed",
+                "job-alpha",
+                "sig-c",
+                "closed",
+                "unknown",
+                iso_ago(200000),
+                iso_ago(190000),
+                iso_ago(189000),
+                iso_ago(189000),
+                "long resolved",
+                None,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path

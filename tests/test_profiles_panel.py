@@ -4,6 +4,7 @@ import time
 
 from hermesd.models import DashboardState, ProfilesState, ProfileSummary
 from hermesd.panels import render_panel
+from hermesd.panels.profiles import render_profiles
 from hermesd.theme import Theme
 from tests.conftest import render_to_str
 
@@ -104,3 +105,14 @@ def test_profiles_panel_detail_handles_no_profiles():
     panel = render_panel(9, state, Theme(), detail=True, profile_view_index=0)
     text = render_to_str(panel, no_color=True)
     assert "No profiles found" in text
+
+
+def test_profiles_detail_handles_absurd_log_mtime() -> None:
+    state = DashboardState(
+        profiles=ProfilesState(
+            profile_count=1,
+            profiles=[ProfileSummary(name="ops", latest_log_mtime=1e18)],
+        )
+    )
+    rendered = render_to_str(render_profiles(state, Theme(), detail=True))
+    assert "—" in rendered

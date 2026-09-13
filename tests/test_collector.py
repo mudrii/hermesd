@@ -1,17 +1,11 @@
-"""Core collector behavior tests against the populated ``~/.hermes`` fixture.
-
-Every test drives a real ``Collector(...).collect()`` and asserts the shape of
-the resulting ``DashboardState``: full-collection happy paths, per-source
-absence/degradation fallbacks, and ``_CollectionHealth`` error bookkeeping.
-This module owns the broad "what does collect() produce" contract; error-path
-and cache-preservation depth lives in ``test_collector_coverage.py`` and
-``test_collector_extended.py``.
-"""
+"""Core collector: construction, collect() orchestration, health fallback,
+available-tool discovery, and cross-cutting redaction helpers."""
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -19,9 +13,21 @@ from pathlib import Path
 
 import pytest
 
-from hermesd.collector import Collector, _CollectionHealth
+from hermesd.collector import (
+    Collector,
+    _coerce_float,
+    _coerce_int,
+    _CollectionHealth,
+    _has_secret_material,
+    _path_resolves_under,
+    _redact_command_string,
+    _redact_secret_args,
+    _redact_secret_text,
+    _redact_secret_url,
+    _safe_exception_text,
+)
 from hermesd.models import DashboardState
-from tests.conftest import create_state_db_tables
+from tests.conftest import create_kanban_db_tables, create_state_db_tables
 
 
 def test_collect_full(populated_hermes_home: Path):
@@ -61,6 +67,41 @@ def test_collect_missing_files(hermes_home: Path):
     assert state.sessions == []
     assert state.config.model == ""
     c.close()
+
+
+def test_stale_path_caches_are_evicted_when_targets_disappear(hermes_home: Path):
+    board_dir = hermes_home / "kanban" / "boards" / "alpha"
+    board_dir.mkdir(parents=True)
+    conn = sqlite3.connect(str(board_dir / "kanban.db"))
+    create_kanban_db_tables(conn)
+    conn.commit()
+    conn.close()
+    (hermes_home / "cron" / "jobs.json").write_text(
+        json.dumps({"jobs": [{"id": "job-1", "name": "Job 1"}]})
+    )
+    job_dir = hermes_home / "cron" / "output" / "job-1"
+    job_dir.mkdir(parents=True)
+    (job_dir / "latest.md").write_text("cron line\n")
+    memory_md = hermes_home / "memories" / "MEMORY.md"
+    memory_md.write_text("one two three\n")
+
+    c = Collector(hermes_home)
+    try:
+        c.collect()
+        assert "alpha" in c._kanban_board_cache
+        assert any(key.endswith(":job-1") for key in c._cron_excerpt_cache)
+        assert any(str(memory_md) in key for key in c._derived_file_cache)
+
+        shutil.rmtree(board_dir)
+        shutil.rmtree(job_dir)
+        memory_md.unlink()
+        c.collect()
+
+        assert "alpha" not in c._kanban_board_cache
+        assert not any(key.endswith(":job-1") for key in c._cron_excerpt_cache)
+        assert not any(str(memory_md) in key for key in c._derived_file_cache)
+    finally:
+        c.close()
 
 
 def test_collect_gateway_not_running(hermes_home: Path):
@@ -346,6 +387,65 @@ def test_collection_health_redacts_secret_material_from_errors():
     assert "secret-value" not in health.errors["source"]
 
 
+def test_safe_exception_text_tolerates_invalid_ipv6_url():
+    text = _safe_exception_text(ValueError("bad value 'https://[broken' in field"))
+
+    assert text.startswith("ValueError: ")
+    assert "https://[broken" in text
+
+
+def test_safe_exception_text_strips_credentials_from_malformed_url():
+    text = _safe_exception_text(
+        RuntimeError("connect https://user:glpat-abc123@[broken/v1?token=sk-secret-123 failed")
+    )
+
+    assert "glpat-abc123" not in text
+    assert "sk-secret-123" not in text
+    assert "[REDACTED]" in text
+
+
+def test_safe_exception_text_tolerates_invalid_port():
+    text = _safe_exception_text(
+        RuntimeError("dial https://user:glpat-abc123@example.com:bad/v1?token=sk-secret-123")
+    )
+
+    assert "glpat-abc123" not in text
+    assert "sk-secret-123" not in text
+
+
+def test_safe_exception_text_degrades_when_stringification_raises():
+    class Hostile(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError("no str for you")
+
+    assert _safe_exception_text(Hostile()) == "Hostile"
+
+
+def test_redact_secret_url_never_raises_on_malformed_urls():
+    assert _redact_secret_url("https://[broken") == "https://[broken"
+
+    redacted = _redact_secret_url("https://user:glpat-abc123@[broken/v1?token=sk-secret-123")
+    assert "glpat-abc123" not in redacted
+    assert "sk-secret-123" not in redacted
+    assert "https://[REDACTED]@[broken" in redacted
+
+
+def test_collect_survives_malformed_url_in_source_error(populated_hermes_home: Path, monkeypatch):
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+
+    def boom(*args: object, **kwargs: object) -> list:
+        raise RuntimeError("request to https://user:glpat-abc123@[broken failed")
+
+    monkeypatch.setattr(c, "_collect_tool_stats", boom)
+    state = c.collect()
+
+    assert "tool_stats" in state.health.failed_sources
+    assert "glpat-abc123" not in state.health.errors["tool_stats"]
+    assert len(state.sessions) == 2
+    assert state.health.ok_sources == state.health.total_sources - 1
+    c.close()
+
+
 def test_collect_recent_activity_suppresses_offline_banner(hermes_home: Path, sample_db: Path):
     (hermes_home / "gateway_state.json").write_text(
         json.dumps({"pid": 0, "gateway_state": "stopped", "platforms": {}})
@@ -410,12 +510,19 @@ def test_collect_reads_session_rows_once_per_cycle(hermes_home: Path):
         def read_tool_stats(self) -> list[dict[str, object]]:
             return []
 
+        def read_model_usage(self, now: float) -> dict[str, list[dict[str, object]]]:
+            return {"all": [], "24h": [], "7d": []}
+
         @property
         def last_read_sessions_stale(self) -> bool:
             return False
 
         @property
         def last_read_tool_stats_stale(self) -> bool:
+            return False
+
+        @property
+        def last_read_model_usage_stale(self) -> bool:
             return False
 
         def close(self) -> None:
@@ -729,11 +836,11 @@ def test_collect_recomputes_today_summaries_when_local_date_changes(
     }
     monkeypatch.setattr(
         "hermesd.collector._local_date",
-        lambda: str(today_context["date"]),
+        lambda _now: str(today_context["date"]),
     )
     monkeypatch.setattr(
         "hermesd.collector._today_epoch",
-        lambda: float(today_context["cutoff"]),
+        lambda _now: float(today_context["cutoff"]),
     )
     c = Collector(hermes_home)
     state1 = c.collect()
@@ -774,3 +881,1204 @@ def test_collect_preserves_token_analytics_on_mid_collection_failure(
     assert state2.token_analytics == state1.token_analytics
     assert "token_analytics" in state2.health.failed_sources
     c.close()
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "state_value"),
+    [
+        ("processes.json", lambda state: state.background_processes),
+        ("auth.json", lambda state: state.skills_memory.credential_pools),
+        ("cron/jobs.json", lambda state: state.cron.jobs),
+        (
+            "channel_directory.json",
+            lambda state: [job.delivery_target_label for job in state.cron.jobs],
+        ),
+        (".update_check", lambda state: state.version_behind),
+        ("sessions/sessions.json", lambda state: state.available_tool_names),
+    ],
+)
+def test_collect_preserves_last_good_json_sources_on_corruption(
+    populated_hermes_home: Path,
+    relative_path: str,
+    state_value,
+):
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    state1 = c.collect()
+    expected = state_value(state1)
+
+    path = populated_hermes_home / relative_path
+    path.write_text("{not valid json")
+    os.utime(path, None)
+    state2 = c.collect()
+
+    assert state_value(state2) == expected
+    c.close()
+
+
+def test_collect_after_close_raises(populated_hermes_home: Path):
+    c = Collector(populated_hermes_home)
+    c.close()
+
+    with pytest.raises(RuntimeError, match="collector is closed"):
+        c.collect()
+
+
+def test_coerce_float_handles_edge_cases():
+    assert _coerce_float(None) == 0.0
+    assert _coerce_float("not-a-number") == 0.0
+    assert _coerce_float("nan") == 0.0
+    assert _coerce_float(float("inf")) == 0.0
+    assert _coerce_float("-1.25") == -1.25
+    assert _coerce_float(True) == 1.0
+
+
+def test_coerce_int_handles_bool_values():
+    assert _coerce_int(True) == 1
+    assert _coerce_int(False) == 0
+
+
+def test_coerce_int_truncates_float_values():
+    assert _coerce_int(3.9) == 3
+    assert _coerce_int(-2.5) == -2
+
+
+def test_coerce_int_handles_bytes_and_bytearray():
+    assert _coerce_int(b"42") == 42
+    assert _coerce_int(bytearray(b"7")) == 7
+    assert _coerce_int(b"not-a-number") == 0
+
+
+def test_redact_secret_args_handles_mixed_and_nested_values():
+    redacted = _redact_secret_args(
+        [
+            "cmd",
+            42,
+            ["--api-key", "sk-secret"],
+            {"token": "secret-token"},
+            "https://example.com/path?token=secret&ok=yes",
+        ]
+    )
+
+    text = " ".join(redacted)
+    assert "sk-secret" not in text
+    assert "secret-token" not in text
+    assert "token=secret" not in text
+    assert "--api-key [REDACTED]" in text
+    assert "[REDACTED]" in text
+    assert "ok=yes" in text
+
+
+def test_redact_secret_url_hides_userinfo_and_secret_query_values():
+    redacted = _redact_secret_url(
+        "https://user:password@example.com:8443/mcp?token=abc123&safe=value"
+    )
+
+    assert redacted == "https://[REDACTED]@example.com:8443/mcp?token=[REDACTED]&safe=value"
+    assert "password" not in redacted
+    assert "abc123" not in redacted
+
+
+def test_redact_secret_url_hides_secret_suffixed_query_keys():
+    redacted = _redact_secret_url(
+        "https://example.com/mcp?private_token=abc&session_key=def&sessionid=ghi&apikey=jkl&page=1"
+    )
+
+    assert "abc" not in redacted
+    assert "def" not in redacted
+    assert "ghi" not in redacted
+    assert "jkl" not in redacted
+    assert redacted.count("[REDACTED]") == 4
+    assert "page=1" in redacted
+
+
+def test_redact_secret_url_keeps_near_miss_query_keys():
+    url = "https://example.com/mcp?monkey=1&keyboard=us&tokenize=true"
+
+    assert _redact_secret_url(url) == url
+
+
+def test_redact_secret_url_tolerates_invalid_port():
+    redacted = _redact_secret_url("https://user:password@example.com:bad/mcp?token=abc123")
+
+    assert redacted == "https://[REDACTED]@example.com/mcp?token=[REDACTED]"
+    assert "password" not in redacted
+    assert "abc123" not in redacted
+
+
+def test_redact_secret_args_handles_aliases_headers_and_dicts():
+    redacted = _redact_secret_args(
+        [
+            "--bearer",
+            "secret-token",
+            "-H",
+            "Authorization: Bearer secret-token",
+            "--client-secret=client-secret",
+            {"Authorization": "Bearer secret-token"},
+            ["--x-api-key", "secret-token"],
+        ]
+    )
+
+    text = " ".join(redacted)
+    assert "secret-token" not in text
+    assert "client-secret=client-secret" not in text
+    assert text.count("[REDACTED]") >= 5
+
+
+def test_redact_secret_args_redacts_url_credentials_in_key_value_form():
+    redacted = _redact_secret_args(["url=https://user:pw@host/x?token=t1"])
+
+    assert redacted == ["url=https://[REDACTED]@host/x?token=[REDACTED]"]
+
+
+def test_redact_secret_args_redacts_url_credentials_in_dashed_option_value():
+    redacted = _redact_secret_args(["--url=https://user:pw@host/x?token=t1"])
+
+    assert redacted == ["--url=https://[REDACTED]@host/x?token=[REDACTED]"]
+
+
+def test_redact_secret_args_key_value_form_leaves_non_url_values_unchanged():
+    assert _redact_secret_args(["token=abc"]) == ["token=[REDACTED]"]
+    assert _redact_secret_args(["name=foo"]) == ["name=foo"]
+
+
+def test_redact_secret_args_redacts_uppercase_scheme_url_in_key_value_form():
+    redacted = _redact_secret_args(["url=HTTPS://user:pw@host/x?token=t1"])
+
+    assert "user:pw" not in redacted[0]
+    assert "token=t1" not in redacted[0]
+    assert "[REDACTED]@host" in redacted[0]
+
+
+def test_redact_secret_args_redacts_non_http_scheme_url_in_key_value_form():
+    redacted = _redact_secret_args(["url=ftp://user:pw@host/x"])
+
+    assert "user:pw" not in redacted[0]
+    assert "[REDACTED]@host" in redacted[0]
+
+
+def test_redact_secret_text_redacts_uppercase_scheme_url_in_free_text():
+    redacted = _redact_secret_text("see HTTPS://user:pw@host/x?token=abc end")
+
+    assert "user:pw" not in redacted
+    assert "token=abc" not in redacted
+    assert "[REDACTED]@host" in redacted
+
+
+def test_redact_secret_text_multi_word_bare_value_preserves_following_uppercase_url():
+    redacted = _redact_secret_text("password=see HTTPS://user:pw@host/x")
+
+    assert redacted == "password=[REDACTED] https://[REDACTED]@host/x"
+
+
+def test_redact_secret_text_redacts_non_http_scheme_url_in_free_text():
+    redacted = _redact_secret_text("see ftp://user:pw@host/x?token=abc end")
+
+    assert "user:pw" not in redacted
+    assert "token=abc" not in redacted
+    assert "[REDACTED]@host" in redacted
+
+
+def test_redact_secret_text_multi_word_bare_value_preserves_following_ftp_url():
+    redacted = _redact_secret_text("password=see ftp://user:pw@host/x")
+
+    assert redacted == "password=[REDACTED] ftp://[REDACTED]@host/x"
+
+
+def test_redact_secret_text_long_letter_run_stays_linear():
+    # 30k scheme-charset letters without "://": the unbounded scheme pattern
+    # backtracked per start position (seconds); the bounded one is linear.
+    redacted = _redact_secret_text("x" * 30_000)
+
+    assert redacted == "x" * 30_000
+
+
+def test_redact_command_string_redacts_url_credentials_in_key_value_form():
+    redacted = _redact_command_string("mcp-server url=https://user:pw@host/x?token=t1")
+
+    assert "user:pw" not in redacted
+    assert "token=t1" not in redacted
+    assert "url=https://[REDACTED]@host/x?token=[REDACTED]" in redacted
+
+
+def test_redact_secret_text_redacts_multi_word_bare_value_to_end_of_line():
+    # Bare values followed by space-separated prose with no top-level delimiter
+    # fail closed: everything to end-of-line is treated as the secret value.
+    assert _redact_secret_text("password=my secret pass") == "password=[REDACTED]"
+
+
+def test_redact_secret_text_redacts_multi_word_bare_value_up_to_next_field():
+    redacted = _redact_secret_text("password=my secret pass, next_key=foo")
+
+    assert redacted == "password=[REDACTED], next_key=[REDACTED]"
+
+
+def test_redact_secret_text_multi_word_bare_value_preserves_following_redacted_url():
+    redacted = _redact_secret_text("token=abc123 https://user:pass@example.com/mcp done")
+
+    assert "abc123" not in redacted
+    assert "user:pass" not in redacted
+    assert "https://[REDACTED]@example.com/mcp" in redacted
+
+
+def test_redact_secret_text_bare_single_token_and_quoted_values_unchanged():
+    assert _redact_secret_text("api_key=sk-secret-123") == "api_key=[REDACTED]"
+    assert _redact_secret_text("token: abc123") == "token: [REDACTED]"
+    assert _redact_secret_text('password="my secret pass"') == 'password="[REDACTED]"'
+
+
+def test_redact_secret_text_leaves_non_secret_key_with_spaces_visible():
+    assert _redact_secret_text("note=my secret pass") == "note=my secret pass"
+
+
+def test_redact_secret_text_deeply_nested_json_fails_closed_without_raising():
+    deep_array = '["x",' * 500 + '"S"' + "]" * 500
+    redacted = _redact_secret_text(deep_array)
+    assert isinstance(redacted, str)
+
+    deep_secret_object = '{"password":' * 500 + '"SYNTHETIC_SECRET"' + "}" * 500
+    redacted_object = _redact_secret_text(deep_secret_object)
+    assert "SYNTHETIC_SECRET" not in redacted_object
+
+
+def test_redact_secret_text_moderately_nested_json_redacts_via_structured_path():
+    payload: dict = {"password": "sk-secret-123"}
+    for _ in range(50):
+        payload = {"wrap": payload}
+    # Non-canonical spacing only normalizes when the structured path re-serializes.
+    value = json.dumps(payload).replace('"wrap": ', '"wrap":  ')
+
+    redacted = _redact_secret_text(value)
+
+    expected: dict = {"password": "[REDACTED]"}
+    for _ in range(50):
+        expected = {"wrap": expected}
+    assert redacted == json.dumps(expected, ensure_ascii=False)
+
+
+def test_redact_secret_text_never_raises_on_malformed_or_nested_inputs():
+    inputs = [
+        '["x",' * 500 + '"S"' + "]" * 500,
+        '{"k":' * 500 + "1" + "}" * 500,
+        '{"password":' * 500 + '"S"' + "}" * 500,
+        "[[[" * 300,
+        "[",
+        "{",
+        '{"a":',
+        '["unclosed',
+        '{"token": "abc",',
+        "[]" * 300,
+        "{}" * 300,
+        "not json at all",
+        '{"a": null}',
+        "[1, 2, 3]",
+    ]
+    for value in inputs:
+        result = _redact_secret_text(value)
+        assert isinstance(result, str)
+
+
+def test_redact_secret_args_non_list_returns_empty():
+    assert _redact_secret_args("--token secret") == []
+    assert _redact_secret_args(None) == []
+
+
+def test_has_secret_material_detects_nested_and_inline_secrets():
+    assert _has_secret_material({"note": "Authorization: Bearer abc"}) is True
+    assert _has_secret_material({"outer": {"token": "abc"}}) is True
+    assert _has_secret_material({"items": [{"api_key": "abc"}]}) is True
+    assert _has_secret_material({"items": ["bearer abc"]}) is True
+    assert _has_secret_material({"items": [["x-api-key: abc"]]}) is True
+    assert _has_secret_material({"plain": "value", "items": ["safe"]}) is False
+
+
+def test_redact_command_string_with_unbalanced_quotes_falls_back_to_text_redaction():
+    redacted = _redact_command_string("run --token=secret-value 'unbalanced")
+    assert "secret-value" not in redacted
+    assert "[REDACTED]" in redacted
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        r'{"password": "prefix\"SYNTHETIC_SECRET suffix"}',
+        r"password='prefix\'SYNTHETIC_SECRET suffix'",
+        '{"api_key": {"value": "SYNTHETIC_SECRET"}}',
+        '{"api_key": ["prefix", ["SYNTHETIC_SECRET"]]}',
+        'INFO {"api_key": {"value": "SYNTHETIC_SECRET"}, "page": 1}',
+        'INFO {"api_key": ["prefix", ["SYNTHETIC_SECRET"]], "page": 1}',
+        'password="prefix SYNTHETIC_SECRET suffix',
+    ],
+)
+def test_redact_secret_text_masks_complete_escaped_and_structured_values(value: str):
+    assert "SYNTHETIC_SECRET" not in _redact_secret_text(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://[broken?api_key=SYNTHETIC_SECRET",
+        "https://[broken/path?api%5Fkey=SYNTHETIC_SECRET",
+        "https://user:SYNTHETIC_SECRET@[broken?token=SYNTHETIC_SECRET",
+    ],
+)
+def test_redact_malformed_url_masks_query_without_path_and_encoded_keys(value: str):
+    assert "SYNTHETIC_SECRET" not in _redact_secret_url(value)
+
+
+def test_redact_secret_text_preserves_nonsecret_query_after_masked_value():
+    text = "request https://example.invalid/?token=secret&page=2 completed"
+    redacted = _redact_secret_text(text)
+    assert "token=[REDACTED]&page=2 completed" in redacted
+
+
+def test_redact_secret_text_redacts_json_style_pairs():
+    redacted = _redact_secret_text('{"api_key": "sk-secret-123"}')
+
+    assert "sk-secret-123" not in redacted
+    assert "[REDACTED]" in redacted
+
+
+def test_redact_secret_text_redacts_nested_json_objects():
+    redacted = _redact_secret_text('{"outer": {"private_token": "glpat-abc123", "page": 1}}')
+
+    assert "glpat-abc123" not in redacted
+    assert "[REDACTED]" in redacted
+    assert "page" in redacted
+
+
+def test_redact_secret_text_masks_quoted_values_with_spaces():
+    assert _redact_secret_text('password="my secret pass"') == 'password="[REDACTED]"'
+
+    spaced = _redact_secret_text('password = "x y"')
+    assert "x y" not in spaced
+    assert "[REDACTED]" in spaced
+
+
+def test_redact_secret_text_preserves_unquoted_and_non_secret_forms():
+    assert _redact_secret_text("api_key=sk-secret-123") == "api_key=[REDACTED]"
+    assert _redact_secret_text("token: abc123") == "token: [REDACTED]"
+    assert _redact_secret_text("page=1") == "page=1"
+    assert _redact_secret_text("monkey=1") == "monkey=1"
+
+
+def test_redact_secret_args_redacts_nested_dicts_and_lists():
+    redacted = _redact_secret_args(
+        [
+            "--config",
+            {"private_token": "glpat-abc123"},
+            [{"items": [{"session_key": "sk-secret-123"}, "plain"]}],
+            {"page": 1},
+        ]
+    )
+
+    text = " ".join(redacted)
+    assert "glpat-abc123" not in text
+    assert "sk-secret-123" not in text
+    assert "[REDACTED]" in text
+    assert "plain" in text
+    assert "page" in text
+
+
+def test_has_secret_material_matches_composed_secret_keys():
+    assert _has_secret_material({"private_token": "glpat-abc123"}) is True
+    assert _has_secret_material({"x-api-key": "sk-secret-123"}) is True
+    assert _has_secret_material({"monkey": "1"}) is False
+    assert _has_secret_material({"keyboard": "us"}) is False
+
+
+def test_collect_available_tools_from_session_json(hermes_home: Path):
+    sessions_json = hermes_home / "sessions" / "sessions.json"
+    sessions_json.write_text(
+        json.dumps(
+            {
+                "entry1": {"session_id": "s1"},
+                "entry2": {"session_id": "s2"},
+            }
+        )
+    )
+    session_file = hermes_home / "sessions" / "session_s1.json"
+    session_file.write_text(
+        json.dumps(
+            {
+                "session_id": "s1",
+                "tools": [{"name": "terminal"}, {"name": "web_search"}, {"name": "read_file"}],
+            }
+        )
+    )
+    second_session_file = hermes_home / "sessions" / "session_s2.json"
+    second_session_file.write_text(
+        json.dumps(
+            {
+                "session_id": "s2",
+                "tools": [{"name": "read_file"}, {"name": "write_file"}, {"name": "fetch_url"}],
+            }
+        )
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.available_tools == 5
+    assert state.available_tool_names == [
+        "fetch_url",
+        "read_file",
+        "terminal",
+        "web_search",
+        "write_file",
+    ]
+    c.close()
+
+
+def test_collect_available_tools_accepts_string_tool_entries(hermes_home: Path):
+    """A session file may list tools as bare strings instead of objects."""
+    (hermes_home / "sessions" / "sessions.json").write_text(
+        json.dumps({"entry1": {"session_id": "s1"}})
+    )
+    (hermes_home / "sessions" / "session_s1.json").write_text(
+        json.dumps({"session_id": "s1", "tools": ["terminal", "web_search"]})
+    )
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.available_tools == 2
+    assert state.available_tool_names == ["terminal", "web_search"]
+    c.close()
+
+
+def test_collect_available_tools_no_sessions_json(hermes_home: Path):
+    c = Collector(hermes_home)
+    state = c.collect()
+    assert state.available_tools == 0
+    c.close()
+
+
+def test_json_cache_returns_stale_on_read_error(hermes_home: Path):
+    path = hermes_home / "test.json"
+    path.write_text(json.dumps({"key": "value"}))
+    c = Collector(hermes_home)
+    data1 = c._read_json_cached(path)
+    assert data1 == {"key": "value"}
+    path.write_text("NOT VALID JSON{{{")
+    data2 = c._read_json_cached(path)
+    assert data2 == {"key": "value"}
+    c.close()
+
+
+def test_json_cache_returns_empty_mapping_on_missing_file(hermes_home: Path):
+    c = Collector(hermes_home)
+    data = c._read_json_cached(hermes_home / "nonexistent.json")
+    assert data == {}
+    c.close()
+
+
+def _write_banner_snapshot(hermes_home: Path, payload: object) -> Path:
+    cache_dir = hermes_home / "cache"
+    cache_dir.mkdir(exist_ok=True)
+    path = cache_dir / "banner_snapshot.json"
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def _write_legacy_sessions(hermes_home: Path, tool_name: str) -> None:
+    sessions_dir = hermes_home / "sessions"
+    (sessions_dir / "sessions.json").write_text(json.dumps({"a": {"session_id": "s1"}}))
+    (sessions_dir / "session_s1.json").write_text(
+        json.dumps({"session_id": "s1", "tools": [{"name": tool_name}]})
+    )
+
+
+def test_available_tools_read_banner_snapshot(hermes_home: Path):
+    _write_banner_snapshot(
+        hermes_home,
+        {
+            "fingerprint": "f1",
+            "enabled_toolsets": ["core"],
+            "tools": [
+                {"type": "function", "function": {"name": "web_search"}},
+                {"type": "function", "function": {"name": "shell_exec"}},
+                {"type": "function", "function": {"name": "web_search"}},
+            ],
+        },
+    )
+    # The legacy index is now a stub that names no sessions.
+    (hermes_home / "sessions" / "sessions.json").write_text(json.dumps({"_README": "legacy"}))
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.available_tool_names == ["shell_exec", "web_search"]
+    assert state.available_tools == 2
+    assert "tools_index" not in state.health.failed_sources
+
+
+def test_available_tools_prefer_banner_snapshot_over_session_files(hermes_home: Path):
+    _write_banner_snapshot(
+        hermes_home,
+        {"tools": [{"type": "function", "function": {"name": "banner_tool"}}]},
+    )
+    _write_legacy_sessions(hermes_home, "legacy_tool")
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.available_tool_names == ["banner_tool"]
+
+
+def test_available_tools_tolerate_malformed_banner_entries(hermes_home: Path):
+    _write_banner_snapshot(
+        hermes_home,
+        {
+            "tools": [
+                "not-a-mapping",
+                {"type": "function"},
+                {"type": "function", "function": {"name": 42}},
+                {"type": "function", "function": {"name": "good_tool"}},
+            ]
+        },
+    )
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.available_tool_names == ["good_tool"]
+
+
+def test_available_tools_fall_back_to_sessions_when_banner_has_no_names(hermes_home: Path):
+    _write_banner_snapshot(hermes_home, {"tools": "not-a-list"})
+    _write_legacy_sessions(hermes_home, "legacy_tool")
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.available_tool_names == ["legacy_tool"]
+
+
+def test_available_tools_empty_without_banner_or_sessions(hermes_home: Path):
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.available_tool_names == []
+    assert state.available_tools == 0
+
+
+def test_session_tool_scan_does_not_retain_parsed_session_documents(hermes_home: Path):
+    """The fallback scan caches extracted names, not whole session documents."""
+    sessions_dir = hermes_home / "sessions"
+    (sessions_dir / "sessions.json").write_text(json.dumps({"a": {"session_id": "s1"}}))
+    session_file = sessions_dir / "session_s1.json"
+    session_file.write_text(
+        json.dumps({"session_id": "s1", "bulk": "x" * 4096, "tools": [{"name": "web_search"}]})
+    )
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+        # White-box on purpose: the defect is unbounded retention of parsed
+        # session JSON inside LastGoodFileCache.
+        cached_paths = set(c._file_cache._json_values)
+    finally:
+        c.close()
+
+    assert state.available_tool_names == ["web_search"]
+    assert str(session_file) not in cached_paths
+
+
+@pytest.mark.parametrize(
+    "value",
+    [float("inf"), float("-inf"), float("nan"), "inf", "-inf", "nan"],
+)
+def test_coerce_int_rejects_non_finite_values(value: object):
+    assert _coerce_int(value) == 0
+
+
+def test_close_returns_promptly_and_skips_remaining_sources(hermes_home: Path, sample_db: Path):
+    started = threading.Event()
+    release = threading.Event()
+    c = Collector(hermes_home)
+    real_gateway = c._collect_gateway
+    later_source_calls: list[int] = []
+    real_config = c._collect_config
+
+    def slow_gateway():
+        started.set()
+        release.wait(10)
+        return real_gateway()
+
+    def counting_config():
+        later_source_calls.append(1)
+        return real_config()
+
+    c._collect_gateway = slow_gateway
+    c._collect_config = counting_config
+
+    collect_errors: list[BaseException] = []
+
+    def run_collect() -> None:
+        try:
+            c.collect()
+        except BaseException as exc:  # pragma: no cover - surfaced by the assert below
+            collect_errors.append(exc)
+
+    closed = threading.Event()
+    collector_thread = threading.Thread(target=run_collect)
+    collector_thread.start()
+    try:
+        assert started.wait(10)
+        closer = threading.Thread(target=lambda: (c.close(), closed.set()))
+        closer.start()
+        # close() sets _closing before queuing for the collect lock, so this
+        # handshake proves the closer is blocked on the lock before release.
+        assert c._closing.wait(10)
+        release.set()
+        start = time.perf_counter()
+        assert closed.wait(10)
+        elapsed = time.perf_counter() - start
+    finally:
+        release.set()
+        collector_thread.join(10)
+        closer.join(10)
+
+    assert collect_errors == []
+    assert elapsed < 1.0
+    assert later_source_calls == []
+
+
+def test_available_tools_refresh_when_session_file_changes(hermes_home: Path):
+    sessions_dir = hermes_home / "sessions"
+    (sessions_dir / "sessions.json").write_text(json.dumps({"a": {"session_id": "s1"}}))
+    session_file = sessions_dir / "session_s1.json"
+    session_file.write_text(json.dumps({"session_id": "s1", "tools": [{"name": "web_search"}]}))
+
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert first.available_tool_names == ["web_search"]
+
+        # Change tool content inside the per-session file only; the index
+        # (sessions.json) is untouched, so its mtime stays the same.
+        session_file.write_text(json.dumps({"session_id": "s1", "tools": [{"name": "shell_exec"}]}))
+        bumped = session_file.stat().st_mtime + 10
+        os.utime(session_file, (bumped, bumped))
+
+        second = c.collect()
+    finally:
+        c.close()
+
+    assert second.available_tool_names == ["shell_exec"]
+
+
+def test_available_tools_cache_binds_each_mtime_to_its_session_file(hermes_home: Path):
+    sessions_dir = hermes_home / "sessions"
+    (sessions_dir / "sessions.json").write_text(
+        json.dumps({"a": {"session_id": "s1"}, "b": {"session_id": "s2"}})
+    )
+    first_file = sessions_dir / "session_s1.json"
+    second_file = sessions_dir / "session_s2.json"
+    first_file.write_text(json.dumps({"tools": [{"name": "first_old"}]}))
+    second_file.write_text(json.dumps({"tools": [{"name": "second_old"}]}))
+    first_mtime = 1_700_000_000
+    second_mtime = first_mtime + 10
+    os.utime(first_file, (first_mtime, first_mtime))
+    os.utime(second_file, (second_mtime, second_mtime))
+
+    c = Collector(hermes_home)
+    try:
+        assert c.collect().available_tool_names == ["first_old", "second_old"]
+
+        first_file.write_text(json.dumps({"tools": [{"name": "first_new"}]}))
+        second_file.write_text(json.dumps({"tools": [{"name": "second_new"}]}))
+        os.utime(first_file, (second_mtime, second_mtime))
+        os.utime(second_file, (first_mtime, first_mtime))
+
+        refreshed = c.collect()
+    finally:
+        c.close()
+
+    assert refreshed.available_tool_names == ["first_new", "second_new"]
+
+
+def test_available_tools_rejects_session_id_path_traversal(hermes_home: Path):
+    sessions_dir = hermes_home / "sessions"
+    (sessions_dir / "sessions.json").write_text(
+        json.dumps({"escaped": {"session_id": "x/../../secret"}})
+    )
+    (sessions_dir / "session_x").mkdir()
+    (hermes_home / "secret.json").write_text(
+        json.dumps({"tools": [{"name": "outside_secret_tool"}]})
+    )
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "outside_secret_tool" not in state.available_tool_names
+
+
+def test_available_tools_rejects_symlinked_session_file(hermes_home: Path, tmp_path: Path):
+    sessions_dir = hermes_home / "sessions"
+    (sessions_dir / "sessions.json").write_text(json.dumps({"a": {"session_id": "s1"}}))
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"tools": [{"name": "outside_secret_tool"}]}))
+    (sessions_dir / "session_s1.json").symlink_to(outside)
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "outside_secret_tool" not in state.available_tool_names
+
+
+def test_available_tools_rejects_symlinked_sessions_index(hermes_home: Path, tmp_path: Path):
+    sessions_dir = hermes_home / "sessions"
+    sessions_index = sessions_dir / "sessions.json"
+    sessions_index.unlink(missing_ok=True)
+    outside = tmp_path / "outside-index.json"
+    outside.write_text(json.dumps({"a": {"session_id": "s1"}}))
+    sessions_index.symlink_to(outside)
+    (sessions_dir / "session_s1.json").write_text(
+        json.dumps({"tools": [{"name": "outside_index_tool"}]})
+    )
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "outside_index_tool" not in state.available_tool_names
+    assert "tools_index" in state.health.failed_sources
+
+
+def test_available_tools_preserves_last_good_after_session_file_becomes_symlink(
+    hermes_home: Path, tmp_path: Path
+):
+    sessions_dir = hermes_home / "sessions"
+    (sessions_dir / "sessions.json").write_text(json.dumps({"a": {"session_id": "s1"}}))
+    session_file = sessions_dir / "session_s1.json"
+    session_file.write_text(json.dumps({"tools": [{"name": "safe_tool"}]}))
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"tools": [{"name": "outside_secret_tool"}]}))
+
+    c = Collector(hermes_home)
+    first = c.collect()
+    assert first.available_tool_names == ["safe_tool"]
+    session_file.unlink()
+    session_file.symlink_to(outside)
+    try:
+        second = c.collect()
+    finally:
+        c.close()
+
+    assert second.available_tool_names == ["safe_tool"]
+    assert "outside_secret_tool" not in second.available_tool_names
+    assert "tools_index" in second.health.failed_sources
+
+
+def test_available_tools_cache_uses_nanosecond_file_signature(
+    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    sessions_dir = hermes_home / "sessions"
+    (sessions_dir / "sessions.json").write_text(json.dumps({"a": {"session_id": "s1"}}))
+    session_file = sessions_dir / "session_s1.json"
+    session_file.write_text(json.dumps({"tools": [{"name": "old_tool"}]}))
+
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert first.available_tool_names == ["old_tool"]
+        old_stat = session_file.stat()
+        session_file.write_text(json.dumps({"tools": [{"name": "new_tool"}]}))
+        os.utime(session_file, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns + 1))
+        monkeypatch.setattr("hermesd.collector._mtime", lambda path: 100.0)
+        second = c.collect()
+    finally:
+        c.close()
+
+    assert second.available_tool_names == ["new_tool"]
+
+
+def test_available_tools_refresh_when_non_max_session_file_changes(hermes_home: Path):
+    """An edit to a session file whose mtime stays below the max must still
+    invalidate the tools cache (a max-only key would miss it)."""
+    sessions_dir = hermes_home / "sessions"
+    (sessions_dir / "sessions.json").write_text(
+        json.dumps({"a": {"session_id": "s1"}, "b": {"session_id": "s2"}})
+    )
+    file1 = sessions_dir / "session_s1.json"
+    file2 = sessions_dir / "session_s2.json"
+    file1.write_text(json.dumps({"session_id": "s1", "tools": [{"name": "web_search"}]}))
+    file2.write_text(json.dumps({"session_id": "s2", "tools": [{"name": "shell_exec"}]}))
+    os.utime(file1, (1000, 1000))
+    os.utime(file2, (2000, 2000))  # file2 holds the max mtime
+
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert first.available_tool_names == ["shell_exec", "web_search"]
+
+        # Edit file1; its mtime changes but stays below the max (2000).
+        file1.write_text(json.dumps({"session_id": "s1", "tools": [{"name": "new_tool"}]}))
+        os.utime(file1, (1500, 1500))
+
+        second = c.collect()
+    finally:
+        c.close()
+
+    assert second.available_tool_names == ["new_tool", "shell_exec"]
+
+
+def test_available_tools_cache_hit_skips_reread(hermes_home: Path, monkeypatch):
+    sessions_dir = hermes_home / "sessions"
+    (sessions_dir / "sessions.json").write_text(json.dumps({"a": {"session_id": "s1"}}))
+    session_file = sessions_dir / "session_s1.json"
+    session_file.write_text(json.dumps({"session_id": "s1", "tools": [{"name": "web_search"}]}))
+
+    # Count real file opens of the per-session file (observable behavior) rather
+    # than wrapping a private collector method.
+    opens: list[Path] = []
+    real_open = Path.open
+
+    def counting_open(self: Path, *args, **kwargs):
+        if self == session_file:
+            opens.append(self)
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert first.available_tools == 1
+        assert "web_search" in first.available_tool_names
+        assert len(opens) >= 1  # cold collect opened the per-session file
+
+        # Second collect with unchanged sessions.json mtime: the available-tools
+        # branch returns the cached (count, names) without re-opening the
+        # per-session file.
+        opens.clear()
+        second = c.collect()
+        assert second.available_tools == 1
+        assert second.available_tool_names == first.available_tool_names
+        assert opens == []
+    finally:
+        c.close()
+
+
+def test_available_tools_oversize_session_file_fails_soft(hermes_home: Path):
+    """A session file past the parsed-file byte cap is never parsed whole; the
+    tools source fails and the last-good inventory survives."""
+    sessions_dir = hermes_home / "sessions"
+    (sessions_dir / "sessions.json").write_text(json.dumps({"a": {"session_id": "s1"}}))
+    session_file = sessions_dir / "session_s1.json"
+    session_file.write_text(json.dumps({"tools": [{"name": "safe_tool"}]}))
+
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert first.available_tool_names == ["safe_tool"]
+
+        oversized = (
+            '{"tools": [{"name": "oversize_tool"}], "bulk": "' + "x" * (9 * 1024 * 1024) + '"}'
+        )
+        session_file.write_text(oversized)
+        second = c.collect()
+    finally:
+        c.close()
+
+    assert second.available_tool_names == ["safe_tool"]
+    assert "oversize_tool" not in second.available_tool_names
+    assert "tools_index" in second.health.failed_sources
+
+
+def test_path_resolves_under_false_when_resolve_raises(tmp_path: Path, monkeypatch):
+    # On Linux/older CPython a symlink-loop makes Path.resolve raise OSError
+    # (ELOOP) or RuntimeError; on macOS/CPython 3.13 resolve(strict=False) is
+    # lexical and never raises. To prove the read-only guard's contract on every
+    # platform we force the documented failure mode. This patches the stdlib
+    # boundary (Path.resolve), not any collector internal.
+    root = tmp_path / "home"
+    root.mkdir()
+    real_resolve = Path.resolve
+
+    def boom(self, *args, **kwargs):
+        if self.name == "escape":
+            raise OSError("simulated ELOOP")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", boom)
+    assert _path_resolves_under(tmp_path / "escape", root) is False
+
+
+def test_path_resolves_under_true_for_real_child(tmp_path: Path):
+    root = tmp_path / "home"
+    child = root / "logs" / "agent.log"
+    child.parent.mkdir(parents=True)
+    child.write_text("x")
+    assert _path_resolves_under(child, root) is True
+    assert _path_resolves_under(tmp_path / "elsewhere", root) is False
+
+
+_LIVE_AVAILABILITY_SNAPSHOT = {
+    "enabled_toolsets": ["bfl", "browser", "clarify", "codegraph", "file"],
+    "tools": [{"type": "function", "function": {"name": "read_file"}}],
+    "availability": {
+        "unavailable_toolsets": [
+            {"name": "bfl", "env_vars": [], "tools": ["bfl_flux3_text_to_video"]},
+            {"name": "browser", "env_vars": [], "tools": ["browser_navigate"]},
+            {"name": "kanban", "env_vars": [], "tools": ["kanban_show"]},
+        ],
+        "lazy_tools": ["bfl_flux3_get_result", "browser_back"],
+        "disabled_tools": [],
+    },
+}
+
+
+def _collect_toolsets(hermes_home: Path) -> DashboardState:
+    c = Collector(hermes_home)
+    try:
+        return c.collect()
+    finally:
+        c.close()
+
+
+def test_toolset_availability_reads_live_banner_snapshot_shape(hermes_home: Path):
+    """availability.unavailable_toolsets is a list of {name, env_vars, tools} dicts."""
+    _write_banner_snapshot(hermes_home, _LIVE_AVAILABILITY_SNAPSHOT)
+
+    state = _collect_toolsets(hermes_home)
+
+    availability = state.toolset_availability
+    assert availability.enabled_toolsets == ["bfl", "browser", "clarify", "codegraph", "file"]
+    assert availability.unavailable_toolsets == ["bfl", "browser", "kanban"]
+    assert availability.lazy_tool_count == 2
+    assert availability.disabled_tool_count == 0
+    assert "toolset_availability" not in state.health.failed_sources
+
+
+def test_toolset_availability_accepts_plain_name_lists(hermes_home: Path):
+    _write_banner_snapshot(
+        hermes_home,
+        {
+            "enabled_toolsets": ["file"],
+            "availability": {
+                "unavailable_toolsets": ["kanban", "browser"],
+                "lazy_tools": ["a"],
+                "disabled_tools": ["b", "c"],
+            },
+        },
+    )
+
+    availability = _collect_toolsets(hermes_home).toolset_availability
+
+    assert availability.unavailable_toolsets == ["browser", "kanban"]
+    assert availability.lazy_tool_count == 1
+    assert availability.disabled_tool_count == 2
+
+
+def test_toolset_availability_unknown_shapes_are_empty(hermes_home: Path):
+    _write_banner_snapshot(
+        hermes_home,
+        {
+            "enabled_toolsets": "everything",
+            "availability": {
+                "unavailable_toolsets": {"kanban": True},
+                "lazy_tools": 7,
+                "disabled_tools": None,
+            },
+        },
+    )
+
+    availability = _collect_toolsets(hermes_home).toolset_availability
+
+    assert availability.enabled_toolsets == []
+    assert availability.unavailable_toolsets == []
+    assert availability.lazy_tool_count == 0
+    assert availability.disabled_tool_count == 0
+
+
+def test_toolset_availability_absent_snapshot_is_empty(hermes_home: Path):
+    availability = _collect_toolsets(hermes_home).toolset_availability
+
+    assert availability.enabled_toolsets == []
+    assert availability.unavailable_toolsets == []
+
+
+def test_last_good_fallback_does_not_regress_across_alternating_failures(
+    populated_hermes_home: Path,
+):
+    """Each source's fallback baseline advances whenever THAT source succeeds.
+
+    Pass 2 fails cron while config refreshes; pass 3 fails config while cron
+    refreshes. Config's pass-3 fallback must serve the pass-2 value, not the
+    older pass-1 whole-state snapshot.
+    """
+    import yaml
+
+    jobs_path = populated_hermes_home / "cron" / "jobs.json"
+    config_path = populated_hermes_home / "config.yaml"
+    jobs_path.write_text(json.dumps({"jobs": [{"id": "nightly", "name": "Nightly digest"}]}))
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+
+    def cron_boom() -> None:
+        raise RuntimeError("cron exploded")
+
+    def config_boom() -> None:
+        raise RuntimeError("config exploded")
+
+    try:
+        first = c.collect()
+        assert first.config.model == "gpt-5.4"
+        assert [job.name for job in first.cron.jobs] == ["Nightly digest"]
+
+        config_path.write_text(yaml.dump({"model": {"default": "gpt-6", "provider": "acme"}}))
+        c._collect_cron = cron_boom  # type: ignore[method-assign]
+        second = c.collect()
+        assert "cron" in second.health.failed_sources
+        assert [job.name for job in second.cron.jobs] == ["Nightly digest"]
+        assert second.config.model == "gpt-6"
+
+        del c._collect_cron  # type: ignore[attr-defined]
+        c._collect_config = config_boom  # type: ignore[method-assign]
+        jobs_path.write_text(json.dumps({"jobs": [{"id": "weekly", "name": "Weekly digest"}]}))
+        third = c.collect()
+        assert "config" in third.health.failed_sources
+        assert "cron" not in third.health.failed_sources
+        assert [job.name for job in third.cron.jobs] == ["Weekly digest"]
+        # The regression: config's fallback must be the pass-2 value (gpt-6),
+        # not the pass-1 value (gpt-5.4) frozen in the last clean state.
+        assert third.config.model == "gpt-6"
+    finally:
+        c.close()
+
+
+def test_last_good_baseline_advances_while_unrelated_source_fails_permanently(
+    populated_hermes_home: Path,
+    monkeypatch,
+):
+    import yaml
+
+    config_path = populated_hermes_home / "config.yaml"
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+
+    def cron_boom() -> None:
+        raise RuntimeError("cron exploded")
+
+    try:
+        assert c.collect().config.model == "gpt-5.4"
+        monkeypatch.setattr(c, "_collect_cron", cron_boom)
+        for model in ("gpt-6", "gpt-7"):
+            config_path.write_text(yaml.dump({"model": {"default": model}}))
+            state = c.collect()
+            assert state.config.model == model
+            assert "cron" in state.health.failed_sources
+
+        def config_boom() -> None:
+            raise RuntimeError("config exploded")
+
+        monkeypatch.setattr(c, "_collect_config", config_boom)
+        degraded = c.collect()
+        assert "config" in degraded.health.failed_sources
+        # Config's own baseline advanced on every successful pass despite cron
+        # failing throughout, so the fallback serves gpt-7, not gpt-5.4.
+        assert degraded.config.model == "gpt-7"
+    finally:
+        c.close()
+
+
+def test_last_good_recovers_after_multiple_partial_failures(
+    populated_hermes_home: Path,
+    monkeypatch,
+):
+    import yaml
+
+    jobs_path = populated_hermes_home / "cron" / "jobs.json"
+    config_path = populated_hermes_home / "config.yaml"
+    jobs_path.write_text(json.dumps({"jobs": [{"id": "nightly", "name": "Nightly digest"}]}))
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+
+    def cron_boom() -> None:
+        raise RuntimeError("cron exploded")
+
+    def config_boom() -> None:
+        raise RuntimeError("config exploded")
+
+    try:
+        c.collect()
+        monkeypatch.setattr(c, "_collect_cron", cron_boom)
+        assert "cron" in c.collect().health.failed_sources
+        monkeypatch.setattr(c, "_collect_config", config_boom)
+        both_failed = c.collect()
+        assert "cron" in both_failed.health.failed_sources
+        assert "config" in both_failed.health.failed_sources
+        assert both_failed.config.model == "gpt-5.4"
+        assert [job.name for job in both_failed.cron.jobs] == ["Nightly digest"]
+
+        monkeypatch.undo()
+        config_path.write_text(yaml.dump({"model": {"default": "gpt-8"}}))
+        jobs_path.write_text(json.dumps({"jobs": [{"id": "hourly", "name": "Hourly sync"}]}))
+        recovered = c.collect()
+        assert recovered.health.failed_sources == []
+        assert recovered.config.model == "gpt-8"
+        assert [job.name for job in recovered.cron.jobs] == ["Hourly sync"]
+
+        # The recovery pass advanced both baselines: a fresh failure serves the
+        # recovered values, not the pre-failure ones.
+        monkeypatch.setattr(c, "_collect_config", config_boom)
+        config_path.write_text(yaml.dump({"model": {"default": "gpt-9"}}))
+        final = c.collect()
+        assert final.config.model == "gpt-8"
+    finally:
+        c.close()
+
+
+def test_shared_field_enrichment_keeps_latest_successful_contribution(
+    populated_hermes_home: Path,
+    monkeypatch,
+):
+    """A gateway sub-source's fallback restores ITS last success, not the last
+    fully-clean pass's whole-state value."""
+    lifecycle_path = populated_hermes_home / "state" / "gateway.lifecycle.json"
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+
+    def cron_boom() -> None:
+        raise RuntimeError("cron exploded")
+
+    try:
+        first = c.collect()
+        assert first.gateway.lifecycle_phase == "running"
+
+        # Cron now fails on every pass, so no later pass is fully clean.
+        monkeypatch.setattr(c, "_collect_cron", cron_boom)
+        lifecycle_path.write_text(
+            json.dumps({"phase": "exited", "pid": 12345, "exit_code": 3, "exit_reason": "stopped"})
+        )
+        second = c.collect()
+        assert "cron" in second.health.failed_sources
+        assert second.gateway.lifecycle_phase == "exited"
+        assert second.gateway.last_exit_code == 3
+
+        # The lifecycle file corrupts: the source fails and must restore the
+        # pass-2 lifecycle fields (its own last success), not pass-1's.
+        lifecycle_path.write_text("{ not json")
+        third = c.collect()
+        assert "gateway_lifecycle" in third.health.failed_sources
+        assert third.gateway.lifecycle_phase == "exited"
+        assert third.gateway.last_exit_code == 3
+    finally:
+        c.close()

@@ -1,83 +1,616 @@
+"""Public façade for the ~/.hermes collectors.
+
+The per-domain readers live in ``hermesd.collect.*``; this module owns the
+``Collector`` orchestration and re-exports the reader helpers so that
+``from hermesd.collector import ...`` keeps resolving every public and
+private name it resolved before the package split.
+"""
+
 from __future__ import annotations
 
-import contextlib
 import functools
 import json
-import math
 import os
-import re
-import shlex
 import sqlite3
-import subprocess
+import subprocess  # noqa: F401  # re-exported: tests patch hermesd.collector.subprocess.run
 import threading
 import time
 import tomllib
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
-from typing import Any, TypeVar
-from urllib.parse import parse_qsl, urlsplit, urlunsplit
+from typing import Any, Literal, NamedTuple, Never, TypeVar
 
-import yaml
+from pydantic import BaseModel
 
-from hermesd.db import HermesDB, snapshot_wal_database
+from hermesd.collect.api_runs import _read_api_runs
+from hermesd.collect.common import (
+    _MAX_TEXT_READ_BYTES,
+    _age_seconds,
+    _as_dict,
+    _as_list,
+    _coerce_float,
+    _coerce_int,
+    _db_source_mtime_ns,
+    _exists_strict,
+    _file_signature,
+    _file_size,
+    _int_mapping,
+    _len_if_sized,
+    _local_date,
+    _mtime,
+    _optional_epoch,
+    _path_resolves_under,
+    _read_tail_text,
+    _read_text_capped,
+    _safe_capped_file,
+    _safe_child_path,
+    _safe_or_absent_child_path,
+    _today_epoch,
+)
+from hermesd.collect.config import (
+    _CONFIG_BACKUP_ENTRY_LIMIT,
+    _channel_capabilities,
+    _config_agent_limits,
+    _config_backup_groups,
+    _credential_auth_type,
+    _credential_expiry,
+    _mcp_tool_filter_summary,
+    _moa_config_summary,
+    _platform_family_label,
+    _provider_free_tier,
+    _provider_model_label,
+    _provider_routing_summary,
+    _scale_to_zero_relay_only,
+    _select_pool_entry,
+    _stale_alias_count,
+)
+from hermesd.collect.cron import (
+    _chronos_configured,
+    _cron_catch_up_occurrences,
+    _cron_catch_up_policy,
+    _cron_job_dispatch,
+    _cron_job_fire_claim,
+    _cron_job_fire_error,
+    _cron_job_paused,
+    _cron_job_pending_slot,
+    _cron_job_repeat,
+    _cron_suggestion_count,
+    _cron_ticker_ages,
+    _cron_ticker_health,
+    _cron_ticker_last_error,
+    _delivery_target_label,
+    _latest_cron_output_excerpt,
+    _latest_cron_output_file,
+    _read_cron_executions_state,
+    _tail_latest_cron_output,
+)
+from hermesd.collect.desktop_plugins import read_desktop_plugins
+from hermesd.collect.gateway import (
+    _LOOP_TICK_SILENCE_STRIKES,
+    _config_generation,
+    _config_stale,
+    _dashboard_client_status,
+    _default_loop_tick_probe,
+    _gateway_ledger_fields,
+    _gateway_start_epoch,
+    _GatewayLedgerRows,
+    _heartbeat_liveness,
+    _lifecycle_status,
+    _loop_tick_probe_plan,
+    _loop_tick_verdict,
+    _platform_status,
+    _read_exit_diag,
+    _read_forensic_companions,
+    _read_gateway_ledger_rows,
+    _read_start_storm,
+    _record_writer,
+    _update_receipt_status,
+)
+from hermesd.collect.hosted_rooms import _read_hosted_rooms
+from hermesd.collect.kanban import (
+    _kanban_claim_ttl_seconds,
+    _read_kanban_board_summary,
+    _read_kanban_notify,
+    _read_kanban_state,
+)
+from hermesd.collect.logs import (
+    _ERROR_LOG_TAIL_LINES,
+    _LOG_LINE_PATTERN,
+    _LOG_TAIL_LINES,
+    _MAX_LOG_LINE_CHARS,
+    _extract_session_id,
+    _latest_log_mtime,
+)
+from hermesd.collect.migration import (
+    _MANIFEST_NAME,
+    _migration_state,
+)
+from hermesd.collect.operations import (
+    StateDbRead,
+    _count_delegation_live_logs,
+    _curator_thresholds,
+    _curator_with_scheduler_state,
+    _is_dashboard_process,
+    _iso_age_seconds,
+    _moa_latest_record_summary,
+    _model_cache_counts,
+    _read_checkpoint_prune_marker,
+    _read_corrupt_ledger_marker,
+    _read_delegation_live_manifests,
+    _read_process_receipts,
+    _read_projects_state,
+    _read_state_snapshots,
+    _read_verification_evidence,
+    _skill_curation_hygiene,
+    _state_db_update,
+    _state_transition_label,
+)
+from hermesd.collect.operations import (
+    _read_state_db as _read_state_db_tables,
+)
+from hermesd.collect.plugins import (
+    CATALOG_SIDECAR_NAME,
+    INSTALL_METADATA_NAME,
+    MANIFEST_NAMES,
+    MAX_PLUGIN_SCAN_DEPTH,
+    PLUGIN_KIND_STANDALONE,
+    CatalogCacheEntry,
+    CatalogProvenance,
+    ManifestChoice,
+    RemovedCatalogEntry,
+    catalog_provenance,
+    catalog_update_available,
+    category_prefix,
+    choose_manifest,
+    declared_capabilities,
+    gate_plugin,
+    install_provenance,
+    parse_catalog_cache,
+    parse_portable_manifest,
+    plugin_key,
+    plugin_name_set,
+    removed_catalog_match,
+    requires_hermes_spec,
+    resolve_plugin_kind,
+)
+from hermesd.collect.recovery import _read_db_recovery
+from hermesd.collect.redaction import (
+    _has_secret_material,
+    _redact_command_string,
+    _redact_secret_args,
+    _redact_secret_text,
+    _redact_secret_url,
+    _safe_exception_text,
+)
+from hermesd.collect.sessions import (
+    _background_process_from_ledger,
+    _context_limit_for,
+    _count_cost_statuses,
+    _estimate_cost,  # noqa: F401  # re-exported for hermesd.collector compatibility
+    _gateway_route_fields,
+    _generation_fields,
+    _hygiene_fields,
+    _read_session_coordination_rows,
+    _read_session_tools,
+    _resolved_session_cost,
+    _session_lease_fields,
+    _SessionCoordinationRows,
+    _summarize_breakdown,
+    _summarize_tokens,
+    _summarize_window,
+    _tool_names_from_entries,
+)
+from hermesd.collect.skills import (
+    _count_skills,
+    _learning_summary,
+    _mcp_schema_cache_summary,
+    _memory_card_count,
+    _read_soul_excerpt,
+    _skill_description,
+    _skill_frontmatter,
+    _skills_prompt_summary,
+    _toolset_availability,
+    _word_count,
+)
+from hermesd.collect.sqlite_util import (
+    _connect_readonly_sqlite,
+    _table_count_or_zero,
+)
+from hermesd.collect.system import (
+    _RECENT_ACTIVITY_WINDOW_SECONDS,
+    _git_checkpoint_summary,
+    _git_ref_signature,
+    _latest_runtime_activity_age,
+    _lease_age_seconds,
+    _observed_process_start_times,
+    _pid_exists,
+    _surface_liveness,
+)
+from hermesd.db import HermesDB
+from hermesd.defaults import DEFAULT_LOG_TAIL_BYTES
 from hermesd.file_cache import JsonMapping, JsonObjectList, LastGoodFileCache
 from hermesd.models import (
-    AUTHORITATIVE_COST_STATUSES,
+    PORTABLE_MANIFEST_NAME,
+    ActiveSurface,
     BackgroundProcessInfo,
     ChannelDirectoryState,
     ChannelPlatformInfo,
     CheckpointInfo,
     ConfigSummary,
     CredentialPoolEntry,
+    CronExecutionsState,
     CronJob,
     CronState,
     CuratorRun,
     DashboardState,
-    DiscoveredRepoSummary,
+    DesktopPluginInfo,
+    GatewayLoopHealth,
     GatewayState,
-    GoalSummary,
     HealthSummary,
     HookInfo,
     KanbanBoardSummary,
-    KanbanRunSummary,
     KanbanState,
-    KanbanTaskLink,
-    KanbanTaskSummary,
     LogLine,
     LogState,
     LogStream,
+    MCPSchemaCache,
     MCPServerInfo,
     MemoryOverview,
+    MigrationState,
     ModelCacheSummary,
+    ModelUsage,
     OperationsState,
-    PlatformStatus,
+    PluginActivation,
     PluginInfo,
     PRMonitorSummary,
     ProfilesState,
     ProfileSummary,
-    ProjectSummary,
     ProviderInfo,
     RuntimeStatus,
+    SessionCoordinationState,
     SessionInfo,
     SkillInfo,
     SkillsMemory,
+    SkillsPromptSnapshot,
+    SourceScope,
+    TerminalBreadcrumb,
+    TerminalSessionReadout,
     TokenAnalytics,
-    TokenBreakdown,
     TokenSummary,
-    TokenWindowSummary,
     ToolGatewayRoute,
+    ToolsetAvailability,
     ToolStats,
-    VerificationEventSummary,
-    VerificationRootSummary,
 )
 from hermesd.paths import HermesPaths
 from hermesd.theme import normalize_skin_name
 
 T = TypeVar("T")
-_LOG_LINE_PATTERN = re.compile(
-    r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}),?\d*\s*-\s*([^-]+?)\s*-\s*(\w+)\s*-\s*(.*)"
+M = TypeVar("M", bound=BaseModel)
+
+
+def _closing_source() -> Never:
+    raise RuntimeError("collector is closing")
+
+
+@dataclass(frozen=True, slots=True)
+class _StateDbReadout:
+    """One state.db pass: operations tables, gateway ledgers and the
+    session-side coordination rows."""
+
+    state: StateDbRead
+    ledgers: _GatewayLedgerRows
+    coordination: _SessionCoordinationRows
+
+
+def _state_db_readout(conn: sqlite3.Connection) -> _StateDbReadout:
+    """Every state.db-backed source's raw rows, read from one connection."""
+    return _StateDbReadout(
+        state=_read_state_db_tables(conn),
+        ledgers=_read_gateway_ledger_rows(conn),
+        coordination=_read_session_coordination_rows(conn),
+    )
+
+
+# Fields each gateway sub-source owns, used to restore just that source's
+# values from the last good state when it fails.
+_HEARTBEAT_FIELDS = ("heartbeat_age_seconds", "loop_health")
+# The probe refines the same verdict the heartbeat ages into, plus the armed stamp.
+_LOOP_TICK_FIELDS = ("loop_health", "loop_tick_armed")
+# Upper bound on runtime/active_sessions.json entries turned into surfaces. Each
+# entry costs a liveness syscall per refresh, so an oversized file must not be
+# able to stall the collector thread.
+_ACTIVE_SURFACE_LIMIT = 200
+# plugins/ scan bounds. The tree is walked at most two levels deep (one level of
+# category recursion, matching upstream), and both the per-directory listing and
+# the retained plugin list are capped because ~/.hermes is untrusted input read
+# every refresh. Hitting either cap sets SkillsMemory.plugin_scan_truncated, so a
+# bounded inventory never presents itself as a complete one.
+_PLUGIN_DIR_ENTRY_LIMIT = 200
+_PLUGIN_LIMIT = 200
+# The desktop inventory enriches SkillsMemory through an independent health
+# source so a transient root listing failure cannot blank agent integrations.
+_DESKTOP_PLUGIN_FIELDS = ("desktop_plugins", "desktop_plugin_scan_truncated")
+# backups/config/ scan — the fields the config-backups source owns on
+# ConfigSummary, so its last-good fallback restores exactly those.
+_CONFIG_BACKUP_FIELDS = (
+    "config_backups_present",
+    "config_backup_groups",
+    "config_backup_groups_truncated",
 )
+# The catalog-cache enrichment owns these SkillsMemory fields plus the flags it
+# stamps onto the plugin rows, so its last-good fallback restores both.
+_PLUGIN_CATALOG_FIELDS = (
+    "plugins",
+    "plugin_catalog_cache_present",
+    "plugin_catalog_cache_age_seconds",
+    "plugin_catalog_update_count",
+    "plugin_catalog_removed_count",
+)
+# cache/blocked-scripts/ scan bounds and the fields the source owns.
+_BLOCKED_SCRIPT_SCAN_LIMIT = 200
+_BLOCKED_SCRIPT_NAME_LIMIT = 3
+_MAX_FILE_LABEL_CHARS = 40
+_BLOCKED_SCRIPT_FIELDS = (
+    "blocked_script_count",
+    "newest_blocked_script_age_seconds",
+    "blocked_script_names",
+)
+# The recovery source owns exactly one nested field, so a corrupt repair ledger or
+# retired-WAL manifest restores that whole value from its own last-good read.
+_DB_RECOVERY_FIELDS = ("db_recovery",)
+# Same shape for the two coordination databases: each source owns one nested
+# field, so a corrupt shared-state.db or runs_idempotency.db degrades only itself.
+_HOSTED_ROOM_FIELDS = ("hosted_rooms",)
+_API_RUN_FIELDS = ("api_runs",)
+# Fields the kanban_notify source owns on KanbanState, used to restore just
+# that source's values from the last good state when it fails.
+_KANBAN_NOTIFY_FIELDS = (
+    "notify_sub_count",
+    "notify_platform_counts",
+    "notify_backlog_total",
+    "notify_max_backlog",
+    "notify_backlog_subs",
+    "notify_orphan_profile_count",
+    "notify_orphan_profiles",
+)
+_DELEGATION_LIVE_FIELDS = (
+    "delegation_live_manifests",
+    "delegation_live_manifest_count",
+)
+_PROCESS_RECEIPT_FIELDS = ("process_receipts",)
+_STATE_SNAPSHOT_FIELDS = ("snapshot_count", "snapshot_total_bytes", "newest_snapshot_age_seconds")
+_LIFECYCLE_FIELDS = (
+    "lifecycle_phase",
+    "last_exit_code",
+    "last_exit_reason",
+    "unclean_previous_exit",
+    "prior_unclean_exit",
+    "prior_suspected_oom",
+)
+# gateway-starts.log: the respawn-storm ledger's fields.
+_RESTART_STORM_FIELDS = (
+    "gateway_starts_recorded",
+    "gateway_starts_2m",
+    "gateway_starts_1h",
+    "restart_storm_cap",
+    "seconds_since_last_gateway_start",
+    "in_respawn_backoff",
+)
+# state/dashboard_clients.heartbeat: web client attachment by mtime only.
+_DASHBOARD_CLIENT_FIELDS = (
+    "dashboard_client_attached",
+    "dashboard_client_last_frame_age_seconds",
+)
+# logs/gateway-exit-diag.log: crash forensics tail plus the event-only
+# companion logs that are stat'd but never read.
+_EXIT_DIAG_FIELDS = (
+    "exit_diag_recorded",
+    "exit_diag_last_tag",
+    "exit_diag_last_age_seconds",
+    "exit_diag_unclean_24h",
+    "exit_diag_size_bytes",
+    "exit_diag_oversized",
+    "forensic_files",
+)
+_UPDATE_RECEIPT_FIELDS = (
+    "last_update_outcome",
+    "last_update_finished_age_seconds",
+    "last_update_from_version",
+    "last_update_to_version",
+    "last_update_failed_step",
+    "runtime_code_skew",
+    "runtime_code_skew_source",
+    "update_receipt_unfinished",
+    "update_fleet_states",
+    "update_fleet_runtime_count",
+)
+_LEDGER_FIELDS = (
+    "gateway_incarnation_count",
+    "gateway_restarts_24h",
+    "current_incarnation_uptime_seconds",
+    "pending_delivery_count",
+    "failed_delivery_count",
+    "pending_deliveries",
+)
+
+
+# Fields each session-coordination sub-source owns within
+# SessionCoordinationState, so a corrupt coordination table degrades only its
+# own group instead of blanking the others.
+_SESSION_LEASE_FIELDS = ("leases", "lease_total")
+_HYGIENE_FIELDS = ("hygiene",)
+_GATEWAY_ROUTE_FIELDS = ("routes", "route_total")
+_GENERATION_FIELDS = (
+    "generations",
+    "generation_chat_total",
+    "generation_reset_total",
+    "generation_count_shrank",
+)
+# terminal-sessions/ scan bounds. One file per terminal identity upstream
+# (writer hermes_cli/terminal_breadcrumbs.py:85-92); the count is an upper
+# bound on live terminals, and only the newest rows are retained for display.
+_TERMINAL_SESSION_SCAN_LIMIT = 200
+_TERMINAL_SESSION_ROW_LIMIT = 12
+_TERMINAL_SESSION_WINDOW_SECONDS = 24 * 60 * 60
+# Bucket for the time-dependent part of derived-cache keys: sliding 7d/30d
+# window cutoffs recompute at most this often when nothing else changed
+# (matches the 60s cutoff bucketing in db.py's model-usage reads).
+_DERIVED_WINDOW_BUCKET_SECONDS = 60
+
+
+class _SourceSpec(NamedTuple):
+    """One entry in the dashboard-state collection table.
+
+    ``field`` is the DashboardState field the result lands in; ``source_name``
+    keys the per-source last-good baseline read by the default fallback.
+    ``fallback`` overrides that default for the sources whose fallback is not a
+    plain per-source value read.
+    """
+
+    field: str
+    source_name: str
+    collect: Callable[[], Any]
+    default_factory: Callable[[], Any]
+    fallback: Callable[[], Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelUsageBundle:
+    """Per-model usage rows for the all-time, 24h and 7d windows."""
+
+    usage_source: Literal["session_model_usage", "sessions"] = "sessions"
+    all_time: tuple[ModelUsage, ...] = ()
+    last_24h: tuple[ModelUsage, ...] = ()
+    last_7d: tuple[ModelUsage, ...] = ()
+
+
+_EMPTY_MODEL_USAGE_BUNDLE = _ModelUsageBundle()
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveSurfaceReadout:
+    """Bounded lease rows plus the selected registry's complete occupancy."""
+
+    surfaces: tuple[ActiveSurface, ...] = ()
+    total_count: int = 0
+
+
+_EMPTY_ACTIVE_SURFACE_READOUT = _ActiveSurfaceReadout()
+
+
+def _model_usage_from_rows(rows: list[dict[str, Any]]) -> tuple[ModelUsage, ...]:
+    return tuple(
+        ModelUsage(
+            model=row.get("model") or "",
+            provider=row.get("provider") or "",
+            task=row.get("task") or "",
+            api_calls=row.get("api_calls") or 0,
+            input_tokens=row.get("input_tokens") or 0,
+            output_tokens=row.get("output_tokens") or 0,
+            cache_read_tokens=row.get("cache_read_tokens") or 0,
+            cache_write_tokens=row.get("cache_write_tokens") or 0,
+            reasoning_tokens=row.get("reasoning_tokens") or 0,
+            estimated_cost_usd=_coerce_float(row.get("estimated_cost_usd")),
+            actual_cost_usd=_coerce_float(row.get("actual_cost_usd")),
+            has_actual_cost=_coerce_float(row.get("actual_cost_usd")) > 0,
+            reported_cost_usd=_coerce_float(row.get("reported_cost_usd")),
+            estimated_only_cost_usd=_coerce_float(row.get("estimated_only_cost_usd")),
+            reported_row_count=row.get("reported_row_count") or 0,
+            row_count=row.get("row_count") or 0,
+            last_seen=row.get("last_seen") or 0.0,
+        )
+        for row in rows
+    )
+
+
+def _read_blocked_scripts(root: Path, home: Path, *, now: float) -> dict[str, Any]:
+    """Stat ``cache/blocked-scripts/`` (bounded); contents are never read.
+
+    These are shell scripts the agent refused to run, so only the file name,
+    the count and the newest mtime are surfaced.
+    """
+    if not _safe_child_path(root, home) or not root.is_dir():
+        return {
+            "blocked_script_count": 0,
+            "newest_blocked_script_age_seconds": None,
+            "blocked_script_names": [],
+        }
+    entries: list[tuple[float, str]] = []
+    for entry in sorted(islice(root.iterdir(), _BLOCKED_SCRIPT_SCAN_LIMIT)):
+        if entry.is_symlink() or not entry.is_file() or not _path_resolves_under(entry, home):
+            continue
+        entries.append((_mtime(entry) or 0.0, entry.name))
+    entries.sort(key=lambda item: (-item[0], item[1]))
+    newest = entries[0][0] if entries else None
+    return {
+        "blocked_script_count": len(entries),
+        "newest_blocked_script_age_seconds": max(0.0, now - newest) if newest else None,
+        "blocked_script_names": [
+            _sanitized_file_label(name) for _, name in entries[:_BLOCKED_SCRIPT_NAME_LIMIT]
+        ],
+    }
+
+
+def _sanitized_file_label(name: str) -> str:
+    """Printable, length-capped file name safe to hand to a panel."""
+    return "".join(char for char in name if char.isprintable())[:_MAX_FILE_LABEL_CHARS]
+
+
+def _path_confirmed_gone(path: Path) -> bool:
+    """True only when the path is verifiably absent; stat errors keep the entry."""
+    try:
+        return not path.exists()
+    except OSError:
+        return False
+
+
+def _memory_file_names(memories_dir: Path) -> list[str]:
+    """Sorted memory documents, excluding the agent's ``*.lock`` files and dotfiles."""
+    if not memories_dir.is_dir():
+        return []
+    return sorted(
+        path.name
+        for path in memories_dir.iterdir()
+        if path.is_file() and not path.name.startswith(".") and path.suffix != ".lock"
+    )
+
+
+def _pr_monitor_summary(filename: str, data: Mapping[str, Any]) -> PRMonitorSummary:
+    """One pr-monitor document, in either the repo/prs or the PR-keyed shape."""
+    entries = _pr_keyed_entries(data)
+    if entries is None:
+        return PRMonitorSummary(
+            filename=filename,
+            repo=str(data.get("repo") or ""),
+            checked_at=str(data.get("checked_at") or ""),
+            monitored_count=_len_if_sized(data.get("prs")) or _len_if_sized(data.get("monitored")),
+            tracked_count=_len_if_sized(data.get("tracked_numbers"))
+            or _len_if_sized(data.get("tracked")),
+            author_pr_count=_len_if_sized(data.get("author_prs"))
+            or _len_if_sized(data.get("author_pr_numbers")),
+        )
+    updated = [str(entry.get("updatedAt") or "") for entry in entries]
+    return PRMonitorSummary(
+        filename=filename,
+        checked_at=max(updated, default=""),
+        monitored_count=len(entries),
+        tracked_count=len(entries),
+        open_count=sum(1 for entry in entries if str(entry.get("state") or "").upper() == "OPEN"),
+        conflicting_count=sum(
+            1 for entry in entries if str(entry.get("mergeable") or "").upper() == "CONFLICTING"
+        ),
+    )
+
+
+def _pr_keyed_entries(data: Mapping[str, Any]) -> list[Mapping[str, Any]] | None:
+    """The PR entries when every top-level key is a PR number, else ``None``."""
+    if not data:
+        return None
+    if not all(str(key).isdigit() and isinstance(value, dict) for key, value in data.items()):
+        return None
+    return [value for value in data.values() if isinstance(value, dict)]
 
 
 @dataclass(slots=True)
@@ -117,18 +650,26 @@ class Collector:
         self,
         hermes_home: Path,
         pid_exists: Callable[[int], bool] | None = None,
+        process_start_times: Callable[[Sequence[int]], dict[int, float]] | None = None,
         profile_name: str | None = None,
-        log_tail_bytes: int = 32768,
+        log_tail_bytes: int = DEFAULT_LOG_TAIL_BYTES,
         db_factory: Callable[[Path], HermesDB] | None = None,
         file_cache: LastGoodFileCache | None = None,
         clock: Callable[[], float] = time.time,
         env: Mapping[str, str] | None = None,
+        loop_tick_probe: Callable[[int, int | None], bool | None] | None = None,
     ):
         self._root_home = hermes_home
         self._file_cache = file_cache if file_cache is not None else LastGoodFileCache()
         self._log_cache: dict[str, list[LogLine]] = {}
         self._pid_exists = pid_exists or _pid_exists
-        self._log_tail_bytes = max(1024, log_tail_bytes)
+        self._process_start_times = process_start_times or _observed_process_start_times
+        # Loop-tick witness probe (state/gateway.loop-tick.<pid>.sock or 127.0.0.1
+        # TCP): True answered, False silent, None no node. Injectable so the suite
+        # never opens real sockets; the default probe is read-only by protocol.
+        self._loop_tick_probe = loop_tick_probe or self._probed_loop_tick
+        self._loop_tick_silent_strikes = 0
+        self._log_tail_bytes = max(1, log_tail_bytes)
         self._paths = HermesPaths(hermes_home, profile_name)
         if db_factory is None:
             # Wire allowed_root so profile db targets are re-validated against
@@ -146,8 +687,23 @@ class Collector:
             | None
         ) = None
         self._available_tools_cache_value: tuple[int, list[str]] = (0, [])
-        self._last_state: DashboardState | None = None
+        # Once a gateway_state.json writer is observed dead, the unchanged file
+        # cannot become authoritative merely because that numeric PID reappears.
+        self._invalidated_gateway_state_signature: tuple[str, int, int] | None = None
+        self._session_tool_names_cache: dict[
+            str, tuple[tuple[str, int, int] | None, tuple[str, ...]]
+        ] = {}
+        # Last successful value per source name. A source's fallback baseline
+        # advances whenever that source succeeds, so one permanently failing
+        # source cannot freeze every other source's last-good data (which a
+        # whole-state snapshot taken only on fully clean passes did).
+        self._last_good_by_source: dict[str, Any] = {}
         self._last_session_rows: list[dict[str, Any]] = []
+        # conversation_generations is never pruned upstream, so its row count
+        # must never shrink between refreshes; remembering the last count is
+        # what turns a shrink into a visible warning instead of a silent
+        # "fewer chats than last tick".
+        self._last_generation_chat_count: int | None = None
         self._log_stream_cache: dict[str, tuple[float | None, int, LogStream]] = {}
         self._cron_excerpt_cache: dict[
             str,
@@ -156,239 +712,536 @@ class Collector:
                 tuple[str, bool, str, float | None],
             ],
         ] = {}
-        self._profile_count_cache: dict[str, tuple[float | None, int]] = {}
+        self._profile_count_cache: dict[str, tuple[int | None, int]] = {}
         self._kanban_board_cache: dict[str, KanbanBoardSummary] = {}
+        # One state.db readout per changed mtime, shared by the goal/delegation
+        # state and the gateway ledgers so a pass snapshots the (large, WAL)
+        # db only once.
+        self._state_db_cache: tuple[int, _StateDbReadout] | None = None
+        self._checkpoint_summary_cache: dict[
+            str, tuple[tuple[int, ...], tuple[int, float | None, str]]
+        ] = {}
+        # Derived values (word counts, card counts, excerpts, frontmatter)
+        # keyed on the source file's signature, so an unchanged SKILL.md /
+        # MEMORY.md / USER.md / SOUL.md is not re-read on every tick.
+        self._derived_file_cache: dict[str, tuple[tuple[str, int, int] | None, Any]] = {}
         self._kanban_board_errors: list[str] = []
-        self._derived_rows: list[dict[str, Any]] | None = None
-        self._derived_date = ""
-        self._derived_cache: dict[str, Any] = {}
+        # Session-row-derived values, one entry per derived name, keyed on
+        # (rows identity, local date, entry-specific deps) — see
+        # _derived_from_rows.
+        self._derived_cache: dict[str, tuple[tuple[object, ...], Any]] = {}
         self._closed = False
+        # Set by close() before it queues for _lock; an in-flight collect pass
+        # checks it between sources and stops doing new work.
+        self._closing = threading.Event()
         # _lock serializes collect() passes and guards the collector-internal
         # caches mutated during a pass (_file_cache, _log_cache,
         # _log_stream_cache, _available_tools_cache_*, _profile_count_cache,
-        # _derived_*) plus _last_state/_last_session_rows. It is deliberately
-        # NOT taken by search_session_ids_by_message(): HermesDB serializes its
-        # own access, so a slow collect pass (git subprocesses, per-profile DB
-        # snapshots) must not stall message search.
+        # _derived_*) plus _last_good_by_source/_last_session_rows. It is
+        # deliberately NOT taken by search_session_ids_by_message(): HermesDB
+        # serializes its own access, so a slow collect pass (git subprocesses,
+        # per-profile DB snapshots) must not stall message search.
         self._lock = threading.RLock()
 
     def collect(self) -> DashboardState:
         with self._lock:
             if self._closed:
                 raise RuntimeError("collector is closed")
+            self._prune_stale_caches()
             health = _CollectionHealth()
             session_rows = self._collect_session_rows(health)
-            state = self._build_dashboard_state(health, session_rows)
-            if not health.failed_sources:
-                self._last_state = state
-            return state
+            return self._build_dashboard_state(health, session_rows)
+
+    def _prune_stale_caches(self) -> None:
+        """Evict path-keyed cache entries whose backing file or board is gone."""
+        boards_dir = self._paths.shared_path("kanban", "boards")
+        self._kanban_board_cache = {
+            slug: summary
+            for slug, summary in self._kanban_board_cache.items()
+            if not _path_confirmed_gone(boards_dir / slug)
+        }
+        self._derived_file_cache = {
+            key: entry
+            for key, entry in self._derived_file_cache.items()
+            if not _path_confirmed_gone(Path(key.split(":", 1)[1]))
+        }
+        self._cron_excerpt_cache = {
+            key: entry
+            for key, entry in self._cron_excerpt_cache.items()
+            if not _path_confirmed_gone(Path(key.rsplit(":", 1)[0]) / key.rsplit(":", 1)[1])
+        }
 
     def _build_dashboard_state(
         self,
         health: _CollectionHealth,
         session_rows: list[dict[str, Any]],
     ) -> DashboardState:
-        safe_collect = health.collect
         session_rows_stale = "sessions" in health.failed_sources
+        results: dict[str, Any] = {}
 
-        def empty_tool_stats() -> list[ToolStats]:
-            return []
-
-        def empty_background_processes() -> list[BackgroundProcessInfo]:
-            return []
-
-        def empty_checkpoints() -> list[CheckpointInfo]:
-            return []
-
-        def empty_sessions() -> list[SessionInfo]:
-            return []
-
-        def derived(name: str, compute: Callable[[list[dict[str, Any]]], T]) -> Callable[[], T]:
+        def derived(
+            name: str,
+            compute: Callable[[list[dict[str, Any]]], T],
+            deps: Callable[[], tuple[object, ...]] | None = None,
+        ) -> Callable[[], T]:
             # Shared shape for every session-row-derived source: memoized via
-            # _derived_from_rows on fresh (non-stale) rows.
+            # _derived_from_rows on fresh (non-stale) rows. `deps` supplies the
+            # extra per-entry key parts (config file signatures, time buckets)
+            # beyond rows identity and the local date.
             return lambda: self._derived_from_rows(
                 name,
                 self._fresh_session_rows(session_rows, session_rows_stale),
                 compute,
+                deps=deps() if deps is not None else (),
             )
 
-        sessions = safe_collect(
-            lambda: self._last_state.sessions if self._last_state is not None else empty_sessions(),
-            "session_models",
-            derived("sessions", self._collect_sessions),
-            empty_sessions,
-        )
-        available_tools = safe_collect(
-            lambda: (
-                (
-                    self._last_state.available_tools,
-                    self._last_state.available_tool_names,
-                )
-                if self._last_state is not None
-                else (0, [])
+        def last_good(source_name: str, default_factory: Callable[[], Any]) -> Callable[[], Any]:
+            # Per-source baseline: the value this source last produced
+            # successfully, regardless of how other sources fared that pass.
+            return lambda: self._last_good_by_source.get(source_name, default_factory())
+
+        # Collected in order: entries below may read an earlier source's result
+        # out of `results` (channels/runtime need gateway, operations needs the
+        # background processes).
+        specs = (
+            _SourceSpec(
+                "sessions",
+                "session_models",
+                # Session rows join context_length_cache.yaml, so that file's
+                # signature is part of the derived-entry key: editing it must
+                # not wait on a SQLite data_version change.
+                derived(
+                    "sessions",
+                    self._collect_sessions,
+                    deps=self._context_length_signature,
+                ),
+                list,
             ),
-            "tools_index",
-            self._collect_available_tools,
-            lambda: (0, []),
-        )
-        tool_count, tool_names = available_tools
-        gateway = safe_collect(
-            lambda: self._last_state.gateway if self._last_state is not None else GatewayState(),
-            "gateway",
-            self._collect_gateway,
-            GatewayState,
-        )
-        tokens_today = safe_collect(
-            lambda: (
-                self._last_state.tokens_today if self._last_state is not None else TokenSummary()
+            _SourceSpec(
+                "available_tools",
+                "tools_index",
+                self._collect_available_tools,
+                lambda: (0, []),
+                # One source feeds two state fields, so its last-good fallback
+                # cannot be a plain per-source value read.
+                fallback=self._last_available_tools,
             ),
-            "tokens_today",
-            derived("tokens_today", self._collect_tokens_today),
-            TokenSummary,
-        )
-        tokens_total = safe_collect(
-            lambda: (
-                self._last_state.tokens_total if self._last_state is not None else TokenSummary()
+            _SourceSpec(
+                "toolset_availability",
+                "toolset_availability",
+                self._collect_toolset_availability,
+                ToolsetAvailability,
             ),
-            "tokens_total",
-            derived("tokens_total", self._collect_tokens_total),
-            TokenSummary,
-        )
-        token_analytics = safe_collect(
-            lambda: (
-                self._last_state.token_analytics
-                if self._last_state is not None
-                else TokenAnalytics()
+            _SourceSpec("gateway", "gateway", self._collect_gateway, GatewayState),
+            # Four sources enrich the same `gateway` field in place: each one
+            # fails (and falls back) independently, so a corrupt heartbeat file
+            # cannot discard the freshly read gateway_state.json.
+            _SourceSpec(
+                "gateway",
+                "gateway_heartbeat",
+                lambda: self._with_heartbeat(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "gateway_heartbeat", results["gateway"], _HEARTBEAT_FIELDS
+                ),
             ),
-            "token_analytics",
-            derived("token_analytics", self._collect_token_analytics),
-            TokenAnalytics,
-        )
-        tool_stats = safe_collect(
-            lambda: (
-                self._last_state.tool_stats if self._last_state is not None else empty_tool_stats()
+            _SourceSpec(
+                "gateway",
+                "gateway_loop_tick",
+                lambda: self._with_loop_tick(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "gateway_loop_tick", results["gateway"], _LOOP_TICK_FIELDS
+                ),
             ),
-            "tool_stats",
-            lambda: self._collect_tool_stats(
-                session_rows,
-                session_rows_stale=session_rows_stale,
+            _SourceSpec(
+                "gateway",
+                "gateway_lifecycle",
+                lambda: self._with_lifecycle(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "gateway_lifecycle", results["gateway"], _LIFECYCLE_FIELDS
+                ),
             ),
-            empty_tool_stats,
-        )
-        total_tool_calls = safe_collect(
-            lambda: self._last_state.total_tool_calls if self._last_state is not None else 0,
-            "tool_call_total",
-            derived("tool_call_total", self._collect_total_tool_calls),
-            int,
-        )
-        background_processes = safe_collect(
-            lambda: (
-                self._last_state.background_processes
-                if self._last_state is not None
-                else empty_background_processes()
+            _SourceSpec(
+                "gateway",
+                "gateway_restart_storm",
+                lambda: self._with_restart_storm(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "gateway_restart_storm", results["gateway"], _RESTART_STORM_FIELDS
+                ),
             ),
-            "background_processes",
-            self._collect_background_processes,
-            empty_background_processes,
-        )
-        checkpoints = safe_collect(
-            lambda: (
-                self._last_state.checkpoints
-                if self._last_state is not None
-                else empty_checkpoints()
+            _SourceSpec(
+                "gateway",
+                "gateway_exit_diag",
+                lambda: self._with_exit_diag(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "gateway_exit_diag", results["gateway"], _EXIT_DIAG_FIELDS
+                ),
             ),
-            "checkpoints",
-            self._collect_checkpoints,
-            empty_checkpoints,
-        )
-        config = safe_collect(
-            lambda: self._last_state.config if self._last_state is not None else ConfigSummary(),
-            "config",
-            self._collect_config,
-            ConfigSummary,
-        )
-        cron = safe_collect(
-            lambda: self._last_state.cron if self._last_state is not None else CronState(),
-            "cron",
-            self._collect_cron,
-            CronState,
-        )
-        channels = safe_collect(
-            lambda: (
-                self._last_state.channels
-                if self._last_state is not None
-                else ChannelDirectoryState()
+            _SourceSpec(
+                "gateway",
+                "dashboard_client",
+                lambda: self._with_dashboard_client(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "dashboard_client", results["gateway"], _DASHBOARD_CLIENT_FIELDS
+                ),
             ),
-            "channels",
-            lambda: self._collect_channels(gateway),
-            ChannelDirectoryState,
+            _SourceSpec(
+                "gateway",
+                "update_receipt",
+                lambda: self._with_update_receipt(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "update_receipt", results["gateway"], _UPDATE_RECEIPT_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "gateway",
+                "gateway_ledgers",
+                lambda: self._with_gateway_ledgers(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "gateway_ledgers", results["gateway"], _LEDGER_FIELDS
+                ),
+            ),
+            # Own source_name so a torn gateway_migration.json (upstream writes it
+            # with a plain write_text) degrades only the migration verdict and keeps
+            # its own last-good value, leaving the gateway beside it fresh.
+            _SourceSpec(
+                "migration",
+                "migration",
+                lambda: self._collect_migration(
+                    results["gateway"], gateway_fresh="gateway" not in health.failed_sources
+                ),
+                MigrationState,
+            ),
+            _SourceSpec(
+                "tokens_today",
+                "tokens_today",
+                derived("tokens_today", self._collect_tokens_today),
+                TokenSummary,
+            ),
+            _SourceSpec(
+                "tokens_total",
+                "tokens_total",
+                derived("tokens_total", self._collect_tokens_total),
+                TokenSummary,
+            ),
+            _SourceSpec(
+                "token_analytics",
+                "token_analytics",
+                # The 7d/30d windows slide with the clock; the time bucket lets
+                # a session age out of a window without waiting for midnight.
+                derived(
+                    "token_analytics",
+                    self._collect_token_analytics,
+                    deps=self._window_time_bucket,
+                ),
+                TokenAnalytics,
+            ),
+            _SourceSpec(
+                "tool_stats",
+                "tool_stats",
+                lambda: self._collect_tool_stats(
+                    session_rows,
+                    session_rows_stale=session_rows_stale,
+                ),
+                list,
+            ),
+            _SourceSpec(
+                "total_tool_calls",
+                "tool_call_total",
+                derived("tool_call_total", self._collect_total_tool_calls),
+                int,
+            ),
+            _SourceSpec(
+                "background_processes",
+                "background_processes",
+                self._collect_background_processes,
+                list,
+            ),
+            _SourceSpec("checkpoints", "checkpoints", self._collect_checkpoints, list),
+            _SourceSpec("config", "config", self._collect_config, ConfigSummary),
+            # Second writer of the `config` field: backups/config/ is scanned and
+            # grouped on its own source so a hostile directory (or a symlink
+            # swap) degrades only the backup audit trail, not the settings read
+            # out of config.yaml itself.
+            _SourceSpec(
+                "config",
+                "config_backups",
+                lambda: self._with_config_backups(results["config"]),
+                lambda: results["config"],
+                fallback=lambda: self._last_source_fields(
+                    "config_backups", results["config"], _CONFIG_BACKUP_FIELDS
+                ),
+            ),
+            _SourceSpec("cron", "cron", self._collect_cron, CronState),
+            # Split from "cron" so a corrupt executions.db keeps jobs.json data.
+            _SourceSpec(
+                "cron_executions",
+                "cron_executions",
+                lambda: self._collect_cron_executions(results["cron"]),
+                CronExecutionsState,
+            ),
+            _SourceSpec(
+                "channels",
+                "channels",
+                lambda: self._collect_channels(results["gateway"]),
+                ChannelDirectoryState,
+            ),
+            _SourceSpec("kanban", "kanban", self._collect_kanban, KanbanState),
+            # Notify subscriptions share kanban.db but fail independently, so a
+            # torn notifier-cursor read cannot blank the board already shown.
+            _SourceSpec(
+                "kanban",
+                "kanban_notify",
+                lambda: self._with_kanban_notify(results["kanban"]),
+                lambda: results["kanban"],
+                fallback=lambda: self._last_source_fields(
+                    "kanban_notify", results["kanban"], _KANBAN_NOTIFY_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "operations",
+                "operations",
+                lambda: self._collect_operations(results["background_processes"]),
+                OperationsState,
+            ),
+            # Second writer of the `operations` field: state-snapshots/ can hold
+            # gigabytes, so a failed scan degrades to the operations state
+            # collected above instead of blanking the whole panel.
+            _SourceSpec(
+                "operations",
+                "state_snapshots",
+                lambda: self._with_state_snapshots(results["operations"]),
+                lambda: results["operations"],
+                fallback=lambda: self._last_source_fields(
+                    "state_snapshots", results["operations"], _STATE_SNAPSHOT_FIELDS
+                ),
+            ),
+            # Third writer of `operations`: an unreadable blocked-scripts dir
+            # keeps the last-good counts rather than reporting a false zero.
+            _SourceSpec(
+                "operations",
+                "blocked_scripts",
+                lambda: self._with_blocked_scripts(results["operations"]),
+                lambda: results["operations"],
+                fallback=lambda: self._last_source_fields(
+                    "blocked_scripts", results["operations"], _BLOCKED_SCRIPT_FIELDS
+                ),
+            ),
+            # Fourth writer of `operations`: the state.db recovery artifacts are
+            # read as presence and metadata only, and a torn repair ledger or
+            # retired-WAL manifest must never read as "no failed repairs".
+            _SourceSpec(
+                "operations",
+                "db_recovery",
+                lambda: self._with_db_recovery(results["operations"]),
+                lambda: results["operations"],
+                fallback=lambda: self._last_source_fields(
+                    "db_recovery", results["operations"], _DB_RECOVERY_FIELDS
+                ),
+            ),
+            # Fifth writer of `operations`: hosted-room coordination lives in its
+            # own ROOT-scoped database, so a corrupt shared-state.db must not take
+            # the rest of the panel's last-good values with it.
+            _SourceSpec(
+                "operations",
+                "hosted_rooms",
+                lambda: self._with_hosted_rooms(results["operations"]),
+                lambda: results["operations"],
+                fallback=lambda: self._last_source_fields(
+                    "hosted_rooms", results["operations"], _HOSTED_ROOM_FIELDS
+                ),
+            ),
+            # Sixth writer of `operations`: the API run replay window is a
+            # separate PROFILE-scoped database again, and it fails independently
+            # for the same reason.
+            _SourceSpec(
+                "operations",
+                "api_runs",
+                lambda: self._with_api_runs(results["operations"]),
+                lambda: results["operations"],
+                fallback=lambda: self._last_source_fields(
+                    "api_runs", results["operations"], _API_RUN_FIELDS
+                ),
+            ),
+            # Seventh writer of `operations`: the live delegation manifests are a
+            # ROOT-scoped cache directory (the same open divergence as the
+            # delegation_live_log_count read inside `operations`), and a torn
+            # manifest must keep the last-good cards instead of blanking them.
+            # Eighth writer of `operations`: process receipts live under the
+            # profile's logs/, upstream's own location, so a vanished receipt
+            # (7-day retention) keeps the last-good list instead of a false zero.
+            _SourceSpec(
+                "operations",
+                "process_receipts",
+                lambda: self._with_process_receipts(results["operations"]),
+                lambda: results["operations"],
+                fallback=lambda: self._last_source_fields(
+                    "process_receipts", results["operations"], _PROCESS_RECEIPT_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "operations",
+                "delegation_live",
+                lambda: self._with_delegation_live(results["operations"]),
+                lambda: results["operations"],
+                fallback=lambda: self._last_source_fields(
+                    "delegation_live", results["operations"], _DELEGATION_LIVE_FIELDS
+                ),
+            ),
+            _SourceSpec("skills_memory", "skills", self._collect_skills_memory, SkillsMemory),
+            _SourceSpec(
+                "skills_memory",
+                "desktop_plugins",
+                lambda: self._with_desktop_plugins(results["skills_memory"]),
+                lambda: results["skills_memory"],
+                fallback=lambda: self._last_source_fields(
+                    "desktop_plugins", results["skills_memory"], _DESKTOP_PLUGIN_FIELDS
+                ),
+            ),
+            # Second writer of the `skills_memory` field: the live catalog cache
+            # adds drift/removal verdicts on top of the discovered plugins. An
+            # unreadable cache fails only this enrichment — the discovered
+            # plugin inventory beside it stays fresh.
+            _SourceSpec(
+                "skills_memory",
+                "plugin_catalog",
+                lambda: self._with_plugin_catalog(results["skills_memory"]),
+                lambda: results["skills_memory"],
+                fallback=lambda: self._last_source_fields(
+                    "plugin_catalog", results["skills_memory"], _PLUGIN_CATALOG_FIELDS
+                ),
+            ),
+            _SourceSpec("mcp_cache", "mcp_cache", self._collect_mcp_cache, MCPSchemaCache),
+            _SourceSpec(
+                "skills_prompt",
+                "skills_prompt",
+                self._collect_skills_prompt,
+                SkillsPromptSnapshot,
+            ),
+            _SourceSpec("memory", "memory", self._collect_memory, MemoryOverview),
+            _SourceSpec("profiles", "profiles", self._collect_profiles, ProfilesState),
+            _SourceSpec("logs", "logs", self._collect_logs, LogState),
+            _SourceSpec("version_behind", "version_check", self._collect_version_behind, int),
+            # Without a last good read the fallback is the shipped skin name,
+            # not the "" that the str default factory would yield.
+            _SourceSpec("active_skin", "skin", self._collect_skin, str, fallback=self._last_skin),
+            _SourceSpec("curator", "curator", self._collect_curator, CuratorRun),
+            _SourceSpec(
+                "model_usage",
+                "model_usage",
+                self._collect_model_usage,
+                lambda: _EMPTY_MODEL_USAGE_BUNDLE,
+                # The bundle is merged into token_analytics below, so its
+                # last-good value is not a plain per-source value read.
+                fallback=self._last_model_usage,
+            ),
+            _SourceSpec(
+                "active_surface_readout",
+                "active_sessions",
+                self._collect_active_surfaces,
+                lambda: _EMPTY_ACTIVE_SURFACE_READOUT,
+            ),
+            # Four sources enrich the same `session_coordination` field: each
+            # fails (and falls back) independently, so one corrupt coordination
+            # table cannot blank the panel's other groups.
+            _SourceSpec(
+                "session_coordination",
+                "session_leases",
+                lambda: self._with_session_leases(
+                    results.get("session_coordination") or SessionCoordinationState()
+                ),
+                SessionCoordinationState,
+                fallback=lambda: self._last_source_fields(
+                    "session_leases",
+                    results.get("session_coordination") or SessionCoordinationState(),
+                    _SESSION_LEASE_FIELDS,
+                ),
+            ),
+            _SourceSpec(
+                "session_coordination",
+                "gateway_hygiene",
+                lambda: self._with_gateway_hygiene(results["session_coordination"], session_rows),
+                lambda: results["session_coordination"],
+                fallback=lambda: self._last_source_fields(
+                    "gateway_hygiene", results["session_coordination"], _HYGIENE_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "session_coordination",
+                "gateway_routes",
+                lambda: self._with_gateway_routes(
+                    results["session_coordination"], results["sessions"]
+                ),
+                lambda: results["session_coordination"],
+                fallback=lambda: self._last_source_fields(
+                    "gateway_routes", results["session_coordination"], _GATEWAY_ROUTE_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "session_coordination",
+                "generation_churn",
+                lambda: self._with_generation_churn(results["session_coordination"]),
+                lambda: results["session_coordination"],
+                fallback=lambda: self._last_source_fields(
+                    "generation_churn", results["session_coordination"], _GENERATION_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "terminal_sessions",
+                "terminal_sessions",
+                self._collect_terminal_sessions,
+                TerminalSessionReadout,
+            ),
+            _SourceSpec(
+                "runtime",
+                "runtime",
+                lambda: self._collect_runtime_status(results["gateway"], results["sessions"]),
+                RuntimeStatus,
+            ),
         )
+
         self._kanban_board_errors = []
-        kanban = safe_collect(
-            lambda: self._last_state.kanban if self._last_state is not None else KanbanState(),
-            "kanban",
-            self._collect_kanban,
-            KanbanState,
-        )
+        pass_good: dict[str, Any] = {}
+        for spec in specs:
+            # close() sets _closing before it queues for the collect lock, so a
+            # quit does not wait out a full pass: every source after the current
+            # one falls straight back to its last-good value.
+            fn = _closing_source if self._closing.is_set() else spec.collect
+            results[spec.field] = health.collect(
+                spec.fallback or last_good(spec.source_name, spec.default_factory),
+                spec.source_name,
+                fn,
+                spec.default_factory,
+            )
+            if spec.source_name not in health.failed_sources:
+                pass_good[spec.source_name] = results[spec.field]
         if self._kanban_board_errors:
             health.mark_failed("kanban", "; ".join(self._kanban_board_errors))
-        operations = safe_collect(
-            lambda: (
-                self._last_state.operations if self._last_state is not None else OperationsState()
-            ),
-            "operations",
-            lambda: self._collect_operations(background_processes),
-            OperationsState,
-        )
-        skills_memory = safe_collect(
-            lambda: (
-                self._last_state.skills_memory if self._last_state is not None else SkillsMemory()
-            ),
-            "skills",
-            self._collect_skills_memory,
-            SkillsMemory,
-        )
-        memory = safe_collect(
-            lambda: self._last_state.memory if self._last_state is not None else MemoryOverview(),
-            "memory",
-            self._collect_memory,
-            MemoryOverview,
-        )
-        profiles = safe_collect(
-            lambda: self._last_state.profiles if self._last_state is not None else ProfilesState(),
-            "profiles",
-            self._collect_profiles,
-            ProfilesState,
-        )
-        logs = safe_collect(
-            lambda: self._last_state.logs if self._last_state is not None else LogState(),
-            "logs",
-            self._collect_logs,
-            LogState,
-        )
-        version_behind = safe_collect(
-            lambda: self._last_state.version_behind if self._last_state is not None else 0,
-            "version_check",
-            self._collect_version_behind,
-            int,
-        )
-        active_skin = safe_collect(
-            lambda: self._last_state.active_skin if self._last_state is not None else "default",
-            "skin",
-            self._collect_skin,
-            str,
-        )
-        curator = safe_collect(
-            lambda: self._last_state.curator if self._last_state is not None else CuratorRun(),
-            "curator",
-            self._collect_curator,
-            CuratorRun,
-        )
-        runtime = safe_collect(
-            lambda: self._last_state.runtime if self._last_state is not None else RuntimeStatus(),
-            "runtime",
-            lambda: self._collect_runtime_status(gateway, sessions),
-            RuntimeStatus,
+        # Advance each source's last-good baseline only when that source
+        # succeeded this pass; a failed source's fallback/default value must
+        # never become the next pass's baseline. Kanban board errors are
+        # reported after the loop, so the merge re-checks failed_sources.
+        for source_name, value in pass_good.items():
+            if source_name not in health.failed_sources:
+                self._last_good_by_source[source_name] = value
+
+        tool_count, tool_names = results.pop("available_tools")
+        model_usage = results.pop("model_usage")
+        active_surface_readout = results.pop("active_surface_readout")
+        results["token_analytics"] = results["token_analytics"].model_copy(
+            update={
+                "usage_source": model_usage.usage_source,
+                "model_usage_all": list(model_usage.all_time),
+                "model_usage_24h": list(model_usage.last_24h),
+                "model_usage_7d": list(model_usage.last_7d),
+            }
         )
         health_summary = HealthSummary(
             total_sources=health.total_sources,
@@ -396,37 +1249,38 @@ class Collector:
             failed_sources=sorted(health.failed_sources),
             errors={source: health.errors[source] for source in sorted(health.errors)},
         )
+        # Every remaining `results` key is a DashboardState field name by
+        # construction: _SourceSpec.field is what this expansion keys off.
         return DashboardState(
             hermes_home=self._paths.root_home,
             selected_profile=self._paths.profile_name,
             profile_mode_label=self._paths.profile_mode_label,
             collected_at=self._clock(),
             health=health_summary,
-            runtime=runtime,
-            gateway=gateway,
-            sessions=sessions,
-            tokens_today=tokens_today,
-            tokens_total=tokens_total,
-            token_analytics=token_analytics,
-            tool_stats=tool_stats,
-            total_tool_calls=total_tool_calls,
             available_tools=tool_count,
             available_tool_names=tool_names,
-            background_processes=background_processes,
-            checkpoints=checkpoints,
-            config=config,
-            cron=cron,
-            channels=channels,
-            kanban=kanban,
-            operations=operations,
-            skills_memory=skills_memory,
-            memory=memory,
-            profiles=profiles,
-            logs=logs,
-            version_behind=version_behind,
-            active_skin=active_skin,
-            curator=curator,
+            active_surfaces=list(active_surface_readout.surfaces),
+            active_surface_count=active_surface_readout.total_count,
+            active_surfaces_truncated=(
+                active_surface_readout.total_count > len(active_surface_readout.surfaces)
+            ),
+            **results,
         )
+
+    def _last_available_tools(self) -> tuple[int, list[str]]:
+        cached: tuple[int, list[str]] = self._last_good_by_source.get("tools_index", (0, []))
+        return cached
+
+    def _last_skin(self) -> str:
+        skin: str = self._last_good_by_source.get("skin", "default")
+        return skin
+
+    def _last_source_fields(self, source_name: str, current: M, fields: tuple[str, ...]) -> M:
+        """Restore one source's fields from its own last successful result."""
+        last: M | None = self._last_good_by_source.get(source_name)
+        if last is None:
+            return current
+        return current.model_copy(update={name: getattr(last, name) for name in fields})
 
     def _fresh_session_rows(
         self,
@@ -437,25 +1291,37 @@ class Collector:
             raise RuntimeError("session rows are stale")
         return rows
 
+    def _context_length_signature(self) -> tuple[object, ...]:
+        return (_file_signature(self._paths.shared_path("context_length_cache.yaml")),)
+
+    def _window_time_bucket(self) -> tuple[object, ...]:
+        return (int(self._clock() // _DERIVED_WINDOW_BUCKET_SECONDS),)
+
     def _derived_from_rows(
         self,
         name: str,
         rows: list[dict[str, Any]],
         compute: Callable[[list[dict[str, Any]]], T],
+        *,
+        deps: tuple[object, ...] = (),
     ) -> T:
         # HermesDB returns the same cached list object while data_version is
-        # unchanged, so row identity is a cheap invalidation key. The local
-        # date is part of the key because "today" aggregates shift at midnight.
-        today = _local_date()
-        if rows is not self._derived_rows or today != self._derived_date:
-            self._derived_cache = {}
-            self._derived_rows = rows
-            self._derived_date = today
-        if name not in self._derived_cache:
-            self._derived_cache[name] = compute(rows)
-        # type-ignore[no-any-return]: heterogeneous per-name cache; each call
-        # site pins T via its compute callable.
-        return self._derived_cache[name]  # type: ignore[no-any-return]
+        # unchanged, so row identity is a cheap invalidation key (the collector
+        # holds the list alive via _last_session_rows, so the id cannot be
+        # recycled). The local date is part of every key because "today"
+        # aggregates shift at midnight; deps carry the entry-specific
+        # dependencies (config file signatures, time buckets for the sliding
+        # windows) so a change there recomputes only the entries that consume
+        # it instead of invalidating the whole cache.
+        key = (id(rows), _local_date(self._clock()), deps)
+        cached = self._derived_cache.get(name)
+        if cached is not None and cached[0] == key:
+            # type-ignore[no-any-return]: heterogeneous per-name cache; each
+            # call site pins T via its compute callable.
+            return cached[1]  # type: ignore[no-any-return]
+        value = compute(rows)
+        self._derived_cache[name] = (key, value)
+        return value
 
     def _collect_session_rows(
         self,
@@ -475,14 +1341,75 @@ class Collector:
         self._last_session_rows = session_rows
         return session_rows
 
+    def _signature_cached(self, kind: str, path: Path, compute: Callable[[], T]) -> T:
+        """Memoize a value derived from path until the file's signature changes.
+
+        A file that cannot be stat'd has no usable key, so its value is
+        recomputed; that path is also the cheap one (no successful open).
+        """
+        key = f"{kind}:{path}"
+        signature = _file_signature(path)
+        cached = self._derived_file_cache.get(key)
+        if cached is not None and signature is not None and cached[0] == signature:
+            # type-ignore[no-any-return]: heterogeneous per-kind cache; each
+            # call site pins T via its compute callable.
+            return cached[1]  # type: ignore[no-any-return]
+        value = compute()
+        if signature is not None:
+            self._derived_file_cache[key] = (signature, value)
+        return value
+
+    def _cached_word_count(self, path: Path, root: Path) -> int:
+        return self._signature_cached("words", path, lambda: _word_count(path, root))
+
+    def _cached_card_count(self, path: Path, root: Path) -> int:
+        return self._signature_cached("cards", path, lambda: _memory_card_count(path, root))
+
+    def _cached_soul_excerpt(self, path: Path, root: Path) -> str:
+        return self._signature_cached("soul", path, lambda: _read_soul_excerpt(path, root))
+
+    def _cached_frontmatter(self, path: Path, root: Path | None = None) -> dict[str, Any]:
+        return self._signature_cached("frontmatter", path, lambda: _skill_frontmatter(path, root))
+
     def _read_json_cached(self, path: Path) -> JsonMapping:
         return self._file_cache.read_json_mapping(path)
+
+    def _read_json_confined(self, path: Path) -> JsonMapping:
+        """Read a JSON mapping under ~/.hermes; a path that escapes reads as absent."""
+        if not _safe_child_path(path, self._paths.root_home):
+            return {}
+        return self._read_json_cached(path)
+
+    def _read_json_reporting_stale(self, path: Path) -> JsonMapping:
+        """Read a JSON mapping, raising when the file cache had to serve last-good.
+
+        Silently reusing the cached value would leave a corrupt source invisible
+        in ``health.failed_sources``; raising names the source while the caller's
+        fallback still preserves the cached data.
+        """
+        data = self._read_json_cached(path)
+        if self._file_cache.last_read_was_stale(path):
+            raise RuntimeError(f"{path.name} is unreadable; keeping last-good values")
+        return data
 
     def _read_json_list_cached(self, path: Path) -> JsonObjectList:
         return self._file_cache.read_json_list(path)
 
     def _read_yaml_cached(self) -> JsonMapping:
         return self._file_cache.read_yaml_mapping(self._paths.shared_path("config.yaml"))
+
+    def _read_yaml_reporting_stale(self) -> JsonMapping:
+        """Read config.yaml, raising when the file cache had to serve last-good.
+
+        Same contract as ``_read_json_reporting_stale``: a config that was once
+        readable and is now malformed or unreadable must degrade the reading
+        source's health instead of silently showing the stale mapping. A file
+        that was never readable (or is absent) is not stale and does not raise.
+        """
+        data = self._read_yaml_cached()
+        if self._file_cache.last_read_was_stale(self._paths.shared_path("config.yaml")):
+            raise RuntimeError("config.yaml is unreadable; keeping last-good values")
+        return data
 
     def search_session_ids_by_message(self, query: str) -> set[str]:
         # Intentionally no self._lock here: HermesDB serializes its own reads,
@@ -497,30 +1424,39 @@ class Collector:
         return rows if rows is not None else self._db.read_sessions()
 
     def _collect_gateway(self) -> GatewayState:
-        data = self._read_json_cached(self._paths.shared_path("gateway_state.json"))
+        path = self._paths.shared_path("gateway_state.json")
+        if not _safe_child_path(path, self._paths.root_home):
+            if "gateway" in self._last_good_by_source:
+                raise RuntimeError(f"{path.name} became unsafe")
+            return GatewayState()
+        data = self._read_json_reporting_stale(path)
         if not data:
             return GatewayState()
-        platforms = []
-        for name, raw_info in _as_dict(data.get("platforms")).items():
-            info = _as_dict(raw_info)
-            if not info:
-                continue
-            platforms.append(
-                PlatformStatus(
-                    name=str(name),
-                    state=str(info.get("state") or "unknown"),
-                    updated_at=str(info.get("updated_at") or ""),
-                    error_code=str(info.get("error_code") or ""),
-                    error_message=str(info.get("error_message") or ""),
-                )
-            )
-        pid = _coerce_int(data.get("pid"))
+        state_signature = _file_signature(path)
+        if (
+            state_signature is not None
+            and self._invalidated_gateway_state_signature is not None
+            and state_signature != self._invalidated_gateway_state_signature
+        ):
+            self._invalidated_gateway_state_signature = None
+        now = self._clock()
+        writer = _record_writer(data)
+        # A non-positive PID is absent, never a target: os.kill(0)/os.kill(-1)
+        # would signal a process group or every process the user owns.
+        recorded_pid = writer.pid or 0
+        pid = recorded_pid
         running = data.get("gateway_state") == "running"
+        recorded_writer_live = False
         # The PID in gateway_state.json can be stale if launchd restarted
-        # the gateway. Check both the recorded PID and the launchd PID.
+        # the gateway. A replacement PID proves a process is running, but it does
+        # not make topology written by the previous process current.
         if running:
             if pid:
-                if not self._pid_exists(pid):
+                if self._pid_exists(pid):
+                    recorded_writer_live = self._invalidated_gateway_state_signature is None
+                else:
+                    if state_signature is not None:
+                        self._invalidated_gateway_state_signature = state_signature
                     # Recorded PID is dead — check if launchd has a live gateway
                     launchd_pid = self._find_gateway_launchd_pid()
                     if launchd_pid:
@@ -528,18 +1464,52 @@ class Collector:
                     else:
                         running = False
             else:
+                if state_signature is not None:
+                    self._invalidated_gateway_state_signature = state_signature
                 launchd_pid = self._find_gateway_launchd_pid()
                 if launchd_pid:
                     pid = launchd_pid
                 else:
                     running = False
+        # Tri-state: an absent or non-list `served_profiles` is no record at all,
+        # while a real list (even []) from a live gateway is authoritative — the
+        # distinction upstream's recorded_served_profiles() makes by returning
+        # None instead of []. The names are kept either way; only the marker is
+        # gated on state-writer liveness, so an old writer's record stays preserved.
+        raw_served = data.get("served_profiles")
+        served_recorded = recorded_writer_live and isinstance(raw_served, list)
+        served_names = [str(profile) for profile in _as_list(raw_served) if profile]
+        # Built after liveness resolution because a platform entry's recorded
+        # ingress URL (and its synthesized listener mirrors) are surfaced only
+        # while the state-file writer is still live.
+        platforms = [
+            _platform_status(
+                str(name),
+                info,
+                now,
+                writer,
+                record_current=recorded_writer_live,
+                served_profiles=served_names,
+            )
+            for name, raw_info in _as_dict(data.get("platforms")).items()
+            if (info := _as_dict(raw_info))
+        ]
         version, behind = self._collect_hermes_version()
-        cfg = self._read_yaml_cached()
+        cfg = self._read_yaml_reporting_stale()
         gateway_cfg = _as_dict(cfg.get("gateway"))
         scale_cfg = _as_dict(cfg.get("scale_to_zero")) or _as_dict(gateway_cfg.get("scale_to_zero"))
         active_agents = _coerce_int(data.get("active_agents"))
         drain_request = self._read_json_cached(self._paths.shared_path(".drain_request.json"))
+        config_generation = _config_generation(data)
         return GatewayState(
+            code_sha=str(data.get("code_sha") or ""),
+            code_version=str(data.get("code_version") or ""),
+            config_fingerprint=config_generation.fingerprint,
+            config_generation_short=config_generation.short,
+            config_sources=config_generation.sources,
+            config_stale=self._config_stale(data, now),
+            session_store_status=str(_as_dict(data.get("session_store")).get("status") or ""),
+            exit_reason=str(data.get("exit_reason") or ""),
             pid=pid,
             running=running,
             state=str(data.get("gateway_state") or "unknown"),
@@ -556,11 +1526,220 @@ class Collector:
                 drain_request.get("principal") or drain_request.get("requested_by") or ""
             ),
             drain_suppress_notification=bool(drain_request.get("suppress_notification")),
-            served_profiles=[
-                str(profile) for profile in _as_list(data.get("served_profiles")) if profile
-            ],
+            served_profiles=served_names,
+            served_profiles_recorded=served_recorded,
             scale_to_zero_idle_timeout_minutes=_coerce_int(scale_cfg.get("idle_timeout_minutes")),
             scale_to_zero_relay_only=_scale_to_zero_relay_only(scale_cfg, platforms),
+        )
+
+    def _config_stale(self, gateway_state: JsonMapping, now: float) -> bool:
+        """Whether config.yaml changed since the running gateway started.
+
+        The recorded ``config_generation`` mtimes are not used: no current
+        hermes-agent writes them, so the stamps left in gateway_state.json are
+        months old and would report stale forever.
+        """
+        start_epoch = _gateway_start_epoch(
+            self._read_json_confined(self._paths.shared_path("state", "gateway.heartbeat")),
+            self._read_json_confined(self._paths.shared_path("state", "gateway.lifecycle.json")),
+            gateway_state,
+            now,
+        )
+        return _config_stale(
+            self._paths.shared_path("config.yaml"), self._paths.root_home, start_epoch
+        )
+
+    def _read_liveness_json(self, path: Path, had_last_good: bool) -> JsonMapping:
+        """Read a gateway liveness file, failing the source on a last-good fallback."""
+        if not _safe_child_path(path, self._paths.root_home):
+            if had_last_good:
+                raise RuntimeError(f"{path.name} became unsafe")
+            return {}
+        data = self._read_json_cached(path)
+        if self._file_cache.last_read_was_stale(path):
+            raise RuntimeError(f"{path.name} is unreadable; keeping last-good values")
+        return data
+
+    def _with_heartbeat(self, gateway: GatewayState) -> GatewayState:
+        path = self._paths.shared_path("state", "gateway.heartbeat")
+        last = self._last_good_by_source.get("gateway_heartbeat")
+        had_last_good = last is not None and last.loop_health is not GatewayLoopHealth.UNKNOWN
+        data = self._read_liveness_json(path, had_last_good)
+        file_mtime = _mtime(path) if _safe_child_path(path, self._paths.root_home) else None
+        age, health = _heartbeat_liveness(
+            data,
+            file_mtime,
+            self._clock(),
+            running=gateway.state == "running",
+        )
+        return gateway.model_copy(update={"heartbeat_age_seconds": age, "loop_health": health})
+
+    def _probed_loop_tick(self, pid: int, tcp_port: int | None) -> bool | None:
+        return _default_loop_tick_probe(pid, tcp_port, self._paths.root_home)
+
+    def _with_loop_tick(self, gateway: GatewayState) -> GatewayState:
+        """Refine the loop verdict with one loop-tick witness probe.
+
+        The witness is served by the gateway's event loop itself, so its answer is
+        direct dispatch evidence that the off-loop heartbeat write lost. Escalation
+        to ``wedged`` needs silence on this many consecutive refreshes
+        (``_LOOP_TICK_SILENCE_STRIKES``): one silent probe is never destructive
+        evidence, mirroring upstream's sustained window without sleeping in the
+        collector thread. Any answer, ambiguity, or non-probing pass resets the
+        strike count.
+        """
+        path = self._paths.shared_path("state", "gateway.heartbeat")
+        heartbeat = (
+            self._read_json_cached(path) if _safe_child_path(path, self._paths.root_home) else {}
+        )
+        plan = _loop_tick_probe_plan(
+            heartbeat,
+            gateway.pid,
+            running=gateway.state == "running",
+        )
+        if plan is None:
+            self._loop_tick_silent_strikes = 0
+            return gateway
+        probe_result = self._loop_tick_probe(plan.pid, plan.tcp_port)
+        if probe_result is False:
+            self._loop_tick_silent_strikes += 1
+        else:
+            self._loop_tick_silent_strikes = 0
+        health = _loop_tick_verdict(
+            gateway.loop_health,
+            gateway.heartbeat_age_seconds,
+            plan,
+            probe_result,
+            sustained_silence=self._loop_tick_silent_strikes >= _LOOP_TICK_SILENCE_STRIKES,
+        )
+        return gateway.model_copy(update={"loop_health": health, "loop_tick_armed": plan.armed})
+
+    def _with_restart_storm(self, gateway: GatewayState) -> GatewayState:
+        """Respawn-storm ledger facts from gateway-starts.log (read-only ring file)."""
+        path = self._paths.shared_path("gateway-starts.log")
+        storm = _read_start_storm(path, self._paths.root_home, self._clock())
+        return gateway.model_copy(update=storm.model_fields(self._clock()))
+
+    def _with_exit_diag(self, gateway: GatewayState) -> GatewayState:
+        """Crash forensics from the tail of the exit-diag ledger; metadata only.
+
+        The extras each record carries (tracebacks, argv, cwd) are never parsed,
+        so nothing secret-bearing reaches the model: only tags, timestamps,
+        counts and file sizes. The tail cap is the same log-tail-bytes budget
+        the log panels use, because upstream never rotates this file.
+        """
+        now = self._clock()
+        diag = _read_exit_diag(
+            self._paths.shared_path("logs", "gateway-exit-diag.log"),
+            self._paths.root_home,
+            now,
+            self._log_tail_bytes,
+        )
+        # Companion logs are stat'd whether or not the ledger exists: the
+        # ledger's writer can be disabled while the companions still grow.
+        return gateway.model_copy(
+            update={
+                "exit_diag_recorded": diag.recorded,
+                "exit_diag_last_tag": diag.last_tag,
+                "exit_diag_last_age_seconds": diag.last_age_seconds,
+                "exit_diag_unclean_24h": diag.unclean_24h,
+                "exit_diag_size_bytes": diag.size_bytes,
+                "exit_diag_oversized": diag.oversized,
+                "forensic_files": _read_forensic_companions(
+                    self._paths.shared_path("logs"), self._paths.root_home, now
+                ),
+            }
+        )
+
+    def _with_dashboard_client(self, gateway: GatewayState) -> GatewayState:
+        """Web dashboard attachment from the marker file's mtime; the socket is never touched."""
+        path = self._paths.shared_path("state", "dashboard_clients.heartbeat")
+        attached, age = _dashboard_client_status(path, self._paths.root_home, self._clock())
+        return gateway.model_copy(
+            update={
+                "dashboard_client_attached": attached,
+                "dashboard_client_last_frame_age_seconds": age,
+            }
+        )
+
+    def _with_lifecycle(self, gateway: GatewayState) -> GatewayState:
+        path = self._paths.shared_path("state", "gateway.lifecycle.json")
+        last = self._last_good_by_source.get("gateway_lifecycle")
+        data = self._read_liveness_json(path, bool(last is not None and last.lifecycle_phase))
+        status = _lifecycle_status(data, self._pid_exists)
+        return gateway.model_copy(
+            update={
+                "lifecycle_phase": status.phase,
+                "last_exit_code": status.last_exit_code,
+                "last_exit_reason": status.last_exit_reason,
+                "unclean_previous_exit": status.unclean_previous_exit,
+                "prior_unclean_exit": status.prior_unclean_exit,
+                "prior_suspected_oom": status.prior_suspected_oom,
+            }
+        )
+
+    def _with_update_receipt(self, gateway: GatewayState) -> GatewayState:
+        path = self._paths.shared_path("logs", "update_receipts", "latest.json")
+        last = self._last_good_by_source.get("update_receipt")
+        data = self._read_liveness_json(path, bool(last is not None and last.last_update_outcome))
+        receipt = _update_receipt_status(data, self._clock(), gateway.code_sha)
+        return gateway.model_copy(
+            update={
+                "last_update_outcome": receipt.outcome,
+                "last_update_finished_age_seconds": receipt.finished_age_seconds,
+                "last_update_from_version": receipt.from_version,
+                "last_update_to_version": receipt.to_version,
+                "last_update_failed_step": receipt.failed_step,
+                "runtime_code_skew": receipt.runtime_code_skew,
+                "runtime_code_skew_source": receipt.runtime_code_skew_source,
+                "update_receipt_unfinished": receipt.update_receipt_unfinished,
+                "update_fleet_states": receipt.update_fleet_states,
+                "update_fleet_runtime_count": receipt.update_fleet_runtime_count,
+            }
+        )
+
+    def _with_gateway_ledgers(self, gateway: GatewayState) -> GatewayState:
+        readout = self._read_state_db()
+        if readout is None:
+            last = self._last_good_by_source.get("gateway_ledgers")
+            if last is not None and last.gateway_incarnation_count:
+                raise RuntimeError("state.db gateway ledgers disappeared or became unsafe")
+            return gateway
+        return gateway.model_copy(update=_gateway_ledger_fields(readout.ledgers, self._clock()))
+
+    def _collect_migration(self, gateway: GatewayState, *, gateway_fresh: bool) -> MigrationState:
+        """Read ``gateway_migration.json`` and judge it against the live artifacts.
+
+        ROOT-scoped: upstream anchors the manifest at the *default* profile home
+        (``hermes_cli/gateway_migrate.py:467-468``), never a secondary's, so a
+        served profile has no copy of its own to read.
+
+        Presence is checked separately from parseability because the two carry
+        different meanings: absent is "never migrated OR successfully rolled back",
+        while present-but-unparseable is a torn ``write_text`` mid-flight. A file
+        that was readable and then vanished or turned unsafe *raises*, so the source
+        is marked failed and its last-good verdict stays on display instead of
+        silently reporting "no migration".
+        """
+        if not gateway_fresh:
+            raise RuntimeError("gateway dependency is stale; keeping last-good migration verdict")
+
+        path = self._paths.shared_path(_MANIFEST_NAME)
+        last = self._last_good_by_source.get("migration")
+        had_last_good = bool(last is not None and last.manifest_present)
+        if not _safe_child_path(path, self._paths.root_home):
+            if had_last_good:
+                raise RuntimeError(f"{path.name} became unsafe")
+            return MigrationState()
+        if not _exists_strict(path):
+            if had_last_good:
+                raise RuntimeError(f"{path.name} disappeared")
+            return MigrationState()
+        return _migration_state(
+            self._read_json_reporting_stale(path),
+            now=self._clock(),
+            cfg=self._read_yaml_reporting_stale(),
+            gateway=gateway,
         )
 
     def _find_gateway_launchd_pid(self) -> int | None:
@@ -568,14 +1747,14 @@ class Collector:
         pid_file = self._paths.shared_path("gateway.pid")
         if pid_file.exists():
             try:
-                content = pid_file.read_text().strip()
+                content = _read_text_capped(pid_file, self._paths.root_home).strip()
                 if content:
                     data = json.loads(content)
                     if isinstance(data, dict):
                         lpid = int(data.get("pid", 0) or 0)
                     else:
                         lpid = int(content)
-                    if lpid and self._pid_exists(lpid):
+                    if lpid > 0 and self._pid_exists(lpid):
                         return lpid
             except (ValueError, json.JSONDecodeError, ProcessLookupError, PermissionError, OSError):
                 pass
@@ -602,9 +1781,10 @@ class Collector:
         return version, behind
 
     def _read_context_lengths(self) -> dict[str, int]:
-        data = self._file_cache.read_yaml_mapping(
-            self._paths.shared_path("context_length_cache.yaml")
-        )
+        path = self._paths.shared_path("context_length_cache.yaml")
+        data = self._file_cache.read_yaml_mapping(path)
+        if self._file_cache.last_read_was_stale(path):
+            raise RuntimeError("context_length_cache.yaml is unreadable; keeping last-good values")
         raw = data.get("context_lengths")
         if not isinstance(raw, dict):
             return {}
@@ -623,12 +1803,14 @@ class Collector:
         context_lengths = self._read_context_lengths()
         return [
             SessionInfo(
-                session_id=r["id"],
+                # NULL id must stay None so the row fails validation and the
+                # source falls back to last-good; only a missing column defaults.
+                session_id=r.get("id", ""),  # row-get-ok
                 source=r.get("source") or "",
                 model=r.get("model") or "",
                 parent_session_id=r.get("parent_session_id") or "",
                 billing_provider=r.get("billing_provider") or "",
-                billing_base_url=r.get("billing_base_url") or "",
+                billing_base_url=_redact_secret_url(r.get("billing_base_url") or ""),
                 billing_mode=r.get("billing_mode") or "",
                 end_reason=r.get("end_reason") or "",
                 context_limit=_context_limit_for(
@@ -653,19 +1835,258 @@ class Collector:
                 handoff_state=r.get("handoff_state") or "",
                 handoff_platform=r.get("handoff_platform") or "",
                 handoff_error=r.get("handoff_error") or "",
-                started_at=r.get("started_at") or 0.0,
+                # SQLite columns are untyped: a text value in an epoch column must
+                # coerce, not fail model validation and blank the whole source.
+                started_at=_coerce_float(r.get("started_at")),
                 ended_at=r.get("ended_at"),
                 title=r.get("title"),
                 is_active=r.get("ended_at") is None and not bool(r.get("archived") or 0),
+                git_branch=r.get("git_branch") or "",
+                chat_type=r.get("chat_type") or "",
+                display_name=r.get("display_name") or "",
+                title_source=r.get("title_source") or "",
+                profile_name=r.get("profile_name") or "",
+                pinned=bool(r.get("pinned") or 0),
+                last_activity_at=_coerce_float(r.get("last_activity_at")),
+                last_activity_description=r.get("last_activity_description") or "",
+                actual_cost_usd=_coerce_float(r.get("actual_cost_usd")),
+                cost_source=r.get("cost_source") or "",
+                compression_failure_error=r.get("compression_failure_error") or "",
+                # 0 and NULL both mean "no deadline" — see _optional_epoch.
+                compression_failure_cooldown_until=_optional_epoch(
+                    r.get("compression_failure_cooldown_until")
+                ),
+                compression_fallback_streak=_coerce_int(r.get("compression_fallback_streak")),
+                compression_ineffective_count=_coerce_int(r.get("compression_ineffective_count")),
+                compression_recovery_deadline=_optional_epoch(
+                    r.get("compression_recovery_deadline")
+                ),
             )
             for r in rows
         ]
+
+    def _collect_model_usage(self) -> _ModelUsageBundle:
+        usage = self._db.read_model_usage(self._clock())
+        if self._db.last_read_model_usage_stale:
+            raise RuntimeError("model usage rows are stale")
+        if not any(usage.values()):
+            return _EMPTY_MODEL_USAGE_BUNDLE
+        return _ModelUsageBundle(
+            usage_source="session_model_usage",
+            all_time=_model_usage_from_rows(usage["all"]),
+            last_24h=_model_usage_from_rows(usage["24h"]),
+            last_7d=_model_usage_from_rows(usage["7d"]),
+        )
+
+    def _collect_active_surfaces(self) -> _ActiveSurfaceReadout:
+        """Lease entries from runtime/active_sessions.json.
+
+        An existing pid is not the recorded process: pids get reused, so liveness
+        compares the registry's ``process_start_time`` (epoch seconds — unlike
+        gateway_state.json, which records centiseconds) against the start time
+        observed for that pid on this host. Every pid is probed in one call rather
+        than one per surface per tick.
+
+        The lease's own metadata is carried beside that verdict: ``lease_id``,
+        ``track_liveness``, and ``started_at``/``updated_at`` as *ages* against the
+        injected clock. Ages are recomputed on every pass and are never stored in
+        the mtime-keyed file cache, which only ever holds the raw JSON.
+
+        Scope note (``.codex/rules/source-ownership.md``): this reads the selected
+        profile's registry via ``profile_path``, matching upstream's
+        ``_state_path`` (``hermes_cli/active_sessions.py:164-168``). Upstream's
+        orphan reclamation sweeps the root home *and every profile home*
+        (``release_orphaned_leases``, ``:660-687``), so the occupancy hermesd
+        reports is one registry's — leases held under other profiles are invisible
+        here and a cross-profile capacity picture would need every home read.
+        """
+        data = self._read_json_confined(self._paths.profile_path("runtime", "active_sessions.json"))
+        entries: list[dict[str, Any]] = []
+        total_count = 0
+        for raw_entry in _as_list(data.get("entries")):
+            entry = _as_dict(raw_entry)
+            if str(entry.get("session_id") or ""):
+                total_count += 1
+                if len(entries) < _ACTIVE_SURFACE_LIMIT:
+                    entries.append(entry)
+        pids = sorted({_coerce_int(entry.get("pid")) for entry in entries} - {0})
+        observed = self._process_start_times(pids) if pids else {}
+        now = self._clock()
+        surfaces = []
+        for entry in entries:
+            pid = _coerce_int(entry.get("pid"))
+            raw_start = entry.get("process_start_time")
+            recorded = _coerce_float(raw_start) if raw_start is not None else 0.0
+            # Presence of metadata.shared_runtime_url is the whole joinable
+            # signal (hermes_cli/shared_session_attach.py:32-47): the value is
+            # never stored — only the boolean reaches the panel.
+            metadata = _as_dict(entry.get("metadata"))
+            surfaces.append(
+                ActiveSurface(
+                    session_id=str(entry.get("session_id") or ""),
+                    surface=str(entry.get("surface") or ""),
+                    pid=pid,
+                    # A non-positive stamp was never recorded; treating 0 as a real
+                    # epoch would compare against every observed start time.
+                    process_start_time=recorded if recorded > 0 else None,
+                    liveness=_surface_liveness(
+                        pid, recorded if recorded > 0 else None, observed, self._pid_exists
+                    ),
+                    lease_id=str(entry.get("lease_id") or ""),
+                    started_at_age_seconds=_lease_age_seconds(entry.get("started_at"), now),
+                    updated_at_age_seconds=_lease_age_seconds(entry.get("updated_at"), now),
+                    track_liveness=bool(entry.get("track_liveness")),
+                    joinable=bool(str(metadata.get("shared_runtime_url") or "")),
+                )
+            )
+        return _ActiveSurfaceReadout(surfaces=tuple(surfaces), total_count=total_count)
+
+    def _with_session_leases(self, coord: SessionCoordinationState) -> SessionCoordinationState:
+        """Turn leases and compression locks from the profile's ``state.db``.
+
+        PROFILE-scoped: upstream opens ``get_hermes_home()/"state.db"`` for
+        both tables (``hermes_state.py:160,178``; writers
+        ``hermes_state_compression.py:433-605``). See
+        ``.codex/rules/source-ownership.md`` (``session_leases``).
+        """
+        readout = self._read_state_db()
+        if readout is None:
+            last = self._last_good_by_source.get("session_leases")
+            if last is not None and last.lease_total:
+                raise RuntimeError("state.db session leases disappeared or became unsafe")
+            return coord
+        return coord.model_copy(
+            update=_session_lease_fields(
+                readout.coordination, now=self._clock(), pid_exists=self._pid_exists
+            )
+        )
+
+    def _with_gateway_hygiene(
+        self, coord: SessionCoordinationState, session_rows: list[dict[str, Any]]
+    ) -> SessionCoordinationState:
+        """Per-chat hygiene failure streaks (PROFILE ``state.db``, table
+        ``gateway_hygiene_state`` — ``hermes_state.py:160,178``). The raw
+        session rows join the recorded compression failure to each streak."""
+        readout = self._read_state_db()
+        if readout is None:
+            last = self._last_good_by_source.get("gateway_hygiene")
+            if last is not None and last.hygiene:
+                raise RuntimeError("state.db gateway hygiene disappeared or became unsafe")
+            return coord
+        return coord.model_copy(
+            update=_hygiene_fields(readout.coordination.hygiene_rows, session_rows)
+        )
+
+    def _with_gateway_routes(
+        self, coord: SessionCoordinationState, sessions: list[SessionInfo]
+    ) -> SessionCoordinationState:
+        """Decoded routing entries (PROFILE ``state.db``, table
+        ``gateway_routing`` — ``hermes_state.py:160,178``; payload writer
+        ``gateway/session.py:535-545``). Dangling routes are those whose
+        session id has no row in the (possibly last-good) session list."""
+        readout = self._read_state_db()
+        if readout is None:
+            last = self._last_good_by_source.get("gateway_routes")
+            if last is not None and last.route_total:
+                raise RuntimeError("state.db gateway routes disappeared or became unsafe")
+            return coord
+        known = frozenset(session.session_id for session in sessions if session.session_id)
+        return coord.model_copy(
+            update=_gateway_route_fields(
+                readout.coordination.routing_rows,
+                route_total=readout.coordination.routing_total,
+                now=self._clock(),
+                known_session_ids=known,
+            )
+        )
+
+    def _with_generation_churn(self, coord: SessionCoordinationState) -> SessionCoordinationState:
+        """Conversation generations (PROFILE ``state.db`` —
+        ``hermes_state.py:160,178``). The table is deliberately never
+        garbage-collected upstream (``hermes_state_common.py:460-487``), so the
+        row count is remembered across refreshes and a shrink sets the panel's
+        invariant-break warning. The remembered count advances only on a
+        successful read; a failed source never invents a shrink."""
+        readout = self._read_state_db()
+        if readout is None:
+            last = self._last_good_by_source.get("generation_churn")
+            if last is not None and last.generation_chat_total:
+                raise RuntimeError("state.db generations disappeared or became unsafe")
+            return coord
+        rows = readout.coordination
+        shrank = (
+            self._last_generation_chat_count is not None
+            and rows.generation_chat_total < self._last_generation_chat_count
+        )
+        self._last_generation_chat_count = rows.generation_chat_total
+        return coord.model_copy(
+            update={
+                **_generation_fields(rows),
+                "generation_count_shrank": shrank,
+            }
+        )
+
+    def _collect_terminal_sessions(self) -> TerminalSessionReadout:
+        """Recent terminal breadcrumbs from ``terminal-sessions/``.
+
+        PROFILE-scoped, agreeing with upstream: the writer resolves the
+        directory through ``get_hermes_home()`` and prunes entries older than
+        30 days (``hermes_cli/terminal_breadcrumbs.py:19-21,26-28,63-73,85-92``).
+        Files within the last 24 hours are the "open CLI terminals" upper
+        bound — a breadcrumb proves the terminal *recorded* a session recently,
+        not that the terminal is still alive, so the copy says "at most".
+
+        The listing and every file read are bounded: dotfiles (the writer's
+        ``.{tid}.tmp`` intermediates) and symlinks are skipped, contents go
+        through the capped reader, and junk payloads read as absent.
+        """
+        directory = self._paths.profile_path("terminal-sessions")
+        home = self._paths.profile_home
+        if not _safe_child_path(directory, home) or not directory.is_dir():
+            return TerminalSessionReadout()
+        now = self._clock()
+        rows: list[TerminalBreadcrumb] = []
+        count = 0
+        for entry in sorted(directory.iterdir(), key=lambda path: path.name)[
+            :_TERMINAL_SESSION_SCAN_LIMIT
+        ]:
+            if entry.name.startswith(".") or not entry.is_file():
+                continue
+            if entry.is_symlink() or not _path_resolves_under(entry, home):
+                continue
+            try:
+                data = json.loads(_read_text_capped(entry, home))
+            except (json.JSONDecodeError, UnicodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            ts = _coerce_float(data.get("ts")) or _mtime(entry)
+            age = _age_seconds(ts or None, now)
+            if age is None or age > _TERMINAL_SESSION_WINDOW_SECONDS:
+                continue
+            count += 1
+            if len(rows) < _TERMINAL_SESSION_ROW_LIMIT:
+                rows.append(
+                    TerminalBreadcrumb(
+                        terminal=_sanitized_file_label(entry.name),
+                        session_id=str(data.get("session_id") or ""),
+                        cwd=str(data.get("cwd") or ""),
+                        age_seconds=age,
+                    )
+                )
+        return TerminalSessionReadout(sessions=rows, count=count)
+
+    def _last_model_usage(self) -> _ModelUsageBundle:
+        bundle: _ModelUsageBundle = self._last_good_by_source.get(
+            "model_usage", _EMPTY_MODEL_USAGE_BUNDLE
+        )
+        return bundle
 
     def _collect_tokens_today(self, rows: list[dict[str, Any]] | None = None) -> TokenSummary:
         rows = self._session_rows_or_read(rows)
         return _summarize_tokens(
             rows,
-            started_at_min=_today_epoch(),
+            started_at_min=_today_epoch(self._clock()),
         )
 
     def _collect_tokens_total(self, rows: list[dict[str, Any]] | None = None) -> TokenSummary:
@@ -715,6 +2136,15 @@ class Collector:
         return sum(r.get("tool_call_count") or 0 for r in rows)
 
     def _collect_background_processes(self) -> list[BackgroundProcessInfo]:
+        # hermes-agent >= 0.21 registers live processes in spawn-ledger.json;
+        # processes.json is the legacy (now usually empty) registry.
+        ledger = self._read_json_list_cached(self._paths.shared_path("spawn-ledger.json"))
+        if ledger:
+            return [
+                _background_process_from_ledger(entry, self._pid_exists)
+                for entry in ledger
+                if _coerce_int(entry.get("pid")) > 0 or str(entry.get("session_id") or "")
+            ]
         entries = self._read_json_list_cached(self._paths.shared_path("processes.json"))
         return [
             BackgroundProcessInfo(
@@ -735,12 +2165,35 @@ class Collector:
                 watcher_message_id=str(entry.get("watcher_message_id") or ""),
                 watcher_interval=_coerce_int(entry.get("watcher_interval")),
                 watch_patterns=[str(item) for item in _as_list(entry.get("watch_patterns"))],
+                alive=self._process_alive(_coerce_int(entry.get("pid"))),
             )
             for entry in entries
             if str(entry.get("session_id") or "")
         ]
 
+    def _process_alive(self, pid: int) -> bool:
+        return bool(pid) and self._pid_exists(pid)
+
     def _collect_available_tools(self) -> tuple[int, list[str]]:
+        banner_names = self._banner_snapshot_tool_names()
+        if banner_names:
+            return len(banner_names), banner_names
+        return self._session_file_tool_names()
+
+    def _banner_snapshot_tool_names(self) -> list[str]:
+        """Tool names from cache/banner_snapshot.json, the live tool inventory."""
+        return sorted(_tool_names_from_entries(self._banner_snapshot().get("tools")))
+
+    def _collect_toolset_availability(self) -> ToolsetAvailability:
+        return _toolset_availability(self._banner_snapshot())
+
+    def _banner_snapshot(self) -> JsonMapping:
+        path = self._paths.shared_path("cache", "banner_snapshot.json")
+        if not _safe_child_path(path, self._paths.root_home):
+            return {}
+        return self._read_json_cached(path)
+
+    def _session_file_tool_names(self) -> tuple[int, list[str]]:
         sessions_root = self._paths.profile_path("sessions")
         sessions_index = sessions_root / "sessions.json"
         if sessions_index.is_symlink() or not _path_resolves_under(sessions_index, sessions_root):
@@ -759,9 +2212,10 @@ class Collector:
         # invalidate the cache even when the index itself is not rewritten;
         # track each path with nanosecond mtime and size (not just the max) so
         # equal/coarse mtimes and filename swaps still invalidate correctly.
-        session_file_signatures = tuple(
-            sorted((_file_signature(path) for path in session_files), key=str)
-        )
+        # The directory mtime cannot replace these per-file stats: on POSIX it
+        # only changes on create/delete/rename, never on a content-only edit.
+        signatures = {str(path): _file_signature(path) for path in session_files}
+        session_file_signatures = tuple(sorted(signatures.values(), key=str))
         cache_key = (sessions_signature, session_file_signatures)
         if sessions_signature is not None and self._available_tools_cache_key == cache_key:
             return self._available_tools_cache_value
@@ -770,24 +2224,43 @@ class Collector:
             self._available_tools_cache_value = (0, [])
             return 0, []
         names: set[str] = set()
+        # Cache the extracted names per file, not the parsed document: routing
+        # every session file through the last-good file cache kept every session
+        # JSON alive for the lifetime of the process.
+        fresh_name_cache: dict[str, tuple[tuple[str, int, int] | None, tuple[str, ...]]] = {}
         for session_file in session_files:
-            data = self._read_json_cached(session_file)
-            if isinstance(data, dict) and "tools" in data:
-                for t in _as_list(data["tools"]):
-                    if isinstance(t, dict):
-                        name = t.get("function", {}).get("name") or t.get("name", "")
-                    else:
-                        name = str(t)
-                    if name:
-                        names.add(name)
+            key = str(session_file)
+            signature = signatures[key]
+            cached = self._session_tool_names_cache.get(key)
+            if cached is not None and signature is not None and cached[0] == signature:
+                file_names = cached[1]
+            else:
+                file_names = tuple(
+                    sorted(
+                        _tool_names_from_entries(
+                            _read_session_tools(session_file),
+                            allow_bare_names=True,
+                        )
+                    )
+                )
+            fresh_name_cache[key] = (signature, file_names)
+            names.update(file_names)
+        self._session_tool_names_cache = fresh_name_cache
         tool_names = sorted(names)
         self._available_tools_cache_key = cache_key
         self._available_tools_cache_value = (len(tool_names), tool_names)
         return self._available_tools_cache_value
 
     def _collect_config(self) -> ConfigSummary:
-        cfg = self._read_yaml_cached()
+        cfg = self._read_yaml_reporting_stale()
         if not cfg:
+            # A config.yaml that parses to nothing after a good read is a
+            # truncated or emptied write, not a real "no configuration": fail
+            # the source so the last-good summary survives instead of blanking
+            # the config panel (same guard shape as the kanban.db readers).
+            last = self._last_good_by_source.get("config")
+            if last is not None and last != ConfigSummary():
+                raise RuntimeError("config.yaml parsed empty")
             return ConfigSummary()
         model_cfg = _as_dict(cfg.get("model"))
         agent_cfg = _as_dict(cfg.get("agent"))
@@ -810,25 +2283,27 @@ class Collector:
         auxiliary_cfg = _as_dict(cfg.get("auxiliary"))
         moa_cfg = _as_dict(cfg.get("moa"))
         moa_summary = _moa_config_summary(moa_cfg)
-        personality = agent_cfg.get("active_personality", "")
+        personality = str(agent_cfg.get("active_personality") or "")
         if not personality:
             personalities = _as_dict(agent_cfg.get("personalities"))
             if personalities:
-                personality = next(iter(personalities))
+                personality = str(next(iter(personalities)))
         dashboard_auth_provider = str(
             dashboard_cfg.get("auth_provider")
             or dashboard_cfg.get("auth")
             or self._env.get("HERMES_DASHBOARD_AUTH_PROVIDER", "")
         )
         return ConfigSummary(
-            model=model_cfg.get("default", ""),
-            provider=model_cfg.get("provider", ""),
+            # Raw YAML may hold null or a wrong type for any of these keys; a
+            # bare .get(key, default) would fail the whole config source.
+            model=str(model_cfg.get("default") or ""),
+            provider=str(model_cfg.get("provider") or ""),
             personality=personality,
-            max_turns=agent_cfg.get("max_turns", 0),
-            compression_threshold=comp_cfg.get("threshold", 0.0),
-            reasoning_effort=agent_cfg.get("reasoning_effort", ""),
-            security_redact=sec_cfg.get("redact_secrets", False),
-            approvals_mode=app_cfg.get("mode", ""),
+            max_turns=_coerce_int(agent_cfg.get("max_turns")),
+            compression_threshold=_coerce_float(comp_cfg.get("threshold")),
+            reasoning_effort=str(agent_cfg.get("reasoning_effort") or ""),
+            security_redact=bool(sec_cfg.get("redact_secrets")),
+            approvals_mode=str(app_cfg.get("mode") or ""),
             provider_routing_summary=_provider_routing_summary(provider_routing_cfg),
             smart_model_routing_enabled=bool(smart_cfg.get("enabled")),
             smart_model_routing_cheap_model=_provider_model_label(
@@ -878,6 +2353,53 @@ class Collector:
             moa_aggregator_label=moa_summary["aggregator_label"],
             moa_save_traces=bool(moa_cfg.get("save_traces")),
             moa_trace_dir=str(moa_cfg.get("trace_dir") or ""),
+            **_config_agent_limits(cfg),
+        )
+
+    def _with_config_backups(self, current: ConfigSummary) -> ConfigSummary:
+        """Group the point-in-time config copies recorded beside config.yaml.
+
+        Upstream writes ``config.yaml.<reason>.<YYYYMMDD-HHMMSS>`` copies under
+        ``<config dir>/backups/config`` (``hermes_cli/config_backups.py:29-69``),
+        keeping the newest five per reason and skipping byte-identical repeats.
+        The config path upstream copies is ``get_config_path()`` —
+        ``hermes_constants.py:1132-1135`` — so the directory inherits whatever
+        home that resolves to; hermesd keeps the ROOT copy on purpose, the same
+        decision as the ``config`` source (see .codex/rules/source-ownership.md).
+
+        Consequences worth rendering honestly: a "good" copy lands only when
+        config.yaml's bytes change, so an old stamp means *unchanged*, not
+        stale; and the stamps are the writer's local time.
+        """
+        backups_dir = self._paths.shared_path("backups", "config")
+        if not _exists_strict(backups_dir) or not backups_dir.is_dir():
+            return current.model_copy(
+                update={
+                    "config_backups_present": False,
+                    "config_backup_groups": [],
+                    "config_backup_groups_truncated": False,
+                }
+            )
+        if backups_dir.is_symlink() or not _path_resolves_under(backups_dir, self._paths.root_home):
+            # Same hardening as the curator run-dir scan: a planted symlink must
+            # fail this source (keeping last-good) instead of being read.
+            raise RuntimeError(f"unsafe config backups directory: {backups_dir.name}")
+        # The directory scan is bounded before sorting: a hostile directory can
+        # hold far more entries than the five-per-reason writer would leave.
+        examined = list(islice(backups_dir.iterdir(), _CONFIG_BACKUP_ENTRY_LIMIT + 1))
+        scan_truncated = len(examined) > _CONFIG_BACKUP_ENTRY_LIMIT
+        entries = sorted(
+            entry.name
+            for entry in examined[:_CONFIG_BACKUP_ENTRY_LIMIT]
+            if entry.is_file() and not entry.is_symlink()
+        )
+        groups, groups_truncated = _config_backup_groups(entries, now=self._clock())
+        return current.model_copy(
+            update={
+                "config_backups_present": True,
+                "config_backup_groups": groups,
+                "config_backup_groups_truncated": scan_truncated or groups_truncated,
+            }
         )
 
     def _collect_tool_gateway_routes(self, cfg: dict[str, Any]) -> list[ToolGatewayRoute]:
@@ -896,7 +2418,7 @@ class Collector:
         return routes
 
     def _collect_cron(self) -> CronState:
-        cfg = self._read_yaml_cached()
+        cfg = self._read_yaml_reporting_stale()
         cron_cfg = _as_dict(cfg.get("cron"))
         tick_path = self._paths.shared_path("cron", ".tick.lock")
         last_tick: float | None = None
@@ -909,6 +2431,7 @@ class Collector:
 
         jobs: list[CronJob] = []
         error_count = 0
+        now = self._clock()
         data = self._read_json_cached(self._paths.shared_path("cron", "jobs.json"))
         if data:
             directory = self._read_json_cached(self._paths.shared_path("channel_directory.json"))
@@ -929,13 +2452,22 @@ class Collector:
                     self._log_tail_bytes,
                 )
                 last_status = j.get("last_status")
+                # A raw null must fall back to the model default, not fail the job.
+                raw_enabled = j.get("enabled", True)
+                enabled = True if raw_enabled is None else bool(raw_enabled)
+                dispatch_lateness, dispatch_kind = _cron_job_dispatch(j)
+                repeat_times, repeat_completed = _cron_job_repeat(j)
+                paused, paused_reason = _cron_job_paused(j)
+                fire_claim_age, fire_claim_state = _cron_job_fire_claim(j, now=now)
+                pending_slot_at, pending_slot_age = _cron_job_pending_slot(j, now=now)
+                fire_error, fire_error_age = _cron_job_fire_error(j, now=now)
                 jobs.append(
                     CronJob(
                         job_id=str(j.get("id") or ""),
                         name=str(j.get("name") or ""),
                         schedule_display=str(j.get("schedule_display") or ""),
                         state=state,
-                        enabled=j.get("enabled", True),
+                        enabled=enabled,
                         deliver=str(j.get("deliver") or ""),
                         delivery_target_label=_delivery_target_label(
                             directory,
@@ -948,11 +2480,50 @@ class Collector:
                         next_run_at=str(j.get("next_run_at") or ""),
                         last_status=str(last_status) if last_status is not None else None,
                         last_error=str(j.get("last_error") or ""),
+                        failure_streak=_coerce_int(j.get("failure_streak")),
+                        paused=paused,
+                        paused_reason=paused_reason,
+                        last_delivery_error=str(j.get("last_delivery_error") or ""),
+                        dispatch_lateness_seconds=dispatch_lateness,
+                        dispatch_kind=dispatch_kind,
+                        repeat_times=repeat_times,
+                        repeat_completed=repeat_completed,
+                        no_agent=bool(j.get("no_agent")),
+                        model=str(j.get("model") or ""),
+                        provider=str(j.get("provider") or ""),
+                        fire_claim_age_seconds=fire_claim_age,
+                        fire_claim_state=fire_claim_state,
+                        pending_slot_scheduled_at=pending_slot_at,
+                        pending_slot_age_seconds=pending_slot_age,
+                        last_fire_error=fire_error,
+                        last_fire_error_age_seconds=fire_error_age,
+                        preflight_alerted=bool(j.get("preflight_alerted")),
+                        model_snapshot=str(j.get("model_snapshot") or ""),
+                        provider_snapshot=str(j.get("provider_snapshot") or ""),
                     )
                 )
 
+        cron_dir = self._paths.shared_path("cron")
+        root = self._paths.root_home
+        heartbeat_age, last_success_age = _cron_ticker_ages(cron_dir, now=now, root=root)
+        ticker_error, ticker_error_age = _cron_ticker_last_error(cron_dir, now=now, root=root)
+        catch_up_count, catch_up_recorded = _cron_catch_up_occurrences(cron_dir, root)
+        catch_up_missed, catch_up_missed_set = _cron_catch_up_policy(cron_cfg)
         return CronState(
             last_tick_ago_seconds=last_tick,
+            ticker_heartbeat_age_seconds=heartbeat_age,
+            ticker_last_success_age_seconds=last_success_age,
+            ticker_health=_cron_ticker_health(
+                heartbeat_age,
+                last_success_age,
+                ticker_error_recorded=bool(ticker_error),
+            ),
+            ticker_last_error=ticker_error,
+            ticker_last_error_age_seconds=ticker_error_age,
+            catch_up_occurrences=catch_up_count,
+            catch_up_occurrences_recorded=catch_up_recorded,
+            catch_up_missed=catch_up_missed,
+            catch_up_missed_set=catch_up_missed_set,
             job_count=len(jobs),
             error_count=error_count,
             max_parallel_jobs=_coerce_int(cron_cfg.get("max_parallel_jobs")),
@@ -965,8 +2536,26 @@ class Collector:
                 _as_dict(cron_cfg.get("chronos")).get("expected_audience")
             ),
             chronos_jwks_configured=bool(_as_dict(cron_cfg.get("chronos")).get("nas_jwks_url")),
-            suggestion_count=_cron_suggestion_count(self._paths.shared_path("cron")),
+            suggestion_count=_cron_suggestion_count(cron_dir),
             jobs=jobs,
+        )
+
+    def _collect_cron_executions(self, cron: CronState) -> CronExecutionsState:
+        """Execution history and incidents, named from the already-collected jobs."""
+        job_names = {job.job_id: job.name for job in cron.jobs if job.job_id}
+        db_path = self._paths.shared_path("cron", "executions.db")
+        # A database that still exists but no longer resolves under ~/.hermes
+        # was swapped for something else; that is a failure, not an absence.
+        if _exists_strict(db_path) and not _safe_child_path(db_path, self._paths.root_home):
+            last = self._last_good_by_source.get("cron_executions")
+            if last is not None and last.db_present:
+                raise RuntimeError("cron/executions.db replaced by unsafe path")
+            return CronExecutionsState()
+        return _read_cron_executions_state(
+            db_path,
+            job_names,
+            now=self._clock(),
+            root=self._paths.root_home,
         )
 
     def _collect_channels(self, gateway: GatewayState) -> ChannelDirectoryState:
@@ -1020,10 +2609,10 @@ class Collector:
         )
 
     def _collect_kanban(self) -> KanbanState:
-        cfg = self._read_yaml_cached()
+        cfg = self._read_yaml_reporting_stale()
         kanban_cfg = _as_dict(cfg.get("kanban"))
         base_state = KanbanState(
-            db_present=self._paths.shared_path("kanban.db").exists(),
+            db_present=_exists_strict(self._paths.shared_path("kanban.db")),
             current_board=self._read_current_kanban_board(),
             dispatch_in_gateway=bool(kanban_cfg.get("dispatch_in_gateway")),
             dispatch_interval_seconds=_coerce_int(kanban_cfg.get("dispatch_interval_seconds")),
@@ -1032,28 +2621,32 @@ class Collector:
             failure_limit=_coerce_int(kanban_cfg.get("failure_limit")),
         )
         db_path = self._paths.shared_path("kanban.db")
-        if not db_path.exists():
-            if self._last_state is not None and self._last_state.kanban.db_present:
+        last_kanban = self._last_good_by_source.get("kanban")
+        if not _exists_strict(db_path):
+            if last_kanban is not None and last_kanban.db_present:
                 raise RuntimeError("kanban.db disappeared")
             return self._with_kanban_boards(base_state)
         if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
-            if self._last_state is not None and self._last_state.kanban.db_present:
+            if last_kanban is not None and last_kanban.db_present:
                 raise RuntimeError("kanban.db replaced by unsafe path")
             return self._with_kanban_boards(base_state)
-        return self._with_kanban_boards(_read_kanban_state(db_path, base_state))
+        return self._with_kanban_boards(_read_kanban_state(db_path, base_state, now=self._clock()))
 
     def _read_current_kanban_board(self) -> str:
         path = self._paths.shared_path("kanban", "current")
+        last_kanban = self._last_good_by_source.get("kanban")
         if path.is_symlink() or not _path_resolves_under(path, self._paths.root_home):
-            if self._last_state is not None and self._last_state.kanban.current_board:
+            if last_kanban is not None and last_kanban.current_board:
                 raise RuntimeError("kanban current board replaced by unsafe path")
             return ""
         try:
-            return path.read_text(encoding="utf-8").strip()
+            with path.open("rb") as handle:
+                raw = handle.read(_MAX_TEXT_READ_BYTES)
         except OSError:
-            if self._last_state is not None and self._last_state.kanban.current_board:
+            if last_kanban is not None and last_kanban.current_board:
                 raise
-        return ""
+            return ""
+        return raw.decode("utf-8", errors="replace").strip()
 
     def _with_kanban_boards(self, state: KanbanState) -> KanbanState:
         boards: list[KanbanBoardSummary] = []
@@ -1100,6 +2693,7 @@ class Collector:
                         slug=board_dir.name,
                         current=board_dir.name == state.current_board,
                         claim_ttl_seconds=state.claim_ttl_seconds,
+                        now=self._clock(),
                     )
                 except (sqlite3.Error, OSError) as exc:
                     self._kanban_board_errors.append(
@@ -1117,6 +2711,47 @@ class Collector:
                 boards.append(summary)
         return state.model_copy(update={"board_count": len(boards), "boards": boards})
 
+    def _with_kanban_notify(self, state: KanbanState) -> KanbanState:
+        """Merge notify-subscription health into the board state.
+
+        Both the store and the profile names live at the root: kanban.db is
+        root-anchored upstream ("Shared across profiles BY DESIGN",
+        ``hermes_cli/kanban_db.py:382-401``) and ``profiles/`` is the root
+        profile store. An absent or unsafe kanban.db reads as no
+        subscriptions; the kanban source itself reports path problems.
+        """
+        db_path = self._paths.shared_path("kanban.db")
+        if (
+            not _exists_strict(db_path)
+            or db_path.is_symlink()
+            or not _path_resolves_under(db_path, self._paths.root_home)
+        ):
+            return state
+        return state.model_copy(
+            update=_read_kanban_notify(
+                db_path, known_profiles=self._kanban_notifier_profile_names()
+            )
+        )
+
+    def _kanban_notifier_profile_names(self) -> frozenset[str] | None:
+        """Profile names under the root ``profiles/`` store, or None when the
+        store cannot be read safely (orphan detection stays silent rather than
+        reporting every stamped subscription orphaned)."""
+        profiles_dir = self._paths.shared_path("profiles")
+        if (
+            profiles_dir.is_symlink()
+            or not _path_resolves_under(profiles_dir, self._paths.root_home)
+            or not profiles_dir.is_dir()
+        ):
+            return None
+        return frozenset(
+            entry.name
+            for entry in profiles_dir.iterdir()
+            if entry.is_dir()
+            and not entry.is_symlink()
+            and _path_resolves_under(entry, profiles_dir)
+        )
+
     def _collect_operations(
         self,
         background_processes: list[BackgroundProcessInfo],
@@ -1124,7 +2759,9 @@ class Collector:
         dashboard_process_count = sum(
             1 for process in background_processes if _is_dashboard_process(process.command)
         )
-        desktop_stamp = self._read_json_cached(self._paths.shared_path("desktop-build-stamp.json"))
+        desktop_stamp = self._read_json_confined(
+            self._paths.shared_path("desktop-build-stamp.json")
+        )
         stamp_label = str(
             desktop_stamp.get("version")
             or desktop_stamp.get("stamp")
@@ -1134,26 +2771,49 @@ class Collector:
             or str(desktop_stamp.get("contentHash") or "")[:12]
             or ""
         )
+        web_ui_stamp = self._read_json_confined(self._paths.shared_path("web-ui-build-stamp.json"))
         operations = OperationsState(
             dashboard_process_count=dashboard_process_count,
             desktop_build_stamp=stamp_label,
             model_caches=self._collect_model_caches(),
             pr_monitors=self._collect_pr_monitors(),
+            web_ui_build_hash=str(web_ui_stamp.get("contentHash") or "")[:12],
+            web_ui_built_age_seconds=_iso_age_seconds(
+                str(web_ui_stamp.get("builtAt") or ""), self._clock()
+            ),
         )
         operations = self._with_response_store(operations)
         operations = self._with_verification_evidence(operations)
         operations = self._with_goals(operations)
         operations = self._with_moa_traces(operations)
-        return self._with_projects(operations)
+        operations = self._with_projects(operations)
+        # Two small marker stats that belong with the panel's forensics rows:
+        # the PROFILE checkpoint auto-prune marker and the ROOT corrupt
+        # spawn-ledger parking bay. Both degrade to "absent", never to an error.
+        return operations.model_copy(
+            update={
+                **_read_checkpoint_prune_marker(
+                    self._paths.profile_path("checkpoints", ".last_prune"),
+                    self._paths.profile_home,
+                    now=self._clock(),
+                ),
+                **_read_corrupt_ledger_marker(
+                    self._paths.shared_path("spawn-ledger.json.corrupt"),
+                    self._paths.root_home,
+                    now=self._clock(),
+                ),
+            }
+        )
 
     def _with_response_store(self, operations: OperationsState) -> OperationsState:
         db_path = self._paths.shared_path("response_store.db")
-        if not db_path.exists():
-            if self._last_state is not None and self._last_state.operations.response_store_present:
+        last = self._last_good_by_source.get("operations")
+        if not _exists_strict(db_path):
+            if last is not None and last.response_store_present:
                 raise RuntimeError("response_store.db disappeared")
             return operations
         if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
-            if self._last_state is not None and self._last_state.operations.response_store_present:
+            if last is not None and last.response_store_present:
                 raise RuntimeError("response_store.db replaced by unsafe path")
             return operations
         with _connect_readonly_sqlite(db_path) as conn:
@@ -1169,12 +2829,16 @@ class Collector:
 
     def _with_verification_evidence(self, operations: OperationsState) -> OperationsState:
         db_path = self._paths.profile_path("verification_evidence.db")
-        if not db_path.exists():
-            if self._last_state is not None and self._last_state.operations.verification_db_present:
+        last = self._last_good_by_source.get("operations")
+        if not _exists_strict(db_path):
+            if last is not None and last.verification_db_present:
                 raise RuntimeError("verification_evidence.db disappeared")
             return operations
-        if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
-            if self._last_state is not None and self._last_state.operations.verification_db_present:
+        # Confined to profile_home, not root_home: a path that resolves into a
+        # *sibling* profile is still under the root, and this source is
+        # profile-scoped (see .codex/rules/source-ownership.md).
+        if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.profile_home):
+            if last is not None and last.verification_db_present:
                 raise RuntimeError("verification_evidence.db replaced by unsafe path")
             return operations
         with _connect_readonly_sqlite(db_path) as conn:
@@ -1183,7 +2847,7 @@ class Collector:
             return _read_verification_evidence(conn, operations)
 
     def _with_moa_traces(self, operations: OperationsState) -> OperationsState:
-        cfg = self._read_yaml_cached()
+        cfg = self._read_yaml_reporting_stale()
         moa_cfg = _as_dict(cfg.get("moa"))
         trace_dir_value = str(moa_cfg.get("trace_dir") or "")
         trace_dir = (
@@ -1198,7 +2862,8 @@ class Collector:
             or not _path_resolves_under(trace_dir, self._paths.root_home)
             or not trace_dir.is_dir()
         ):
-            if self._last_state is not None and self._last_state.operations.moa_trace_count:
+            last = self._last_good_by_source.get("operations")
+            if last is not None and last.moa_trace_count:
                 raise RuntimeError("MoA trace directory disappeared or became unsafe")
             return operations
         traces = [
@@ -1225,12 +2890,15 @@ class Collector:
 
     def _with_projects(self, operations: OperationsState) -> OperationsState:
         db_path = self._paths.profile_path("projects.db")
-        if not db_path.exists():
-            if self._last_state is not None and self._last_state.operations.projects_db_present:
+        last = self._last_good_by_source.get("operations")
+        if not _exists_strict(db_path):
+            if last is not None and last.projects_db_present:
                 raise RuntimeError("projects.db disappeared")
             return operations
-        if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
-            if self._last_state is not None and self._last_state.operations.projects_db_present:
+        # Confined to profile_home, not root_home: a sibling profile's projects.db
+        # is still under the root, and this source is profile-scoped.
+        if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.profile_home):
+            if last is not None and last.projects_db_present:
                 raise RuntimeError("projects.db replaced by unsafe path")
             return operations
         with _connect_readonly_sqlite(db_path) as conn:
@@ -1239,24 +2907,256 @@ class Collector:
             return _read_projects_state(conn, operations, self._paths)
 
     def _with_goals(self, operations: OperationsState) -> OperationsState:
+        """Apply every state.db-backed operations source from one open.
+
+        Goals, delegations and DB-maintenance metadata all live in state.db, so
+        they share the single (mtime-cached) readout with the gateway ledgers
+        rather than taking a WAL snapshot each.
+        """
+        readout = self._read_state_db()
+        if readout is None:
+            last = self._last_good_by_source.get("operations")
+            if last is not None and (
+                last.goal_count or last.delegation_count or last.state_db_schema_version
+            ):
+                raise RuntimeError("state.db operations data disappeared or became unsafe")
+            return operations
+        db_path = self._paths.profile_path("state.db")
+        update = _state_db_update(readout.state, now=self._clock(), pid_exists=self._pid_exists)
+        update["state_db_size_bytes"] = _file_size(db_path)
+        update["state_db_wal_size_bytes"] = _file_size(db_path.with_name(f"{db_path.name}-wal"))
+        update["delegation_live_log_count"] = _count_delegation_live_logs(
+            self._paths.shared_path("cache", "delegation", "live"),
+            self._paths.root_home,
+        )
+        return operations.model_copy(update=update)
+
+    def _read_state_db(self) -> _StateDbReadout | None:
+        """Operations tables and gateway ledgers from one state.db pass; None when absent.
+
+        Runs on the connection HermesDB already holds for the very same
+        state.db, so the WAL is snapshotted once per change instead of twice
+        per tick; the readout is redone only when state.db (or its -wal)
+        changes and is shared by every source in a pass.
+        """
         db_path = self._paths.profile_path("state.db")
         if (
-            not db_path.exists()
+            not _exists_strict(db_path)
             or db_path.is_symlink()
-            or not _path_resolves_under(db_path, self._paths.root_home)
+            # Confined to profile_home, not root_home: a sibling profile's
+            # state.db is still under the root, and this source is
+            # profile-scoped. In root mode profile_home is root_home.
+            or not _path_resolves_under(db_path, self._paths.profile_home)
         ):
-            if self._last_state is not None and self._last_state.operations.goal_count:
-                raise RuntimeError("state.db goal state disappeared or became unsafe")
+            return None
+        mtime = _db_source_mtime_ns(db_path)
+        cached = self._state_db_cache
+        if cached is not None and mtime is not None and cached[0] == mtime:
+            return cached[1]
+        readout = self._db.run_readout(_state_db_readout)
+        if mtime is not None:
+            self._state_db_cache = (mtime, readout)
+        return readout
+
+    def _with_blocked_scripts(self, operations: OperationsState) -> OperationsState:
+        return operations.model_copy(
+            update=_read_blocked_scripts(
+                self._paths.shared_path("cache", "blocked-scripts"),
+                self._paths.root_home,
+                now=self._clock(),
+            )
+        )
+
+    def _with_state_snapshots(self, operations: OperationsState) -> OperationsState:
+        return operations.model_copy(
+            update=_read_state_snapshots(
+                self._paths.shared_path("state-snapshots"),
+                self._paths.root_home,
+                now=self._clock(),
+            )
+        )
+
+    def _with_db_recovery(self, operations: OperationsState) -> OperationsState:
+        """Recovery artifacts beside the profile-scoped ``state.db``.
+
+        PROFILE-scoped, and it agrees with upstream: the database hermes-agent
+        repairs is ``get_hermes_home()/"state.db"`` (``hermes_state.py:160``,
+        repair invoked at ``:535``), and every artifact is written as a sibling of
+        it (``hermes_state_repair.py:317``, ``hermes_state_dbfile.py:228``). The
+        scan is therefore confined to ``profile_home``, not ``root_home``: a
+        sibling profile's ledger is that profile's evidence, not this one's. See
+        ``.codex/rules/source-ownership.md``.
+
+        Nothing here repairs, checkpoints, integrity-checks or hashes the
+        database — only a bounded directory listing, ``stat`` on name-matched
+        entries, and two small JSON manifests. Read errors and corrupt manifests
+        propagate so this source alone falls back to its last-good value.
+        """
+        db_path = self._paths.profile_path("state.db")
+        return operations.model_copy(
+            update={
+                "db_recovery": _read_db_recovery(
+                    db_path, self._paths.profile_home, now=self._clock()
+                )
+            }
+        )
+
+    def _with_hosted_rooms(self, operations: OperationsState) -> OperationsState:
+        """Hosted-room coordination from the ROOT ``shared-state.db``.
+
+        ROOT-scoped *and* deliberately not the master ``state.db``:
+        ``gateway/hosted_rooms.py:398-414`` resolves the hosted-room database to
+        ``<root>/shared-state.db`` even for a profile gateway, because pointing
+        profile gateways at the session store makes every profile process a
+        long-lived writer on it. Upstream pins that with its own test
+        (``tests/gateway/test_hosted_rooms.py:1344-1364``). The live ``state.db``
+        still carries empty legacy ``hosted_room*`` tables, so reading *that*
+        file would report a dead table as the coordination state. See
+        ``.codex/rules/source-ownership.md``.
+
+        Content-free: grants, link catalogs and target URLs, event payloads and
+        actors, revoked-grant scope keys and the ``hosted_room_policy_*``
+        transcript tables are never selected. An absent database is not a
+        failure; one lost or made unsafe after a good read raises so this source
+        keeps its last-good value.
+        """
+        db_path = self._paths.shared_path("shared-state.db")
+        last = self._last_good_by_source.get("hosted_rooms")
+        if not _exists_strict(db_path):
+            if last is not None and last.hosted_rooms.db_present:
+                raise RuntimeError("shared-state.db disappeared")
+            return operations
+        # The symlink test is the load-bearing half: shared_path() can only
+        # resolve outside root_home through a link, and this source is ROOT-scoped
+        # so root_home is the confinement boundary (as in _with_response_store).
+        if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
+            if last is not None and last.hosted_rooms.db_present:
+                raise RuntimeError("shared-state.db replaced by unsafe path")
             return operations
         with _connect_readonly_sqlite(db_path) as conn:
             conn.row_factory = sqlite3.Row
-            return _read_goal_state(conn, operations)
+            conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+            hosted_rooms = _read_hosted_rooms(
+                conn, now=self._clock(), db_size_bytes=_file_size(db_path)
+            )
+        return operations.model_copy(update={"hosted_rooms": hosted_rooms})
+
+    def _with_api_runs(self, operations: OperationsState) -> OperationsState:
+        """Retained API run reservations from ``runs_idempotency.db``.
+
+        PROFILE-scoped, and it agrees with upstream:
+        ``gateway/platforms/api_server_run_idempotency.py:67`` resolves
+        ``get_hermes_home()/"runs_idempotency.db"``. That is the opposite of the
+        ROOT-scoped ``shared-state.db`` read beside it, and the two are documented
+        as separate rows in ``.codex/rules/source-ownership.md`` for exactly that
+        reason.
+
+        ``fingerprint``, ``idempotency_key`` and ``scope`` are never selected. An
+        absent or empty store is *not* reported as "no API activity": upstream
+        prunes an aged row only once its status is terminal, and falls back to
+        process memory when the file cannot be opened — a fallback hermesd cannot
+        observe, because the ``durable`` capability is only served over HTTP.
+        """
+        db_path = self._paths.profile_path("runs_idempotency.db")
+        last = self._last_good_by_source.get("api_runs")
+        if not _exists_strict(db_path):
+            if last is not None and last.api_runs.db_present:
+                raise RuntimeError("runs_idempotency.db disappeared")
+            return operations
+        # Confined to profile_home, not root_home: a sibling profile's store is
+        # still under the root, and this source is profile-scoped.
+        if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.profile_home):
+            if last is not None and last.api_runs.db_present:
+                raise RuntimeError("runs_idempotency.db replaced by unsafe path")
+            return operations
+        with _connect_readonly_sqlite(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+            api_runs = _read_api_runs(
+                conn,
+                now=self._clock(),
+                db_size_bytes=_file_size(db_path),
+                pid_exists=self._pid_exists,
+            )
+        return operations.model_copy(update={"api_runs": api_runs})
+
+    def _with_delegation_live(self, operations: OperationsState) -> OperationsState:
+        """Live delegation manifests from ``cache/delegation/live/``.
+
+        ROOT-scoped, matching the ``delegation_live_log_count`` read beside it in
+        `_with_goals` — an existing open divergence recorded in
+        ``.codex/rules/source-ownership.md``: upstream resolves the directory
+        through ``get_hermes_dir("cache/delegation", "delegation_cache")/live``
+        (``tools/delegation_live_log.py:40-43``), i.e. the profile home, while
+        hermesd keeps the whole delegation cluster on the root resolver.
+
+        The manifest is written at dispatch and amended after the batch joins
+        (``tools/delegation_live_log.py:255-287``). Nothing here reads the live
+        roster: per-task tool counts, steer state and depth exist only in
+        gateway memory and over RPC. Absent directory, junk manifests and
+        symlinked run dirs are healthy empty defaults, never errors.
+        """
+        live_root = self._paths.shared_path("cache", "delegation", "live")
+        return operations.model_copy(
+            update=_read_delegation_live_manifests(
+                live_root,
+                self._paths.root_home,
+                now=self._clock(),
+            )
+        )
+
+    def _with_process_receipts(self, operations: OperationsState) -> OperationsState:
+        """Recently finished background processes from ``logs/process-results/``.
+
+        PROFILE-scoped, and it agrees with upstream:
+        ``tools/process_registry_results.py:30,58`` resolves
+        ``get_hermes_home()/"logs"/"process-results"`` — the same
+        ``get_hermes_home()`` anchor as the registry checkpoint at
+        ``tools/process_registry.py:41,45-50`` that the ownership table already
+        records. That is the opposite of the ROOT ``spawn-ledger.json``: the two
+        registries are deliberately not the same scope.
+
+        Absence is normal (7-day retention, 64-file cap), so a missing or
+        unsafe directory reads as an empty state rather than a failed source.
+        """
+        receipts_dir = self._paths.profile_path("logs", "process-results")
+        return operations.model_copy(
+            update={
+                "process_receipts": _read_process_receipts(
+                    receipts_dir,
+                    self._paths.profile_home,
+                    now=self._clock(),
+                )
+            }
+        )
 
     def _collect_curator(self) -> CuratorRun:
+        # Read the scheduler state and curator config once for the whole pass;
+        # both the no-run fallback and the populated run apply the same overlay.
+        scheduler_state = self._read_json_cached(
+            self._paths.profile_path("skills", ".curator_state")
+        )
+        curator_cfg = _as_dict(self._read_yaml_reporting_stale().get("curator"))
+        stale_days, archive_days, thresholds_customized = _curator_thresholds(curator_cfg)
+        # skills/.usage.json is PROFILE-scoped (tools/skill_usage.py:50): the
+        # patch-reuse loop and per-skill threshold windows describe the
+        # selected profile's library, while the thresholds themselves are the
+        # ROOT config's curator overrides — the existing mixed `curator` row.
+        hygiene = _skill_curation_hygiene(
+            self._read_json_cached(self._paths.profile_path("skills", ".usage.json")),
+            now=self._clock(),
+            stale_after_days=stale_days,
+            archive_after_days=archive_days,
+        )
         base_run = _curator_with_scheduler_state(
-            CuratorRun(),
-            self._read_json_cached(self._paths.profile_path("skills", ".curator_state")),
-            _as_dict(self._read_yaml_cached().get("curator")),
+            CuratorRun(), scheduler_state, curator_cfg
+        ).model_copy(
+            update={
+                "stale_after_days": stale_days,
+                "archive_after_days": archive_days,
+                "thresholds_customized": thresholds_customized,
+                **hygiene,
+            }
         )
         curator_dir = self._paths.shared_path("logs", "curator")
         if (
@@ -1318,8 +3218,8 @@ class Collector:
                 llm_summary=str(data.get("llm_summary") or ""),
                 llm_error=str(data.get("llm_error") or ""),
             ),
-            self._read_json_cached(self._paths.profile_path("skills", ".curator_state")),
-            _as_dict(self._read_yaml_cached().get("curator")),
+            scheduler_state,
+            curator_cfg,
         )
 
     def _collect_model_caches(self) -> list[ModelCacheSummary]:
@@ -1359,6 +3259,9 @@ class Collector:
                     "pr_monitor_*.json",
                     "pr-monitor/*.json",
                     "pr_monitor/*.json",
+                    # hermes-agent >= 0.21 keeps PR-monitor state here, next to
+                    # a .bak and a .lock sibling that the *.json glob excludes.
+                    "cron/state/pr_monitor*.json",
                 )
                 for path in base.glob(pattern)
                 if path.is_file() and not path.is_symlink() and _path_resolves_under(path, base)
@@ -1371,17 +3274,7 @@ class Collector:
             data = self._read_json_cached(path)
             if not data:
                 continue
-            summary = PRMonitorSummary(
-                filename=path.name,
-                repo=str(data.get("repo") or ""),
-                checked_at=str(data.get("checked_at") or ""),
-                monitored_count=_len_if_sized(data.get("prs"))
-                or _len_if_sized(data.get("monitored")),
-                tracked_count=_len_if_sized(data.get("tracked_numbers"))
-                or _len_if_sized(data.get("tracked")),
-                author_pr_count=_len_if_sized(data.get("author_prs"))
-                or _len_if_sized(data.get("author_pr_numbers")),
-            )
+            summary = _pr_monitor_summary(path.name, data)
             key = summary.repo or f"::{path.name}"
             existing = deduped.get(key)
             if existing is None or summary.checked_at > existing.checked_at:
@@ -1407,14 +3300,13 @@ class Collector:
                     skills.append(SkillInfo(name=skill_dir.name, category=cat, description=desc))
 
         mem_dir = self._paths.profile_path("memories")
-        mem_count = 0
-        if mem_dir.is_dir():
-            mem_count = sum(1 for f in mem_dir.iterdir() if f.is_file())
+        mem_count = len(_memory_file_names(mem_dir))
 
         auth_data = self._read_json_cached(self._paths.shared_path("auth.json"))
-        cfg = self._read_yaml_cached()
+        cfg = self._read_yaml_reporting_stale()
         boot_md = self._paths.shared_path("BOOT.md")
         providers = self._collect_providers(auth_data)
+        plugins, plugin_scan_truncated = self._collect_plugins(cfg)
         return SkillsMemory(
             skill_count=len(skills),
             skill_categories=len(categories),
@@ -1422,43 +3314,81 @@ class Collector:
             providers=providers,
             credential_pools=self._collect_credential_pools(auth_data),
             hooks=self._collect_hooks(),
-            plugins=self._collect_plugins(cfg),
+            plugins=plugins,
+            plugin_scan_truncated=plugin_scan_truncated,
             mcp_servers=self._collect_mcp_servers(cfg),
             boot_md_present=boot_md.exists(),
             boot_md_mtime=_mtime(boot_md),
             skills=skills,
         )
 
+    def _collect_mcp_cache(self) -> MCPSchemaCache:
+        path = self._paths.shared_path("cache", "mcp_schema_cache.json")
+        if not _safe_or_absent_child_path(path, self._paths.root_home):
+            return MCPSchemaCache()
+        if not path.is_file() or path.is_symlink():
+            return MCPSchemaCache()
+        return _mcp_schema_cache_summary(
+            self._read_json_reporting_stale(path),
+            self._file_age_seconds(path),
+            self._configured_mcp_server_names(),
+            # Entry TTL is evaluated against the injected clock, not the file
+            # mtime and not time.time(), so a frozen clock is testable.
+            self._clock(),
+        )
+
+    def _configured_mcp_server_names(self) -> list[str]:
+        """Every configured MCP server name, for cache-membership comparison.
+
+        ``ConfigSummary.mcp_server_names`` is display-bounded, so membership has
+        to be computed from the full set here: comparing against the truncated
+        list would report every configured server past the cap as uncached.
+        """
+        servers = _as_dict(self._read_yaml_reporting_stale().get("mcp_servers"))
+        return sorted(str(name) for name in servers)
+
+    def _collect_skills_prompt(self) -> SkillsPromptSnapshot:
+        path = self._paths.shared_path(".skills_prompt_snapshot.json")
+        if not _safe_or_absent_child_path(path, self._paths.root_home):
+            return SkillsPromptSnapshot()
+        return _skills_prompt_summary(
+            self._read_json_reporting_stale(path), self._file_age_seconds(path)
+        )
+
+    def _file_age_seconds(self, path: Path) -> float | None:
+        """Age of ``path`` against the injected clock, clamped at zero."""
+        return _age_seconds(_mtime(path), self._clock())
+
     def _collect_memory(self) -> MemoryOverview:
-        cfg = self._read_yaml_cached()
+        cfg = self._read_yaml_reporting_stale()
         memory_cfg = _as_dict(cfg.get("memory"))
         memories_dir = self._paths.profile_path("memories")
         soul_path = self._paths.profile_path("SOUL.md")
+        root = self._paths.root_home
 
-        memory_files = (
-            sorted(path.name for path in memories_dir.iterdir() if path.is_file())
-            if memories_dir.is_dir()
-            else []
-        )
+        memory_files = _memory_file_names(memories_dir)
+        memory_md = memories_dir / "MEMORY.md"
+        user_md = memories_dir / "USER.md"
         learning_summary = _learning_summary(
             self._paths.profile_path("skills"),
             self._read_json_cached(self._paths.profile_path("skills", ".usage.json")),
+            frontmatter=self._cached_frontmatter,
         )
 
         return MemoryOverview(
             provider=str(memory_cfg.get("provider") or ""),
             memory_file_count=len(memory_files),
-            memory_word_count=_word_count(memories_dir / "MEMORY.md"),
-            user_word_count=_word_count(memories_dir / "USER.md"),
+            memory_word_count=self._cached_word_count(memory_md, root),
+            user_word_count=self._cached_word_count(user_md, root),
             soul_size_bytes=_file_size(soul_path),
-            soul_excerpt=_read_soul_excerpt(soul_path),
+            soul_excerpt=self._cached_soul_excerpt(soul_path, root),
             memory_files=memory_files,
             skill_usage_count=learning_summary["used"],
             learned_skill_count=learning_summary["learned"],
             pinned_skill_count=learning_summary["pinned"],
             agent_created_skill_count=learning_summary["agent"],
-            memory_card_count=_memory_card_count(memories_dir / "MEMORY.md")
-            + _memory_card_count(memories_dir / "USER.md"),
+            memory_card_count=self._cached_card_count(memory_md, root)
+            + self._cached_card_count(user_md, root),
         )
 
     def _collect_hooks(self) -> list[HookInfo]:
@@ -1470,7 +3400,10 @@ class Collector:
         for hook_dir in sorted(hooks_dir.iterdir()):
             if not hook_dir.is_dir():
                 continue
-            manifest = self._file_cache.read_yaml_mapping(hook_dir / "HOOK.yaml")
+            manifest_path = hook_dir / "HOOK.yaml"
+            if not _safe_capped_file(manifest_path, hooks_dir):
+                continue
+            manifest = self._file_cache.read_yaml_mapping(manifest_path)
             if not manifest or not (hook_dir / "handler.py").exists():
                 continue
             events = manifest.get("events") or []
@@ -1485,39 +3418,314 @@ class Collector:
             )
         return hooks
 
-    def _collect_plugins(self, cfg: dict[str, Any]) -> list[PluginInfo]:
+    def _collect_plugins(self, cfg: dict[str, Any]) -> tuple[list[PluginInfo], bool]:
+        """Discovered plugins, plus whether the directory walk was cut short.
+
+        Both directory shapes upstream scans (``plugins_discovery.py:102-131``): a
+        flat ``<root>/<name>/`` keyed by its manifest name, and a category
+        ``<root>/<cat>/<name>/`` keyed by the path ``<cat>/<name>``. A directory
+        with no manifest is a *category*, not a plugin, and is recursed into once;
+        it is never reported on its own account.
+
+        Three manifest filenames are accepted, in upstream's precedence order, and
+        the losers are recorded rather than silently dropped. Every read is
+        confined to the plugins root and byte-capped, so — unlike upstream, which
+        accepts a symlinked ``plugin.json`` — a symlinked manifest is refused.
+        """
         plugins_dir = self._paths.shared_path("plugins")
         if not plugins_dir.is_dir():
-            return []
+            return [], False
 
-        disabled_cfg = _as_dict(cfg.get("plugins"))
-        disabled_list = disabled_cfg.get("disabled") or []
-        disabled = {str(name) for name in disabled_list if name}
+        plugins_cfg = _as_dict(cfg.get("plugins"))
+        enabled = plugin_name_set(plugins_cfg.get("enabled"))
+        disabled = plugin_name_set(plugins_cfg.get("disabled"))
+        # One file keyed by manifest name: read once per pass however many plugins
+        # were found, because a per-plugin read would be N opens of the same bytes.
+        install_metadata = self._read_install_metadata(plugins_dir)
 
-        plugins: list[PluginInfo] = []
-        for plugin_dir in sorted(plugins_dir.iterdir()):
-            if not plugin_dir.is_dir():
-                continue
-            manifest = self._file_cache.read_yaml_mapping(plugin_dir / "plugin.yaml")
-            if not manifest:
-                continue
-            dashboard_manifest = self._read_json_cached(plugin_dir / "dashboard" / "manifest.json")
-            tools = manifest.get("provides_tools") or []
-            hooks = manifest.get("provides_hooks") or manifest.get("hooks") or []
-            name = str(manifest.get("name") or plugin_dir.name)
-            plugins.append(
-                PluginInfo(
-                    name=name,
-                    version=str(manifest.get("version") or ""),
-                    description=str(manifest.get("description") or ""),
-                    source="user",
-                    enabled=name not in disabled,
-                    tool_count=len(tools) if isinstance(tools, list) else 0,
-                    hook_count=len(hooks) if isinstance(hooks, list) else 0,
-                    dashboard_enabled=bool(dashboard_manifest),
-                )
+        found, truncated = self._scan_plugin_dirs(plugins_dir)
+        plugins = [
+            self._read_plugin(
+                plugin_dir,
+                prefix,
+                choice,
+                plugins_dir,
+                enabled=enabled,
+                disabled=disabled,
+                install_metadata=install_metadata,
             )
-        return plugins
+            for plugin_dir, prefix, choice in found
+        ]
+        return plugins, truncated
+
+    def _with_desktop_plugins(self, current: SkillsMemory) -> SkillsMemory:
+        """Add the root app-extension inventory without coupling its health to skills."""
+        plugins, truncated = self._collect_desktop_plugins()
+        return current.model_copy(
+            update={
+                "desktop_plugins": plugins,
+                "desktop_plugin_scan_truncated": truncated,
+            }
+        )
+
+    def _with_plugin_catalog(self, current: SkillsMemory) -> SkillsMemory:
+        """Flag catalog drift, catalog removals and unmanaged installs.
+
+        Upstream compares an installed plugin's ``.hermes-catalog.json`` sha
+        with the live catalog's pin (``plugins_cmd_catalog.py:277-291``) and
+        blocks installs whose name/catalog name/repo is on the kill list
+        (``plugin_catalog.py:198-211``, ``plugins_cmd_catalog.py:96-103``). The
+        live catalog reaches disk through ``cache/plugin-catalog.json``
+        (``plugin_catalog.py:216-218``), refreshed on a 6h mtime TTL. hermesd
+        reads that cache from the ROOT home — the same divergence as the
+        ``plugins/`` directory it describes, kept so both sides of the
+        comparison describe one home (see .codex/rules/source-ownership.md).
+
+        No cache means no claims: update/removal flags stay False and the panel
+        says the checks are unavailable, never "everything is current".
+        """
+        cache_path = self._paths.shared_path("cache", "plugin-catalog.json")
+        if not _exists_strict(cache_path) or not cache_path.is_file():
+            return current.model_copy(
+                update={
+                    "plugin_catalog_cache_present": False,
+                    "plugin_catalog_cache_age_seconds": None,
+                    "plugin_catalog_update_count": 0,
+                    "plugin_catalog_removed_count": 0,
+                }
+            )
+        if cache_path.is_symlink() or not _path_resolves_under(cache_path, self._paths.root_home):
+            raise RuntimeError(f"unsafe plugin catalog cache: {cache_path.name}")
+        entries, removed = parse_catalog_cache(self._read_json_cached(cache_path))
+        plugins = [
+            self._flag_plugin_with_catalog(plugin, entries, removed) for plugin in current.plugins
+        ]
+        return current.model_copy(
+            update={
+                "plugins": plugins,
+                "plugin_catalog_cache_present": True,
+                "plugin_catalog_cache_age_seconds": self._file_age_seconds(cache_path),
+                "plugin_catalog_update_count": sum(
+                    1 for plugin in plugins if plugin.catalog_update_available
+                ),
+                "plugin_catalog_removed_count": sum(
+                    1 for plugin in plugins if plugin.catalog_removed
+                ),
+            }
+        )
+
+    def _flag_plugin_with_catalog(
+        self,
+        plugin: PluginInfo,
+        entries: dict[str, CatalogCacheEntry],
+        removed: list[RemovedCatalogEntry],
+    ) -> PluginInfo:
+        entry = entries.get(plugin.catalog_name) if plugin.catalog_name else None
+        update = catalog_update_available(plugin.catalog_sha, entry)
+        match = removed_catalog_match(
+            plugin.name, plugin.catalog_name, plugin.catalog_repo, removed=removed
+        )
+        if not update and match is None:
+            return plugin
+        return plugin.model_copy(
+            update={
+                "catalog_update_available": update,
+                "catalog_removed": match is not None,
+                "catalog_removed_reason": match.reason if match else "",
+            }
+        )
+
+    def _collect_desktop_plugins(self) -> tuple[list[DesktopPluginInfo], bool]:
+        """Read the app-level root defined by desktop-plugins-root.ts:1-38."""
+        return read_desktop_plugins(
+            self._paths.shared_path("desktop-plugins"),
+            self._paths.root_home,
+        )
+
+    def _scan_plugin_dirs(self, base: Path) -> tuple[list[tuple[Path, str, ManifestChoice]], bool]:
+        """``(plugin_dir, key prefix, winning manifest)`` triples under ``base``.
+
+        Bounded twice over, because ``~/.hermes`` is untrusted: at most
+        ``_PLUGIN_DIR_ENTRY_LIMIT`` entries of any one directory are examined, and
+        at most ``_PLUGIN_LIMIT`` plugin directories are retained. Either cap
+        firing sets the truncation flag the panel reports — a capped list must
+        never read as a complete inventory.
+        """
+        found: list[tuple[Path, str, ManifestChoice]] = []
+        truncated = False
+
+        def walk(scan: Path, prefix: str, depth: int) -> None:
+            nonlocal truncated
+            entries = sorted(islice(scan.iterdir(), _PLUGIN_DIR_ENTRY_LIMIT + 1))
+            if len(entries) > _PLUGIN_DIR_ENTRY_LIMIT:
+                truncated = True
+            for child in entries[:_PLUGIN_DIR_ENTRY_LIMIT]:
+                if not child.is_dir():
+                    continue
+                choice = choose_manifest(self._plugin_manifest_names(child, base))
+                if choice is not None:
+                    if len(found) >= _PLUGIN_LIMIT:
+                        truncated = True
+                        return
+                    found.append((child, prefix, choice))
+                elif depth < MAX_PLUGIN_SCAN_DEPTH and _path_resolves_under(child, base):
+                    # No manifest: a category, recursed into once. Past the cap
+                    # upstream logs "no plugin.yaml, depth cap reached" and stops.
+                    walk(child, category_prefix(prefix, child.name), depth + 1)
+
+        walk(base, "", 0)
+        return found, truncated
+
+    def _plugin_manifest_names(self, plugin_dir: Path, base: Path) -> tuple[str, ...]:
+        """Manifest filenames present in one plugin directory.
+
+        Returned in ``MANIFEST_NAMES`` order rather than in the order they were
+        stat'd, so :func:`choose_manifest` cannot be fed a readdir-order-dependent
+        candidate list. A symlink is refused outright and an oversized manifest is
+        refused by the byte cap: upstream accepts a symlinked ``plugin.json``,
+        hermesd does not, because this check is what stops a plugin tree from
+        steering a read outside ``~/.hermes``.
+        """
+        present: list[str] = []
+        for name in MANIFEST_NAMES:
+            path = plugin_dir / name
+            if _exists_strict(path) and _safe_capped_file(path, base):
+                present.append(name)
+        return tuple(present)
+
+    def _read_plugin(
+        self,
+        plugin_dir: Path,
+        prefix: str,
+        choice: ManifestChoice,
+        base: Path,
+        *,
+        enabled: frozenset[str],
+        disabled: frozenset[str],
+        install_metadata: JsonMapping,
+    ) -> PluginInfo:
+        """Build one plugin's record from its winning manifest and its sidecars."""
+        portable = choice.filename == PORTABLE_MANIFEST_NAME
+        manifest_path = plugin_dir / choice.filename
+        raw = (
+            self._read_json_cached(manifest_path)
+            if portable
+            else self._file_cache.read_yaml_mapping(manifest_path)
+        )
+        if not raw:
+            # Present but did not parse (or parsed to nothing). Reported rather
+            # than dropped: this directory is a plugin, and the manifest that
+            # would have named it is the thing that failed.
+            return self._unusable_plugin(plugin_dir, choice, f"{choice.filename} is unreadable")
+
+        caps: list[str] = []
+        cap_count = 0
+        tools: object = []
+        hooks: object = []
+        if portable:
+            parsed, error = parse_portable_manifest(raw)
+            if parsed is None:
+                return self._unusable_plugin(plugin_dir, choice, error)
+            name, version, description = parsed.name, parsed.version, parsed.description
+            # portable_plugin_manifest maps only name/version/description, and
+            # never sets kind — so there is no __init__.py scan and no capability
+            # or version-gate declaration to read here, however plausible the
+            # plugin.json looks.
+            kind = PLUGIN_KIND_STANDALONE
+            key = plugin_key(prefix=prefix, dirname=plugin_dir.name, name=name)
+            requires = ""
+        else:
+            name = str(raw.get("name") or plugin_dir.name)
+            version = str(raw.get("version") or "")
+            description = str(raw.get("description") or "")
+            kind = resolve_plugin_kind(
+                raw.get("kind"),
+                self._plugin_init_source(plugin_dir),
+                declared_present="kind" in raw,
+            )
+            key = plugin_key(prefix=prefix, dirname=plugin_dir.name, name=name)
+            requires = requires_hermes_spec(raw.get("requires_hermes"))
+            caps, cap_count = declared_capabilities(raw.get("capabilities"))
+            tools = raw.get("provides_tools") or []
+            hooks = raw.get("provides_hooks") or raw.get("hooks") or []
+
+        gate = gate_plugin(key=key, name=name, kind=kind, enabled=enabled, disabled=disabled)
+        install = install_provenance(install_metadata.get(name))
+        catalog = self._read_catalog_sidecar(plugin_dir, base)
+        dashboard_manifest = self._read_json_cached(plugin_dir / "dashboard" / "manifest.json")
+        return PluginInfo(
+            name=name,
+            version=version,
+            description=description,
+            source="user",
+            activation=gate.activation,
+            activation_reason=gate.reason,
+            kind=kind,
+            manifest_key=key,
+            manifest_file=choice.filename,
+            manifest_shadowed=list(choice.shadowed),
+            tool_count=len(tools) if isinstance(tools, list) else 0,
+            hook_count=len(hooks) if isinstance(hooks, list) else 0,
+            dashboard_enabled=bool(dashboard_manifest),
+            requires_hermes=requires,
+            declared_capabilities=caps,
+            declared_capability_count=cap_count,
+            installed_revision=install.revision,
+            pinned_revision=install.pinned_revision,
+            install_source=install.source,
+            catalog_name=catalog.name if catalog else "",
+            catalog_repo=catalog.repo if catalog else "",
+            catalog_sha=catalog.sha if catalog else "",
+            catalog_tier=catalog.tier if catalog else "",
+            catalog_installed_at=catalog.installed_at if catalog else "",
+        )
+
+    def _unusable_plugin(self, plugin_dir: Path, choice: ManifestChoice, reason: str) -> PluginInfo:
+        """A manifest that is present but unusable: reported, never dropped.
+
+        The directory name is all hermesd can state with evidence, because the
+        manifest that would have named the plugin is the thing that failed.
+        """
+        return PluginInfo(
+            name=plugin_dir.name,
+            activation=PluginActivation.UNKNOWN,
+            activation_reason=reason,
+            manifest_file=choice.filename,
+            manifest_shadowed=list(choice.shadowed),
+        )
+
+    def _read_install_metadata(self, plugins_dir: Path) -> JsonMapping:
+        """``plugins/.install-metadata.json`` — one read per pass, keyed by name.
+
+        Upstream raises ``PluginOperationError`` on a copy it cannot parse
+        (``plugins_cmd.py:434-441``). hermesd treats it as no provenance instead:
+        a read-only viewer must not fail a whole panel over a sidecar it reads
+        only to annotate that panel, and "no provenance recorded" is the truthful
+        reading of a file hermesd cannot parse.
+        """
+        path = plugins_dir / INSTALL_METADATA_NAME
+        if not _exists_strict(path) or not _safe_capped_file(path, plugins_dir):
+            return {}
+        return self._read_json_confined(path)
+
+    def _read_catalog_sidecar(self, plugin_dir: Path, base: Path) -> CatalogProvenance | None:
+        """``<plugin_dir>/.hermes-catalog.json``, or None for a non-catalog install."""
+        path = plugin_dir / CATALOG_SIDECAR_NAME
+        if not _exists_strict(path) or not _safe_capped_file(path, base):
+            return None
+        return catalog_provenance(self._read_json_confined(path))
+
+    def _plugin_init_source(self, plugin_dir: Path) -> str:
+        """Text of a plugin's ``__init__.py``, for import-free kind detection.
+
+        Upstream routes an undeclared memory/model provider to its own discovery
+        by scanning this file; reading it is what lets hermesd agree without
+        importing plugin code.
+        """
+        path = plugin_dir / "__init__.py"
+        if not _safe_capped_file(path, plugin_dir):
+            return ""
+        return _read_text_capped(path, self._paths.root_home)
 
     def _collect_mcp_servers(self, cfg: dict[str, Any]) -> list[MCPServerInfo]:
         servers = _as_dict(cfg.get("mcp_servers"))
@@ -1563,14 +3771,9 @@ class Collector:
         return checkpoints
 
     def _summarize_checkpoint(self, repo_dir: Path) -> CheckpointInfo:
-        workdir = ""
         workdir_file = repo_dir / "HERMES_WORKDIR"
-        if workdir_file.exists():
-            try:
-                workdir = workdir_file.read_text(errors="replace").strip()
-            except OSError:
-                workdir = ""
-        commit_count, last_checkpoint_at, last_reason = _git_checkpoint_summary(repo_dir)
+        workdir = _read_text_capped(workdir_file, repo_dir).strip()
+        commit_count, last_checkpoint_at, last_reason = self._checkpoint_summary(repo_dir)
         workdir_name = Path(workdir).name if workdir else ""
         return CheckpointInfo(
             repo_id=repo_dir.name,
@@ -1581,32 +3784,28 @@ class Collector:
             last_checkpoint_at=last_checkpoint_at,
         )
 
+    def _checkpoint_summary(self, repo_dir: Path) -> tuple[int, float | None, str]:
+        # Two git subprocesses per repo per tick dominate a collect pass; the
+        # answer only changes when the repo's refs change.
+        key = str(repo_dir)
+        signature = _git_ref_signature(repo_dir)
+        cached = self._checkpoint_summary_cache.get(key)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        summary = _git_checkpoint_summary(repo_dir)
+        self._checkpoint_summary_cache[key] = (signature, summary)
+        return summary
+
     def _read_skill_description(self, category: str, name: str) -> str:
         """Read the description from a skill's SKILL.md frontmatter."""
         skills_dir = self._paths.profile_path("skills")
         # Skills are at skills/<category>/<name>/SKILL.md
         skill_md = skills_dir / category / name / "SKILL.md"
-        if not skill_md.exists():
-            return ""
-        try:
-            text = skill_md.read_text(errors="replace")
-            lines = text.splitlines()
-            if lines and lines[0].strip() == "---":
-                frontmatter_lines: list[str] = []
-                for line in lines[1:]:
-                    if line.strip() == "---":
-                        data = yaml.safe_load("\n".join(frontmatter_lines)) or {}
-                        if isinstance(data, dict):
-                            description = data.get("description")
-                            if isinstance(description, str):
-                                return description
-                        break
-                    frontmatter_lines.append(line)
-        except OSError:
-            pass
-        except yaml.YAMLError:
-            pass
-        return ""
+        return self._signature_cached(
+            "skill_desc",
+            skill_md,
+            lambda: _skill_description(skill_md, skills_dir),
+        )
 
     def _collect_providers(self, data: dict[str, Any]) -> list[ProviderInfo]:
         if not data:
@@ -1615,7 +3814,14 @@ class Collector:
         pool = _as_dict(data.get("credential_pool"))
         providers_section = _as_dict(data.get("providers"))
         all_names = set(pool.keys()) | set(providers_section.keys())
-        return [ProviderInfo(name=name, is_active=(name == active)) for name in sorted(all_names)]
+        return [
+            ProviderInfo(
+                name=name,
+                is_active=(name == active),
+                free_tier=_provider_free_tier(_as_dict(providers_section.get(name))),
+            )
+            for name in sorted(all_names)
+        ]
 
     def _collect_credential_pools(self, data: dict[str, Any]) -> list[CredentialPoolEntry]:
         if not data:
@@ -1650,32 +3856,67 @@ class Collector:
         return entries
 
     def _collect_logs(self) -> LogState:
+        # Each entry carries the scope that owns it: `profile_path` streams live
+        # under the selected profile, `shared_path` streams under the root. The
+        # two cannot be told apart from `LogStream.path` (a bare file name), so
+        # the scope travels with the stream — see
+        # .codex/rules/source-ownership.md.
+        root = SourceScope.ROOT
+        profile = SourceScope.PROFILE
         stream_specs = [
-            ("agent", self._paths.profile_path("logs", "agent.log"), 20),
-            ("gateway", self._paths.profile_path("logs", "gateway.log"), 20),
-            ("errors", self._paths.profile_path("logs", "errors.log"), 10),
-            ("desktop", self._paths.shared_path("logs", "desktop.log"), 20),
-            ("dashboard", self._paths.shared_path("logs", "dashboard.log"), 20),
-            ("gui", self._paths.shared_path("logs", "gui.log"), 20),
-            ("update", self._paths.shared_path("logs", "update.log"), 20),
-            ("gateway.error", self._paths.shared_path("logs", "gateway.error.log"), 20),
-            ("tui crash", self._paths.shared_path("logs", "tui_gateway_crash.log"), 20),
-            ("audit", self._paths.shared_path("logs", "audit.log"), 20),
-            ("mcp.stderr", self._paths.shared_path("logs", "mcp-stderr.log"), 20),
-            ("workspace", self._paths.shared_path("logs", "workspace.log"), 20),
-            ("workspace.error", self._paths.shared_path("logs", "workspace.error.log"), 20),
+            ("agent", self._paths.profile_path("logs", "agent.log"), _LOG_TAIL_LINES, profile),
+            ("gateway", self._paths.profile_path("logs", "gateway.log"), _LOG_TAIL_LINES, profile),
+            (
+                "errors",
+                self._paths.profile_path("logs", "errors.log"),
+                _ERROR_LOG_TAIL_LINES,
+                profile,
+            ),
+            ("desktop", self._paths.shared_path("logs", "desktop.log"), _LOG_TAIL_LINES, root),
+            ("dashboard", self._paths.shared_path("logs", "dashboard.log"), _LOG_TAIL_LINES, root),
+            ("gui", self._paths.shared_path("logs", "gui.log"), _LOG_TAIL_LINES, root),
+            ("update", self._paths.shared_path("logs", "update.log"), _LOG_TAIL_LINES, root),
+            (
+                "gateway.error",
+                self._paths.shared_path("logs", "gateway.error.log"),
+                _LOG_TAIL_LINES,
+                root,
+            ),
+            (
+                "tui crash",
+                self._paths.shared_path("logs", "tui_gateway_crash.log"),
+                _LOG_TAIL_LINES,
+                root,
+            ),
+            ("audit", self._paths.shared_path("logs", "audit.log"), _LOG_TAIL_LINES, root),
+            (
+                "mcp.stderr",
+                self._paths.shared_path("logs", "mcp-stderr.log"),
+                _LOG_TAIL_LINES,
+                root,
+            ),
+            ("workspace", self._paths.shared_path("logs", "workspace.log"), _LOG_TAIL_LINES, root),
+            (
+                "workspace.error",
+                self._paths.shared_path("logs", "workspace.error.log"),
+                _LOG_TAIL_LINES,
+                root,
+            ),
         ]
         streams = [
-            self._tail_log_stream(name, path, max_lines)
-            for name, path, max_lines in stream_specs
-            if path.exists() or str(path) in self._log_cache
+            self._tail_log_stream(name, path, max_lines, scope)
+            for name, path, max_lines, scope in stream_specs
+            if _exists_strict(path) or str(path) in self._log_cache
         ]
-        cron_lines = self._tail_latest_cron_output(self._paths.shared_path("cron", "output"), 20)
+        cron_lines = self._tail_latest_cron_output(
+            self._paths.shared_path("cron", "output"), _LOG_TAIL_LINES
+        )
         if cron_lines:
             streams.append(
                 LogStream(
                     name="cron",
                     path="cron/output",
+                    scope=SourceScope.ROOT,
                     lines=cron_lines,
                 )
             )
@@ -1708,9 +3949,11 @@ class Collector:
     def _collect_runtime_status(
         self, gateway: GatewayState, sessions: list[SessionInfo]
     ) -> RuntimeStatus:
-        last_activity_age = _latest_runtime_activity_age(self._paths)
+        last_activity_age = _latest_runtime_activity_age(self._paths, self._clock())
         has_active_sessions = any(session.is_active for session in sessions)
-        recent_activity = last_activity_age is not None and last_activity_age <= 300
+        recent_activity = (
+            last_activity_age is not None and last_activity_age <= _RECENT_ACTIVITY_WINDOW_SECONDS
+        )
         agent_running = gateway.running or has_active_sessions or recent_activity
         banner = "" if agent_running else "AGENT OFFLINE"
         return RuntimeStatus(
@@ -1744,18 +3987,19 @@ class Collector:
             latest_log_mtime=_latest_log_mtime(logs_path) if logs_safe else None,
             skill_count=_count_skills(skills_path) if skills_safe else 0,
             db_size_bytes=_file_size(db_path) if db_safe else 0,
-            soul_excerpt=_read_soul_excerpt(soul_path) if soul_safe else "",
+            soul_excerpt=(self._cached_soul_excerpt(soul_path, profile_home) if soul_safe else ""),
         )
 
     def _last_profile_exists(self, name: str) -> bool:
-        if self._last_state is None:
+        last = self._last_good_by_source.get("profiles")
+        if last is None:
             return False
-        return any(profile.name == name for profile in self._last_state.profiles.profiles)
+        return any(profile.name == name for profile in last.profiles)
 
     def _profile_session_count(self, name: str, db_path: Path) -> int:
         # Opening a profile DB snapshots WAL files to a temp dir, so only
         # re-open and re-count when the db (or its -wal) mtime changes.
-        mtime = _profile_db_mtime(db_path)
+        mtime = _db_source_mtime_ns(db_path)
         cached = self._profile_count_cache.get(name)
         if cached is not None and mtime is not None and cached[0] == mtime:
             return cached[1]
@@ -1771,10 +4015,14 @@ class Collector:
         self._profile_count_cache[name] = (mtime, session_count)
         return session_count
 
-    def _tail_log_stream(self, name: str, path: Path, max_lines: int) -> LogStream:
+    def _tail_log_stream(
+        self, name: str, path: Path, max_lines: int, scope: SourceScope
+    ) -> LogStream:
         key = str(path)
         if not _path_resolves_under(path, self._paths.root_home) or not path.exists():
-            return LogStream(name=name, path=path.name, lines=self._log_cache.get(key, []))
+            return LogStream(
+                name=name, path=path.name, scope=scope, lines=self._log_cache.get(key, [])
+            )
         size_bytes = _file_size(path)
         mtime = _mtime(path)
         cached_stream = self._log_stream_cache.get(key)
@@ -1787,7 +4035,7 @@ class Collector:
             return cached_stream[2]
         try:
             text = _read_tail_text(path, self._log_tail_bytes)
-            lines = text.strip().splitlines()[-max_lines:]
+            lines = [line[:_MAX_LOG_LINE_CHARS] for line in text.strip().splitlines()[-max_lines:]]
             result = []
             for line in lines:
                 match = _LOG_LINE_PATTERN.match(line)
@@ -1810,6 +4058,7 @@ class Collector:
             stream = LogStream(
                 name=name,
                 path=path.name,
+                scope=scope,
                 size_bytes=size_bytes,
                 mtime=mtime,
                 lines=result if result else self._log_cache.get(key, []),
@@ -1817,7 +4066,9 @@ class Collector:
             self._log_stream_cache[key] = (mtime, size_bytes, stream)
             return stream
         except OSError:
-            return LogStream(name=name, path=path.name, lines=self._log_cache.get(key, []))
+            return LogStream(
+                name=name, path=path.name, scope=scope, lines=self._log_cache.get(key, [])
+            )
 
     def _tail_latest_cron_output(self, output_root: Path, max_lines: int) -> list[LogLine]:
         key = f"cron:{output_root}"
@@ -1880,7 +4131,7 @@ class Collector:
         return 0
 
     def _collect_skin(self) -> str:
-        cfg = self._read_yaml_cached()
+        cfg = self._read_yaml_reporting_stale()
         skin = _as_dict(cfg.get("display")).get("skin", "default")
         if not skin:
             return "default"
@@ -1891,1576 +4142,7 @@ class Collector:
         self._db.interrupt()
 
     def close(self) -> None:
+        self._closing.set()
         with self._lock:
             self._closed = True
             self._db.close()
-
-
-def _today_epoch() -> float:
-    import datetime
-
-    now = datetime.datetime.now()
-    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    return midnight.timestamp()
-
-
-def _summarize_tokens(
-    rows: list[dict[str, Any]],
-    started_at_min: float | None = None,
-) -> TokenSummary:
-    input_tokens = 0
-    output_tokens = 0
-    cache_read_tokens = 0
-    cache_write_tokens = 0
-    reasoning_tokens = 0
-    total_cost_usd = 0.0
-    contributing_rows = 0
-    reported_rows = 0
-    for row in rows:
-        started_at = row.get("started_at") or 0.0
-        if started_at_min is not None and started_at < started_at_min:
-            continue
-        contributing_rows += 1
-        if _session_cost_is_reported(row):
-            reported_rows += 1
-        input_tokens += row.get("input_tokens") or 0
-        output_tokens += row.get("output_tokens") or 0
-        cache_read_tokens += row.get("cache_read_tokens") or 0
-        cache_write_tokens += row.get("cache_write_tokens") or 0
-        reasoning_tokens += row.get("reasoning_tokens") or 0
-        total_cost_usd += _resolved_session_cost(row)
-    return TokenSummary(
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        cache_read_tokens=cache_read_tokens,
-        cache_write_tokens=cache_write_tokens,
-        reasoning_tokens=reasoning_tokens,
-        total_cost_usd=total_cost_usd,
-        cost_is_estimated=contributing_rows == 0 or reported_rows < contributing_rows,
-    )
-
-
-def _summarize_window(
-    label: str,
-    rows: list[dict[str, Any]],
-    days: int,
-    *,
-    now: float | None = None,
-) -> TokenWindowSummary:
-    cutoff = (now if now is not None else time.time()) - days * 86400
-    filtered = [row for row in rows if (row.get("started_at") or 0.0) >= cutoff]
-    totals = _summarize_tokens(filtered)
-    prompt_tokens = totals.input_tokens + totals.cache_read_tokens
-    cache_ratio = totals.cache_read_tokens / prompt_tokens if prompt_tokens > 0 else 0.0
-    return TokenWindowSummary(
-        label=label,
-        session_count=len(filtered),
-        input_tokens=totals.input_tokens,
-        output_tokens=totals.output_tokens,
-        cache_read_tokens=totals.cache_read_tokens,
-        total_cost_usd=totals.total_cost_usd,
-        cache_ratio=cache_ratio,
-    )
-
-
-def _count_cost_statuses(rows: list[dict[str, Any]]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for row in rows:
-        status = str(row.get("cost_status") or "unknown")
-        counts[status] = counts.get(status, 0) + 1
-    return counts
-
-
-def _summarize_breakdown(rows: list[dict[str, Any]], key_name: str) -> list[TokenBreakdown]:
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for row in rows:
-        label = str(row.get(key_name) or "unknown")
-        grouped.setdefault(label, []).append(row)
-
-    summaries = []
-    for label, group in grouped.items():
-        totals = _summarize_tokens(group)
-        summaries.append(
-            TokenBreakdown(
-                label=label,
-                session_count=len(group),
-                input_tokens=totals.input_tokens,
-                output_tokens=totals.output_tokens,
-                cache_read_tokens=totals.cache_read_tokens,
-                total_cost_usd=totals.total_cost_usd,
-            )
-        )
-    return sorted(
-        summaries,
-        key=lambda summary: (-summary.total_cost_usd, -summary.input_tokens, summary.label),
-    )
-
-
-# Approximate fallback cost per 1M tokens (USD), not billing authority.
-# Provider-reported costs win; keep these estimates reviewed when common model pricing changes.
-_COST_PER_M = {
-    "input": 2.50,  # GPT-4o / Claude Sonnet class
-    "output": 10.00,
-    "cache_read": 0.30,  # typical prompt caching discount
-    "cache_write": 3.125,  # input x 1.25, typical cache write premium
-    "reasoning": 10.00,
-}
-
-
-def _estimate_cost(
-    input_tokens: int,
-    output_tokens: int,
-    cache_read_tokens: int,
-    reasoning_tokens: int,
-    cache_write_tokens: int = 0,
-) -> float:
-    input_tokens = _bounded_token_count(input_tokens)
-    output_tokens = _bounded_token_count(output_tokens)
-    cache_read_tokens = _bounded_token_count(cache_read_tokens)
-    cache_write_tokens = _bounded_token_count(cache_write_tokens)
-    reasoning_tokens = _bounded_token_count(reasoning_tokens)
-    return (
-        input_tokens * _COST_PER_M["input"]
-        + output_tokens * _COST_PER_M["output"]
-        + cache_read_tokens * _COST_PER_M["cache_read"]
-        + cache_write_tokens * _COST_PER_M["cache_write"]
-        + reasoning_tokens * _COST_PER_M["reasoning"]
-    ) / 1_000_000
-
-
-def _session_cost_is_reported(row: dict[str, Any]) -> bool:
-    return (
-        str(row.get("cost_status") or "") in AUTHORITATIVE_COST_STATUSES
-        and row.get("estimated_cost_usd") is not None
-    )
-
-
-def _resolved_session_cost(row: dict[str, Any]) -> float:
-    raw_cost = row.get("estimated_cost_usd")
-    cost = _coerce_float(raw_cost)
-    if _session_cost_is_reported(row):
-        return cost
-    if cost:
-        return cost
-    return _estimate_cost(
-        row.get("input_tokens") or 0,
-        row.get("output_tokens") or 0,
-        row.get("cache_read_tokens") or 0,
-        row.get("reasoning_tokens") or 0,
-        row.get("cache_write_tokens") or 0,
-    )
-
-
-def _bounded_token_count(value: int) -> int:
-    if value <= 0:
-        return 0
-    return min(value, 10**15)
-
-
-def _latest_log_mtime(logs_dir: Path) -> float | None:
-    if not logs_dir.is_dir():
-        return None
-    mtimes = []
-    for path in logs_dir.iterdir():
-        if not path.is_file():
-            continue
-        try:
-            mtimes.append(path.stat().st_mtime)
-        except OSError:
-            continue
-    if not mtimes:
-        return None
-    return max(mtimes)
-
-
-def _latest_runtime_activity_age(paths: HermesPaths) -> float | None:
-    now = time.time()
-    candidates = [
-        paths.profile_path("state.db"),
-        paths.profile_path("sessions", "sessions.json"),
-        paths.profile_path("logs", "agent.log"),
-        paths.shared_path("gateway_state.json"),
-    ]
-    latest = max((_mtime(path) or 0.0) for path in candidates)
-    if latest <= 0.0:
-        return None
-    return max(0.0, now - latest)
-
-
-def _count_skills(skills_dir: Path) -> int:
-    if not skills_dir.is_dir():
-        return 0
-    count = 0
-    for category_dir in skills_dir.iterdir():
-        if not category_dir.is_dir() or category_dir.name.startswith("."):
-            continue
-        for skill_dir in category_dir.iterdir():
-            if skill_dir.is_dir():
-                count += 1
-    return count
-
-
-def _file_size(path: Path) -> int:
-    try:
-        return path.stat().st_size
-    except OSError:
-        return 0
-
-
-def _word_count(path: Path) -> int:
-    if not path.exists():
-        return 0
-    try:
-        return len(path.read_text(errors="replace").split())
-    except OSError:
-        return 0
-
-
-def _read_soul_excerpt(path: Path) -> str:
-    if not path.exists():
-        return ""
-    try:
-        for line in path.read_text(errors="replace").splitlines():
-            stripped = line.strip()
-            if stripped:
-                return stripped[:80]
-    except OSError:
-        return ""
-    return ""
-
-
-def _learning_summary(skills_dir: Path, usage: dict[str, Any]) -> dict[str, int]:
-    usage_metadata = {str(name): _as_dict(raw) for name, raw in usage.items()}
-    learned = set(_learned_skill_names(skills_dir))
-    pinned = set()
-    agent_created = set()
-
-    for name, metadata in usage_metadata.items():
-        if _usage_indicates_learned(metadata):
-            learned.add(name)
-        if bool(metadata.get("pinned")):
-            pinned.add(name)
-        if str(metadata.get("created_by") or metadata.get("source") or "") == "agent":
-            agent_created.add(name)
-
-    learned_dir = skills_dir / "learned"
-    if learned_dir.is_dir() and not learned_dir.is_symlink():
-        for skill_dir in sorted(learned_dir.iterdir()):
-            if not skill_dir.is_dir() or skill_dir.is_symlink():
-                continue
-            name = skill_dir.name
-            metadata = _skill_frontmatter(skill_dir / "SKILL.md")
-            learned.add(name)
-            if bool(metadata.get("pinned")):
-                pinned.add(name)
-            if str(metadata.get("created_by") or metadata.get("source") or "") == "agent":
-                agent_created.add(name)
-
-    return {
-        "used": len(usage_metadata),
-        "learned": len(learned),
-        "pinned": len(pinned),
-        "agent": len(agent_created),
-    }
-
-
-def _usage_indicates_learned(metadata: dict[str, Any]) -> bool:
-    return bool(
-        metadata.get("learned")
-        or metadata.get("agent_created")
-        or metadata.get("profile_skill")
-        or metadata.get("pinned")
-        or str(metadata.get("created_by") or metadata.get("source") or "") == "agent"
-    )
-
-
-def _learned_skill_names(skills_dir: Path) -> list[str]:
-    learned_dir = skills_dir / "learned"
-    if not learned_dir.is_dir() or learned_dir.is_symlink():
-        return []
-    return [
-        skill_dir.name
-        for skill_dir in sorted(learned_dir.iterdir())
-        if skill_dir.is_dir() and not skill_dir.is_symlink()
-    ]
-
-
-def _skill_frontmatter(path: Path) -> dict[str, Any]:
-    with contextlib.suppress(OSError, yaml.YAMLError):
-        lines = path.read_text(errors="replace").splitlines()
-        if not lines or lines[0].strip() != "---":
-            return {}
-        frontmatter: list[str] = []
-        for line in lines[1:]:
-            if line.strip() == "---":
-                data = yaml.safe_load("\n".join(frontmatter)) or {}
-                return data if isinstance(data, dict) else {}
-            frontmatter.append(line)
-    return {}
-
-
-def _memory_card_count(path: Path) -> int:
-    with contextlib.suppress(OSError):
-        return sum(
-            1 for line in path.read_text(errors="replace").splitlines() if line.startswith("## ")
-        )
-    return 0
-
-
-def _read_tail_text(path: Path, max_bytes: int) -> str:
-    """Read at most the last max_bytes of path, decoded with replacement."""
-    with path.open("rb") as handle:
-        handle.seek(0, 2)
-        size = handle.tell()
-        handle.seek(max(0, size - max_bytes))
-        return handle.read().decode("utf-8", errors="replace")
-
-
-def _mtime(path: Path) -> float | None:
-    try:
-        return path.stat().st_mtime
-    except OSError:
-        return None
-
-
-def _file_signature(path: Path) -> tuple[str, int, int] | None:
-    try:
-        stat = path.stat()
-    except OSError:
-        return None
-    return str(path), stat.st_mtime_ns, stat.st_size
-
-
-def _safe_mtime(path: Path) -> float:
-    return _mtime(path) or 0.0
-
-
-def _profile_db_mtime(db_path: Path) -> float | None:
-    mtimes = [
-        mtime
-        for candidate in (db_path, db_path.with_name(f"{db_path.name}-wal"))
-        if (mtime := _mtime(candidate)) is not None
-    ]
-    return max(mtimes) if mtimes else None
-
-
-def _local_date() -> str:
-    return time.strftime("%Y-%m-%d")
-
-
-def _provider_model_label(cfg: dict[str, Any]) -> str:
-    provider = str(cfg.get("provider") or "")
-    model = str(cfg.get("model") or "")
-    if provider and model:
-        return f"{provider}/{model}"
-    return provider or model
-
-
-def _moa_config_summary(cfg: dict[str, Any]) -> dict[str, Any]:
-    presets = _as_dict(cfg.get("presets"))
-    default_preset = str(cfg.get("default_preset") or "")
-    if not default_preset and presets:
-        default_preset = next(iter(presets))
-    active_preset = str(cfg.get("active_preset") or "")
-    selected_preset = _as_dict(presets.get(active_preset) or presets.get(default_preset))
-    if not selected_preset and not presets:
-        selected_preset = cfg
-    references = [
-        item for item in _as_list(selected_preset.get("reference_models")) if isinstance(item, dict)
-    ]
-    return {
-        "default_preset": default_preset,
-        "active_preset": active_preset,
-        "preset_count": len(presets),
-        "reference_model_count": len(references),
-        "aggregator_label": _provider_model_label(_as_dict(selected_preset.get("aggregator"))),
-    }
-
-
-def _scale_to_zero_relay_only(
-    cfg: dict[str, Any],
-    platforms: list[PlatformStatus],
-) -> bool:
-    if "relay_only" in cfg or "relay_only_when_idle" in cfg:
-        return bool(cfg.get("relay_only") or cfg.get("relay_only_when_idle"))
-    connected = [platform.name for platform in platforms if platform.state == "connected"]
-    return not connected or all(_platform_is_relay_only(name) for name in connected)
-
-
-def _platform_is_relay_only(name: str) -> bool:
-    normalized = name.lower().replace("-", "_")
-    return normalized in {"raft", "photon", "imessage"}
-
-
-def _kanban_claim_ttl_seconds(cfg: dict[str, Any]) -> int:
-    for key in ("claim_ttl_seconds", "worker_claim_ttl_seconds", "claim_timeout_seconds"):
-        value = _coerce_int(cfg.get(key))
-        if value > 0:
-            return value
-    return 300
-
-
-def _moa_latest_record_summary(path: Path, max_bytes: int) -> tuple[str, list[str]]:
-    with contextlib.suppress(OSError):
-        for line in reversed(_read_tail_text(path, max_bytes).splitlines()):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            with contextlib.suppress(json.JSONDecodeError):
-                data = json.loads(stripped)
-                if isinstance(data, dict):
-                    keys = sorted(str(key) for key in data)[:8]
-                    labels = [
-                        str(data.get(field) or "")
-                        for field in ("event", "type", "status", "phase", "preset")
-                        if data.get(field)
-                    ]
-                    return (" ".join(labels[:3]) or "json record", keys)
-    return "", []
-
-
-def _chronos_configured(cfg: dict[str, Any]) -> bool:
-    return bool(
-        cfg.get("portal_url")
-        and cfg.get("callback_url")
-        and cfg.get("expected_audience")
-        and cfg.get("nas_jwks_url")
-    )
-
-
-def _cron_suggestion_count(cron_dir: Path) -> int:
-    candidates = [
-        cron_dir / "suggestions.json",
-        cron_dir / "cron_suggestions.json",
-        cron_dir / "suggestions",
-    ]
-    total = 0
-    for path in candidates:
-        if path.is_symlink() or not _path_resolves_under(path, cron_dir.parent):
-            continue
-        if path.is_file():
-            with contextlib.suppress(OSError, json.JSONDecodeError):
-                data = json.loads(path.read_text(encoding="utf-8"))
-                total += _suggestion_count_from_data(data)
-        elif path.is_dir():
-            with contextlib.suppress(OSError):
-                total += sum(
-                    1
-                    for child in path.iterdir()
-                    if child.is_file()
-                    and not child.is_symlink()
-                    and child.suffix.lower() in {".json", ".yaml", ".yml", ".md"}
-                    and _path_resolves_under(child, cron_dir.parent)
-                )
-    return total
-
-
-def _suggestion_count_from_data(data: object) -> int:
-    if isinstance(data, list):
-        return len(data)
-    if isinstance(data, dict):
-        for key in ("suggestions", "items", "jobs"):
-            value = data.get(key)
-            if isinstance(value, list):
-                return len(value)
-        return len(data)
-    return 0
-
-
-def _provider_routing_summary(cfg: dict[str, Any]) -> str:
-    if not cfg:
-        return ""
-    sort = str(cfg.get("sort") or "")
-    only = cfg.get("only") or []
-    ignore = cfg.get("ignore") or []
-    order = cfg.get("order") or []
-    parts = []
-    if sort:
-        parts.append(sort)
-    if isinstance(only, list) and only:
-        parts.append(f"only:{len(only)}")
-    elif isinstance(ignore, list) and ignore:
-        parts.append(f"ignore:{len(ignore)}")
-    elif isinstance(order, list) and order:
-        parts.append(f"order:{len(order)}")
-    return " ".join(parts)
-
-
-def _mcp_tool_filter_summary(cfg: dict[str, Any]) -> str:
-    if not cfg:
-        return ""
-    include = cfg.get("include") or []
-    exclude = cfg.get("exclude") or []
-    if isinstance(include, list) and include:
-        return ",".join(str(item) for item in include[:3])
-    if isinstance(exclude, list) and exclude:
-        return f"exclude:{len(exclude)}"
-    return ""
-
-
-def _extract_session_id(message: str) -> str:
-    match = re.search(r"(?:session(?:_id)?|sid)[=: ]([A-Za-z0-9_-]+)", message, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    return ""
-
-
-def _delivery_target_label(directory: dict[str, Any], deliver: str) -> str:
-    if not deliver:
-        return ""
-    if deliver in {"local", "origin"}:
-        return deliver
-    if ":" not in deliver:
-        return deliver
-
-    platform, target = deliver.split(":", 1)
-    entries = _as_dict(directory.get("platforms")).get(platform)
-    if isinstance(entries, list):
-        for entry in entries:
-            if isinstance(entry, dict) and str(entry.get("name") or "") == target:
-                return f"{platform}:{target}"
-    return deliver
-
-
-def _latest_cron_output_file(
-    output_root: Path,
-    job_id: str,
-    *,
-    stop_at: Path | None = None,
-) -> Path | None:
-    """Locate the newest cron output file for job_id without reading it."""
-    if not job_id:
-        return None
-    job_output_dir = output_root / job_id
-    output_root_escaped = stop_at is not None and not _path_resolves_under(output_root, stop_at)
-    job_output_dir_escaped = not _path_resolves_under(job_output_dir, output_root)
-    if output_root_escaped or job_output_dir_escaped or not job_output_dir.is_dir():
-        return None
-    files = []
-    for path in job_output_dir.iterdir():
-        try:
-            if not path.is_symlink() and path.is_file():
-                files.append(path)
-        except OSError:
-            continue
-    if not files:
-        return None
-    return max(files, key=_safe_mtime)
-
-
-def _latest_cron_output_excerpt(
-    output_root: Path,
-    job_id: str,
-    max_bytes: int,
-    *,
-    stop_at: Path | None = None,
-) -> tuple[str, bool, str, float | None]:
-    latest = _latest_cron_output_file(output_root, job_id, stop_at=stop_at)
-    if latest is None:
-        return "", False, "", None
-    latest_mtime = _mtime(latest)
-    try:
-        lines = _read_tail_text(latest, max_bytes).splitlines()
-    except OSError:
-        return "", False, "", None
-    silent = any("[SILENT]" in line.upper() for line in lines)
-    for line in lines:
-        stripped = line.strip()
-        if stripped and "[SILENT]" not in stripped.upper():
-            return stripped[:80], silent, latest.name, latest_mtime
-    return "", silent, latest.name, latest_mtime
-
-
-def _tail_latest_cron_output(
-    output_root: Path,
-    max_lines: int,
-    max_bytes: int,
-    *,
-    stop_at: Path | None = None,
-) -> list[LogLine]:
-    output_root_escaped = stop_at is not None and not _path_resolves_under(output_root, stop_at)
-    if output_root_escaped or not output_root.is_dir():
-        return []
-    latest_file: Path | None = None
-    latest_mtime = 0.0
-    for job_dir in output_root.iterdir():
-        if job_dir.is_symlink() or not job_dir.is_dir():
-            continue
-        for path in job_dir.iterdir():
-            try:
-                if path.is_symlink() or not path.is_file():
-                    continue
-                mtime = path.stat().st_mtime
-            except OSError:
-                continue
-            if mtime > latest_mtime:
-                latest_file = path
-                latest_mtime = mtime
-    if latest_file is None:
-        return []
-    try:
-        lines = _read_tail_text(latest_file, max_bytes).splitlines()[-max_lines:]
-    except OSError:
-        return []
-    return [LogLine(message=_redact_secret_text(line.strip())) for line in lines if line.strip()]
-
-
-def _path_resolves_under(path: Path, root: Path) -> bool:
-    try:
-        resolved_path = path.resolve(strict=False)
-        resolved_root = root.resolve(strict=False)
-    except (OSError, RuntimeError):
-        return False
-    return resolved_path == resolved_root or resolved_path.is_relative_to(resolved_root)
-
-
-def _read_kanban_state(db_path: Path, base_state: KanbanState) -> KanbanState:
-    with _connect_readonly_sqlite(db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        status_counts = _count_by(conn, "SELECT status, COUNT(*) FROM tasks GROUP BY status")
-        assignee_counts = _count_by(
-            conn,
-            "SELECT COALESCE(NULLIF(assignee, ''), 'unassigned'), COUNT(*) "
-            "FROM tasks GROUP BY COALESCE(NULLIF(assignee, ''), 'unassigned')",
-        )
-        active_rows = _query_rows(
-            conn,
-            "SELECT * FROM tasks "
-            "WHERE status IN ('in_progress', 'running', 'claimed') "
-            "OR current_run_id IS NOT NULL OR worker_pid IS NOT NULL "
-            "ORDER BY COALESCE(last_heartbeat_at, started_at, created_at, 0) DESC LIMIT 10",
-        )
-        problem_rows = _query_rows(
-            conn,
-            "SELECT * FROM tasks "
-            "WHERE status IN ('blocked', 'failed', 'error') "
-            "OR consecutive_failures > 0 OR COALESCE(last_failure_error, '') != '' "
-            "ORDER BY COALESCE(last_heartbeat_at, started_at, created_at, 0) DESC LIMIT 10",
-        )
-        run_rows = _query_rows(
-            conn,
-            "SELECT * FROM task_runs ORDER BY started_at DESC, id DESC LIMIT 10",
-        )
-        recent_task_rows = _read_recent_enriched_tasks(conn)
-        return base_state.model_copy(
-            update={
-                "db_present": True,
-                "task_count": _table_count(conn, "tasks"),
-                "run_count": _table_count(conn, "task_runs"),
-                "event_count": _table_count(conn, "task_events"),
-                "comment_count": _table_count(conn, "task_comments"),
-                "link_count": _table_count_or_zero(conn, "task_links"),
-                "attachment_count": _table_count_or_zero(conn, "task_attachments"),
-                "stale_claim_count": _stale_claim_count_from_tasks(
-                    conn,
-                    base_state.claim_ttl_seconds,
-                ),
-                "status_counts": status_counts,
-                "assignee_counts": assignee_counts,
-                "active_tasks": [_kanban_task_from_row(row) for row in active_rows],
-                "problem_tasks": [_kanban_task_from_row(row) for row in problem_rows],
-                "recent_tasks": [_kanban_task_from_row(row) for row in recent_task_rows],
-                "task_links": _read_task_links(conn),
-                "recent_runs": [_kanban_run_from_row(row) for row in run_rows],
-            }
-        )
-
-
-def _read_kanban_board_summary(
-    db_path: Path,
-    *,
-    slug: str,
-    current: bool,
-    claim_ttl_seconds: int,
-) -> KanbanBoardSummary:
-    with _connect_readonly_sqlite(db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        return KanbanBoardSummary(
-            slug=slug,
-            current=current,
-            task_count=_table_count(conn, "tasks"),
-            run_count=_table_count_or_zero(conn, "task_runs"),
-            problem_count=_count_rows_or_zero(
-                conn,
-                "SELECT COUNT(*) FROM tasks WHERE status IN ('blocked', 'failed', 'error')",
-            ),
-            stale_claim_count=_stale_claim_count_from_tasks(conn, claim_ttl_seconds),
-            block_kind_counts=(
-                _count_by(
-                    conn,
-                    "SELECT block_kind, COUNT(*) FROM tasks "
-                    "WHERE COALESCE(block_kind, '') != '' GROUP BY block_kind",
-                )
-                if _column_exists(conn, "tasks", "block_kind")
-                else {}
-            ),
-        )
-
-
-def _read_verification_evidence(
-    conn: sqlite3.Connection,
-    operations: OperationsState,
-) -> OperationsState:
-    return operations.model_copy(
-        update={
-            "verification_db_present": True,
-            "verification_event_count": _table_count(conn, "verification_events"),
-            "verification_failed_count": _verification_failed_count(conn),
-            "verification_state_count": _table_count_or_zero(conn, "verification_state"),
-            "verification_latest_events": _read_verification_events(conn),
-            "verification_roots": _read_verification_roots(conn),
-        }
-    )
-
-
-def _read_goal_state(conn: sqlite3.Connection, operations: OperationsState) -> OperationsState:
-    goals = _read_goal_summaries(conn)
-    return operations.model_copy(
-        update={
-            "goal_count": len(goals),
-            "active_goal_count": sum(1 for goal in goals if goal.status == "active"),
-            "waiting_goal_count": sum(
-                1 for goal in goals if goal.waiting_on_pid or goal.waiting_on_session
-            ),
-            "goals": goals,
-        }
-    )
-
-
-def _read_goal_summaries(conn: sqlite3.Connection) -> list[GoalSummary]:
-    if not _table_exists(conn, "state_meta"):
-        return []
-    rows = _query_rows(
-        conn,
-        "SELECT key, value FROM state_meta WHERE key LIKE 'goal:%' ORDER BY key LIMIT 8",
-    )
-    goals: list[GoalSummary] = []
-    for row in rows:
-        raw_value = str(row.get("value") or "")
-        with contextlib.suppress(json.JSONDecodeError):
-            data = json.loads(raw_value)
-            if isinstance(data, dict):
-                goals.append(_goal_summary_from_row(str(row.get("key") or ""), data))
-    return goals
-
-
-def _goal_summary_from_row(key: str, data: dict[str, Any]) -> GoalSummary:
-    contract = _as_dict(data.get("contract"))
-    return GoalSummary(
-        session_id=key.removeprefix("goal:"),
-        goal=str(data.get("goal") or ""),
-        status=str(data.get("status") or ""),
-        turns_used=_coerce_int(data.get("turns_used")),
-        max_turns=_coerce_int(data.get("max_turns")),
-        has_contract=any(value not in (None, "", [], {}) for value in contract.values()),
-        waiting_on_pid=_coerce_int(data.get("waiting_on_pid")),
-        waiting_on_session=str(data.get("waiting_on_session") or ""),
-        waiting_reason=str(data.get("waiting_reason") or ""),
-        subgoal_count=len(_as_list(data.get("subgoals"))),
-    )
-
-
-def _read_projects_state(
-    conn: sqlite3.Connection,
-    operations: OperationsState,
-    paths: HermesPaths,
-) -> OperationsState:
-    return operations.model_copy(
-        update={
-            "projects_db_present": True,
-            "project_count": _table_count(conn, "projects"),
-            "project_archived_count": _count_rows_or_zero(
-                conn,
-                "SELECT COUNT(*) FROM projects WHERE archived != 0",
-            ),
-            "project_folder_count": _table_count_or_zero(conn, "project_folders"),
-            "discovered_repo_count": _table_count_or_zero(conn, "discovered_repos"),
-            "project_missing_primary_path_count": _count_rows_or_zero(
-                conn,
-                "SELECT COUNT(*) FROM projects WHERE COALESCE(primary_path, '') = ''",
-            ),
-            "projects": _read_project_summaries(conn, operations.verification_roots, paths),
-            "discovered_repos": _read_discovered_repos(conn),
-        }
-    )
-
-
-def _curator_with_scheduler_state(
-    run: CuratorRun,
-    state: dict[str, Any],
-    curator_cfg: dict[str, Any],
-) -> CuratorRun:
-    if not state and not curator_cfg:
-        return run
-    return run.model_copy(
-        update={
-            "scheduler_state_present": bool(state),
-            "scheduler_paused": bool(state.get("paused")),
-            "scheduler_run_count": _coerce_int(state.get("run_count")),
-            "scheduler_last_run_at": str(state.get("last_run_at") or ""),
-            "scheduler_last_report_path": str(state.get("last_report_path") or ""),
-            "consolidate_enabled": bool(curator_cfg.get("consolidate")),
-        }
-    )
-
-
-def _read_project_summaries(
-    conn: sqlite3.Connection,
-    verification_roots: list[VerificationRootSummary],
-    paths: HermesPaths,
-) -> list[ProjectSummary]:
-    with contextlib.suppress(sqlite3.Error):
-        rows = _query_rows(
-            conn,
-            "SELECT slug, name, board_slug, primary_path, archived "
-            "FROM projects ORDER BY archived ASC, created_at DESC, slug ASC LIMIT 8",
-        )
-        return [
-            ProjectSummary(
-                slug=str(row.get("slug") or ""),
-                name=str(row.get("name") or ""),
-                board_slug=str(row.get("board_slug") or ""),
-                primary_path=str(row.get("primary_path") or ""),
-                archived=bool(row.get("archived")),
-                verification_root_count=_project_verification_root_count(
-                    str(row.get("primary_path") or ""),
-                    verification_roots,
-                ),
-                kanban_board_present=_kanban_board_present(
-                    paths,
-                    str(row.get("board_slug") or ""),
-                ),
-            )
-            for row in rows
-        ]
-    return []
-
-
-def _read_discovered_repos(conn: sqlite3.Connection) -> list[DiscoveredRepoSummary]:
-    if not _table_exists(conn, "discovered_repos"):
-        return []
-    with contextlib.suppress(sqlite3.Error):
-        rows = _query_rows(
-            conn,
-            "SELECT root, label, last_seen FROM discovered_repos "
-            "ORDER BY COALESCE(last_seen, '') DESC, root ASC LIMIT 5",
-        )
-        return [
-            DiscoveredRepoSummary(
-                root=str(row.get("root") or ""),
-                label=str(row.get("label") or ""),
-                last_seen=str(row.get("last_seen") or ""),
-            )
-            for row in rows
-        ]
-    return []
-
-
-def _project_verification_root_count(
-    primary_path: str,
-    verification_roots: list[VerificationRootSummary],
-) -> int:
-    if not primary_path:
-        return 0
-    return sum(
-        1 for root in verification_roots if _same_path_or_descendant(root.root, primary_path)
-    )
-
-
-def _kanban_board_present(paths: HermesPaths, board_slug: str) -> bool:
-    if not board_slug:
-        return False
-    if board_slug in {"root", "default"}:
-        path = paths.shared_path("kanban.db")
-        return (
-            path.exists() and not path.is_symlink() and _path_resolves_under(path, paths.root_home)
-        )
-    path = paths.shared_path("kanban", "boards", board_slug, "kanban.db")
-    return path.exists() and not path.is_symlink() and _path_resolves_under(path, paths.root_home)
-
-
-def _same_path_or_descendant(candidate: str, parent: str) -> bool:
-    candidate_path = candidate.rstrip(os.sep)
-    parent_path = parent.rstrip(os.sep)
-    if not candidate_path or not parent_path:
-        return False
-    return candidate_path == parent_path or candidate_path.startswith(parent_path + os.sep)
-
-
-def _read_verification_events(conn: sqlite3.Connection) -> list[VerificationEventSummary]:
-    rows = _query_rows(
-        conn,
-        "SELECT id, created_at, session_id, root, command, canonical_command, "
-        "kind, scope, status, exit_code, output_summary "
-        "FROM verification_events ORDER BY id DESC LIMIT 8",
-    )
-    return [
-        VerificationEventSummary(
-            event_id=_coerce_int(row.get("id")),
-            created_at=str(row.get("created_at") or ""),
-            session_id=str(row.get("session_id") or ""),
-            root=str(row.get("root") or ""),
-            command=str(row.get("command") or ""),
-            canonical_command=str(row.get("canonical_command") or ""),
-            kind=str(row.get("kind") or ""),
-            scope=str(row.get("scope") or ""),
-            status=str(row.get("status") or ""),
-            exit_code=_coerce_int(row.get("exit_code")),
-            output_summary=str(row.get("output_summary") or ""),
-        )
-        for row in rows
-    ]
-
-
-def _read_verification_roots(conn: sqlite3.Connection) -> list[VerificationRootSummary]:
-    if not _table_exists(conn, "verification_state"):
-        return []
-    rows = _query_rows(
-        conn,
-        "SELECT session_id, root, last_event_id, last_edit_at, changed_paths_json "
-        "FROM verification_state "
-        "ORDER BY COALESCE(last_edit_at, '') DESC, COALESCE(last_event_id, 0) DESC "
-        "LIMIT 8",
-    )
-    return [
-        VerificationRootSummary(
-            session_id=str(row.get("session_id") or ""),
-            root=str(row.get("root") or ""),
-            last_event_id=_coerce_int(row.get("last_event_id")),
-            last_edit_at=str(row.get("last_edit_at") or ""),
-            changed_path_count=_json_list_count(row.get("changed_paths_json")),
-        )
-        for row in rows
-    ]
-
-
-def _verification_failed_count(conn: sqlite3.Connection) -> int:
-    cur = conn.execute("SELECT COUNT(*) FROM verification_events WHERE status != 'passed'")
-    row = cur.fetchone()
-    return int(row[0] or 0) if row is not None else 0
-
-
-def _count_rows_or_zero(conn: sqlite3.Connection, sql: str) -> int:
-    with contextlib.suppress(sqlite3.Error):
-        cur = conn.execute(sql)
-        row = cur.fetchone()
-        return int(row[0] or 0) if row is not None else 0
-    return 0
-
-
-def _json_list_count(value: object) -> int:
-    if not isinstance(value, str) or not value:
-        return 0
-    with contextlib.suppress(json.JSONDecodeError):
-        decoded = json.loads(value)
-        if isinstance(decoded, list):
-            return len(decoded)
-    return 0
-
-
-def _context_limit_for(context_lengths: Mapping[str, int], model: str, base_url: str) -> int:
-    normalized_base = base_url.rstrip("/")
-    exact = context_lengths.get(f"{model}@{normalized_base}")
-    if exact is not None:
-        return exact
-
-    origin = _url_origin(normalized_base)
-    if not origin:
-        return 0
-    for key, value in sorted(context_lengths.items()):
-        cached_model, sep, cached_base = key.partition("@")
-        if sep and cached_model == model and _url_origin(cached_base) == origin:
-            return value
-    return 0
-
-
-def _url_origin(value: str) -> str:
-    parsed = urlsplit(value)
-    if not parsed.scheme or not parsed.netloc:
-        return ""
-    return f"{parsed.scheme}://{parsed.netloc}"
-
-
-def _safe_child_path(path: Path, root: Path) -> bool:
-    return not path.is_symlink() and _path_resolves_under(path, root)
-
-
-def _safe_or_absent_child_path(path: Path, root: Path) -> bool:
-    if path.is_symlink():
-        return False
-    return not path.exists() or _path_resolves_under(path, root)
-
-
-@contextlib.contextmanager
-def _connect_readonly_sqlite(db_path: Path) -> Iterator[sqlite3.Connection]:
-    conn: sqlite3.Connection | None = None
-    if db_path.with_name(f"{db_path.name}-wal").exists():
-        snapshot_dir, snapshot_db = snapshot_wal_database(db_path, prefix="hermesd-kanban-")
-        try:
-            conn = sqlite3.connect(f"{snapshot_db.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
-            yield conn
-            return
-        finally:
-            if conn is not None:
-                conn.close()
-            snapshot_dir.cleanup()
-    conn = sqlite3.connect(
-        f"{db_path.resolve().as_uri()}?mode=ro&immutable=1",
-        uri=True,
-        timeout=2,
-    )
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-
-def _query_rows(conn: sqlite3.Connection, sql: str) -> list[dict[str, Any]]:
-    cur = conn.execute(sql)
-    return [dict(row) for row in cur.fetchall()]
-
-
-def _table_count(conn: sqlite3.Connection, table_name: str) -> int:
-    cur = conn.execute(f"SELECT COUNT(*) FROM {table_name}")
-    row = cur.fetchone()
-    return int(row[0]) if row is not None else 0
-
-
-def _table_count_or_zero(conn: sqlite3.Connection, table_name: str) -> int:
-    with contextlib.suppress(sqlite3.Error):
-        return _table_count(conn, table_name)
-    return 0
-
-
-def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
-    cur = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
-        (table_name,),
-    )
-    return cur.fetchone() is not None
-
-
-def _column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
-    with contextlib.suppress(sqlite3.Error):
-        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-        return any(str(row[1] or "") == column_name for row in rows)
-    return False
-
-
-def _stale_claim_count_from_tasks(conn: sqlite3.Connection, claim_ttl_seconds: int) -> int:
-    if not _table_exists(conn, "tasks"):
-        return 0
-    now = int(time.time())
-    ttl = claim_ttl_seconds if claim_ttl_seconds > 0 else 300
-    conditions = []
-    if _column_exists(conn, "tasks", "claim_expires"):
-        conditions.append(f"COALESCE(claim_expires, 0) > 0 AND claim_expires < {now}")
-    if _column_exists(conn, "tasks", "last_heartbeat_at"):
-        conditions.append(f"COALESCE(last_heartbeat_at, 0) > 0 AND last_heartbeat_at < {now - ttl}")
-    if not conditions:
-        return 0
-    return _count_rows_or_zero(
-        conn,
-        "SELECT COUNT(*) FROM tasks WHERE "
-        + " OR ".join(f"({condition})" for condition in conditions),
-    )
-
-
-def _read_task_links(conn: sqlite3.Connection) -> list[KanbanTaskLink]:
-    with contextlib.suppress(sqlite3.Error):
-        rows = _query_rows(
-            conn,
-            "SELECT parent_id, child_id FROM task_links "
-            "ORDER BY COALESCE(parent_id, ''), COALESCE(child_id, '') LIMIT 20",
-        )
-        return [
-            KanbanTaskLink(
-                parent_id=str(row.get("parent_id") or ""),
-                child_id=str(row.get("child_id") or ""),
-            )
-            for row in rows
-        ]
-    return []
-
-
-def _read_recent_enriched_tasks(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    with contextlib.suppress(sqlite3.Error):
-        return _query_rows(
-            conn,
-            "SELECT * FROM tasks "
-            "WHERE completed_at IS NOT NULL OR COALESCE(workspace_path, '') != '' "
-            "OR COALESCE(goal_mode, '') != '' OR COALESCE(current_step_key, '') != '' "
-            "OR COALESCE(branch_name, '') != '' "
-            "ORDER BY COALESCE(completed_at, last_heartbeat_at, started_at, created_at, 0) "
-            "DESC LIMIT 10",
-        )
-    return []
-
-
-def _count_by(conn: sqlite3.Connection, sql: str) -> dict[str, int]:
-    cur = conn.execute(sql)
-    return {str(row[0] or "unknown"): int(row[1] or 0) for row in cur.fetchall()}
-
-
-def _kanban_task_from_row(row: dict[str, Any]) -> KanbanTaskSummary:
-    return KanbanTaskSummary(
-        task_id=str(row.get("id") or ""),
-        title=str(row.get("title") or ""),
-        assignee=str(row.get("assignee") or ""),
-        status=str(row.get("status") or ""),
-        priority=_coerce_int(row.get("priority")),
-        consecutive_failures=_coerce_int(row.get("consecutive_failures")),
-        worker_pid=_coerce_int(row.get("worker_pid")),
-        session_id=str(row.get("session_id") or ""),
-        last_failure_error=str(row.get("last_failure_error") or ""),
-        last_heartbeat_at=_coerce_int(row.get("last_heartbeat_at")),
-        claim_expires=_coerce_int(row.get("claim_expires")),
-        current_run_id=_coerce_int(row.get("current_run_id")),
-        model_override=str(row.get("model_override") or ""),
-        branch_name=str(row.get("branch_name") or ""),
-        skills=str(row.get("skills") or ""),
-        completed_at=_coerce_int(row.get("completed_at")),
-        workspace_path=str(row.get("workspace_path") or ""),
-        goal_mode=str(row.get("goal_mode") or ""),
-        current_step_key=str(row.get("current_step_key") or ""),
-    )
-
-
-def _kanban_run_from_row(row: dict[str, Any]) -> KanbanRunSummary:
-    return KanbanRunSummary(
-        run_id=_coerce_int(row.get("id")),
-        task_id=str(row.get("task_id") or ""),
-        profile=str(row.get("profile") or ""),
-        status=str(row.get("status") or ""),
-        outcome=str(row.get("outcome") or ""),
-        worker_pid=_coerce_int(row.get("worker_pid")),
-        started_at=_coerce_int(row.get("started_at")),
-        ended_at=_coerce_int(row.get("ended_at")),
-        error=str(row.get("error") or ""),
-        summary=str(row.get("summary") or ""),
-    )
-
-
-def _model_cache_counts(data: dict[str, Any]) -> tuple[int, int]:
-    if not data:
-        return 0, 0
-    model_count = 0
-    for provider_data in data.values():
-        provider = _as_dict(provider_data)
-        models = provider.get("models")
-        if isinstance(models, dict | list):
-            model_count += len(models)
-    return len(data), model_count
-
-
-def _channel_capabilities(name: str) -> list[str]:
-    if name == "feishu":
-        return ["meeting invites"]
-    return []
-
-
-def _platform_family_label(name: str) -> str:
-    normalized = name.lower().replace("-", "_")
-    families = {
-        "whatsapp_cloud": "WhatsApp Cloud",
-        "whatsapp_baileys": "WhatsApp Baileys",
-        "teams": "Teams",
-        "microsoft_teams": "Teams",
-        "photon": "Photon/iMessage",
-        "imessage": "Photon/iMessage",
-        "raft": "Raft",
-        "slack": "Slack",
-        "discord": "Discord",
-        "telegram": "Telegram",
-        "matrix": "Matrix",
-        "feishu": "Feishu",
-    }
-    return families.get(normalized, name)
-
-
-def _stale_alias_count(aliases: dict[str, Any]) -> int:
-    count = 0
-    for entries in aliases.values():
-        for value in _as_dict(entries).values():
-            entry = _as_dict(value)
-            if entry and bool(entry.get("stale") or entry.get("is_stale") or entry.get("expired")):
-                count += 1
-    return count
-
-
-def _is_dashboard_process(command: str) -> bool:
-    if "hermes dashboard" in command:
-        return True
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        parts = command.split()
-    return any(Path(part).name == "hermesd" for part in parts)
-
-
-def _len_if_sized(value: object) -> int:
-    if isinstance(value, dict | list | tuple | set):
-        return len(value)
-    return 0
-
-
-def _int_mapping(value: object) -> dict[str, int]:
-    raw = _as_dict(value)
-    return {str(key): _coerce_int(count) for key, count in raw.items() if str(key)}
-
-
-def _state_transition_label(entry: dict[str, Any]) -> str:
-    from_state = str(entry.get("from") or entry.get("from_state") or "")
-    to_state = str(entry.get("to") or entry.get("to_state") or "")
-    at = str(entry.get("at") or entry.get("timestamp") or entry.get("created_at") or "")
-    if from_state or to_state:
-        label = f"{from_state or 'unknown'} -> {to_state or 'unknown'}"
-    else:
-        label = str(entry.get("state") or "")
-    return f"{label} @ {at}" if at and label else label
-
-
-def _git_checkpoint_summary(repo_dir: Path) -> tuple[int, float | None, str]:
-    commit_count = 0
-    try:
-        count_result = subprocess.run(
-            ["git", "--git-dir", str(repo_dir), "rev-list", "--count", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=2,
-        )
-    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
-        return 0, None, ""
-
-    if count_result.returncode == 0:
-        commit_count = _coerce_int(count_result.stdout.strip())
-    if commit_count <= 0:
-        return 0, None, ""
-
-    try:
-        log_result = subprocess.run(
-            ["git", "--git-dir", str(repo_dir), "log", "-1", "--format=%ct%x09%s", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=2,
-        )
-    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
-        # A non-UTF-8 commit subject must not fail the whole checkpoints source.
-        return commit_count, None, ""
-
-    if log_result.returncode != 0:
-        return commit_count, None, ""
-
-    raw = log_result.stdout.strip()
-    if "\t" not in raw:
-        return commit_count, None, raw
-
-    ts_text, reason = raw.split("\t", 1)
-    timestamp = _coerce_float(ts_text)
-    return commit_count, (timestamp or None), reason
-
-
-_SECRET_FIELD_NAMES = {
-    "api_key",
-    "id_token",
-    "access_token",
-    "authorization",
-    "bearer",
-    "client_secret",
-    "credential",
-    "pass",
-    "passwd",
-    "pin",
-    "pwd",
-    "refresh_token",
-    "secret",
-    "token",
-    "x_api_key",
-    "x-api-key",
-    "user_token",
-}
-
-_OAUTH_FIELD_NAMES = {"id_token", "access_token", "refresh_token"}
-_API_KEY_FIELD_NAMES = {"api_key", "secret", "token", "user_token"}
-_SECRET_URL_QUERY_KEYS = {
-    "access_token",
-    "api_key",
-    "auth",
-    "auth_token",
-    "authorization",
-    "bearer",
-    "client_secret",
-    "credential",
-    "id_token",
-    "key",
-    "pass",
-    "passwd",
-    "password",
-    "pin",
-    "pwd",
-    "refresh_token",
-    "secret",
-    "token",
-    "x_api_key",
-    "x-api-key",
-    "user_token",
-}
-_SECRET_OPTION_NAMES = {
-    "access-token",
-    "api-key",
-    "apikey",
-    "auth",
-    "auth-token",
-    "authorization",
-    "bearer",
-    "client-secret",
-    "credential",
-    "h",
-    "header",
-    "id-token",
-    "k",
-    "key",
-    "p",
-    "pass",
-    "passwd",
-    "password",
-    "pin",
-    "pwd",
-    "refresh-token",
-    "secret",
-    "t",
-    "token",
-    "x-api-key",
-    "user-token",
-}
-
-
-def _as_dict(value: object) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return value
-    return {}
-
-
-def _as_list(value: object) -> list[object]:
-    if isinstance(value, list):
-        return value
-    return []
-
-
-def _select_pool_entry(raw_entry: object) -> dict[str, Any]:
-    """Reduce a credential_pool value to one representative entry.
-
-    Live ``auth.json`` stores each provider's credentials as a list of entries;
-    older configs used a single dict. The lowest-priority entry (the next
-    credential to be used) represents the provider; ties keep list order.
-    """
-    if isinstance(raw_entry, list):
-        candidates = [_as_dict(item) for item in raw_entry]
-        candidates = [item for item in candidates if item]
-        if not candidates:
-            return {}
-        return min(
-            enumerate(candidates),
-            key=lambda pair: (_coerce_int(pair[1].get("priority")), pair[0]),
-        )[1]
-    return _as_dict(raw_entry)
-
-
-def _coerce_int(value: object) -> int:
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str):
-        try:
-            return int(value or "0")
-        except ValueError:
-            return 0
-    if isinstance(value, (bytes, bytearray)):
-        try:
-            return int(value)
-        except ValueError:
-            return 0
-    return 0
-
-
-def _coerce_float(value: object) -> float:
-    if isinstance(value, bool):
-        return float(value)
-    if isinstance(value, int | float):
-        result = float(value)
-        return result if math.isfinite(result) else 0.0
-    if isinstance(value, str):
-        try:
-            result = float(value or "0")
-        except ValueError:
-            return 0.0
-        return result if math.isfinite(result) else 0.0
-    return 0.0
-
-
-def _normalize_secret_option_name(option: str) -> str:
-    return option.lstrip("-").lower().replace("_", "-")
-
-
-def _secret_key_name(value: object) -> str:
-    return str(value).strip().lower().replace("_", "-")
-
-
-def _redact_secret_url(value: str) -> str:
-    if not value:
-        return ""
-    parts = urlsplit(value)
-    if not parts.scheme or not parts.netloc:
-        return value
-    netloc = parts.netloc
-    if parts.username or parts.password:
-        host = parts.hostname or ""
-        if ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        try:
-            port = parts.port
-        except ValueError:
-            port = None
-        if port is not None:
-            host = f"{host}:{port}"
-        netloc = f"[REDACTED]@{host}"
-    query_pairs = parse_qsl(parts.query, keep_blank_values=True)
-    if not query_pairs:
-        return urlunsplit(parts._replace(netloc=netloc))
-    redacted_query = "&".join(
-        f"{key}={'[REDACTED]' if key.lower() in _SECRET_URL_QUERY_KEYS else item_value}"
-        for key, item_value in query_pairs
-    )
-    return urlunsplit(parts._replace(netloc=netloc, query=redacted_query))
-
-
-def _redact_secret_args(args: object) -> list[str]:
-    if not isinstance(args, list):
-        return []
-    redacted: list[str] = []
-    redact_next = False
-    for raw_arg in args:
-        if redact_next:
-            redacted.append("[REDACTED]")
-            redact_next = False
-            continue
-        if isinstance(raw_arg, list):
-            redacted.extend(_redact_secret_args(raw_arg))
-            continue
-        if isinstance(raw_arg, dict) and _has_secret_material(raw_arg):
-            redacted.append("[REDACTED]")
-            continue
-        arg = _redact_secret_url(str(raw_arg))
-        if "=" in arg:
-            option, _value = arg.split("=", 1)
-            if _normalize_secret_option_name(option) in _SECRET_OPTION_NAMES:
-                redacted.append(f"{option}=[REDACTED]")
-                continue
-            if option.startswith(("http://", "https://")):
-                redacted.append(_redact_secret_url(arg))
-                continue
-        if arg.startswith("-") and _normalize_secret_option_name(arg) in _SECRET_OPTION_NAMES:
-            redacted.append(arg)
-            redact_next = True
-            continue
-        redacted.append(arg)
-    return redacted
-
-
-def _has_secret_material(data: dict[str, Any]) -> bool:
-    for key, value in data.items():
-        key_name = _secret_key_name(key)
-        if (
-            key_name in _SECRET_FIELD_NAMES
-            or key_name in _SECRET_OPTION_NAMES
-            or key_name in _SECRET_URL_QUERY_KEYS
-        ) and value not in (None, ""):
-            return True
-        if isinstance(value, str) and _looks_like_secret_value(value):
-            return True
-        if isinstance(value, dict) and _has_secret_material(value):
-            return True
-        if isinstance(value, list) and any(_contains_secret_material(item) for item in value):
-            return True
-    return False
-
-
-def _contains_secret_material(value: object) -> bool:
-    if isinstance(value, dict):
-        return _has_secret_material(value)
-    if isinstance(value, list):
-        return any(_contains_secret_material(item) for item in value)
-    return isinstance(value, str) and _looks_like_secret_value(value)
-
-
-def _looks_like_secret_value(value: str) -> bool:
-    lowered = value.lower()
-    return "bearer " in lowered or "authorization:" in lowered or "x-api-key" in lowered
-
-
-def _redact_secret_text(value: str) -> str:
-    redacted = re.sub(r"https?://[^,\s]+", lambda match: _redact_secret_url(match.group(0)), value)
-    redacted = re.sub(r"(?i)(bearer)\s+[^,\s]+", r"\1 [REDACTED]", redacted)
-    return re.sub(
-        r"(?i)(access[-_]?token|api[-_]?key|authorization|client[-_]?secret|credential|"
-        r"pass(?:word|wd)?|pwd|pin|refresh[-_]?token|secret|token|x[-_]?api[-_]?key)"
-        r"([=:]\s*)[^,\s]+",
-        r"\1\2[REDACTED]",
-        redacted,
-    )
-
-
-def _safe_exception_text(exc: Exception) -> str:
-    return f"{type(exc).__name__}: {_redact_secret_text(str(exc))[:200]}"
-
-
-def _redact_command_string(command: str) -> str:
-    if not command:
-        return ""
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        return _redact_secret_text(command)
-    return " ".join(_redact_secret_args(parts))
-
-
-def _credential_auth_type(entry: dict[str, Any], provider_entry: dict[str, Any]) -> str:
-    auth_type = str(entry.get("auth_type") or "")
-    if auth_type:
-        return auth_type
-
-    merged_keys = set(entry) | set(provider_entry)
-    if merged_keys & _OAUTH_FIELD_NAMES:
-        return "oauth"
-    if merged_keys & _API_KEY_FIELD_NAMES:
-        return "api_key"
-    return ""
-
-
-def _credential_expiry(entry: dict[str, Any], provider_entry: dict[str, Any]) -> str:
-    for key in (
-        "expires_at",
-        "access_expires_at",
-        "token_expires_at",
-        "agent_key_expires_at",
-        "expiry",
-    ):
-        value = entry.get(key) or provider_entry.get(key)
-        if value:
-            return str(value)
-    return ""
-
-
-def _pid_exists(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True

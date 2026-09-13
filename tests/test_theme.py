@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from hermesd.theme import Theme, load_theme, normalize_skin_name
@@ -58,10 +60,10 @@ def test_load_theme_read_error_falls_back(hermes_home, monkeypatch):
     config_path = hermes_home / "config.yaml"
     config_path.write_text("display:\n  skin: ares\n")
 
-    def fail_open(*args, **kwargs):
+    def fail_read(path):
         raise OSError("unreadable")
 
-    monkeypatch.setattr("builtins.open", fail_open)
+    monkeypatch.setattr("hermesd.theme._read_capped", fail_read)
     t = load_theme(hermes_home)
     assert t.banner_title == "#FFD700"
 
@@ -69,6 +71,44 @@ def test_load_theme_read_error_falls_back(hermes_home, monkeypatch):
 def test_load_theme_no_config(hermes_home):
     t = load_theme(hermes_home)
     assert t.banner_title == "#FFD700"
+
+
+def test_load_theme_corrupt_after_success_returns_last_good(hermes_home):
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text("display:\n  skin: ares\n")
+    assert load_theme(hermes_home).skin_name == "ares"
+
+    config_path.write_text("display: [")
+    t = load_theme(hermes_home)
+    assert t.skin_name == "ares"
+    assert t.banner_title == "#C7A96B"
+
+
+def test_load_theme_oversize_config_returns_last_good(hermes_home):
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text("display:\n  skin: ares\n")
+    assert load_theme(hermes_home).skin_name == "ares"
+
+    config_path.write_bytes(b"display:\n  skin: mono\n" + b"#" * (8 * 1024 * 1024))
+    t = load_theme(hermes_home)
+    assert t.skin_name == "ares"
+
+
+def test_load_theme_stat_permission_error_returns_last_good(hermes_home, monkeypatch):
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text("display:\n  skin: ares\n")
+    assert load_theme(hermes_home).skin_name == "ares"
+
+    real_stat = Path.stat
+
+    def denied_stat(self, *args, **kwargs):
+        if self == config_path:
+            raise PermissionError("EACCES")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", denied_stat)
+    t = load_theme(hermes_home)
+    assert t.skin_name == "ares"
 
 
 def test_theme_rich_style():

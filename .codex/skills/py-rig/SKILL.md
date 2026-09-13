@@ -61,7 +61,7 @@ Follow this workflow:
    If the task materially changes project conventions, architecture, or workflow expectations, update `AGENTS.md` or the relevant rule/skill in the same change. Update `CHANGELOG.md` for user-visible changes and `README.md` when install/usage instructions change.
 
 8. Verify locally before opening a PR.
-   Run `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy hermesd`, `uv run pytest tests/ -v -W error::ResourceWarning`, `uv run pip-audit`, `uv lock --check`, `uv build`, wheel smoke installs, and `uvx twine check dist/*`. CI runs the same gate commands across Python 3.11/3.12/3.13.
+   Run `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy hermesd`, `uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing`, `uv run pip-audit`, `uv lock --check`, `uv build`, wheel smoke installs, and `uvx twine check dist/*`. CI runs the same gate commands across Python 3.11/3.12/3.13/3.14.
 </process>
 
 <design_rules>
@@ -110,17 +110,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+
 class DatabaseReader(Protocol):
     def read_sessions(self) -> list[dict[str, object]]: ...
     def read_tool_stats(self) -> list[dict[str, object]]: ...
 
+
 class Clock(Protocol):
     def now(self) -> float: ...
 
+
 @dataclass(frozen=True, slots=True)
 class SessionSummarizer:
-    db: DatabaseReader     # injected, not constructed inside
-    clock: Clock           # no time.time() inside this class
+    db: DatabaseReader  # injected, not constructed inside
+    clock: Clock  # no time.time() inside this class
 
     def summarize(self) -> dict[str, object]:
         rows = self.db.read_sessions()
@@ -189,7 +192,7 @@ Strict types are enforced via `mypy` in CI.
 - `[tool.mypy]` in `pyproject.toml` is the source of truth for enforced strictness
 - Every public function has explicit parameter and return type annotations
 - Minimize `Any` in domain code; use `object`, `Protocol`, generics, `Union`, or narrower types
-- **Boundary-Any carve-out.** Raw SQL row reads in `hermesd/db.py` return `list[dict[str, Any]]` — this is allowed by per-module mypy override because SQLite rows are untyped at the source. Translate into typed Pydantic models at the earliest reasonable point (see `hermesd/collector.py::_collect_sessions`). Do not propagate `Any` past the collector.
+- **Boundary-Any policy (convention, not mypy-enforced).** `[tool.mypy]` never sets `disallow_any_explicit`, so explicit `Any` is currently legal in every module; the `hermesd.db` per-module override (`disallow_any_explicit = false`) is a no-op today and only becomes meaningful if the base flag is ever enabled. By convention, `Any` stays at the untyped boundary: raw SQLite rows (`hermesd/db.py`, `hermesd/collect/sqlite_util.py`) and parsed JSON/YAML/state data (`hermesd/collect/*`, `hermesd/collector.py`). Translate into typed Pydantic models at the earliest reasonable point — `hermesd/models.py` and `hermesd/panels/*` contain no `Any`, and new `Any` should not be introduced past the collector. Enabling `disallow_any_explicit = true` repo-wide currently reports 150+ violations across the boundary modules; tightening to enforcement is aspirational and would require narrowing the boundary types first.
 - `NewType` for domain IDs and values that should not mix: `UserId = NewType("UserId", int)` — plain assignment, not the `type` statement
 - `Protocol` for dependency boundaries; enables structural typing without inheritance coupling
 - `Literal` for constrained value sets; `Final` for immutable module-level bindings
@@ -250,13 +253,16 @@ Add new tests to the matching prefix. Use `tests/conftest.py` fixtures (`hermes_
 def collector(hermes_home: Path) -> Collector:
     return Collector(hermes_home)
 
+
 def test_collector_returns_empty_state_when_home_is_bare(collector: Collector) -> None:
     state = collector.collect()
     assert state.gateway.running is False
     assert state.sessions == []
 
+
 def test_collector_preserves_cache_on_db_corruption(
-    collector: Collector, sample_db: Path,
+    collector: Collector,
+    sample_db: Path,
 ) -> None:
     first = collector.collect()
     sample_db.write_bytes(b"corrupt")
@@ -298,11 +304,12 @@ Docstrings (hermesd convention):
 Keep errors and types strict and readable.
 
 - Raise specific exceptions with context; never bare `except:` — it catches `SystemExit` and `KeyboardInterrupt`
-- `except Exception:` without re-raise is acceptable only at top-level boundary handlers:
+- `except Exception:` without re-raise is acceptable only at these boundary handlers:
   - CLI entry point (`hermesd/__main__.py::main`)
   - Collector and input threads (`hermesd/app.py::_collector_loop`, `_input_loop`)
   - Per-source collection boundary (`hermesd/collector.py::_CollectionHealth.collect`)
   - Message-search worker thread (`hermesd/app.py::_search_session_messages_worker`)
+  - Exception-message sanitizer (`hermesd/collect/redaction.py::_safe_exception_text`) — must remain non-throwing while handling another error; return only the exception type if sanitization fails
   - Signal handlers
   Everywhere else, re-raise or handle specifically.
 - `raise NewError("context") from original_err` to preserve cause chains
@@ -341,7 +348,7 @@ Before finishing, verify:
 - [ ] structure is clean, predictable, and free of dumping-ground modules
 - [ ] dependencies are injected explicitly below the composition root — no hidden construction or global state
 - [ ] no hardcoded runtime values (URLs, ports, credentials, paths, timeouts)
-- [ ] types are strict and explicit — no `Any` outside the documented `db.py` boundary, no bare `# type: ignore`
+- [ ] types follow `<type_discipline>` — `Any` stays at the documented SQLite and parsed-data boundaries, no bare `# type: ignore`
 - [ ] every public function has explicit parameter and return type annotations
 - [ ] functions are short, focused, and readable in one pass
 - [ ] formatting, indentation, and whitespace follow `ruff format` defaults
@@ -365,7 +372,7 @@ Reject these patterns:
 - Protocol-per-class abstraction without consumer need
 - hardcoded configuration or collaborator construction **below the composition root**
 - `Any` added or left in touched code without explicit justification or the documented boundary carve-out
-- bare `except:` anywhere; `except Exception:` without re-raise outside top-level boundary handlers
+- bare `except:` anywhere; `except Exception:` without re-raise outside the handlers listed in `<error_and_type_rules>`
 - mutable default arguments (`def fn(items=[])`)
 - `import *` in non-`__init__.py` files
 - module-level mutable global state used as hidden dependency
@@ -380,7 +387,7 @@ Reject these patterns:
 - deep inheritance hierarchies when composition would be clearer
 - writing to `~/.hermes/` or importing from `hermes-agent`
 - returning blank/None renderables from panels on error (violates "never blank the display")
-- 3.12+ syntax (inline generics, `type` statement, `@override`) or 3.13+ syntax (`TypeIs`, `warnings.deprecated`) in library code while `requires-python` still includes 3.11
+- 3.12+ syntax (inline generics, `type` statement, `@override`), 3.13+ syntax (`TypeIs`, `warnings.deprecated`), or 3.14+ syntax (template strings) in library code while `requires-python` still includes 3.11
 </reject_patterns>
 
 <success_criteria>

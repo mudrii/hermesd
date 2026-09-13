@@ -1,0 +1,76 @@
+name: Security
+
+# Periodic validation of dependencies whose versions did not change: newly
+# published advisories can affect unchanged pins (audit CI-12). The blocking
+# per-change gate stays in CI; this workflow re-checks the same locked set on
+# a schedule and by manual dispatch.
+
+on:
+  schedule:
+    - cron: "23 6 * * 1" # Mondays 06:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  installed-audit:
+    name: Installed environment audit (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/locked-env
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Audit installed environment (pip-audit)
+        run: uv run python scripts/pip_audit_gate.py
+
+  lockfile-scan:
+    name: Lockfile scan (pip-audit, offline resolution)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/locked-env
+        with:
+          python-version: "3.11"
+      - name: Export locked requirements
+        # Scan the lockfile directly, without installing it: complements the
+        # installed-environment audit and covers every marker-resolved pin,
+        # including the dev toolchain.
+        run: uv export --format requirements-txt --no-hashes --no-emit-project --all-extras --output-file "$RUNNER_TEMP/locked-requirements.txt"
+      - name: Scan locked requirements (pip-audit)
+        run: uv run python scripts/pip_audit_gate.py --requirement "$RUNNER_TEMP/locked-requirements.txt" --no-deps --disable-pip
+
+  gate:
+    name: Security gate
+    needs: [installed-audit, lockfile-scan]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Fail unless every security job succeeded
+        env:
+          RESULTS: >-
+            installed-audit=${{ needs.installed-audit.result }}
+            lockfile-scan=${{ needs.lockfile-scan.result }}
+        run: |
+          status=0
+          for pair in $RESULTS; do
+            job="${pair%%=*}"
+            result="${pair#*=}"
+            if [ "$result" != "success" ]; then
+              echo "::error::required security job '$job' finished with '$result'"
+              status=1
+            fi
+          done
+          exit $status

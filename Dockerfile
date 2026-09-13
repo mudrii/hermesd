@@ -3,6 +3,10 @@ FROM python:3.11-slim@sha256:9534e5a8e315485d4061ed659af0fd78a284c015f9b73661b41
 LABEL maintainer="Nous Research"
 LABEL description="TUI monitoring dashboard for Hermes AI agent"
 
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd --gid 1000 hermesd \
     && useradd --uid 1000 --gid hermesd --create-home hermesd
 
@@ -14,6 +18,7 @@ RUN pip install --no-cache-dir pip==26.2.1 uv==0.12.10 \
 
 COPY hermesd/ hermesd/
 RUN uv sync --locked --no-dev \
+    && chmod -R a+rX hermesd \
     && rm -rf /root/.cache /root/.cache/uv
 
 USER hermesd

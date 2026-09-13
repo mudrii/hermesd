@@ -4,6 +4,9 @@ import re
 from datetime import datetime
 
 from rich.markup import escape
+from rich.text import Text
+
+from hermesd.theme import Theme
 
 # Strips terminal escape sequences AND their payloads, plus raw control codes:
 # OSC/DCS/SOS/PM/APC (payload terminated by BEL or ST, or unterminated at end
@@ -47,6 +50,21 @@ def sanitize_terminal_text(value: str) -> str:
 def escape_terminal_text(value: str) -> str:
     """Strip terminal controls, then escape Rich markup in a string cell."""
     return escape(sanitize_terminal_text(value))
+
+
+def fmt_age_seconds(age: int) -> str:
+    """Render a non-negative age in seconds as a compact s/m/h label."""
+    if age < 60:
+        return f"{age}s"
+    if age < 3600:
+        return f"{age // 60}m"
+    return f"{age // 3600}h"
+
+
+def section_heading(label: str, theme: Theme, *, leading_blank: bool = True) -> Text:
+    """Bold sub-section heading inside a detail panel."""
+    prefix = "\n" if leading_blank else ""
+    return Text(f"{prefix}{label}\n", style=f"bold {theme.ui_label}")
 
 
 def fmt_usd(value: float) -> str:

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermesd"
-version = "2026.7.11"
+version = "2026.9.8"
 description = "TUI monitoring dashboard for Hermes AI agent"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,9 +30,14 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "rich>=14.0.0",
-    "pyyaml>=6.0",
-    "pydantic>=2.0.0",
+    # Exact tested pins (audit CI-06): a fresh install must resolve to the same
+    # runtime versions exercised by the locked CI/dev/Docker environments, so
+    # an unpublished major cannot sneak into user installs. Bump these only
+    # together with uv.lock; scripts/check_wheel_pins.py enforces the match in
+    # CI by comparing wheel metadata against uv.lock.
+    "rich==14.3.3",
+    "pyyaml==6.0.3",
+    "pydantic==2.13.4",
 ]
 
 [project.optional-dependencies]
@@ -79,7 +84,7 @@ exclude_lines = [
     "raise NotImplementedError",
     "return NotImplemented",
     "@(abc\\.)?abstractmethod",
-    "\\.\\.\\.",
+    "^\\s*\\.\\.\\.\\s*(#.*)?$",
 ]
 show_missing = true
 fail_under = 96
@@ -135,6 +140,7 @@ check_untyped_defs = false
 include = [
     "hermesd/",
     "tests/",
+    ".codex/rules/source-ownership.md",
     ".github/",
     "CHANGELOG.md",
     "CONTRIBUTING.md",

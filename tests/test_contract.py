@@ -63,6 +63,28 @@ def test_fixture_contract_allows_absent_optional_source_values(hermes_home: Path
     _assert_hermes_home_has_no_drifted_blank_fields(hermes_home)
 
 
+def test_fixture_contract_ignores_hidden_sessions(hermes_home: Path):
+    """A hidden session with populated optional fields must not be demanded of the collector."""
+    conn = sqlite3.connect(hermes_home / "state.db")
+    create_state_db_tables(conn, include_schema_version=False, include_v021_columns=True)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, hidden, end_reason, billing_mode) "
+        "VALUES ('gone', 'cli', 1.0, 1, 'user_quit', 'subscription_included')"
+    )
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, hidden, end_reason) "
+        "VALUES ('kept', 'cli', 2.0, 0, 'cron_complete')"
+    )
+    conn.commit()
+    conn.close()
+
+    assert "gone" not in _raw_session_optional_values(hermes_home / "state.db")
+    assert _raw_session_optional_values(hermes_home / "state.db")["kept"] == {
+        "end_reason": "cron_complete"
+    }
+    _assert_hermes_home_has_no_drifted_blank_fields(hermes_home)
+
+
 def _assert_hermes_home_has_no_drifted_blank_fields(home: Path) -> None:
     collector = Collector(home)
     try:
@@ -119,7 +141,13 @@ def _assert_hermes_home_has_no_drifted_blank_fields(home: Path) -> None:
     # C1 — platform names must match when the source has platform entries.
     raw_platform_names = _raw_gateway_platform_names(home / "gateway_state.json")
     if raw_platform_names:
-        collected_platform_names = {platform.name for platform in state.gateway.platforms}
+        # A grammar-valid ``<profile>:<platform>`` key is surfaced as two fields, so
+        # the raw key is rebuilt before comparing; an invalid one stays verbatim in
+        # `name` with an empty `profile` and rebuilds to itself.
+        collected_platform_names = {
+            f"{platform.profile}:{platform.name}" if platform.profile else platform.name
+            for platform in state.gateway.platforms
+        }
         assert raw_platform_names <= collected_platform_names, (
             "gateway_state.json platform entries were not surfaced (see C1)"
         )
@@ -197,7 +225,9 @@ def _raw_session_optional_values(path: Path) -> dict[str, dict[str, str]]:
         if "id" not in columns or not selected_fields:
             return {}
         selected_columns = ", ".join(("id", *selected_fields))
-        rows = conn.execute(f"SELECT {selected_columns} FROM sessions").fetchall()
+        # Must agree with HermesDB.read_sessions: hidden rows are never collected.
+        where = " WHERE COALESCE(hidden, 0) = 0" if "hidden" in columns else ""
+        rows = conn.execute(f"SELECT {selected_columns} FROM sessions{where}").fetchall()
         expected: dict[str, dict[str, str]] = {}
         for row in rows:
             populated = {

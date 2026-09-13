@@ -12,7 +12,7 @@
 uv venv .venv --python 3.11
 source .venv/bin/activate
 uv sync --locked --all-extras --dev
-uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing  # full suite
+uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing  # full suite
 uv run pytest tests/ -q --cov=hermesd --cov-report=term-missing  # coverage (CI gate: 96%)
 uv run ruff check .                 # lint
 uv run ruff format --check .        # format check
@@ -25,10 +25,12 @@ python -m venv /tmp/hermesd-wheel-smoke
 /tmp/hermesd-wheel-smoke/bin/python -m pip install dist/hermesd-*.whl
 /tmp/hermesd-wheel-smoke/bin/hermesd --version
 /tmp/hermesd-wheel-smoke/bin/python -I -m hermesd --version
+/tmp/hermesd-wheel-smoke/bin/python scripts/installed_smoke.py
 python -m venv /tmp/hermesd-sdist-smoke
 /tmp/hermesd-sdist-smoke/bin/python -m pip install dist/hermesd-*.tar.gz
 /tmp/hermesd-sdist-smoke/bin/hermesd --version
 /tmp/hermesd-sdist-smoke/bin/python -I -m hermesd --version
+/tmp/hermesd-sdist-smoke/bin/python scripts/installed_smoke.py
 uv run twine check dist/*           # package metadata
 hermesd                              # run the dashboard
 hermesd --hermes-home /path          # custom hermes home
@@ -41,13 +43,22 @@ hermesd --snapshot-format json       # machine-readable full-state snapshot
 hermesd --log-tail-bytes 8192        # cap per-refresh log reads for large files
 ```
 
+CI/CD and release policy (branch protection, release eligibility, dependency
+pinning, update cadence) is documented canonically in
+[`docs/ci-release-policy.md`](docs/ci-release-policy.md); the command list
+above mirrors the CI gates rather than defining them.
+
 ## Architecture
 
 ```
 hermesd/
   __main__.py     CLI entry point (argparse)
   app.py          Rich TUI: Live context, input thread, adaptive layout
-  collector.py    Reads all ~/.hermes data sources (JSON, YAML, SQLite, files)
+  collector.py    Collector orchestration + public facade over collect/
+  collect/        Per-domain readers (sessions, kanban, cron, skills, plugins,
+                  operations, config, gateway, migration, logs, redaction,
+                  sqlite_util, system, common, recovery, hosted_rooms, api_runs)
+  defaults.py     Shared refresh-rate and log-tail-bytes defaults
   db.py           Read-only SQLite with PRAGMA data_version caching
   file_cache.py   mtime-keyed JSON/YAML cache
   models.py       Pydantic models for DashboardState
@@ -84,7 +95,7 @@ Canonical contributor workflow lives in [`CONTRIBUTING.md`](CONTRIBUTING.md). Th
 
 1. **Write the failing test first** — this project mandates TDD/ATDD (see `.codex/skills/py-rig/SKILL.md`).
 2. Add data model fields to `models.py`.
-3. Populate them in `collector.py`.
+3. Populate them in the matching `collect/*.py` reader and wire it into `collector.py`. Resolve every path through `shared_path()`/`profile_path()` per [`.codex/rules/source-ownership.md`](.codex/rules/source-ownership.md), and add the new `source_name` to that file's ownership table (a test enforces it).
 4. Render in `panels/*.py` (both `_render_compact` and `_render_detail`).
 5. Make tests pass with the minimum change; refactor while green.
 6. Update `app.py` layout if adding new panels; add a `_render_*_panel(ctx: PanelRenderContext)` wrapper in `panels/__init__.py`, register it in `_RENDERERS` and `PANEL_NAMES`, then add its panel number to `_WIDE_LAYOUT_SPEC`, `_COMPACT_LAYOUT_SPEC`, and `_TALL_NARROW_LAYOUT_SPEC` in `app.py` as needed.
@@ -95,4 +106,5 @@ See also:
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — branch/PR workflow and per-panel instructions.
 - [`.codex/rules/python-idioms.md`](.codex/rules/python-idioms.md) — version-tagged modern Python syntax.
 - [`.codex/rules/python-patterns.md`](.codex/rules/python-patterns.md) — style, types, errors, tests.
+- [`.codex/rules/source-ownership.md`](.codex/rules/source-ownership.md) — which Hermes home (root vs. profile) owns each source; read it before adding a reader.
 - [`.codex/skills/py-rig/SKILL.md`](.codex/skills/py-rig/SKILL.md) — design/TDD/ATDD/DI/review discipline.

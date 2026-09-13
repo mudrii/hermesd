@@ -6,20 +6,32 @@ import pytest
 from rich.console import Console
 
 from hermesd.models import (
+    ActiveSurface,
+    ApiRunReservation,
+    ApiRunReservationsState,
     BackgroundProcessInfo,
     ChannelDirectoryState,
     ChannelPlatformInfo,
     CheckpointInfo,
+    ConfigSourceStamp,
     ConfigSummary,
     CredentialPoolEntry,
+    CronExecution,
+    CronExecutionsState,
+    CronIncident,
     CronJob,
+    CronJobExecutionStats,
     CronState,
     CuratorRun,
     DashboardState,
+    DbRecoveryState,
+    DelegationInfo,
     DiscoveredRepoSummary,
     GatewayState,
     GoalSummary,
     HookInfo,
+    HostedRoomState,
+    HostedRoomSummary,
     KanbanBoardSummary,
     KanbanRunSummary,
     KanbanState,
@@ -27,9 +39,13 @@ from hermesd.models import (
     KanbanTaskSummary,
     LogLine,
     LogState,
+    MCPCacheEntry,
+    MCPCacheEntryState,
+    MCPSchemaCache,
     MCPServerInfo,
     MemoryOverview,
     ModelCacheSummary,
+    ModelUsage,
     OperationsState,
     PlatformStatus,
     PluginInfo,
@@ -38,12 +54,15 @@ from hermesd.models import (
     ProfileSummary,
     ProjectSummary,
     ProviderInfo,
+    RetiredWalGeneration,
     SessionInfo,
     SkillInfo,
     SkillsMemory,
+    SkillsPromptSnapshot,
     TokenAnalytics,
     TokenBreakdown,
     ToolGatewayRoute,
+    ToolsetAvailability,
     ToolStats,
     VerificationEventSummary,
     VerificationRootSummary,
@@ -73,6 +92,19 @@ def _state_for(panel_num: int) -> DashboardState:
                 drain_active=True,
                 drain_principal=INJECT,
                 drain_requested_at=INJECT,
+                code_sha=INJECT,
+                code_version=INJECT,
+                config_fingerprint=INJECT,
+                config_generation_short=INJECT,
+                config_sources=[ConfigSourceStamp(name=INJECT, path=INJECT, exists=True)],
+                session_store_status=INJECT,
+                exit_reason=INJECT,
+                lifecycle_phase=INJECT,
+                last_exit_reason=INJECT,
+                last_update_outcome=INJECT,
+                last_update_from_version=INJECT,
+                last_update_to_version=INJECT,
+                last_update_failed_step=INJECT,
                 served_profiles=[INJECT],
                 platforms=[
                     PlatformStatus(
@@ -122,6 +154,31 @@ def _state_for(panel_num: int) -> DashboardState:
                     rewind_count=1,
                     message_count=5,
                     is_active=True,
+                    profile_name=INJECT,
+                    chat_type=INJECT,
+                    display_name=INJECT,
+                    title_source=INJECT,
+                    git_branch=INJECT,
+                    last_activity_description=INJECT,
+                    compression_failure_error=INJECT,
+                    cost_source=INJECT,
+                    end_reason=INJECT,
+                    billing_base_url=INJECT,
+                    billing_mode=INJECT,
+                    pinned=True,
+                )
+            ],
+            active_surface_count=1,
+            active_surfaces=[
+                ActiveSurface(
+                    session_id="sess_injection_001",
+                    surface=INJECT,
+                    pid=42,
+                    alive=True,
+                    lease_id=INJECT,
+                    started_at_age_seconds=60.0,
+                    updated_at_age_seconds=10.0,
+                    track_liveness=True,
                 )
             ],
         )
@@ -131,6 +188,16 @@ def _state_for(panel_num: int) -> DashboardState:
             token_analytics=TokenAnalytics(
                 by_model=[TokenBreakdown(label=INJECT, session_count=1)],
                 by_provider=[TokenBreakdown(label=INJECT, session_count=1)],
+                usage_source="session_model_usage",
+                model_usage_all=[
+                    ModelUsage(model=INJECT, provider=INJECT, task=INJECT, api_calls=2)
+                ],
+                model_usage_24h=[
+                    ModelUsage(model=INJECT, provider=INJECT, task=INJECT, api_calls=1)
+                ],
+                model_usage_7d=[
+                    ModelUsage(model=INJECT, provider=INJECT, task=INJECT, api_calls=2)
+                ],
             ),
         )
     if panel_num == 4:  # Tools
@@ -139,6 +206,12 @@ def _state_for(panel_num: int) -> DashboardState:
             total_tool_calls=2,
             available_tools=1,
             available_tool_names=[INJECT],
+            toolset_availability=ToolsetAvailability(
+                enabled_toolsets=[INJECT],
+                unavailable_toolsets=[INJECT],
+                lazy_tool_count=1,
+                disabled_tool_count=1,
+            ),
             background_processes=[BackgroundProcessInfo(session_id=INJECT, command=INJECT, pid=42)],
             checkpoints=[
                 CheckpointInfo(
@@ -168,6 +241,23 @@ def _state_for(panel_num: int) -> DashboardState:
                 moa_active_preset=INJECT,
                 moa_preset_count=1,
                 moa_aggregator_label=INJECT,
+                mcp_server_count=1,
+                mcp_server_names=[INJECT],
+                updates_pre_update_backup=INJECT,
+                updates_check=True,
+                updates_backup_keep=5,
+                logging_level=INJECT,
+                plugin_enabled_count=1,
+                plugin_disabled_count=1,
+                goals_max_turns=3,
+                delegation_max_concurrent_children=2,
+                delegation_max_spawn_depth=2,
+                delegation_orchestrator_enabled=True,
+                tool_loop_warnings_enabled=True,
+                tool_loop_hard_stop_enabled=True,
+                max_live_sessions=4,
+                streaming_enabled=True,
+                network_proxy_configured=True,
             ),
         )
     if panel_num == 6:  # Cron
@@ -187,6 +277,47 @@ def _state_for(panel_num: int) -> DashboardState:
                         last_status="error",
                         last_error=INJECT,
                         next_run_at="2026-06-14T00:00:00Z",
+                        paused=True,
+                        paused_reason=INJECT,
+                        last_delivery_error=INJECT,
+                        dispatch_kind=INJECT,
+                        pending_slot_scheduled_at=INJECT,
+                        last_fire_error=INJECT,
+                        model_snapshot=INJECT,
+                        provider_snapshot=INJECT,
+                    )
+                ],
+            ),
+            cron_executions=CronExecutionsState(
+                db_present=True,
+                job_stats=[
+                    CronJobExecutionStats(
+                        job_id="job_injection",
+                        completed_24h=1,
+                        failed_24h=1,
+                        last_status=INJECT,
+                        last_error_excerpt=INJECT,
+                    )
+                ],
+                recent=[
+                    CronExecution(
+                        execution_id=INJECT,
+                        job_id="job_injection",
+                        job_name=INJECT,
+                        status=INJECT,
+                        error_excerpt=INJECT,
+                    )
+                ],
+                open_incident_count=1,
+                unacked_incident_count=1,
+                open_incidents=[
+                    CronIncident(
+                        incident_id=INJECT,
+                        job_id="job_injection",
+                        job_name=INJECT,
+                        state=INJECT,
+                        failure_type=INJECT,
+                        error_excerpt=INJECT,
                     )
                 ],
             ),
@@ -210,11 +341,53 @@ def _state_for(panel_num: int) -> DashboardState:
                     )
                 ],
                 hooks=[HookInfo(name=INJECT, description=INJECT, events=[INJECT])],
-                plugins=[PluginInfo(name=INJECT, version=INJECT, description=INJECT)],
+                plugins=[
+                    PluginInfo(
+                        name=INJECT,
+                        version=INJECT,
+                        description=INJECT,
+                        activation_reason=INJECT,
+                        kind=INJECT,
+                        manifest_key=INJECT,
+                        manifest_file=INJECT,
+                        manifest_shadowed=[INJECT],
+                        requires_hermes=INJECT,
+                        declared_capabilities=[INJECT],
+                        declared_capability_count=1,
+                        installed_revision=INJECT,
+                        pinned_revision=INJECT,
+                        install_source=INJECT,
+                        catalog_name=INJECT,
+                        catalog_repo=INJECT,
+                        catalog_sha=INJECT,
+                        catalog_tier=INJECT,
+                        catalog_installed_at=INJECT,
+                    )
+                ],
                 mcp_servers=[
                     MCPServerInfo(name=INJECT, transport=INJECT, target=INJECT, tool_filter=INJECT)
                 ],
                 skills=[SkillInfo(name=INJECT, category="dev", description=INJECT)],
+            ),
+            config=ConfigSummary(mcp_server_count=2, mcp_server_names=[INJECT, "cached-server"]),
+            mcp_cache=MCPSchemaCache(
+                mcp_cache_present=True,
+                mcp_cached_server_count=1,
+                mcp_cached_server_names=["cached-server"],
+                mcp_schema_cache_age_seconds=60.0,
+                mcp_unassessable_entry_count=1,
+                mcp_entries=[
+                    MCPCacheEntry(
+                        name=INJECT,
+                        state=MCPCacheEntryState.UNASSESSABLE,
+                        reason=INJECT,
+                        fingerprint=INJECT,
+                    )
+                ],
+            ),
+            skills_prompt=SkillsPromptSnapshot(
+                prompted_skill_count=1,
+                prompt_snapshot_age_seconds=120.0,
             ),
         )
     if panel_num == 8:  # Logs
@@ -294,7 +467,37 @@ def _state_for(panel_num: int) -> DashboardState:
                 dashboard_process_count=1,
                 desktop_build_stamp=INJECT,
                 model_caches=[ModelCacheSummary(name=INJECT, provider_count=1, model_count=1)],
-                pr_monitors=[PRMonitorSummary(filename=INJECT, repo=INJECT, checked_at=INJECT)],
+                pr_monitors=[
+                    PRMonitorSummary(
+                        filename=INJECT,
+                        repo=INJECT,
+                        checked_at=INJECT,
+                        monitored_count=1,
+                        tracked_count=1,
+                        author_pr_count=1,
+                        open_count=1,
+                        conflicting_count=1,
+                    )
+                ],
+                delegation_count=1,
+                delegation_running_count=1,
+                delegations=[
+                    DelegationInfo(
+                        delegation_id=INJECT,
+                        origin_session=INJECT,
+                        state=INJECT,
+                        delivery_state=INJECT,
+                        goal=INJECT,
+                        result_status=INJECT,
+                        error_excerpt=INJECT,
+                    )
+                ],
+                state_db_schema_version=6,
+                state_db_file_generation=INJECT,
+                state_db_fts_storage_version=INJECT,
+                web_ui_build_hash=INJECT,
+                blocked_script_count=1,
+                blocked_script_names=[INJECT],
                 verification_db_present=True,
                 verification_latest_events=[
                     VerificationEventSummary(
@@ -338,6 +541,38 @@ def _state_for(panel_num: int) -> DashboardState:
                         waiting_reason=INJECT,
                     )
                 ],
+                db_recovery=DbRecoveryState(
+                    repair_ledger_present=True,
+                    failed_attempts=1,
+                    last_attempt=INJECT,
+                    last_attempt_age_seconds=60.0,
+                    malformed_backup_count=1,
+                    retired_wal_count=1,
+                    newest_retired_wal=RetiredWalGeneration(
+                        manifest_present=True,
+                        captured_at=INJECT,
+                        captured_at_age_seconds=60.0,
+                        trigger=INJECT,
+                        wal_bytes=4096,
+                        main_mode=INJECT,
+                    ),
+                    auto_maintenance_lock_file_present=True,
+                ),
+                hosted_rooms=HostedRoomState(
+                    db_present=True,
+                    active_room_count=1,
+                    # The reader allowlists event kinds against a closed enum, so
+                    # an injected key here is panel defence-in-depth rather than
+                    # a value a collector could produce.
+                    event_kind_counts={INJECT: 1},
+                    rooms=[HostedRoomSummary(room_id=INJECT, name=INJECT)],
+                ),
+                api_runs=ApiRunReservationsState(
+                    db_present=True,
+                    reservation_count=1,
+                    scope_count=1,
+                    reservations=[ApiRunReservation(run_id=INJECT)],
+                ),
             ),
         )
     if panel_num == 13:  # Curator
@@ -357,6 +592,12 @@ def _state_for(panel_num: int) -> DashboardState:
             ),
         )
     raise AssertionError(f"no state builder for panel {panel_num}")
+
+
+# Panels 3 (Tokens / Cost) and 12 (Operations) render only numeric aggregates in
+# their compact views — no untrusted free-text field reaches the screen there, so
+# the literal-bracket assertion cannot apply to them.
+_NO_FREE_TEXT_COMPACT_PANELS = {3, 12}
 
 
 @pytest.mark.parametrize("panel_num", range(1, 14))
@@ -379,12 +620,13 @@ def test_panel_does_not_crash_on_markup_injection(panel_num: int, detail: bool) 
 def test_panel_preserves_literal_brackets(panel_num: int, detail: bool) -> None:
     state = _state_for(panel_num)
     rendered = render_to_str(render_panel(panel_num, state, Theme(), detail=detail))
+    if not detail and panel_num in _NO_FREE_TEXT_COMPACT_PANELS:
+        return
     # The bracket pair must survive as literal text, not be parsed away as a
-    # Rich style tag. Compact views only show a subset of fields, so require
-    # the literal in at least the detail view where every field is rendered.
-    if detail:
-        assert PAIR in rendered, f"panel {panel_num} detail stripped literal {PAIR!r}"
-        assert CLOSER in rendered, f"panel {panel_num} detail dropped literal {CLOSER!r}"
+    # Rich style tag.
+    view = "detail" if detail else "compact"
+    assert PAIR in rendered, f"panel {panel_num} {view} stripped literal {PAIR!r}"
+    assert CLOSER in rendered, f"panel {panel_num} {view} dropped literal {CLOSER!r}"
 
 
 @pytest.mark.parametrize(
@@ -412,5 +654,7 @@ def test_panel_strips_terminal_control_sequences(
     rendered = output.getvalue()
     assert "\x1b" not in rendered
     assert "\x9b" not in rendered
-    if detail:
+    # Stripping the escape must not eat the surrounding text: wherever a free-text
+    # field reaches the screen, the literal payload has to still be readable.
+    if detail or panel_num not in _NO_FREE_TEXT_COMPACT_PANELS:
         assert "beforeafter" in rendered

@@ -14,24 +14,54 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  changes:
+    name: Classify changed files
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    timeout-minutes: 5
+    outputs:
+      docker: ${{ steps.filter.outputs.docker }}
+      nix: ${{ steps.filter.outputs.nix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          python-version: ${{ matrix.python-version }}
-          version: "0.12.10"
-          enable-cache: true
-      - name: Check lockfile
-        run: uv lock --check
-      - name: Install locked dependencies
-        run: uv sync --locked --all-extras --dev
+          fetch-depth: 2
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: filter
+        with:
+          filters: |
+            # Docker inputs: build recipe, packaged application source, and
+            # every file the build copies or reads (pyproject, lockfile,
+            # README, LICENSE are package metadata and build inputs).
+            docker:
+              - '.github/workflows/ci.yml'
+              - '.dockerignore'
+              - 'Dockerfile'
+              - 'LICENSE'
+              - 'README.md'
+              - 'hermesd/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+            # Nix inputs: flake definition plus the same packaged source and
+            # metadata the flake build consumes.
+            nix:
+              - '.github/workflows/ci.yml'
+              - 'flake.nix'
+              - 'flake.lock'
+              - 'LICENSE'
+              - 'README.md'
+              - 'hermesd/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+
+  static:
+    name: Static analysis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/locked-env
+        with:
+          python-version: "3.11"
       - name: Lint (ruff)
         run: uv run ruff check .
       - name: Format check (ruff)
@@ -40,56 +70,111 @@ jobs:
         run: uv run mypy hermesd
       - name: Compile check
         run: uv run python -m compileall hermesd
+
+  security:
+    name: Dependency audit (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/locked-env
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Audit dependencies (pip-audit, classified gate)
+        run: uv run python scripts/pip_audit_gate.py
+
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/locked-env
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile check
+        run: uv run python -m compileall hermesd
       - name: Test
-        run: uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
-      - name: Audit dependencies (pip-audit)
-        run: uv run pip-audit
+        run: uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing --junitxml="$RUNNER_TEMP/pytest-results.xml"
+      - name: Upload test diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: test-diagnostics-${{ matrix.python-version }}
+          path: |
+            ${{ runner.temp }}/pytest-results.xml
+            .coverage
+          if-no-files-found: ignore
+          retention-days: 7
 
   macos:
+    name: Tests (macOS)
     runs-on: macos-15
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: ./.github/actions/locked-env
         with:
           python-version: "3.14"
-          version: "0.12.10"
-          enable-cache: true
-      - name: Install locked dependencies
-        run: uv sync --locked --all-extras --dev
       - name: Test on macOS
-        run: uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
+        run: uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing --junitxml="$RUNNER_TEMP/pytest-results.xml"
+      - name: Upload test diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: macos-diagnostics
+          path: |
+            ${{ runner.temp }}/pytest-results.xml
+            .coverage
+          if-no-files-found: ignore
+          retention-days: 7
 
   package:
+    name: Package
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: ./.github/actions/locked-env
         with:
           python-version: "3.11"
-          version: "0.12.10"
-          enable-cache: true
-      - name: Check lockfile
-        run: uv lock --check
-      - name: Install locked dependencies
-        run: uv sync --locked --all-extras --dev
       - name: Build package
         run: uv build
+      - name: Verify wheel dependency pins match the lockfile
+        run: uv run python scripts/check_wheel_pins.py
       - name: Smoke test built wheel
+        # Smoke venvs live outside the checkout so local and CI runs never
+        # leave accidental repository artifacts behind (audit CI-21).
         run: |
-          uv run python -m venv .wheel-smoke
-          .wheel-smoke/bin/python -m pip install dist/*.whl
-          .wheel-smoke/bin/hermesd --version
-          .wheel-smoke/bin/python -I -m hermesd --version
-          uv run python -m venv .sdist-smoke
-          .sdist-smoke/bin/python -m pip install dist/*.tar.gz
-          .sdist-smoke/bin/hermesd --version
-          .sdist-smoke/bin/python -I -m hermesd --version
+          uv run python -m venv "$RUNNER_TEMP/wheel-smoke"
+          "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip install dist/*.whl
+          "$RUNNER_TEMP/wheel-smoke/bin/hermesd" --version
+          "$RUNNER_TEMP/wheel-smoke/bin/python" -I -m hermesd --version
+          "$RUNNER_TEMP/wheel-smoke/bin/python" scripts/installed_smoke.py
+          uv run python -m venv "$RUNNER_TEMP/sdist-smoke"
+          "$RUNNER_TEMP/sdist-smoke/bin/python" -m pip install dist/*.tar.gz
+          "$RUNNER_TEMP/sdist-smoke/bin/hermesd" --version
+          "$RUNNER_TEMP/sdist-smoke/bin/python" -I -m hermesd --version
+          "$RUNNER_TEMP/sdist-smoke/bin/python" scripts/installed_smoke.py
       - name: Check package metadata
         run: uv run twine check dist/*
 
   docker:
+    name: Docker
+    needs: changes
+    # Pull requests skip Docker only when no classified input changed; trusted
+    # events (push to main, manual dispatch) always run the full validation.
+    if: >-
+      needs.changes.outputs.docker == 'true' ||
+      github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -98,12 +183,117 @@ jobs:
         run: docker build --tag hermesd-ci .
       - name: Smoke test Docker image
         run: docker run --rm hermesd-ci --version
+      - name: Smoke test Docker checkpoint support
+        # Exercises the installed hermesd end to end through its public CLI
+        # with a synthetic checkpoint repo - no private collector imports
+        # (audit CI-22).
+        run: |
+          docker run --rm -i --network none --entrypoint python hermesd-ci - <<'PY'
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          with tempfile.TemporaryDirectory() as directory:
+              home = Path(directory) / ".hermes"
+              for name in ("logs", "sessions", "skills", "memories", "cron"):
+                  (home / name).mkdir(parents=True)
+
+              repo = home / "checkpoints" / "smoke000000000000"
+              workdir = Path(directory) / "workspaces" / "project-alpha"
+              workdir.mkdir(parents=True)
+              repo.mkdir(parents=True)
+              (repo / "HERMES_WORKDIR").write_text(str(workdir))
+
+              subprocess.run(["git", "init", "--quiet", "--bare", str(repo)], check=True)
+
+              def git(*args: str) -> None:
+                  subprocess.run(
+                      ["git", "--git-dir", str(repo), "--work-tree", str(workdir), *args],
+                      check=True,
+                  )
+
+              git("config", "user.email", "smoke@example.invalid")
+              git("config", "user.name", "Smoke Test")
+              (workdir / "notes.txt").write_text("checkpoint smoke\n")
+              for number in range(2):
+                  if number:
+                      (workdir / "notes.txt").write_text(f"checkpoint smoke v{number}\n")
+                  git("add", "-A")
+                  git("commit", "--quiet", "-m", f"checkpoint {number}")
+
+              snapshot = subprocess.run(
+                  [
+                      "hermesd", "--hermes-home", str(home),
+                      "--snapshot-panel", "4", "--no-color",
+                  ],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+              assert "Checkpoints (1)" in snapshot.stdout, snapshot.stdout
+              assert "checkpoint 1" in snapshot.stdout, snapshot.stdout
+          PY
 
   nix:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    name: Nix (${{ matrix.os }})
+    needs: changes
+    if: >-
+      needs.changes.outputs.nix == 'true' ||
+      github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
-      - name: Check commit-pinned Nix flake
+      - name: Check commit-pinned Nix flake (builds package, tests, and smoke checks)
         run: nix flake check --no-write-lock-file
+      - name: Build hermesd package (runs the pytest suite)
+        run: nix build .#hermesd
+      - name: Smoke test installed executable
+        run: ./result/bin/hermesd --version
+
+  # Single stable required check for branch protection. It always runs and
+  # treats every non-success outcome of expected work — including skipped-by-
+  # filter jobs that their classification says should have run, cancelled
+  # jobs, and a failed changes job — as a failed gate (audit CI-14).
+  gate:
+    name: CI gate
+    needs: [changes, static, security, test, macos, package, docker, nix]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Fail unless every expected job succeeded
+        env:
+          RESULTS: >-
+            changes=${{ needs.changes.result }}
+            static=${{ needs.static.result }}
+            security=${{ needs.security.result }}
+            test=${{ needs.test.result }}
+            macos=${{ needs.macos.result }}
+            package=${{ needs.package.result }}
+            docker=${{ needs.docker.result }}
+            nix=${{ needs.nix.result }}
+          DOCKER_EXPECTED: ${{ needs.changes.outputs.docker == 'true' || github.event_name != 'pull_request' }}
+          NIX_EXPECTED: ${{ needs.changes.outputs.nix == 'true' || github.event_name != 'pull_request' }}
+        run: |
+          status=0
+          for pair in $RESULTS; do
+            job="${pair%%=*}"
+            result="${pair#*=}"
+            case "$job" in
+              docker) expected="$DOCKER_EXPECTED" ;;
+              nix) expected="$NIX_EXPECTED" ;;
+              *) expected="true" ;;
+            esac
+            [ "$expected" = "true" ] || continue
+            if [ "$result" != "success" ]; then
+              echo "::error::required job '$job' finished with '$result'"
+              status=1
+            fi
+          done
+          exit $status

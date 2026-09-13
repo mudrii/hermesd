@@ -2,6 +2,11 @@
 
 Thanks for your interest in contributing to hermesd!
 
+CI/CD and release policy (branch protection, release eligibility, dependency
+pinning, update cadence) is documented canonically in
+[`docs/ci-release-policy.md`](docs/ci-release-policy.md); this guide links to
+it rather than restating it.
+
 ## Getting Started
 
 ```bash
@@ -10,7 +15,7 @@ cd hermesd
 uv venv .venv --python 3.11
 source .venv/bin/activate
 uv sync --locked --all-extras --dev
-uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
+uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
 ```
 
 ## Development Workflow
@@ -21,7 +26,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 2. **Write the failing test first** — acceptance-level if user-visible, unit-level otherwise
 3. **Implement the minimum change** that makes the test pass
 4. **Refactor while green** — improve naming/cohesion without changing behavior
-5. **Run the full suite** — `uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing`
+5. **Run the full suite** — `uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing`
 6. **Run lint + type + audit + lock + build + package smoke**:
 
    ```bash
@@ -35,11 +40,11 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
    python -m venv /tmp/hermesd-wheel-smoke
    /tmp/hermesd-wheel-smoke/bin/python -m pip install dist/hermesd-*.whl
    /tmp/hermesd-wheel-smoke/bin/hermesd --version
-   /tmp/hermesd-wheel-smoke/bin/python -m hermesd --version
+   /tmp/hermesd-wheel-smoke/bin/python -I -m hermesd --version
    python -m venv /tmp/hermesd-sdist-smoke
    /tmp/hermesd-sdist-smoke/bin/python -m pip install dist/hermesd-*.tar.gz
    /tmp/hermesd-sdist-smoke/bin/hermesd --version
-   /tmp/hermesd-sdist-smoke/bin/python -m hermesd --version
+   /tmp/hermesd-sdist-smoke/bin/python -I -m hermesd --version
    uv run twine check dist/*
    ```
 
@@ -76,7 +81,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 
 1. Create `hermesd/panels/your_panel.py` with a `render_your_panel(state, theme, detail=False)` function
 2. Add your data to `hermesd/models.py` (Pydantic model)
-3. Collect the data in `hermesd/collector.py`
+3. Collect the data in the matching `hermesd/collect/*.py` reader, wired in via `hermesd/collector.py`
 4. Register in `hermesd/panels/__init__.py`: add a `_render_your_panel(ctx: PanelRenderContext)` wrapper, add it to `_RENDERERS`, and add the label to `PANEL_NAMES`
 5. Add tests in `tests/test_your_panel.py`
 6. Update the overview layout specs in `hermesd/app.py` (`_WIDE_LAYOUT_SPEC`, `_COMPACT_LAYOUT_SPEC`, `_TALL_NARROW_LAYOUT_SPEC`) if the new panel needs overview placement
@@ -84,7 +89,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 ## Adding Data to an Existing Panel
 
 1. Add fields to the relevant model in `hermesd/models.py`
-2. Populate them in `hermesd/collector.py`
+2. Populate them in the matching `hermesd/collect/*.py` reader, wired in via `hermesd/collector.py`
 3. Render them in the panel's `_render_compact` and/or `_render_detail` functions
 4. Add tests
 
@@ -92,7 +97,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 
 ```bash
 # Full suite
-uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
+uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
 
 # Single file
 uv run pytest tests/test_collector.py -v
@@ -103,22 +108,22 @@ uv run pytest tests/ -x --tb=short
 
 Test categories:
 - `test_models.py` — Pydantic model construction
-- `test_db_extended.py` / `test_db_resilience.py` — SQLite reader, WAL snapshotting, caching, resilience
+- `test_db_extended.py` / `test_db_null_tolerance.py` — SQLite reader, WAL snapshotting, caching, NULL coalescing (including a static guard against `.get(col, default)` on rows)
 - `test_file_cache.py` — mtime-keyed JSON/YAML cache
-- `test_collector.py` / `test_collector_extended.py` / `test_collector_coverage.py` / `test_collector_fixes.py` — data collection from `~/.hermes/`
-- `test_session_active.py` — session active/ended detection
-- `test_cost_estimation.py` — token/cost reconciliation edge cases
+- `test_collector.py` — `Collector` construction, `collect()` orchestration, health/fallback, available tools
+- `test_collector_<source>.py` (`sessions`, `cron`, `kanban`, `skills`, `gateway`, `operations`, `config`, `logs`, `profiles`) — one file per `hermesd/collect/*.py` reader
+- `test_paths.py` — `HermesPaths` resolution and profile scoping
 - `test_theme.py` — skin loading and theme inheritance
 - `test_formatting.py` — shared panel formatting helpers
-- `test_main.py` — CLI argument parsing and snapshot modes
-- `test_app.py` / `test_app_extended.py` / `test_app_fixes.py` — TUI key handling, layout, lifecycle
-- `test_panels.py` / `test_panels_extended.py` / `test_panels_fixes.py` — cross-panel rendering (compact + detail) and panel regression fixes
-- `test_cron_panel.py` / `test_curator_panel.py` / `test_curator.py` / `test_memory_panel.py` / `test_skills_panel.py` / `test_tools_panel.py` / `test_profiles_panel.py` / `test_profiles.py` — dedicated panel rendering tests
-- `test_gateway_resilience.py` / `test_curator_resilience.py` — error handling, cache preservation
-- `test_persistence_fixes.py` — persistence-layer regression fixes
+- `test_main.py` — CLI argument parsing, snapshot modes, signal exit codes
+- `test_app.py` / `test_app_extended.py` / `test_app_input.py` — TUI key handling, input thread, layout, lifecycle
+- `test_panels.py` / `test_panels_extended.py` — cross-panel rendering (compact + detail)
+- `test_<panel>_panel.py` — one file per panel (`gateway`, `sessions`, `tokens`, `tools`, `config`, `cron`, `skills`, `logs`, `profiles`, `memory`, `kanban`, `operations`, `curator`)
+- `test_markup_safety.py` / `test_unicode_rendering.py` — Rich markup escaping, secret-redaction safety and CJK/wide-character rendering across every panel
+- `test_*_resilience.py` (`collector`, `db`, `gateway`, `curator`) — every test injects an error and asserts the next read returns last-good data
 - `test_package_metadata.py` — packaging, workflow, long-description, and wheel-smoke contracts
 - `test_import_hygiene.py` / `test_readonly_invariant.py` — standalone-package and read-only safety contracts
-- `test_markup_safety.py` — Rich markup and secret-redaction safety
+- `test_tui_integration.py` — real-pty end-to-end TUI test
 - `test_contract.py` — opt-in contract test against a real `~/.hermes` (not part of the default suite)
 
 ## Reporting Issues

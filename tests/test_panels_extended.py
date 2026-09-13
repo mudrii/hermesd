@@ -123,9 +123,16 @@ def test_sessions_panel_detail_surfaces_billing_summary_before_long_session_tabl
     )
     assert "Billing & Context" in text
     assert "Lifetime / Limit" in text
-    # Detail table caps at 50 rows; sorted most-recent-first, sess_070 is the
-    # last rendered row of the main table (and is not in the billing table).
-    assert text.index("Billing & Context") < text.index("sess_070")
+    # The detail table caps at 50 rows behind a 20-row scroll window; sorted
+    # most-recent-first, sess_100 is the last row rendered at the top offset
+    # (and is not in the billing table).
+    assert text.index("Billing & Context") < text.index("sess_100")
+    # Rows beyond the window stay reachable by scrolling into the capped table.
+    scrolled = render_to_str(
+        render_panel(2, DashboardState(sessions=sessions), Theme(), detail=True, scroll_offset=30),
+        width=160,
+    )
+    assert "sess_070" in scrolled
 
 
 def test_sessions_panel_detail_filter_query():

@@ -6,7 +6,7 @@ import rich.box
 from rich.panel import Panel
 from rich.text import Text
 
-from hermesd.models import DashboardState, LogLine
+from hermesd.models import DashboardState, LogLine, SourceScope
 from hermesd.panels.formatting import sanitize_terminal_text
 from hermesd.theme import Theme
 
@@ -121,7 +121,9 @@ def _render_detail(
     )
     total = len(log_lines)
     max_offset = _max_offset(total)
-    offset = min(scroll_offset, max_offset)
+    # Clamp both ends: a negative offset would slice from the end of the list
+    # and render an empty page with a negative line counter.
+    offset = max(0, min(scroll_offset, max_offset))
     visible_lines = log_lines[offset : offset + _DETAIL_VISIBLE_LOG_LINES]
 
     lines = Text()
@@ -132,6 +134,9 @@ def _render_detail(
         else:
             tab_bar.append(f"  {name}  ", style=theme.banner_dim)
     lines.append_text(tab_bar)
+    lines.append("\n")
+    lines.append(" Scope: ", style=theme.ui_label)
+    lines.append(_scope_label(state, sub_view), style=theme.ui_accent)
     if filter_query:
         lines.append("\n")
         lines.append(" Filter: ", style=theme.ui_label)
@@ -237,3 +242,17 @@ def _log_stream_map(state: DashboardState) -> dict[str, list[LogLine]]:
         "errors": state.logs.error_lines,
         "cron": state.logs.cron_lines,
     }
+
+
+def _scope_label(state: DashboardState, sub_view: str) -> str:
+    """Which Hermes home the selected stream is resolved against.
+
+    Streams of the same base name exist in both scopes (``logs/agent.log`` and
+    ``profiles/<name>/logs/agent.log``), and ``LogStream.path`` carries only the
+    file name, so the scope is what tells an operator which copy they read.
+    See ``.codex/rules/source-ownership.md``.
+    """
+    for stream in state.logs.streams:
+        if stream.name == sub_view:
+            return stream.scope.value
+    return SourceScope.ROOT.value

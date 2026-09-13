@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from hermesd.collect.common import _exists_strict
+from hermesd.file_cache import _read_capped
+
 _BUILTIN_SKINS: dict[str, dict[str, str]] = {
     "default": {
         "banner_border": "#CD7F32",
@@ -166,19 +169,26 @@ class Theme:
         return _STATUS_BAR_BG
 
 
-def load_theme(hermes_home: Path) -> Theme:
-    skin_name = "default"
-    config_path = hermes_home / "config.yaml"
-    if config_path.exists():
-        try:
-            import yaml
+_LAST_GOOD_THEMES: dict[str, Theme] = {}
 
-            with open(config_path, encoding="utf-8") as f:
-                cfg = yaml.safe_load(f) or {}
-            if isinstance(cfg, dict):
-                display = cfg.get("display", {})
-                if isinstance(display, dict):
-                    skin_name = str(display.get("skin", "default") or "default")
-        except (OSError, UnicodeError, yaml.YAMLError):
-            pass
-    return Theme(normalize_skin_name(skin_name))
+
+def load_theme(hermes_home: Path) -> Theme:
+    import yaml
+
+    config_path = hermes_home / "config.yaml"
+    cache_key = str(config_path)
+    try:
+        if not _exists_strict(config_path):
+            return Theme()
+        cfg = yaml.safe_load(_read_capped(config_path)) or {}
+        skin_name = "default"
+        if isinstance(cfg, dict):
+            display = cfg.get("display", {})
+            if isinstance(display, dict):
+                skin_name = str(display.get("skin", "default") or "default")
+        theme = Theme(normalize_skin_name(skin_name))
+        _LAST_GOOD_THEMES[cache_key] = theme
+        return theme
+    except (OSError, UnicodeError, yaml.YAMLError):
+        last_good = _LAST_GOOD_THEMES.get(cache_key)
+        return last_good if last_good is not None else Theme()

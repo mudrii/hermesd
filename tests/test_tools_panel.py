@@ -2,8 +2,18 @@
 
 from __future__ import annotations
 
-from hermesd.models import DashboardState, ToolStats
+import pytest
+from rich.table import Table
+
+import hermesd.panels.tools as tools_module
+from hermesd.models import (
+    BackgroundProcessInfo,
+    DashboardState,
+    ToolsetAvailability,
+    ToolStats,
+)
 from hermesd.panels import render_panel
+from hermesd.panels.tools import render_tools
 from hermesd.theme import Theme
 from tests.conftest import render_to_str
 
@@ -95,3 +105,202 @@ def test_tools_compact_shows_summary():
     text = render_to_str(panel, width=100)
     assert "29 available" in text
     assert "10 calls" in text
+
+
+def test_tools_detail_handles_absurd_started_at() -> None:
+    state = DashboardState(
+        background_processes=[
+            BackgroundProcessInfo(session_id="s", command="make", started_at=1e18)
+        ]
+    )
+    rendered = render_to_str(render_tools(state, Theme(), detail=True))
+    assert "—" in rendered
+
+
+def _process(**fields: object) -> BackgroundProcessInfo:
+    base: dict[str, object] = {
+        "session_id": "proc_alpha",
+        "command": "pytest -q",
+        "pid": 4242,
+        "purpose": "dashboard",
+        "port": 9119,
+        "profile": "coding",
+        "alive": True,
+    }
+    base.update(fields)
+    return BackgroundProcessInfo(**base)  # type: ignore[arg-type]
+
+
+def test_tools_detail_renders_purpose_port_and_profile_columns():
+    state = DashboardState(background_processes=[_process()])
+    text = render_to_str(render_tools(state, Theme(), detail=True), width=180)
+    assert "Purpose" in text
+    assert "Port" in text
+    assert "Profile" in text
+    row = next(line for line in text.splitlines() if "proc_alpha" in line)
+    assert "dashboard" in row
+    assert "9119" in row
+    assert "coding" in row
+
+
+def test_tools_detail_uses_placeholders_for_missing_process_metadata():
+    state = DashboardState(
+        background_processes=[_process(purpose="", port=0, profile="", pid=0, alive=False)]
+    )
+    text = render_to_str(render_tools(state, Theme(), detail=True), width=180)
+    row = next(line for line in text.splitlines() if "proc_alpha" in line)
+    assert row.count("—") >= 3
+
+
+def test_tools_detail_marks_dead_processes():
+    state = DashboardState(
+        background_processes=[
+            _process(session_id="proc_live", alive=True),
+            _process(session_id="proc_dead", pid=4343, alive=False),
+        ]
+    )
+    text = render_to_str(render_tools(state, Theme(), detail=True), width=180)
+    live_row = next(line for line in text.splitlines() if "proc_live" in line)
+    dead_row = next(line for line in text.splitlines() if "proc_dead" in line)
+    assert "✗" not in live_row
+    assert "4343 ✗" in dead_row
+
+
+def test_tools_detail_escapes_markup_hostile_process_metadata():
+    state = DashboardState(
+        background_processes=[
+            _process(
+                purpose="[bold]mcp\x1b[2J-helper[/bold]",
+                profile="\x1b]8;;http://evil\x07[red]p[/red]",
+                command="run [blink]x[/blink]",
+            )
+        ]
+    )
+    text = render_to_str(render_tools(state, Theme(), detail=True), width=200)
+    assert "\x1b[2J" not in text
+    assert "http://evil" not in text
+    assert "[bold]mcp" in text
+    assert "[blink]x" in text
+
+
+def test_tools_detail_empty_process_table_still_renders():
+    state = DashboardState(background_processes=[])
+    text = render_to_str(render_tools(state, Theme(), detail=True), width=180)
+    assert "No running background processes" in text
+
+
+def _availability_state(**fields: object) -> DashboardState:
+    return DashboardState(toolset_availability=ToolsetAvailability(**fields))
+
+
+def test_tools_detail_shows_toolset_availability_line():
+    state = _availability_state(
+        enabled_toolsets=["file", "web", "terminal"],
+        unavailable_toolsets=["bfl", "browser", "kanban"],
+        lazy_tool_count=8,
+        disabled_tool_count=1,
+    )
+
+    text = render_to_str(render_tools(state, Theme(), detail=True), width=180, no_color=True)
+
+    assert "Toolsets: 3 enabled" in text
+    assert "unavailable: bfl, browser, kanban" in text
+    assert "8 lazy" in text
+    assert "1 disabled" in text
+
+
+def test_tools_detail_omits_unavailable_when_all_toolsets_load():
+    state = _availability_state(enabled_toolsets=["file", "web"])
+
+    text = render_to_str(render_tools(state, Theme(), detail=True), width=180, no_color=True)
+
+    assert "Toolsets: 2 enabled" in text
+    assert "unavailable" not in text
+
+
+def test_tools_detail_omits_toolset_line_without_a_snapshot():
+    text = render_to_str(render_tools(DashboardState(), Theme(), detail=True), width=180)
+
+    assert "Toolsets:" not in text
+
+
+def test_tools_compact_marks_unavailable_toolsets():
+    state = _availability_state(enabled_toolsets=["file"], unavailable_toolsets=["kanban"])
+
+    text = render_to_str(render_tools(state, Theme()), width=100, no_color=True)
+
+    assert "1 toolset unavailable" in text
+
+
+def test_tools_compact_has_no_marker_when_all_toolsets_load():
+    state = _availability_state(enabled_toolsets=["file"])
+
+    text = render_to_str(render_tools(state, Theme()), width=100, no_color=True)
+
+    assert "unavailable" not in text
+
+
+def test_tools_detail_escapes_markup_hostile_toolset_names():
+    state = _availability_state(
+        enabled_toolsets=["ok"], unavailable_toolsets=["[bold red]evil\x1b[2J", "[/]x"]
+    )
+
+    text = render_to_str(render_tools(state, Theme(), detail=True), width=180, no_color=True)
+
+    assert "[bold red]evil" in text
+    assert "[/]x" in text
+    assert "\x1b[2J" not in text
+
+
+def _counting_build_spy(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    calls = [0]
+    real_build = tools_module._build_tool_calls_table
+
+    def counting_build(tool_stats: list[ToolStats], theme: Theme) -> Table:
+        calls[0] += 1
+        return real_build(tool_stats, theme)
+
+    monkeypatch.setattr(tools_module, "_build_tool_calls_table", counting_build)
+    return calls
+
+
+def test_tools_detail_memoizes_calls_table_for_unchanged_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 2 Hz render loop must not rebuild the calls table between collects."""
+    state = DashboardState(
+        tool_stats=[ToolStats(name="terminal", call_count=5)],
+        total_tool_calls=5,
+    )
+    theme = Theme()
+    build_calls = _counting_build_spy(monkeypatch)
+
+    render_tools(state, theme, detail=True)
+    render_tools(state, theme, detail=True)
+
+    assert build_calls[0] == 1
+
+
+def test_tools_detail_rebuilds_calls_table_for_new_state_or_theme(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = DashboardState(
+        tool_stats=[ToolStats(name="terminal", call_count=5)],
+        total_tool_calls=5,
+    )
+    theme = Theme()
+    build_calls = _counting_build_spy(monkeypatch)
+
+    render_tools(state, theme, detail=True)
+    # A fresh collect yields a new tool_stats list, even with equal contents.
+    render_tools(
+        DashboardState(
+            tool_stats=[ToolStats(name="terminal", call_count=5)],
+            total_tool_calls=5,
+        ),
+        theme,
+        detail=True,
+    )
+    render_tools(state, Theme(), detail=True)
+
+    assert build_calls[0] == 3

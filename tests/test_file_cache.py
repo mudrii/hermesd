@@ -1,3 +1,5 @@
+"""mtime-keyed JSON/YAML last-good file cache."""
+
 from __future__ import annotations
 
 import json
@@ -8,7 +10,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from hermesd.file_cache import LastGoodFileCache
+from hermesd.file_cache import _MAX_PARSED_FILE_BYTES, LastGoodFileCache
 
 
 def test_cache_hit_reuses_value_until_mtime_changes(tmp_path):
@@ -132,6 +134,59 @@ def test_file_cache_handles_concurrent_reads(tmp_path):
     assert errors == []
 
 
+@pytest.mark.parametrize("kind", ["json", "yaml", "json_list"])
+def test_deleted_file_evicts_cache_and_returns_default(tmp_path, kind):
+    """A deleted source file must stop serving its last-good value forever."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "data.src"
+    if kind == "json":
+        path.write_text(json.dumps({"value": 1}))
+        read, loaded, default = cache.read_json_mapping, {"value": 1}, {}
+    elif kind == "yaml":
+        path.write_text(yaml.safe_dump({"value": 1}))
+        read, loaded, default = cache.read_yaml_mapping, {"value": 1}, {}
+    else:
+        path.write_text(json.dumps([{"value": 1}]))
+        read, loaded, default = cache.read_json_list, [{"value": 1}], []
+    assert read(path) == loaded
+
+    path.unlink()
+
+    assert read(path) == default
+    # Recreating the file must be picked up rather than serving the evicted value.
+    if kind == "json":
+        path.write_text(json.dumps({"value": 2}))
+        assert read(path) == {"value": 2}
+    elif kind == "yaml":
+        path.write_text(yaml.safe_dump({"value": 2}))
+        assert read(path) == {"value": 2}
+    else:
+        path.write_text(json.dumps([{"value": 2}]))
+        assert read(path) == [{"value": 2}]
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="chmod 000 does not block stat when running as root",
+)
+def test_unstatable_file_preserves_last_good_value(tmp_path):
+    """A transient stat error (not deletion) keeps serving the last-good value."""
+    cache = LastGoodFileCache()
+    directory = tmp_path / "locked"
+    directory.mkdir()
+    path = directory / "data.json"
+    path.write_text(json.dumps({"value": 1}))
+    assert cache.read_json_mapping(path) == {"value": 1}
+
+    directory.chmod(0o000)
+    try:
+        assert cache.read_json_mapping(path) == {"value": 1}
+    finally:
+        directory.chmod(0o755)
+
+    assert cache.read_json_mapping(path) == {"value": 1}
+
+
 @pytest.mark.parametrize("kind", ["json", "yaml"])
 def test_invalid_utf8_preserves_last_good_value(tmp_path, kind):
     cache = LastGoodFileCache()
@@ -143,3 +198,290 @@ def test_invalid_utf8_preserves_last_good_value(tmp_path, kind):
     path.write_bytes(b"\xff")
 
     assert read(path) == {"value": 1}
+
+
+def _clone_stat(
+    result: os.stat_result,
+    *,
+    st_mtime: float,
+    st_mtime_ns: int,
+    st_size: int | None = None,
+) -> os.stat_result:
+    """Rebuild a stat result with a controlled mtime granularity.
+
+    Simulates a filesystem whose float st_mtime has 1-second granularity while
+    st_mtime_ns still distinguishes successive writes.
+    """
+    return os.stat_result(
+        (
+            result.st_mode,
+            result.st_ino,
+            result.st_dev,
+            result.st_nlink,
+            result.st_uid,
+            result.st_gid,
+            result.st_size if st_size is None else st_size,
+            result.st_atime,
+            st_mtime,
+            result.st_ctime,
+        ),
+        {
+            "st_atime_ns": result.st_atime_ns,
+            "st_mtime_ns": st_mtime_ns,
+            "st_ctime_ns": result.st_ctime_ns,
+        },
+    )
+
+
+def _pin_coarse_mtime(monkeypatch, path: Path, reference: os.stat_result) -> None:
+    """Force path.stat() to report reference's float mtime but a newer st_mtime_ns."""
+    real_stat = Path.stat
+
+    def fake_stat(self: Path, *args, **kwargs) -> os.stat_result:
+        result = real_stat(self, *args, **kwargs)
+        if self == path:
+            return _clone_stat(
+                result,
+                st_mtime=reference.st_mtime,
+                st_mtime_ns=reference.st_mtime_ns + 1_000_000,
+            )
+        return result
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+
+
+def test_malformed_json_fixed_within_same_second_is_reloaded(tmp_path, monkeypatch):
+    """A same-second fix to a malformed file must not be hidden by bad-mtime caching."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "data.json"
+    path.write_text("{ not valid json")
+    assert cache.read_json_mapping(path) == {}
+    reference = path.stat()
+
+    path.write_text(json.dumps({"fixed": 1}))
+    _pin_coarse_mtime(monkeypatch, path, reference)
+
+    assert cache.read_json_mapping(path) == {"fixed": 1}
+
+
+def test_malformed_yaml_fixed_within_same_second_is_reloaded(tmp_path, monkeypatch):
+    cache = LastGoodFileCache()
+    path = tmp_path / "config.yaml"
+    path.write_text(":\n  - [unclosed")
+    assert cache.read_yaml_mapping(path) == {}
+    reference = path.stat()
+
+    path.write_text(yaml.safe_dump({"fixed": 1}))
+    _pin_coarse_mtime(monkeypatch, path, reference)
+
+    assert cache.read_yaml_mapping(path) == {"fixed": 1}
+
+
+def test_valid_json_changed_within_same_second_is_reloaded(tmp_path, monkeypatch):
+    """Same-second valid-content changes must invalidate the cached value too."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "data.json"
+    path.write_text(json.dumps({"v": 1}))
+    assert cache.read_json_mapping(path) == {"v": 1}
+    reference = path.stat()
+
+    path.write_text(json.dumps({"v": 2}))
+    _pin_coarse_mtime(monkeypatch, path, reference)
+
+    assert cache.read_json_mapping(path) == {"v": 2}
+
+
+def test_oversized_json_is_refused_and_keeps_the_last_good_value(tmp_path):
+    """A document over the parse cap is treated exactly like a malformed one."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "models_dev_cache.json"
+    path.write_text(json.dumps({"v": 1}))
+    assert cache.read_json_mapping(path) == {"v": 1}
+
+    padding = "p" * (_MAX_PARSED_FILE_BYTES + 1)
+    path.write_text(json.dumps({"v": 2, "pad": padding}))
+    assert path.stat().st_size > _MAX_PARSED_FILE_BYTES
+
+    assert cache.read_json_mapping(path) == {"v": 1}
+    assert cache.last_read_was_stale(path) is True
+
+
+def test_oversized_json_is_not_reparsed_on_every_read(tmp_path, monkeypatch):
+    cache = LastGoodFileCache()
+    path = tmp_path / "huge.json"
+    path.write_text(json.dumps({"pad": "p" * (_MAX_PARSED_FILE_BYTES + 1)}))
+
+    def exploding_open(*args, **kwargs):
+        raise AssertionError("an over-cap file must never be opened")
+
+    monkeypatch.setattr(Path, "open", exploding_open)
+
+    assert cache.read_json_mapping(path) == {}
+    assert cache.read_json_mapping(path) == {}
+
+
+def test_file_grown_past_cap_between_stat_and_read_is_rejected(tmp_path, monkeypatch):
+    """A stat that under-reports size must not let an oversized document parse."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "data.json"
+    path.write_text(json.dumps({"v": 1}))
+    assert cache.read_json_mapping(path) == {"v": 1}
+
+    path.write_text(json.dumps({"v": 2, "pad": "p" * (_MAX_PARSED_FILE_BYTES + 1)}))
+    real_stat = Path.stat
+
+    def small_size_stat(self: Path, *args, **kwargs) -> os.stat_result:
+        result = real_stat(self, *args, **kwargs)
+        if self == path:
+            return _clone_stat(
+                result,
+                st_mtime=result.st_mtime,
+                st_mtime_ns=result.st_mtime_ns,
+                st_size=1,
+            )
+        return result
+
+    monkeypatch.setattr(Path, "stat", small_size_stat)
+
+    assert cache.read_json_mapping(path) == {"v": 1}
+    assert cache.last_read_was_stale(path) is True
+
+
+def test_file_swapped_mid_read_is_not_cached_under_stale_mtime(tmp_path, monkeypatch):
+    """A post-read mtime mismatch must drop the read instead of caching it."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "data.json"
+    path.write_text(json.dumps({"v": 1}))
+    assert cache.read_json_mapping(path) == {"v": 1}
+
+    path.write_text(json.dumps({"v": 2}))
+    real_stat = Path.stat
+    stat_calls = 0
+
+    def swapped_stat(self: Path, *args, **kwargs) -> os.stat_result:
+        nonlocal stat_calls
+        result = real_stat(self, *args, **kwargs)
+        if self == path:
+            stat_calls += 1
+            if stat_calls == 2:
+                return _clone_stat(
+                    result,
+                    st_mtime=result.st_mtime,
+                    st_mtime_ns=result.st_mtime_ns + 1_000_000,
+                )
+        return result
+
+    monkeypatch.setattr(Path, "stat", swapped_stat)
+    assert cache.read_json_mapping(path) == {"v": 1}
+    assert cache.last_read_was_stale(path) is True
+
+    monkeypatch.undo()
+    assert cache.read_json_mapping(path) == {"v": 2}
+
+
+def test_file_just_under_the_cap_still_loads(tmp_path):
+    """models_dev_cache.json is ~4.5 MB in a real ~/.hermes and must keep loading."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "big-but-ok.json"
+    path.write_text(json.dumps({"pad": "p" * (5 * 1024 * 1024)}))
+    assert path.stat().st_size < _MAX_PARSED_FILE_BYTES
+
+    assert cache.read_json_mapping(path)["pad"].startswith("p")
+
+
+@pytest.mark.parametrize("kind", ["json", "yaml"])
+def test_transient_open_failure_recovers_without_mtime_change(tmp_path, monkeypatch, kind):
+    """A PermissionError mid-load must not poison the mtime as permanently bad.
+
+    The file's content changes (new mtime) while the open fails: the cache
+    serves the last-good value and marks the read stale, but — unlike a parse
+    error — it must NOT record the new mtime as bad. Once access is restored
+    with the SAME mtime, the very next refresh returns the new value without
+    any mtime change, and the stale flag clears.
+    """
+    cache = LastGoodFileCache()
+    path = tmp_path / f"data.{kind}"
+    if kind == "json":
+        path.write_text('{"v": 1}')
+        read = cache.read_json_mapping
+    else:
+        path.write_text("v: 1\n")
+        read = cache.read_yaml_mapping
+    assert read(path) == {"v": 1}
+
+    # Swap in new content (new mtime), then make open fail.
+    if kind == "json":
+        path.write_text('{"v": 2}')
+    else:
+        path.write_text("v: 2\n")
+
+    real_open = Path.open
+    open_calls = 0
+
+    def failing_open(self: Path, *args, **kwargs):
+        nonlocal open_calls
+        if self == path:
+            open_calls += 1
+            raise PermissionError("file locked by another process")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+
+    assert read(path) == {"v": 1}
+    assert cache.last_read_was_stale(path) is True
+    # Not bad-mtime cached: a second failed read retries the open instead of
+    # short-circuiting on the poisoned mtime (parse errors stay cached — see
+    # the *_invalid_shape_reuses_bad_mtime tests).
+    assert read(path) == {"v": 1}
+    assert open_calls == 2
+
+    monkeypatch.undo()
+    assert read(path) == {"v": 2}
+    assert cache.last_read_was_stale(path) is False
+
+
+def test_transient_oserror_on_never_readable_file_returns_default(tmp_path, monkeypatch):
+    """A transient I/O failure with no cached value yields the default and no stale flag."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "data.json"
+    path.write_text(json.dumps({"v": 1}))
+
+    real_open = Path.open
+
+    def failing_open(self: Path, *args, **kwargs):
+        if self == path:
+            raise OSError("transient read failure")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+
+    assert cache.read_json_mapping(path) == {}
+    assert cache.last_read_was_stale(path) is False
+
+
+def test_invalid_utf8_keeps_bad_mtime_caching(tmp_path, monkeypatch):
+    """UnicodeDecodeError is a content (decode) failure, not transient I/O.
+
+    The same bytes always fail to decode, so — like a parse error — the mtime
+    is remembered as bad and the file is not re-opened every refresh.
+    """
+    cache = LastGoodFileCache()
+    path = tmp_path / "data.json"
+    path.write_text('{"ok": 1}')
+    assert cache.read_json_mapping(path) == {"ok": 1}
+
+    path.write_bytes(b"\xff")
+    open_calls = 0
+    real_open = Path.open
+
+    def counting_open(self: Path, *args, **kwargs):
+        nonlocal open_calls
+        if self == path:
+            open_calls += 1
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+
+    assert cache.read_json_mapping(path) == {"ok": 1}
+    assert cache.read_json_mapping(path) == {"ok": 1}
+    assert open_calls == 1

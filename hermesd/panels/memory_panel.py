@@ -8,7 +8,7 @@ from rich.text import Text
 
 from hermesd.models import DashboardState, MemoryOverview
 from hermesd.panels.formatting import escape_terminal_text as escape
-from hermesd.panels.formatting import sanitize_terminal_text
+from hermesd.panels.formatting import sanitize_terminal_text, section_heading
 from hermesd.theme import Theme
 
 
@@ -70,9 +70,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     sections.append(summary)
 
     if memory.memory_files:
-        files_header = Text()
-        files_header.append("\nFiles\n", style=f"bold {theme.ui_label}")
-        sections.append(files_header)
+        sections.append(section_heading("Files", theme))
 
         files_table = Table(box=None, show_header=True, padding=(0, 1))
         files_table.add_column("Name", style=theme.ui_accent)
@@ -82,9 +80,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         sections.append(files_table)
 
     if memory.soul_excerpt:
-        soul_header = Text()
-        soul_header.append("\nSOUL Excerpt\n", style=f"bold {theme.ui_label}")
-        sections.append(soul_header)
+        sections.append(section_heading("SOUL Excerpt", theme))
         sections.append(
             Text(f"  {sanitize_terminal_text(memory.soul_excerpt)}\n", style=theme.banner_dim)
         )

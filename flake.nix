@@ -6,23 +6,64 @@
   };
 
   outputs = { self, nixpkgs }:
-    nixpkgs.lib.genAttrs [
-      "aarch64-darwin"
-      "aarch64-linux"
-      "x86_64-darwin"
-      "x86_64-linux"
-    ] (system:
-      let
-        pkgs = nixpkgs.legacyPackages.${system};
-        python = pkgs.python311;
-        hermesd = python.pkgs.buildPythonApplication {
+    let
+      systems = [
+        "aarch64-darwin"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "x86_64-linux"
+      ];
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+
+      # Single source of truth for the package version: the flake always reads
+      # it from pyproject.toml, so the two cannot drift apart.
+      hermesdVersion = pkgs: (pkgs.lib.importTOML ./pyproject.toml).project.version;
+
+      # hermesd's build-system requires hatchling>=1.32,<2 (Core Metadata 2.5;
+      # see pyproject.toml), but the pinned nixpkgs rev tops out at 1.31.0 and
+      # nixos-unstable had not moved past it either. Take hatchling from PyPI
+      # directly, hash-validated, so the Nix build satisfies the same floor as
+      # the locked environments.
+      mkHatchling = pkgs:
+        pkgs.python312.pkgs.buildPythonPackage rec {
+          pname = "hatchling";
+          version = "1.32.0";
+          format = "wheel";
+          src = pkgs.fetchurl {
+            url = "https://files.pythonhosted.org/packages/a9/84/1798b6d85ecde0e31546004efd25c5de1b1f49250644a60cce460e12593a/hatchling-1.32.0-py3-none-any.whl";
+            hash = "sha256-DhfJw7mqfGJazI0PW2IvEH1QSa+ez1raTeGq2lvnzbw=";
+          };
+          dependencies = with pkgs.python312.pkgs; [
+            packaging
+            pathspec
+            pluggy
+            tomlkit
+            trove-classifiers
+          ];
+          doCheck = false;
+        };
+
+      mkHermesd = pkgs:
+        let
+          python = pkgs.python312;
+        in
+        python.pkgs.buildPythonApplication {
           pname = "hermesd";
-          version = "2026.7.11";
+          version = hermesdVersion pkgs;
           pyproject = true;
 
           src = ./.;
 
-          build-system = [ python.pkgs.hatchling ];
+          build-system = [ (mkHatchling pkgs) ];
+
+          # The published wheel pins its runtime requirements exactly (audit
+          # CI-06); this Nix derivation deliberately satisfies them from
+          # nixpkgs instead, whose in-tree versions (e.g. rich 15) can run
+          # ahead of the locked baseline. The build-time pytest suite and the
+          # installed-CLI smoke are what validate those nixpkgs versions here,
+          # so the wheel-metadata runtime-deps check, which would demand the
+          # uv.lock pins verbatim, does not apply to this channel.
+          dontCheckRuntimeDeps = true;
 
           dependencies = with python.pkgs; [
             rich
@@ -30,7 +71,16 @@
             pydantic
           ];
 
-          nativeCheckInputs = [ python.pkgs.pytestCheckHook ];
+          # The package build itself executes the pytest suite (checkPhase),
+          # so `nix build .#hermesd` and `nix flake check` both prove that the
+          # packaged code passes its tests — not merely that it evaluates.
+          # git is a hermesd runtime dependency (checkpoint summaries) and the
+          # test fixtures build bare checkpoint repos, so it must be on PATH
+          # in the sandbox.
+          nativeCheckInputs = [
+            python.pkgs.pytestCheckHook
+            pkgs.git
+          ];
 
           meta = with pkgs.lib; {
             description = "TUI monitoring dashboard for Hermes AI agent";
@@ -39,25 +89,62 @@
             mainProgram = "hermesd";
           };
         };
-      in
-      {
-        packages.default = hermesd;
-        packages.hermesd = hermesd;
+    in
+    {
+      packages = forAllSystems (pkgs:
+        let hermesd = mkHermesd pkgs;
+        in {
+          default = hermesd;
+          inherit hermesd;
+        });
 
-        apps.default = flake-utils.lib.mkApp {
-          drv = hermesd;
+      apps = forAllSystems (pkgs: {
+        default = {
+          type = "app";
+          program = "${mkHermesd pkgs}/bin/hermesd";
         };
+      });
 
-        devShells.default = pkgs.mkShell {
-          packages = [
-            python
-            python.pkgs.rich
-            python.pkgs.pyyaml
-            python.pkgs.pydantic
-            python.pkgs.pytest
-            pkgs.uv
-          ];
-        };
-      }
-    );
+      devShells = forAllSystems (pkgs:
+        let python = pkgs.python312;
+        in {
+          default = pkgs.mkShell {
+            packages = [
+              python
+              python.pkgs.rich
+              python.pkgs.pyyaml
+              python.pkgs.pydantic
+              python.pkgs.pytest
+              pkgs.uv
+            ];
+          };
+        });
+
+      checks = forAllSystems (pkgs:
+        let hermesd = mkHermesd pkgs;
+        in {
+          # `nix flake check` builds every derivation under checks, so listing
+          # the package here forces its realization (and its pytest suite)
+          # even for callers that only run the flake-level check.
+          inherit hermesd;
+
+          # Realize the package and exercise the installed executable — the
+          # same smoke every published artifact must pass.
+          hermesd-cli-smoke = pkgs.runCommand "hermesd-cli-smoke"
+            {
+              nativeBuildInputs = [ hermesd ];
+              expectedVersion = hermesdVersion pkgs;
+              meta.timeout = 300;
+            }
+            ''
+              output="$(hermesd --version)"
+              echo "installed executable: $output"
+              echo "$output" | grep -F "hermesd $expectedVersion" > /dev/null || {
+                echo "installed hermesd does not report version $expectedVersion" >&2
+                exit 1
+              }
+              touch "$out"
+            '';
+        });
+    };
 }

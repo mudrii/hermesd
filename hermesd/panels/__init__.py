@@ -21,6 +21,7 @@ class PanelRenderContext:
     filter_query: str = ""
     session_sort: str = "recent"
     session_message_match_ids: set[str] | None = None
+    expand_skills: bool = False
 
 
 PanelRenderer = Callable[[PanelRenderContext], Panel]
@@ -77,6 +78,7 @@ def _render_skills_panel(ctx: PanelRenderContext) -> Panel:
         ctx.theme,
         detail=ctx.detail,
         scroll_offset=ctx.scroll_offset,
+        expand_skills=ctx.expand_skills,
     )
 
 
@@ -173,6 +175,7 @@ def render_panel(
     filter_query: str = "",
     session_sort: str = "recent",
     session_message_match_ids: set[str] | None = None,
+    expand_skills: bool = False,
 ) -> Panel:
     renderer = _RENDERERS.get(panel_num)
     if renderer is None:
@@ -183,6 +186,7 @@ def render_panel(
         detail=detail,
         log_sub_view=log_sub_view,
         scroll_offset=scroll_offset,
+        expand_skills=expand_skills,
         profile_view_index=profile_view_index,
         filter_query=filter_query,
         session_sort=session_sort,

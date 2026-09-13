@@ -1,6 +1,6 @@
-# Modern Python Idioms (3.11 – 3.13)
+# Modern Python Idioms (3.11 – 3.14)
 
-Each pattern below is tagged with its minimum Python version. hermesd's `requires-python = ">=3.11"` and CI matrix-tests on 3.11, 3.12, and 3.13 — so **any syntax tagged 3.12+ or 3.13+ cannot be used unconditionally** in the codebase. It may only appear behind a version guard or in code paths that the 3.11 interpreter never parses.
+Each pattern below is tagged with its minimum Python version. hermesd's `requires-python = ">=3.11"` and CI matrix-tests on 3.11, 3.12, 3.13, and 3.14 — so **any syntax tagged 3.12+, 3.13+, or 3.14+ cannot be used unconditionally** in the codebase. It may only appear behind a version guard or in code paths that the 3.11 interpreter never parses.
 
 If you raise `requires-python` in `pyproject.toml`, update this file's floor.
 
@@ -17,16 +17,20 @@ Project-wide conventions that apply on every version:
 - **3.11+** — safe everywhere in hermesd.
 - **3.12+** — SyntaxError on 3.11. Do not use in library code.
 - **3.13+** — ImportError/AttributeError on 3.11 and 3.12. Do not use in library code.
+- **3.14+** — SyntaxError/ImportError on 3.11 through 3.13. Do not use in library code.
 
 ---
 
 ## Exception Groups — 3.11+
 
 ```python
-raise ExceptionGroup("validation errors", [
-    ValueError("name is required"),
-    ValueError("age must be positive"),
-])
+raise ExceptionGroup(
+    "validation errors",
+    [
+        ValueError("name is required"),
+        ValueError("age must be positive"),
+    ],
+)
 
 try:
     validate(data)
@@ -52,6 +56,7 @@ Prefer over bare `create_task` for structured concurrency with automatic cancell
 ```python
 from enum import StrEnum
 
+
 class Status(StrEnum):
     PENDING = "pending"
     ACTIVE = "active"
@@ -64,6 +69,7 @@ Prefer over plain string constants for fixed string sets. Values serialize natur
 
 ```python
 from typing import Self
+
 
 class Builder:
     def with_name(self, name: str) -> Self:
@@ -78,14 +84,19 @@ Use for fluent APIs and factory methods instead of forward references or class-b
 ```python
 from typing import Never, NoReturn
 
+
 def die(msg: str) -> NoReturn:
     raise RuntimeError(msg)
 
+
 def exhaustive(x: Status) -> str:
     match x:
-        case Status.PENDING: return "p"
-        case Status.ACTIVE:  return "a"
-        case Status.CLOSED:  return "c"
+        case Status.PENDING:
+            return "p"
+        case Status.ACTIVE:
+            return "a"
+        case Status.CLOSED:
+            return "c"
     _: Never = x  # mypy catches a missing case here
     raise AssertionError(_)
 ```
@@ -110,6 +121,7 @@ Use for multi-branch dispatch on structured data and command patterns. Prefer `i
 
 ```python
 from dataclasses import dataclass, field
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class OrderLine:
@@ -150,6 +162,7 @@ Pre-3.12 equivalent (safe everywhere):
 
 ```python
 from typing import TypeAlias
+
 Vector: TypeAlias = list[float]
 ```
 
@@ -159,6 +172,7 @@ Vector: TypeAlias = list[float]
 # 3.12+ only:
 def first[T](items: Sequence[T]) -> T: ...
 
+
 def decorator[**P, R](fn: Callable[P, R]) -> Callable[P, R]: ...
 ```
 
@@ -166,9 +180,11 @@ Pre-3.12 equivalent:
 
 ```python
 from typing import TypeVar, ParamSpec
+
 T = TypeVar("T")
 P = ParamSpec("P")
 R = TypeVar("R")
+
 
 def first(items: Sequence[T]) -> T: ...
 def decorator(fn: Callable[P, R]) -> Callable[P, R]: ...
@@ -178,6 +194,7 @@ def decorator(fn: Callable[P, R]) -> Callable[P, R]: ...
 
 ```python
 from typing import override
+
 
 class JsonParser(BaseParser):
     @override
@@ -203,6 +220,7 @@ UserId = NewType("UserId", int)
 ```python
 from typing import TypeIs
 
+
 def is_str_list(val: list[object]) -> TypeIs[list[str]]:
     return all(isinstance(x, str) for x in val)
 ```
@@ -214,11 +232,26 @@ On 3.11/3.12, import from `typing_extensions` (add dependency first). If the pro
 ```python
 from warnings import deprecated
 
+
 @deprecated("Use new_function instead")
 def old_function() -> None: ...
 ```
 
 `warnings.deprecated` is 3.13-only. On 3.11/3.12, import from `typing_extensions` (add dependency first) or use a manual deprecation decorator.
+
+---
+
+## 3.14+ only — do not use unconditionally
+
+### Template strings (3.14)
+
+```python
+# 3.14+ only — SyntaxError on 3.11 through 3.13:
+name = "world"
+msg = t"hello {name}"
+```
+
+Template strings (`t"..."`, PEP 750) parse only on 3.14+. Stick with f-strings while `requires-python = ">=3.11"`.
 
 ---
 

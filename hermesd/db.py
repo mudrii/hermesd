@@ -5,19 +5,44 @@ import shutil
 import sqlite3
 import tempfile
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, TypeVar
+
+from hermesd.collect.common import _db_source_mtime_ns, _exists_strict, _safe_child_path
+from hermesd.models import AUTHORITATIVE_COST_STATUSES
 
 T = TypeVar("T")
 _RECONNECT_ERROR_THRESHOLD = 3
 _CONNECT_BACKOFF_READS = 2
+# Caps the LIKE fallback result set. The scan itself is unbounded on a miss;
+# this bounds what a pathological match can hand back to the UI.
+_LIKE_SEARCH_LIMIT = 500
+# Seconds sqlite3 waits on a locked database before raising. hermesd is a
+# read-only viewer refreshing on a timer: fail fast and keep last-good data
+# rather than stall the render loop behind a writer.
+_SQLITE_TIMEOUT_SECONDS = 2
+_MODEL_USAGE_ROW_LIMIT = 50
+# SQL literal for the authoritative-cost classification, kept in sync with
+# AUTHORITATIVE_COST_STATUSES (single source of truth in models.py).
+_AUTHORITATIVE_COST_STATUS_SQL = ", ".join(
+    f"'{status}'" for status in sorted(AUTHORITATIVE_COST_STATUSES)
+)
+# Window cutoffs are rounded down to this bucket so repeated reads inside the
+# same bucket hit the cache instead of re-querying on every collector pass.
+_MODEL_USAGE_CUTOFF_BUCKET_SECONDS = 60
+# (window name, lookback seconds); None means "all time".
+_MODEL_USAGE_WINDOWS: tuple[tuple[str, float | None], ...] = (
+    ("all", None),
+    ("24h", 86400.0),
+    ("7d", 7 * 86400.0),
+)
 
 
 class HermesDB:
     def __init__(self, db_path: Path, allowed_root: Path | None = None):
         self._path = db_path
-        # When set, _open_target re-validates on every (re)connect that the db
+        # When set, _open_targets re-validates on every (re)connect that the db
         # path is not a symlink and still resolves under this root, closing the
         # profile symlink TOCTOU window left by startup-only validation.
         self._allowed_root = allowed_root
@@ -41,6 +66,11 @@ class HermesDB:
         self._last_read_sessions_stale = False
         self._last_read_session_count_stale = False
         self._last_read_tool_stats_stale = False
+        self._cached_model_usage: dict[str, list[dict[str, Any]]] = _empty_model_usage()
+        self._cached_model_usage_key: tuple[int | None, tuple[float | None, ...]] | None = None
+        self._cached_model_usage_initialized = False
+        self._last_read_model_usage_stale = False
+        self._model_usage_available: bool | None = None
         self._cached_message_search_query: str = ""
         self._cached_message_search_results: set[str] = set()
         self._cached_message_search_version: int | None = None
@@ -53,6 +83,7 @@ class HermesDB:
         self._messages_fts_supports_session_id: bool | None = None
         self._messages_fts_available: bool | None = None
         self._session_column_names: set[str] | None = None
+        self._message_column_names: set[str] | None = None
         self._snapshot_dir: tempfile.TemporaryDirectory[str] | None = None
         self._closed = False
         self._connect()
@@ -61,15 +92,37 @@ class HermesDB:
         if self._closed:
             return
         self._close_connection()
-        if not self._path.exists():
+        # _exists_strict, not Path.exists(): on Python 3.14 an unreadable
+        # parent directory would otherwise read as "no database" and blank the
+        # session panel instead of failing the source.
+        if not _exists_strict(self._path):
             self._connected_mtime_ns = None
             self._consecutive_errors = 0
             self._mark_cached_reads_stale()
             return
         try:
-            db_path, uri_params = self._open_target()
-            self._uri = f"{db_path.resolve().as_uri()}?{uri_params}"
-            conn = sqlite3.connect(self._uri, uri=True, timeout=2, check_same_thread=False)
+            conn: sqlite3.Connection | None = None
+            uri = ""
+            for db_path, uri_params in self._open_targets():
+                uri = f"{db_path.resolve().as_uri()}?{uri_params}"
+                try:
+                    conn = sqlite3.connect(
+                        uri, uri=True, timeout=_SQLITE_TIMEOUT_SECONDS, check_same_thread=False
+                    )
+                    # Opening SQLite is lazy: validate the schema before
+                    # publishing the handle, so unreadable snapshots enter
+                    # the normal stale-data/reconnect path immediately.
+                    conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+                except (OSError, sqlite3.Error):
+                    if conn is not None:
+                        with contextlib.suppress(sqlite3.Error):
+                            conn.close()
+                        conn = None
+                    continue
+                break
+            if conn is None:
+                raise sqlite3.OperationalError(f"unable to open database: {self._path}")
+            self._uri = uri
             conn.row_factory = sqlite3.Row
             with self._connection_ref_lock:
                 self._conn = conn
@@ -78,18 +131,30 @@ class HermesDB:
             self._cached_session_count_version = None
             self._cached_tool_stats_version = None
             self._cached_message_search_version = None
+            self._cached_model_usage_key = None
+            self._model_usage_available = None
             self._consecutive_errors = 0
             self._connect_backoff_reads = 0
             self._connected_mtime_ns = self._source_mtime_ns()
             self._messages_fts_supports_session_id = None
             self._messages_fts_available = None
             self._session_column_names = None
+            self._message_column_names = None
         except (OSError, sqlite3.OperationalError):
             self._close_connection()
             self._connected_mtime_ns = None
             self._consecutive_errors = 0
             self._connect_backoff_reads = _CONNECT_BACKOFF_READS
             self._mark_cached_reads_stale()
+            # The db exists but cannot be opened at all. A fresh reader has no
+            # initialized caches, so _mark_cached_reads_stale is a no-op there
+            # and callers would read the empty cache as a legitimate zero
+            # instead of a failed source; flag every read surface stale.
+            self._last_read_sessions_stale = True
+            self._last_read_session_count_stale = True
+            self._last_read_tool_stats_stale = True
+            self._last_message_search_stale = True
+            self._last_read_model_usage_stale = True
 
     def _close_connection(self) -> None:
         with self._connection_ref_lock:
@@ -102,14 +167,26 @@ class HermesDB:
             self._snapshot_dir.cleanup()
             self._snapshot_dir = None
 
-    def _open_target(self) -> tuple[Path, str]:
-        if self._allowed_root is not None and not _safe_sidecar_path(
-            self._path, self._allowed_root
-        ):
+    def _open_targets(self) -> Iterator[tuple[Path, str]]:
+        """Select an immutable source read or a private WAL snapshot.
+
+        Even read-only WAL connections can reuse a writable shared-memory
+        mapping held by another connection in this process. Always snapshot
+        WAL databases so SQLite bookkeeping stays outside the Hermes home.
+        The snapshot is reused until the source mtime changes.
+        """
+        if self._allowed_root is not None and not _safe_child_path(self._path, self._allowed_root):
             raise OSError(f"Refusing to open database outside allowed root: {self._path}")
-        if not self._path.with_name(f"{self._path.name}-wal").exists():
-            return self._path, "mode=ro&immutable=1"
-        return self._snapshot_wal_database(), "mode=ro"
+        wal_path = self._path.with_name(f"{self._path.name}-wal")
+        if wal_path.is_symlink():
+            raise OSError(f"Refusing to open database with unsafe SQLite WAL sidecar: {wal_path}")
+        # _exists_strict, not Path.exists(): on Python 3.14 an unreadable -wal
+        # would otherwise read as "no WAL" and silently route to immutable=1,
+        # serving checkpoint-lagging data instead of failing the source.
+        if not _exists_strict(wal_path):
+            yield self._path, "mode=ro&immutable=1"
+            return
+        yield self._snapshot_wal_database(), "mode=ro"
 
     def _snapshot_wal_database(self) -> Path:
         snapshot_dir, snapshot_db = snapshot_wal_database(self._path, prefix="hermesd-state-")
@@ -117,13 +194,7 @@ class HermesDB:
         return snapshot_db
 
     def _source_mtime_ns(self) -> int | None:
-        mtimes = []
-        for path in (self._path, self._path.with_name(f"{self._path.name}-wal")):
-            try:
-                mtimes.append(path.stat().st_mtime_ns)
-            except OSError:
-                continue
-        return max(mtimes) if mtimes else None
+        return _db_source_mtime_ns(self._path)
 
     def _source_changed(self) -> bool:
         current_mtime = self._source_mtime_ns()
@@ -138,6 +209,8 @@ class HermesDB:
             self._last_read_tool_stats_stale = True
         if self._cached_message_search_initialized:
             self._last_message_search_stale = True
+        if self._cached_model_usage_initialized:
+            self._last_read_model_usage_stale = True
 
     def _ensure_connection(self) -> sqlite3.Connection | None:
         if self._closed:
@@ -211,8 +284,28 @@ class HermesDB:
 
     def _read_all_sessions(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
         columns = ", ".join(self._session_columns(conn))
-        cur = conn.execute(f"SELECT {columns} FROM sessions ORDER BY started_at DESC")
+        # last_activity_at only exists on newer hermes-agent schemas; older
+        # databases must keep the original started_at ordering.
+        order_by = (
+            "COALESCE(last_activity_at, started_at)"
+            if "last_activity_at" in self._session_column_set(conn)
+            else "started_at"
+        )
+        where = self._hidden_session_filter(conn)
+        cur = conn.execute(f"SELECT {columns} FROM sessions{where} ORDER BY {order_by} DESC")
         return [dict(row) for row in cur.fetchall()]
+
+    def _hidden_session_filter(self, conn: sqlite3.Connection) -> str:
+        """Return the WHERE clause hiding soft-deleted sessions, or '' on old schemas."""
+        if "hidden" not in self._session_column_set(conn):
+            return ""
+        return " WHERE COALESCE(hidden, 0) = 0"
+
+    def _session_column_set(self, conn: sqlite3.Connection) -> set[str]:
+        if self._session_column_names is None:
+            cur = conn.execute("PRAGMA table_info(sessions)")
+            self._session_column_names = {str(row["name"]) for row in cur.fetchall()}
+        return self._session_column_names
 
     def _session_columns(self, conn: sqlite3.Connection) -> list[str]:
         wanted_columns = [
@@ -244,11 +337,129 @@ class HermesDB:
             "handoff_state",
             "handoff_platform",
             "handoff_error",
+            # hermes-agent 0.21 columns; absent on older databases.
+            "git_branch",
+            "chat_type",
+            "display_name",
+            "title_source",
+            "profile_name",
+            "pinned",
+            "last_activity_at",
+            "last_activity_description",
+            "actual_cost_usd",
+            "cost_source",
+            # Rotation-stable gateway chat key; the session-hygiene join reads
+            # it (hermes_state_gateway.py:513-529). Absent on older databases.
+            "session_key",
+            # Durable anti-thrash guard (hermes_state_common.py:375-379);
+            # absent on databases written before it landed.
+            "compression_failure_cooldown_until",
+            "compression_failure_error",
+            "compression_fallback_streak",
+            "compression_ineffective_count",
+            "compression_recovery_deadline",
         ]
-        if self._session_column_names is None:
-            cur = conn.execute("PRAGMA table_info(sessions)")
-            self._session_column_names = {str(row["name"]) for row in cur.fetchall()}
-        return [column for column in wanted_columns if column in self._session_column_names]
+        available = self._session_column_set(conn)
+        return [column for column in wanted_columns if column in available]
+
+    @property
+    def last_read_model_usage_stale(self) -> bool:
+        with self._lock:
+            return self._last_read_model_usage_stale
+
+    def read_model_usage(self, now: float) -> dict[str, list[dict[str, Any]]]:
+        """Aggregated `session_model_usage` rows for the all-time, 24h and 7d windows.
+
+        Returns empty windows when the table is absent (older hermes-agent), and
+        the last-good result after a SQLite error.
+        """
+        with self._lock:
+            cutoffs = _model_usage_cutoffs(now)
+            conn = self._ensure_connection()
+            if conn is None:
+                return self._cached_model_usage
+            version = self._current_version()
+            cache_key = (version, cutoffs)
+            if version is not None and self._cached_model_usage_key == cache_key:
+                self._last_read_model_usage_stale = False
+                return self._cached_model_usage
+            try:
+                usage = self._read_model_usage(conn, cutoffs)
+            except sqlite3.Error:
+                self._last_read_model_usage_stale = True
+                self._record_read_error()
+                return self._cached_model_usage
+            self._cached_model_usage = usage
+            self._cached_model_usage_key = cache_key
+            self._cached_model_usage_initialized = True
+            self._consecutive_errors = 0
+            self._last_read_model_usage_stale = False
+            return usage
+
+    def _read_model_usage(
+        self,
+        conn: sqlite3.Connection,
+        cutoffs: tuple[float | None, ...],
+    ) -> dict[str, list[dict[str, Any]]]:
+        if not self._model_usage_table_present(conn):
+            return _empty_model_usage()
+        return {
+            window[0]: self._aggregate_model_usage(conn, cutoff)
+            for window, cutoff in zip(_MODEL_USAGE_WINDOWS, cutoffs, strict=True)
+        }
+
+    def _model_usage_table_present(self, conn: sqlite3.Connection) -> bool:
+        if self._model_usage_available is None:
+            cur = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='session_model_usage'"
+            )
+            self._model_usage_available = cur.fetchone() is not None
+        return self._model_usage_available
+
+    def _aggregate_model_usage(
+        self,
+        conn: sqlite3.Connection,
+        cutoff: float | None,
+    ) -> list[dict[str, Any]]:
+        where_clause = "" if cutoff is None else "WHERE last_seen >= ? "
+        parameters: tuple[Any, ...] = () if cutoff is None else (cutoff,)
+        cur = conn.execute(
+            "SELECT model, billing_provider AS provider, task, "
+            "SUM(api_call_count) AS api_calls, "
+            "SUM(input_tokens) AS input_tokens, "
+            "SUM(output_tokens) AS output_tokens, "
+            "SUM(cache_read_tokens) AS cache_read_tokens, "
+            "SUM(cache_write_tokens) AS cache_write_tokens, "
+            "SUM(reasoning_tokens) AS reasoning_tokens, "
+            "SUM(estimated_cost_usd) AS estimated_cost_usd, "
+            "SUM(actual_cost_usd) AS actual_cost_usd, "
+            # Per-row cost split: a row with a provider-billed cost, or an
+            # authoritative zero/known one (reported/exact/included), counts
+            # toward the reported side; every other row toward the estimated
+            # side. A billed row's own estimate is never double-counted.
+            # NULL comparisons evaluate falsy, so NULL actual/cost_status rows
+            # land on the estimated side.
+            f"SUM(CASE WHEN actual_cost_usd > 0 THEN actual_cost_usd "
+            f"WHEN cost_status IN ({_AUTHORITATIVE_COST_STATUS_SQL}) "
+            f"THEN COALESCE(actual_cost_usd, estimated_cost_usd, 0) "
+            f"ELSE 0 END) AS reported_cost_usd, "
+            f"SUM(CASE WHEN actual_cost_usd > 0 "
+            f"OR cost_status IN ({_AUTHORITATIVE_COST_STATUS_SQL}) "
+            f"THEN 0 ELSE COALESCE(estimated_cost_usd, 0) END) AS estimated_only_cost_usd, "
+            f"SUM(CASE WHEN actual_cost_usd > 0 "
+            f"OR cost_status IN ({_AUTHORITATIVE_COST_STATUS_SQL}) "
+            f"THEN 1 ELSE 0 END) AS reported_row_count, "
+            "COUNT(*) AS row_count, "
+            "MAX(last_seen) AS last_seen "
+            f"FROM session_model_usage {where_clause}"
+            "GROUP BY model, billing_provider, task "
+            "ORDER BY COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) "
+            "+ COALESCE(SUM(cache_read_tokens), 0) + COALESCE(SUM(cache_write_tokens), 0) "
+            "+ COALESCE(SUM(reasoning_tokens), 0) DESC, model ASC "
+            f"LIMIT {_MODEL_USAGE_ROW_LIMIT}",
+            parameters,
+        )
+        return [dict(row) for row in cur.fetchall()]
 
     def read_session_count(self) -> int:
         with self._lock:
@@ -271,7 +482,8 @@ class HermesDB:
             return self._cached_session_count
 
     def _read_session_count(self, conn: sqlite3.Connection) -> int:
-        cur = conn.execute("SELECT COUNT(*) FROM sessions")
+        # Must agree with read_sessions: hidden rows are not shown, so not counted.
+        cur = conn.execute(f"SELECT COUNT(*) FROM sessions{self._hidden_session_filter(conn)}")
         row = cur.fetchone()
         return int(row[0]) if row is not None else 0
 
@@ -292,12 +504,23 @@ class HermesDB:
             return self._cached_tool_stats
 
     def _read_tool_stats(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        # messages.active exists only on newer hermes-agent schemas; 0 marks a
+        # message compacted out of the live transcript, which must not be counted.
+        active_filter = (
+            " AND COALESCE(active, 1) = 1" if self._filters_inactive_messages(conn) else ""
+        )
         cur = conn.execute(
             "SELECT tool_name, COUNT(*) as call_count "
-            "FROM messages WHERE tool_name IS NOT NULL "
+            f"FROM messages WHERE tool_name IS NOT NULL{active_filter} "
             "GROUP BY tool_name ORDER BY call_count DESC"
         )
         return [dict(row) for row in cur.fetchall()]
+
+    def _message_columns(self, conn: sqlite3.Connection) -> set[str]:
+        if self._message_column_names is None:
+            cur = conn.execute("PRAGMA table_info(messages)")
+            self._message_column_names = {str(row["name"]) for row in cur.fetchall()}
+        return self._message_column_names
 
     def search_session_ids_by_message(self, query: str) -> set[str]:
         normalized = query.strip()
@@ -324,6 +547,8 @@ class HermesDB:
                     except sqlite3.Error:
                         session_ids = self._search_session_ids_by_like(conn, normalized)
                     else:
+                        # FTS matches whole tokens, so a mid-token substring
+                        # legitimately misses; LIKE is what finds it.
                         if not session_ids:
                             session_ids = self._search_session_ids_by_like(conn, normalized)
                 else:
@@ -341,6 +566,24 @@ class HermesDB:
                 if self._cached_message_search_query != normalized:
                     return set()
             return self._cached_message_search_results
+
+    def run_readout(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+        """Run `fn` against the shared read-only connection, reconnecting if needed.
+
+        Callers that need extra tables out of the same database reuse this
+        instead of opening a second connection every tick. ``sqlite3.Error``
+        propagates on purpose: the calling source treats it as a failure and
+        keeps its last-good data.
+        """
+        with self._lock:
+            conn = self._ensure_connection()
+            if conn is None:
+                raise sqlite3.OperationalError(f"database unavailable: {self._path}")
+            try:
+                return fn(conn)
+            except sqlite3.Error:
+                self._record_read_error()
+                raise
 
     def _read_cached(
         self,
@@ -397,29 +640,41 @@ class HermesDB:
             cur = conn.execute("PRAGMA table_info(messages_fts)")
             columns = {str(row[1]) for row in cur.fetchall()}
             self._messages_fts_supports_session_id = "session_id" in columns
-        if self._messages_fts_supports_session_id:
-            cur = conn.execute(
-                "SELECT DISTINCT session_id FROM messages_fts WHERE messages_fts MATCH ?",
-                (fts_query,),
-            )
+        active_only = self._filters_inactive_messages(conn)
+        if self._messages_fts_supports_session_id and not active_only:
+            sql = "SELECT DISTINCT session_id FROM messages_fts WHERE messages_fts MATCH ?"
         else:
-            cur = conn.execute(
+            # Joining messages on rowid is required to read session_id when the
+            # FTS table lacks it, and to apply the active filter when it has it.
+            active_filter = " AND COALESCE(messages.active, 1) = 1" if active_only else ""
+            sql = (
                 "SELECT DISTINCT messages.session_id "
                 "FROM messages_fts "
                 "JOIN messages ON messages.id = messages_fts.rowid "
-                "WHERE messages_fts MATCH ?",
-                (fts_query,),
+                f"WHERE messages_fts MATCH ?{active_filter}"
             )
+        cur = conn.execute(sql, (fts_query,))
         return {str(row[0]) for row in cur.fetchall() if row[0]}
+
+    def _filters_inactive_messages(self, conn: sqlite3.Connection) -> bool:
+        """True when messages.active exists, marking rows compacted out of the transcript."""
+        return "active" in self._message_columns(conn)
 
     def _search_session_ids_by_like(self, conn: sqlite3.Connection, query: str) -> set[str]:
         pattern = f"%{_escape_like_pattern(query.lower())}%"
+        # The OR pair must stay parenthesised: AND binds tighter, so an unbracketed
+        # active filter would only constrain the tool_name branch.
+        active_filter = (
+            " AND COALESCE(active, 1) = 1" if self._filters_inactive_messages(conn) else ""
+        )
         cur = conn.execute(
             "SELECT DISTINCT session_id "
             "FROM messages "
-            "WHERE LOWER(COALESCE(content, '')) LIKE ? ESCAPE '\\' "
-            "OR LOWER(COALESCE(tool_name, '')) LIKE ? ESCAPE '\\'",
-            (pattern, pattern),
+            "WHERE (LOWER(COALESCE(content, '')) LIKE ? ESCAPE '\\' "
+            "OR LOWER(COALESCE(tool_name, '')) LIKE ? ESCAPE '\\')"
+            f"{active_filter} "
+            "LIMIT ?",
+            (pattern, pattern, _LIKE_SEARCH_LIMIT),
         )
         return {str(row[0]) for row in cur.fetchall() if row[0]}
 
@@ -437,6 +692,15 @@ class HermesDB:
             self._close_connection()
 
 
+def _empty_model_usage() -> dict[str, list[dict[str, Any]]]:
+    return {window[0]: [] for window in _MODEL_USAGE_WINDOWS}
+
+
+def _model_usage_cutoffs(now: float) -> tuple[float | None, ...]:
+    bucket = (now // _MODEL_USAGE_CUTOFF_BUCKET_SECONDS) * _MODEL_USAGE_CUTOFF_BUCKET_SECONDS
+    return tuple(None if span is None else bucket - span for _, span in _MODEL_USAGE_WINDOWS)
+
+
 def _escape_like_pattern(query: str) -> str:
     return query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
@@ -447,8 +711,8 @@ def snapshot_wal_database(
     """Copy a WAL-mode database and its sidecars into a fresh temp dir.
 
     Returns the TemporaryDirectory (caller owns cleanup) and the snapshot db
-    path. Sidecars are copied only when they safely resolve under db_path's
-    directory.
+    path. Missing sidecars are allowed; present sidecars must resolve safely
+    under db_path's directory or the snapshot is refused.
     """
     snapshot_dir = tempfile.TemporaryDirectory(prefix=prefix)
     snapshot_root = Path(snapshot_dir.name)
@@ -457,23 +721,17 @@ def snapshot_wal_database(
         shutil.copy2(db_path, snapshot_db)
         for suffix in ("-wal", "-shm"):
             source = db_path.with_name(f"{db_path.name}{suffix}")
-            if source.exists() and _safe_sidecar_path(source, db_path.parent):
-                shutil.copy2(source, snapshot_root / source.name)
+            if source.is_symlink():
+                raise OSError(f"Refusing to snapshot unsafe SQLite sidecar: {source}")
+            if not _exists_strict(source):
+                continue
+            if not _safe_child_path(source, db_path.parent):
+                raise OSError(f"Refusing to snapshot unsafe SQLite sidecar: {source}")
+            shutil.copy2(source, snapshot_root / source.name)
     except OSError:
         snapshot_dir.cleanup()
         raise
     return snapshot_dir, snapshot_db
-
-
-def _safe_sidecar_path(path: Path, root: Path) -> bool:
-    if path.is_symlink():
-        return False
-    try:
-        resolved_path = path.resolve(strict=False)
-        resolved_root = root.resolve(strict=False)
-    except (OSError, RuntimeError):
-        return False
-    return resolved_path == resolved_root or resolved_path.is_relative_to(resolved_root)
 
 
 def _quote_fts_query(query: str) -> str:

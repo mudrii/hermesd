@@ -176,7 +176,9 @@ def test_gateway_panel_detail_shows_platform_error():
         ),
     )
     panel = render_panel(1, state, Theme(), detail=True)
-    text = render_to_str(panel, width=120)
+    # Widened past 120: the platform table gained a Profile column, and at 120 the
+    # Error cell wraps mid-message.
+    text = render_to_str(panel, width=160)
     assert "failed to reconnect" in text
     assert "reconnect_failed" in text
     assert "restart" in text.lower()
