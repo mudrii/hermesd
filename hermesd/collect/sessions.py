@@ -553,6 +553,17 @@ def _route_free_text(value: object) -> str:
     return _redact_text_fields(_redact_bare_credentials(str(value or "")))
 
 
+# Chat-controlled free text from ``entry_json``: redacted *and* clipped, because
+# the 64 KiB column cap leaves room for a display name or a reason long enough to
+# swamp the panel's cell and the JSON snapshot. Redaction runs first, so a
+# credential can never survive as a truncated prefix.
+_ROUTE_TEXT_CHARS = 40
+
+
+def _route_text(value: object) -> str:
+    return _route_free_text(value)[:_ROUTE_TEXT_CHARS]
+
+
 def _gateway_route(
     row: dict[str, Any],
     *,
@@ -581,13 +592,13 @@ def _gateway_route(
         session_id=session_id,
         platform=str(entry.get("platform") or ""),
         chat_type=str(entry.get("chat_type") or ""),
-        display_name=_route_free_text(entry.get("display_name"))[:40],
+        display_name=_route_text(entry.get("display_name")),
         updated_at_age_seconds=_age_seconds(updated_at, now),
         suspended=_coerce_bool(entry.get("suspended")),
         resume_pending=_coerce_bool(entry.get("resume_pending")),
-        resume_reason=_route_free_text(entry.get("resume_reason")),
+        resume_reason=_route_text(entry.get("resume_reason")),
         was_auto_reset=_coerce_bool(entry.get("was_auto_reset")),
-        auto_reset_reason=_route_free_text(entry.get("auto_reset_reason")),
+        auto_reset_reason=_route_text(entry.get("auto_reset_reason")),
         # The durable executing-turn marker: its start age is only meaningful
         # while a token exists (gateway/session.py:515-518).
         turn_age_seconds=_age_seconds(turn_started, now) if turn_token else None,

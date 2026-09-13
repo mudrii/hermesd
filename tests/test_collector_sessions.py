@@ -2787,3 +2787,40 @@ def test_gateway_route_display_name_is_clipped(hermes_home: Path) -> None:
 
     assert len(route.display_name) == 40
     assert route.display_name == "N" * 40
+
+
+def test_gateway_route_reasons_are_clipped(hermes_home: Path) -> None:
+    """Both reasons are chat-controlled free text and need a bound, not just redaction.
+
+    ``entry_json`` is capped at 64 KiB, so a single route could put two
+    multi-thousand-character strings into the panel's flags cell and the JSON
+    snapshot. Redaction runs first, so a credential cannot survive as a prefix.
+    """
+    conn = _make_coordination_db(hermes_home)
+    insert_gateway_route(
+        conn,
+        "telegram:506",
+        {
+            "session_id": "sess-1",
+            "platform": "telegram",
+            "resume_pending": True,
+            "resume_reason": "R" * 5000,
+            "was_auto_reset": True,
+            # A credential just past the clip boundary: clipping before
+            # redacting would leave a recognisable token prefix in the cell.
+            "auto_reset_reason": "A" * 30 + "sk-live-abcdefghijklmnop",
+        },
+        _COORD_NOW - 30,
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: False)
+    try:
+        route = c.collect().session_coordination.routes[0]
+    finally:
+        c.close()
+
+    assert route.resume_reason == "R" * 40
+    assert route.auto_reset_reason == "A" * 30 + "[REDACTED]"
+    assert "sk-live" not in route.auto_reset_reason
