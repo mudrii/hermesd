@@ -8,7 +8,7 @@ from typing import Any
 
 from hermesd.collect.common import _age_seconds, _as_dict, _as_list, _coerce_bool, _coerce_int
 from hermesd.collect.redaction import _API_KEY_FIELD_NAMES, _OAUTH_FIELD_NAMES
-from hermesd.models import ConfigBackupGroup, PlatformStatus
+from hermesd.models import ConfigBackupGroup, ConfigBackupKind, PlatformStatus
 
 # Upper bound on name lists surfaced from config/cache mappings.
 _MAX_LISTED_NAMES = 20
@@ -164,20 +164,26 @@ _CORRUPT_REASON = "corrupt"
 # so ranking them first means the cap can never evict the "last changed" stamp
 # or the corrupt alert; the bulk audit trail (setup/migration/other) absorbs
 # the truncation instead.
-_KIND_RANK = {"good": 0, "corrupt": 1, "setup": 2, "migration": 3, "other": 4}
+_KIND_RANK = {
+    ConfigBackupKind.GOOD: 0,
+    ConfigBackupKind.CORRUPT: 1,
+    ConfigBackupKind.SETUP: 2,
+    ConfigBackupKind.MIGRATION: 3,
+    ConfigBackupKind.OTHER: 4,
+}
 
 
-def _backup_reason_kind(reason: str) -> str:
+def _backup_reason_kind(reason: str) -> ConfigBackupKind:
     """Coarse bucket for the audit trail: setup/migration stamps vs the rest."""
     if reason == _GOOD_REASON:
-        return _GOOD_REASON
+        return ConfigBackupKind.GOOD
     if reason == _CORRUPT_REASON:
-        return _CORRUPT_REASON
+        return ConfigBackupKind.CORRUPT
     if reason.startswith("pre-setup"):
-        return "setup"
+        return ConfigBackupKind.SETUP
     if "migrate" in reason:
-        return "migration"
-    return "other"
+        return ConfigBackupKind.MIGRATION
+    return ConfigBackupKind.OTHER
 
 
 def _config_backup_stamp_epoch(stamp: str) -> float | None:
@@ -236,7 +242,7 @@ def _config_backup_groups(
                 newest_age_seconds=_age_seconds(newest_epoch, now),
             )
         )
-    groups.sort(key=lambda group: (_KIND_RANK.get(group.kind, 99), group.reason))
+    groups.sort(key=lambda group: (_KIND_RANK[group.kind], group.reason))
     truncated = len(groups) > _CONFIG_BACKUP_GROUP_LIMIT
     return groups[:_CONFIG_BACKUP_GROUP_LIMIT], truncated
 

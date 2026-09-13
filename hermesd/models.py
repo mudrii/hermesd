@@ -1136,6 +1136,21 @@ class ToolGatewayRoute(BaseModel):
     token_present: bool = False
 
 
+class ConfigBackupKind(StrEnum):
+    """Fixed vocabulary for a backup group's coarse bucket.
+
+    Derived from the writer's reason word (``hermes_cli/config_backups.py:29-69``):
+    ``good``/``corrupt`` are the load-bearing states, ``setup`` and ``migration``
+    are the audit trail, and anything else the naming scheme allows is ``other``.
+    """
+
+    GOOD = "good"
+    CORRUPT = "corrupt"
+    SETUP = "setup"
+    MIGRATION = "migration"
+    OTHER = "other"
+
+
 class ConfigBackupGroup(BaseModel):
     """One backup-reason group inside ``backups/config/``.
 
@@ -1147,7 +1162,7 @@ class ConfigBackupGroup(BaseModel):
     """
 
     reason: str
-    kind: str = ""
+    kind: ConfigBackupKind = ConfigBackupKind.OTHER
     count: int = 0
     newest_stamp: str = ""
     newest_age_seconds: float | None = None
