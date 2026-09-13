@@ -161,6 +161,10 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         suspended = sum(1 for row in coord.hygiene if row.suspended)
         if suspended:
             lines.append(f" · {suspended} compaction off", style=f"bold {theme.ui_error}")
+    if coord.generation_count_shrank:
+        # The never-prune invariant broke. Compact has no Reset Churn head, so
+        # the flag rides its own marker rather than staying detail-only.
+        lines.append("  ⚠ reset churn: generations table shrank", style=f"bold {theme.ui_error}")
     if state.terminal_sessions.count:
         lines.append(f"  {state.terminal_sessions.count} cli tty", style=theme.banner_dim)
     lines.append(f"   {total_msgs} msgs  {total_tc} tools\n", style=theme.banner_text)
@@ -887,7 +891,10 @@ def _coordination_sections(state: DashboardState, theme: Theme) -> list[Renderab
             sections.append(
                 Text(f"  {_route_counts_label(waiting, dangling)}\n", style=theme.banner_text)
             )
-    if coord.generation_chat_total:
+    # An emptied table is the worst case of the never-prune invariant break:
+    # the chat total is 0 exactly when the shrink flag is set, so gating on the
+    # total alone would hide the warning it exists to raise.
+    if coord.generation_chat_total or coord.generation_count_shrank:
         sections.append(section_heading("Reset Churn", theme))
         sections.append(_reset_churn_section(coord, theme))
     term = state.terminal_sessions
@@ -1048,7 +1055,7 @@ def _reset_churn_section(coord: SessionCoordinationState, theme: Theme) -> Rende
     lines.append(f" across {coord.generation_chat_total} chat(s)", style=theme.banner_text)
     if coord.generation_count_shrank:
         lines.append(
-            " · table shrank between refreshes — upstream never prunes it",
+            " · table shrank between refreshes — an invariant break; upstream never prunes it",
             style=f"bold {theme.ui_error}",
         )
     lines.append("\n")
