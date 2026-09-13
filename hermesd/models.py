@@ -1912,6 +1912,13 @@ class ApiRunReservationsState(BaseModel):
 PROCESS_RECEIPT_RETENTION_SECONDS: int = 7 * 24 * 60 * 60
 PROCESS_RECEIPT_MAX_FILES: int = 64
 
+# Upstream's checkpoint auto-prune wrapper defaults (``tools/checkpoint_manager.py:1094``):
+# it short-circuits within ``min_interval_hours`` of the marker, so hermesd flags
+# overdue at 2x the interval — a stale marker is a missed wrapper run, not proof
+# of anything about the store itself.
+CHECKPOINT_PRUNE_INTERVAL_SECONDS: int = 24 * 60 * 60
+CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS: int = 2 * CHECKPOINT_PRUNE_INTERVAL_SECONDS
+
 
 class ProcessReceipt(BaseModel):
     """One finished background process, from ``logs/process-results/proc_*.json``.
@@ -2021,6 +2028,30 @@ class OperationsState(BaseModel):
     # Written by its own source (``process_receipts``): a receipt directory that
     # disappears (7-day retention) must keep the last-good list, not blank it.
     process_receipts: ProcessReceiptsState = Field(default_factory=ProcessReceiptsState)
+    # Checkpoint auto-prune wrapper marker, PROFILE ``checkpoints/.last_prune``
+    # (``tools/checkpoint_manager.py:1094-1130``).
+    checkpoint_prune_marker_present: bool = False
+    checkpoint_prune_marker_age_seconds: float | None = None
+    # ROOT parking bay for an unparseable spawn ledger
+    # (``hermes_cli/process_identity.py:160-171``).
+    spawn_ledger_corrupt_present: bool = False
+    spawn_ledger_corrupt_age_seconds: float | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def checkpoint_prune_overdue(self) -> bool:
+        """True when a marker exists and is older than the 48h overdue window.
+
+        Caveat kept with the render copy: a fresh marker proves the wrapper RAN,
+        not that pruning succeeded — per-repo failures land in the prune result,
+        not in the marker — so this flag is never a store-health verdict.
+        """
+        age = self.checkpoint_prune_marker_age_seconds
+        return (
+            self.checkpoint_prune_marker_present
+            and age is not None
+            and age > CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS
+        )
 
 
 class CuratorRun(BaseModel):

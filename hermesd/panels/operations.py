@@ -8,6 +8,8 @@ from rich.text import Text
 
 from hermesd.models import (
     API_RUN_RETENTION_SECONDS,
+    CHECKPOINT_PRUNE_INTERVAL_SECONDS,
+    CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS,
     HOSTED_ROOM_DISBANDED_RETENTION_SECONDS,
     MAX_ACTIVE_HOSTED_ROOMS,
     MAX_DISBANDED_HOSTED_ROOM_TOMBSTONES,
@@ -152,6 +154,19 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     if ops.blocked_script_count:
         lines.append("  Blocked scripts: ", style=theme.ui_label)
         lines.append(f"{ops.blocked_script_count}\n", style=theme.ui_warn)
+    if ops.checkpoint_prune_overdue:
+        age = ops.checkpoint_prune_marker_age_seconds
+        lines.append("  ⚠ Checkpoint prune overdue ", style=theme.ui_warn)
+        lines.append(
+            f"({_age_span_label(age)} since last pass)\n",
+            style=theme.ui_warn,
+        )
+    if ops.spawn_ledger_corrupt_present:
+        lines.append("  ⚠ spawn-ledger corrupt ", style=theme.ui_warn)
+        lines.append(
+            f"(parked {_age_span_label(ops.spawn_ledger_corrupt_age_seconds)} ago)\n",
+            style=theme.ui_warn,
+        )
     lines.append("  Verify: ", style=theme.ui_label)
     if ops.verification_db_present:
         lines.append(
@@ -528,7 +543,34 @@ def _summary_table(ops: OperationsState, theme: Theme) -> Table:
         )
     if ops.blocked_script_count:
         summary.add_row("Blocked scripts", _blocked_scripts_label(ops))
+    if ops.checkpoint_prune_marker_present:
+        summary.add_row("Checkpoint Prune", _checkpoint_prune_label(ops))
+    if ops.spawn_ledger_corrupt_present:
+        summary.add_row("Spawn Ledger", _spawn_ledger_corrupt_label(ops))
     return summary
+
+
+def _checkpoint_prune_label(ops: OperationsState) -> str:
+    """Marker age against upstream's 24h interval, with the overdue verdict.
+
+    The caveat is part of the row: a fresh marker proves the wrapper ran, not
+    that pruning succeeded.
+    """
+    age = _age_span_label(ops.checkpoint_prune_marker_age_seconds)
+    verdict = (
+        f"OVERDUE (> {_age_span_label(float(CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS))})"
+        if ops.checkpoint_prune_overdue
+        else f"interval {_age_span_label(float(CHECKPOINT_PRUNE_INTERVAL_SECONDS))}"
+    )
+    return f"last pass {age} ago · {verdict} · a fresh marker proves the wrapper ran, not that pruning succeeded"
+
+
+def _spawn_ledger_corrupt_label(ops: OperationsState) -> str:
+    """The parked corrupt ledger: presence and age, contents never read."""
+    return (
+        f"⚠ corrupt ledger parked {_age_span_label(ops.spawn_ledger_corrupt_age_seconds)} ago "
+        "(read-only viewer; contents never parsed)"
+    )
 
 
 def _blocked_scripts_label(ops: OperationsState) -> str:

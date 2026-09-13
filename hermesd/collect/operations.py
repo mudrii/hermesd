@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from hermesd.collect.common import (
+    _MAX_TEXT_READ_BYTES,
     _age_seconds,
     _as_dict,
     _as_list,
@@ -594,7 +595,7 @@ def _process_receipt_from_file(
     can legitimately approach 200 KiB of output, so refusing at the shared cap
     keeps a worst-case file from being read whole while counting it above.
     """
-    data = _json_object_capped(_read_text_capped(path, home))
+    data = _json_object_capped(_read_text_capped(path, home), max_bytes=_MAX_TEXT_READ_BYTES)
     if data is None:
         return None
     output = str(data.get("output") or "")
@@ -610,6 +611,64 @@ def _process_receipt_from_file(
         finished_age_seconds=_age_seconds(mtime, now),
         output_tail=_redact_secret_text(output[-_PROCESS_RECEIPT_TAIL_MAX_CHARS:]),
     )
+
+
+def _read_checkpoint_prune_marker(marker_path: Path, home: Path, *, now: float) -> dict[str, Any]:
+    """The checkpoint auto-prune wrapper's ``.last_prune`` marker.
+
+    PROFILE scope: the marker lives in ``checkpoints/``, which upstream resolves
+    through ``get_hermes_home()`` (``tools/checkpoint_manager.py:33,37-42``), and
+    is written as a bare epoch after each wrapper pass (``:1106-1116``) with a
+    default interval of 24h (``:1094``). A fresh marker proves the wrapper ran,
+    not that pruning succeeded — per-repo failures are swallowed into the prune
+    result — so nothing downstream may read this as a store-health verdict.
+    Unreadable content falls back to the file mtime; an absent or unsafe marker
+    is a healthy default.
+    """
+    update: dict[str, Any] = {
+        "checkpoint_prune_marker_present": False,
+        "checkpoint_prune_marker_age_seconds": None,
+    }
+    if (
+        marker_path.is_symlink()
+        or not _path_resolves_under(marker_path, home)
+        or not _exists_strict(marker_path)
+        or not marker_path.is_file()
+    ):
+        return update
+    stamp = _coerce_float(_read_text_capped(marker_path, home).strip())
+    age = _age_seconds(stamp if stamp > 0 else None, now)
+    if age is None:
+        age = _age_seconds(_safe_mtime(marker_path), now)
+    update["checkpoint_prune_marker_present"] = True
+    update["checkpoint_prune_marker_age_seconds"] = age
+    return update
+
+
+def _read_corrupt_ledger_marker(path: Path, home: Path, *, now: float) -> dict[str, Any]:
+    """The ``spawn-ledger.json.corrupt`` parking bay, presence and mtime only.
+
+    ROOT scope, pinned to the ledger itself: upstream parks an unparseable
+    ``spawn-ledger.json`` beside it with ``os.replace``
+    (``hermes_cli/process_identity.py:160-171``), and the ledger resolves through
+    ``get_default_hermes_root()`` ("Machine-root ledger path",
+    ``:27,128-137``). The parked file's contents are the corrupt bytes and are
+    never read here — mtime is the only signal.
+    """
+    update: dict[str, Any] = {
+        "spawn_ledger_corrupt_present": False,
+        "spawn_ledger_corrupt_age_seconds": None,
+    }
+    if (
+        path.is_symlink()
+        or not _path_resolves_under(path, home)
+        or not _exists_strict(path)
+        or not path.is_file()
+    ):
+        return update
+    update["spawn_ledger_corrupt_present"] = True
+    update["spawn_ledger_corrupt_age_seconds"] = _age_seconds(_safe_mtime(path), now)
+    return update
 
 
 def _read_state_snapshots(root: Path, home: Path, *, now: float) -> dict[str, Any]:

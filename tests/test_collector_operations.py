@@ -2602,11 +2602,19 @@ def test_process_receipts_junk_and_oversized_are_counted_not_listed(
     oversized = receipts_dir / "proc_big.json"
     oversized.write_text(json.dumps({"id": "proc_big", "output": "x" * 300_000}))
 
+    # A legitimately large receipt (upstream allows ~200 KiB of output) still parses.
+    _write_receipt(
+        hermes_home,
+        "proc_mid.json",
+        _receipt_record(id="proc_mid", output="y" * 100_000),
+    )
+
     ops = _collect_ops(hermes_home).operations
     receipts = ops.process_receipts
     # Presence count includes unreadable/oversized files; only parseable ones list.
-    assert receipts.receipt_count == 2
-    assert receipts.receipts == []
+    assert receipts.receipt_count == 3
+    assert [r.process_id for r in receipts.receipts] == ["proc_mid"]
+    assert len(receipts.receipts[0].output_tail) <= 400
 
 
 def test_process_receipts_symlinked_dir_reads_as_absent(
@@ -2626,3 +2634,79 @@ def test_process_receipts_symlinked_dir_reads_as_absent(
     assert ops.process_receipts.dir_present is True  # the real dir exists
     assert ops.process_receipts.receipt_count == 0  # symlinked children are skipped
     assert ops.process_receipts.receipts == []
+
+
+# --- checkpoint prune marker (item 22) + corrupt ledger marker (item 24) -----
+
+
+def test_checkpoint_prune_marker_age_and_overdue_threshold(hermes_home: Path, sample_db: Path):
+    """A marker older than 48h (2x the 24h interval) flags overdue.
+
+    Marker content is a bare epoch written by ``maybe_auto_prune_checkpoints``
+    (``tools/checkpoint_manager.py:1106-1116``).
+    """
+    checkpoints = hermes_home / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    marker = checkpoints / ".last_prune"
+
+    ops = _collect_ops(hermes_home).operations
+    assert ops.checkpoint_prune_marker_present is False
+    assert ops.checkpoint_prune_marker_age_seconds is None
+    assert ops.checkpoint_prune_overdue is False
+
+    marker.write_text(str(_FIXED_NOW - 3600))
+    ops = _collect_ops(hermes_home).operations
+    assert ops.checkpoint_prune_marker_present is True
+    assert ops.checkpoint_prune_marker_age_seconds == pytest.approx(3600)
+    assert ops.checkpoint_prune_overdue is False
+
+    marker.write_text(str(_FIXED_NOW - 50 * 3600))
+    ops = _collect_ops(hermes_home).operations
+    assert ops.checkpoint_prune_marker_age_seconds == pytest.approx(50 * 3600)
+    assert ops.checkpoint_prune_overdue is True
+
+
+def test_checkpoint_prune_marker_junk_content_falls_back_to_mtime(
+    hermes_home: Path, sample_db: Path
+):
+    """Upstream treats a corrupt marker as "no prior run"; hermesd falls back to
+    the file mtime so an unreadable stamp still shows staleness."""
+    marker = hermes_home / "checkpoints" / ".last_prune"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("not-a-number")
+    stamp = _FIXED_NOW - 60 * 3600
+    os.utime(marker, (stamp, stamp))
+
+    ops = _collect_ops(hermes_home).operations
+    assert ops.checkpoint_prune_marker_present is True
+    assert ops.checkpoint_prune_marker_age_seconds == pytest.approx(60 * 3600)
+    assert ops.checkpoint_prune_overdue is True
+
+
+def test_spawn_ledger_corrupt_marker_presence_and_age(hermes_home: Path, sample_db: Path):
+    """The parking bay is created by ``_read_ledger_or_quarantine``
+    (``hermes_cli/process_identity.py:160-171``) next to the ROOT ledger."""
+    ops = _collect_ops(hermes_home).operations
+    assert ops.spawn_ledger_corrupt_present is False
+    assert ops.spawn_ledger_corrupt_age_seconds is None
+
+    marker = hermes_home / "spawn-ledger.json.corrupt"
+    marker.write_text("[{corrupt ledger contents")
+    stamp = _FIXED_NOW - 7200
+    os.utime(marker, (stamp, stamp))
+
+    ops = _collect_ops(hermes_home).operations
+    assert ops.spawn_ledger_corrupt_present is True
+    assert ops.spawn_ledger_corrupt_age_seconds == pytest.approx(7200)
+
+
+def test_spawn_ledger_corrupt_symlink_is_ignored(
+    hermes_home: Path, sample_db: Path, tmp_path: Path
+):
+    outside = tmp_path / "outside-corrupt.json"
+    outside.write_text("nope")
+    marker = hermes_home / "spawn-ledger.json.corrupt"
+    marker.symlink_to(outside)
+
+    ops = _collect_ops(hermes_home).operations
+    assert ops.spawn_ledger_corrupt_present is False

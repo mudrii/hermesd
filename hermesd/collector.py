@@ -120,6 +120,8 @@ from hermesd.collect.operations import (
     _iso_age_seconds,
     _moa_latest_record_summary,
     _model_cache_counts,
+    _read_checkpoint_prune_marker,
+    _read_corrupt_ledger_marker,
     _read_delegation_live_manifests,
     _read_process_receipts,
     _read_projects_state,
@@ -2199,7 +2201,24 @@ class Collector:
         operations = self._with_verification_evidence(operations)
         operations = self._with_goals(operations)
         operations = self._with_moa_traces(operations)
-        return self._with_projects(operations)
+        operations = self._with_projects(operations)
+        # Two small marker stats that belong with the panel's forensics rows:
+        # the PROFILE checkpoint auto-prune marker and the ROOT corrupt
+        # spawn-ledger parking bay. Both degrade to "absent", never to an error.
+        return operations.model_copy(
+            update={
+                **_read_checkpoint_prune_marker(
+                    self._paths.profile_path("checkpoints", ".last_prune"),
+                    self._paths.profile_home,
+                    now=self._clock(),
+                ),
+                **_read_corrupt_ledger_marker(
+                    self._paths.shared_path("spawn-ledger.json.corrupt"),
+                    self._paths.root_home,
+                    now=self._clock(),
+                ),
+            }
+        )
 
     def _with_response_store(self, operations: OperationsState) -> OperationsState:
         db_path = self._paths.shared_path("response_store.db")

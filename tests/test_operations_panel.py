@@ -304,6 +304,70 @@ def test_operations_detail_goal_waiting_falls_back_to_session() -> None:
     assert "pid " not in text
 
 
+# --- checkpoint prune marker (item 22) + corrupt ledger (item 24) -----------
+
+
+def test_compact_warns_when_checkpoint_prune_is_overdue():
+    from hermesd.models import (
+        CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS,
+    )
+
+    overdue = render_to_str(
+        render_operations(
+            _ops_state(
+                checkpoint_prune_marker_present=True,
+                checkpoint_prune_marker_age_seconds=float(
+                    CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS + 3600
+                ),
+            ),
+            Theme(),
+        ),
+        no_color=True,
+    )
+    fresh = render_to_str(
+        render_operations(
+            _ops_state(
+                checkpoint_prune_marker_present=True,
+                checkpoint_prune_marker_age_seconds=3600.0,
+            ),
+            Theme(),
+        ),
+        no_color=True,
+    )
+    assert "Checkpoint prune overdue" in overdue
+    assert "Checkpoint prune overdue" not in fresh
+
+
+def test_compact_warns_when_spawn_ledger_corrupt_marker_exists():
+    flagged = render_to_str(
+        render_operations(
+            _ops_state(spawn_ledger_corrupt_present=True, spawn_ledger_corrupt_age_seconds=7200.0),
+            Theme(),
+        ),
+        no_color=True,
+    )
+    absent = render_to_str(render_operations(_ops_state(), Theme()), no_color=True)
+    assert "spawn-ledger corrupt" in flagged
+    assert "2h" in flagged
+    assert "spawn-ledger corrupt" not in absent
+
+
+def test_detail_summary_rows_render_prune_and_ledger_markers():
+    from hermesd.models import CHECKPOINT_PRUNE_INTERVAL_SECONDS
+
+    state = _ops_state(
+        checkpoint_prune_marker_present=True,
+        checkpoint_prune_marker_age_seconds=float(CHECKPOINT_PRUNE_INTERVAL_SECONDS * 5),
+        spawn_ledger_corrupt_present=True,
+        spawn_ledger_corrupt_age_seconds=7200.0,
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+    assert "Checkpoint Prune" in text
+    assert "OVERDUE" in text
+    assert "Spawn Ledger" in text
+    assert "corrupt" in text
+
+
 # --- live delegation manifests (item 12) ------------------------------------
 
 
