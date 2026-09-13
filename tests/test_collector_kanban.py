@@ -1143,6 +1143,9 @@ def test_collect_kanban_completion_contract_and_breaker_state(hermes_home: Path)
     assert override.breaker_limit == 1
     assert override.breaker_tripped is True
     assert tasks["t_safe"].breaker_tripped is False
+    # A review task with only a contract still surfaces through the
+    # enrichment read so its contract can be displayed.
+    assert "t_rev" in {task.task_id for task in state.kanban.recent_tasks}
 
 
 def test_kanban_completion_contract_url_credentials_are_redacted(hermes_home: Path):
@@ -1179,9 +1182,6 @@ def test_kanban_completion_contract_url_credentials_are_redacted(hermes_home: Pa
     )
     assert task.completion_contract == "https://[REDACTED]@github.com/o/r/pull/1"
     assert "user:tok@" not in state.model_dump_json()
-    # A review task with only a contract still surfaces through the
-    # enrichment read so its contract can be displayed.
-    assert "t_rev" in {task.task_id for task in state.kanban.recent_tasks}
 
 
 def test_collect_kanban_breaker_trips_at_default_limit_without_config(hermes_home: Path):
