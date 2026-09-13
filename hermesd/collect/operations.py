@@ -404,11 +404,10 @@ def _count_delegation_live_logs(live_root: Path, home: Path) -> int:
 # Live-delegation manifest bounds. The manifest is a small dispatch-time
 # document (one entry per child task), 64 KiB refuses a runaway blob while
 # holding every realistic batch; the rendered card list is capped far below the
-# bounded directory scan, and only a few task logs are tailed per card.
+# bounded directory scan, and only the displayed tasks are tailed per card.
 _LIVE_MANIFEST_MAX_BYTES = 64 * 1024
 _MAX_LIVE_MANIFESTS = 5
 _MAX_LIVE_TASKS = 8
-_MAX_LIVE_LOG_TAILS = 4
 _LIVE_TAIL_MAX_BYTES = 1024
 _LIVE_TAIL_MAX_LINES = 4
 _LIVE_TAIL_LINE_MAX_CHARS = 160
@@ -428,9 +427,13 @@ def _read_delegation_live_manifests(live_root: Path, home: Path, *, now: float) 
     and any path that resolves outside ``home`` are skipped. The count is
     presence-based (every run dir holding a capped ``manifest.json``), while
     only the newest ``_MAX_LIVE_MANIFESTS`` directories are parsed into cards —
-    so the panel can say "showing N of M" instead of silently truncating. A
-    torn manifest still counts its delegation but yields no card; it must never
-    fail the source.
+    so the panel can say "showing N of M" instead of silently truncating. A card
+    materialises at most ``_MAX_LIVE_TASKS`` tasks, so at most that many
+    ``task-<index>.log`` files are opened per card regardless of how many
+    entries the manifest lists; ``running_task_count`` and ``tasks_truncated``
+    are still computed from every raw entry, so those counts describe the whole
+    batch rather than the displayed slice. A torn manifest still counts its
+    delegation but yields no card; it must never fail the source.
     """
     empty = {"delegation_live_manifests": [], "delegation_live_manifest_count": 0}
     if not _safe_child_path(live_root, home) or not live_root.is_dir():
@@ -477,8 +480,11 @@ def _live_manifest_from_dir(
     if data is None:
         return None
     task_entries = _as_list(data.get("tasks"))
-    tasks = [_live_task_from_entry(_as_dict(entry), run_dir, home) for entry in task_entries]
-    listed = tasks[:_MAX_LIVE_TASKS]
+    # Only the displayed slice is materialised, so the per-task log tails stay
+    # bounded by _MAX_LIVE_TASKS instead of the (unbounded) manifest size; the
+    # counts below are still derived from every raw entry.
+    entries = [_as_dict(entry) for entry in task_entries]
+    tasks = [_live_task_from_entry(entry, run_dir, home) for entry in entries[:_MAX_LIVE_TASKS]]
     # The run dir IS the delegation id upstream (the writer names it so); the
     # manifest's own field is ignored, so a doctored id cannot mislabel a card.
     return DelegationLiveManifest(
@@ -489,10 +495,12 @@ def _live_manifest_from_dir(
         completed=str(data.get("completed") or ""),
         manifest_present=True,
         dir_age_seconds=_age_seconds(mtime, now),
-        task_count=_coerce_int(data.get("task_count")) or len(task_entries),
-        running_task_count=sum(1 for task in tasks if task.status == "running"),
-        tasks=listed,
-        tasks_truncated=len(tasks) > len(listed),
+        task_count=_coerce_int(data.get("task_count")) or len(entries),
+        running_task_count=sum(
+            1 for entry in entries if str(entry.get("status") or "") == "running"
+        ),
+        tasks=tasks,
+        tasks_truncated=len(entries) > len(tasks),
     )
 
 

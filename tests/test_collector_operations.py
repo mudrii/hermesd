@@ -2508,6 +2508,49 @@ def test_delegation_live_manifest_task_list_is_capped(hermes_home: Path, sample_
     assert manifest.running_task_count == 12  # counted over every entry, not the cap
 
 
+def test_delegation_live_manifest_tails_only_the_displayed_tasks(
+    hermes_home: Path, sample_db: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Log tails are read for the displayed slice only; counts still cover all."""
+    live = hermes_home / "cache" / "delegation" / "live"
+    cap = operations_module._MAX_LIVE_TASKS
+    total = cap + 4
+    tasks = [
+        {
+            "index": index,
+            "goal": f"g{index}",
+            # Every task past the display cut is running, so a running count
+            # taken from the slice alone would read 0.
+            "status": "completed" if index < cap else "running",
+        }
+        for index in range(total)
+    ]
+    _write_live_delegation(
+        live,
+        "deleg_many_tasks",
+        _sample_manifest(task_count=total, tasks=tasks),
+        logs={f"task-{index}.log": f"log line {index}\n" for index in range(total)},
+    )
+
+    calls: list[Path] = []
+    real_tail = operations_module._live_log_tail
+
+    def counting_tail(path: Path, home: Path) -> list[str]:
+        calls.append(path)
+        return real_tail(path, home)
+
+    monkeypatch.setattr(operations_module, "_live_log_tail", counting_tail)
+    ops = _collect_ops(hermes_home).operations
+    card = ops.delegation_live_manifests[0]
+
+    assert len(calls) == cap
+    assert len(card.tasks) == cap
+    assert [task.status for task in card.tasks] == ["completed"] * cap
+    assert card.tasks_truncated is True
+    assert card.task_count == total
+    assert card.running_task_count == total - cap
+
+
 # --- process completion receipts (item 13) -----------------------------------
 
 
