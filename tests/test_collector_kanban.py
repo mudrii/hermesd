@@ -1164,9 +1164,97 @@ def test_collect_kanban_breaker_trips_at_default_limit_without_config(hermes_hom
 
 
 def test_kanban_breaker_limit_prefers_task_override_then_config_then_default():
-    assert kanban_module._breaker_limit(0, 0) == 2
-    assert kanban_module._breaker_limit(0, 3) == 3
+    assert kanban_module._breaker_limit(None, 0) == 2
+    assert kanban_module._breaker_limit(None, 3) == 3
     assert kanban_module._breaker_limit(1, 3) == 1
+    # 0 is a real override upstream ("trip immediately"), not an unset marker.
+    assert kanban_module._breaker_limit(0, 3) == 0
+    assert kanban_module._breaker_limit(0, 0) == 0
+    # A corrupt negative column clamps to the same immediate trip.
+    assert kanban_module._breaker_limit(-1, 3) == 0
+
+
+def test_collect_kanban_breaker_trips_immediately_when_max_retries_is_zero(hermes_home: Path):
+    """max_retries = 0 is an explicit per-task override that trips the breaker
+    on the first failure (kanban_db_dispatch.py:1027-1034); it must not fall
+    back to the config or default limit."""
+    (hermes_home / "config.yaml").write_text(yaml.dump({"kanban": {"failure_limit": 5}}))
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, consecutive_failures, max_retries) "
+        "VALUES ('t_zero', 'Zero retries', 'in_progress', 1, 1, 0)"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    tasks = {
+        task.task_id: task
+        for task in [
+            *state.kanban.active_tasks,
+            *state.kanban.problem_tasks,
+            *state.kanban.recent_tasks,
+        ]
+    }
+    task = tasks["t_zero"]
+    assert task.max_retries == 0
+    assert task.breaker_limit == 0
+    assert task.breaker_tripped is True
+
+
+def test_collect_kanban_breaker_null_max_retries_uses_config_limit(hermes_home: Path):
+    """A NULL max_retries is the only unset marker: it falls through to
+    kanban.failure_limit (the default-2 path is covered without config)."""
+    (hermes_home / "config.yaml").write_text(yaml.dump({"kanban": {"failure_limit": 5}}))
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, consecutive_failures) "
+        "VALUES ('t_null', 'No override', 'in_progress', 1, 4)"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    task = state.kanban.active_tasks[0]
+    assert task.max_retries == 0
+    assert task.breaker_limit == 5
+    assert task.breaker_tripped is False
+
+
+def test_collect_kanban_breaker_task_max_retries_overrides_config_limit(hermes_home: Path):
+    """A positive per-task max_retries wins over the config failure limit."""
+    (hermes_home / "config.yaml").write_text(yaml.dump({"kanban": {"failure_limit": 5}}))
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, consecutive_failures, max_retries) "
+        "VALUES ('t_three', 'Three retries', 'in_progress', 1, 3, 3)"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    task = state.kanban.active_tasks[0]
+    assert task.max_retries == 3
+    assert task.breaker_limit == 3
+    assert task.breaker_tripped is True
 
 
 def test_read_kanban_notify_fields_without_required_columns_returns_empty():

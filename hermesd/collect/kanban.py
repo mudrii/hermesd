@@ -36,8 +36,12 @@ _DEFAULT_CLAIM_TTL_SECONDS = 300
 # Failure circuit breaker: the trip threshold order is per-task max_retries >
 # the dispatcher's kanban.failure_limit config > DEFAULT_FAILURE_LIMIT = 2
 # (hermes_cli/kanban_db_dispatch.py:33 and _record_task_failure :986-1013,
-# recompute_ready hermes_cli/kanban_db.py:2012-2050). max_retries <= 0 reads
-# as unset here: upstream stores NULL, and coercion cannot tell 0 from NULL.
+# recompute_ready hermes_cli/kanban_db.py:2012-2050). A task's max_retries is
+# an explicit override whenever the column is NOT NULL — upstream passes 0
+# through its int coercion (hermes_cli/kanban_db.py:1892-1894) and switches on
+# ``task_override is not None`` (kanban_db_dispatch.py:1027-1032), so
+# ``--max-retries 0`` means "trip on the first failure" and only NULL falls
+# through to the config value.
 _DEFAULT_FAILURE_LIMIT = 2
 
 
@@ -196,10 +200,19 @@ _ENRICHED_TASK_TEXT_COLUMNS = (
 )
 
 
-def _breaker_limit(max_retries: int, failure_limit: int) -> int:
-    """Upstream trip threshold: task override, then config, then the default."""
-    if max_retries > 0:
-        return max_retries
+def _optional_int(value: object) -> int | None:
+    """Coerce to int, preserving a genuine null (an unset max_retries column)."""
+    return None if value is None else _coerce_int(value)
+
+
+def _breaker_limit(max_retries: int | None, failure_limit: int) -> int:
+    """Upstream trip threshold: task override, then config, then the default.
+
+    ``max_retries`` is the raw column, so 0 survives as an immediate-trip
+    override instead of being mistaken for NULL.
+    """
+    if max_retries is not None:
+        return max(0, max_retries)
     if failure_limit > 0:
         return failure_limit
     return _DEFAULT_FAILURE_LIMIT
@@ -236,7 +249,7 @@ def _read_recent_enriched_tasks(conn: sqlite3.Connection) -> list[dict[str, Any]
 
 def _kanban_task_from_row(row: dict[str, Any], *, failure_limit: int = 0) -> KanbanTaskSummary:
     consecutive_failures = _coerce_int(row.get("consecutive_failures"))
-    max_retries = _coerce_int(row.get("max_retries"))
+    max_retries = _optional_int(row.get("max_retries"))
     breaker_limit = _breaker_limit(max_retries, failure_limit)
     return KanbanTaskSummary(
         task_id=str(row.get("id") or ""),
@@ -259,7 +272,7 @@ def _kanban_task_from_row(row: dict[str, Any], *, failure_limit: int = 0) -> Kan
         goal_mode=str(row.get("goal_mode") or ""),
         current_step_key=str(row.get("current_step_key") or ""),
         completion_contract=str(row.get("completion_contract") or ""),
-        max_retries=max_retries,
+        max_retries=max_retries or 0,
         breaker_limit=breaker_limit,
         breaker_tripped=consecutive_failures >= breaker_limit,
     )
