@@ -131,6 +131,7 @@ from hermesd.collect.migration import (
 )
 from hermesd.collect.operations import (
     StateDbRead,
+    _checkpoint_prune_interval_seconds,
     _count_delegation_live_logs,
     _curator_thresholds,
     _curator_with_scheduler_state,
@@ -2828,6 +2829,7 @@ class Collector:
                     self._paths.profile_path("checkpoints", ".last_prune"),
                     self._paths.profile_home,
                     now=self._clock(),
+                    interval_seconds=_checkpoint_prune_interval_seconds(self._read_yaml_cached()),
                 ),
                 **_read_corrupt_ledger_marker(
                     self._paths.shared_path("spawn-ledger.json.corrupt"),

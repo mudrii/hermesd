@@ -2323,6 +2323,8 @@ PROCESS_RECEIPT_MAX_FILES: int = 64
 # overdue at 2x the interval — a stale marker is a missed wrapper run, not proof
 # of anything about the store itself.
 CHECKPOINT_PRUNE_INTERVAL_SECONDS: int = 24 * 60 * 60
+# The overdue window is twice the *configured* cadence
+# (``checkpoints.min_interval_hours``); this is the default-policy value.
 CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS: int = 2 * CHECKPOINT_PRUNE_INTERVAL_SECONDS
 
 
@@ -2438,6 +2440,10 @@ class OperationsState(BaseModel):
     # (``tools/checkpoint_manager.py:1094-1130``).
     checkpoint_prune_marker_present: bool = False
     checkpoint_prune_marker_age_seconds: float | None = None
+    # The effective wrapper cadence: ``checkpoints.min_interval_hours`` from
+    # config.yaml, defaulting to upstream's 24h. The overdue window is 2x this,
+    # so a deliberately slower policy is never reported as a missed pass.
+    checkpoint_prune_interval_seconds: float = float(CHECKPOINT_PRUNE_INTERVAL_SECONDS)
     # ROOT parking bay for an unparseable spawn ledger
     # (``hermes_cli/process_identity.py:160-171``).
     spawn_ledger_corrupt_present: bool = False
@@ -2446,18 +2452,15 @@ class OperationsState(BaseModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def checkpoint_prune_overdue(self) -> bool:
-        """True when a marker exists and is older than the 48h overdue window.
+        """True when a marker exists and is older than twice the configured interval.
 
         Caveat kept with the render copy: a fresh marker proves the wrapper RAN,
         not that pruning succeeded — per-repo failures land in the prune result,
         not in the marker — so this flag is never a store-health verdict.
         """
         age = self.checkpoint_prune_marker_age_seconds
-        return (
-            self.checkpoint_prune_marker_present
-            and age is not None
-            and age > CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS
-        )
+        overdue_after = 2 * self.checkpoint_prune_interval_seconds
+        return self.checkpoint_prune_marker_present and age is not None and age > overdue_after
 
 
 class SkillCurationWindow(BaseModel):

@@ -8,8 +8,6 @@ from rich.text import Text
 
 from hermesd.models import (
     API_RUN_RETENTION_SECONDS,
-    CHECKPOINT_PRUNE_INTERVAL_SECONDS,
-    CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS,
     HOSTED_ROOM_DISBANDED_RETENTION_SECONDS,
     MAX_ACTIVE_HOSTED_ROOMS,
     MAX_DISBANDED_HOSTED_ROOM_TOMBSTONES,
@@ -573,10 +571,11 @@ def _checkpoint_prune_label(ops: OperationsState) -> str:
     that pruning succeeded.
     """
     age = _age_span_label(ops.checkpoint_prune_marker_age_seconds)
+    interval = ops.checkpoint_prune_interval_seconds
     verdict = (
-        f"OVERDUE (> {_age_span_label(float(CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS))})"
+        f"OVERDUE (> {_age_span_label(2 * interval)})"
         if ops.checkpoint_prune_overdue
-        else f"interval {_age_span_label(float(CHECKPOINT_PRUNE_INTERVAL_SECONDS))}"
+        else f"interval {_age_span_label(interval)}"
     )
     return f"last pass {age} ago · {verdict} · a fresh marker proves the wrapper ran, not that pruning succeeded"
 

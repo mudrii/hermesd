@@ -2817,3 +2817,46 @@ def test_spawn_ledger_corrupt_symlink_is_ignored(
 
     ops = _collect_ops(hermes_home).operations
     assert ops.spawn_ledger_corrupt_present is False
+
+
+def test_checkpoint_prune_interval_follows_the_configured_wrapper_cadence(
+    hermes_home: Path, sample_db: Path
+):
+    """The overdue window follows ``checkpoints.min_interval_hours``.
+
+    Upstream resolves the wrapper's cadence from config
+    (``checkpoints.min_interval_hours``, ``hermes_cli/cli.py:1133``,
+    ``gateway/run.py:3671``, default 24h), so a slower policy must not be
+    reported as overdue — and a faster one must not hide a missed pass.
+    """
+    checkpoints = hermes_home / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    (checkpoints / ".last_prune").write_text(str(_FIXED_NOW - 72 * 3600))
+
+    # Default cadence: 72h is overdue.
+    ops = _collect_ops(hermes_home).operations
+    assert ops.checkpoint_prune_interval_seconds == pytest.approx(24 * 3600)
+    assert ops.checkpoint_prune_overdue is True
+
+    # A weekly policy: the same marker is not overdue.
+    (hermes_home / "config.yaml").write_text("checkpoints:\n  min_interval_hours: 168\n")
+    ops = _collect_ops(hermes_home).operations
+    assert ops.checkpoint_prune_interval_seconds == pytest.approx(168 * 3600)
+    assert ops.checkpoint_prune_overdue is False
+
+    # A faster policy: an 8h cadence makes 17h overdue.
+    (checkpoints / ".last_prune").write_text(str(_FIXED_NOW - 17 * 3600))
+    (hermes_home / "config.yaml").write_text("checkpoints:\n  min_interval_hours: 8\n")
+    ops = _collect_ops(hermes_home).operations
+    assert ops.checkpoint_prune_interval_seconds == pytest.approx(8 * 3600)
+    assert ops.checkpoint_prune_overdue is True
+
+
+@pytest.mark.parametrize("value", ["junk", 0, -5, True, None])
+def test_checkpoint_prune_interval_ignores_unusable_config_values(
+    hermes_home: Path, sample_db: Path, value: object
+):
+    """Only a positive real number counts; anything else keeps the 24h default."""
+    (hermes_home / "config.yaml").write_text(f"checkpoints:\n  min_interval_hours: {value!r}\n")
+    ops = _collect_ops(hermes_home).operations
+    assert ops.checkpoint_prune_interval_seconds == pytest.approx(24 * 3600)

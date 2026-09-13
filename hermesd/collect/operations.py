@@ -7,7 +7,7 @@ import json
 import os
 import shlex
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from itertools import islice
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -38,6 +38,7 @@ from hermesd.collect.sqlite_util import (
     _table_exists,
 )
 from hermesd.models import (
+    CHECKPOINT_PRUNE_INTERVAL_SECONDS,
     CuratorRun,
     DelegationInfo,
     DelegationLiveManifest,
@@ -624,7 +625,27 @@ def _process_receipt_from_file(
     )
 
 
-def _read_checkpoint_prune_marker(marker_path: Path, home: Path, *, now: float) -> dict[str, Any]:
+def _checkpoint_prune_interval_seconds(cfg: Mapping[str, Any]) -> float:
+    """The wrapper's configured cadence in seconds (``min_interval_hours``).
+
+    Upstream reads ``checkpoints.min_interval_hours`` before deciding whether a
+    pass is due (``hermes_cli/cli.py:1133``, ``gateway/run.py:3671``) with a 24h
+    default, so a marker age only means "overdue" relative to that policy. Only
+    a positive real number counts; anything else keeps the default.
+    """
+    raw = _as_dict(cfg.get("checkpoints")).get("min_interval_hours")
+    if isinstance(raw, bool) or not isinstance(raw, int | float) or raw <= 0:
+        return float(CHECKPOINT_PRUNE_INTERVAL_SECONDS)
+    return float(raw) * 3600.0
+
+
+def _read_checkpoint_prune_marker(
+    marker_path: Path,
+    home: Path,
+    *,
+    now: float,
+    interval_seconds: float = float(CHECKPOINT_PRUNE_INTERVAL_SECONDS),
+) -> dict[str, Any]:
     """The checkpoint auto-prune wrapper's ``.last_prune`` marker.
 
     PROFILE scope: the marker lives in ``checkpoints/``, which upstream resolves
@@ -639,6 +660,7 @@ def _read_checkpoint_prune_marker(marker_path: Path, home: Path, *, now: float) 
     update: dict[str, Any] = {
         "checkpoint_prune_marker_present": False,
         "checkpoint_prune_marker_age_seconds": None,
+        "checkpoint_prune_interval_seconds": interval_seconds,
     }
     if (
         marker_path.is_symlink()
