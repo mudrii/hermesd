@@ -327,14 +327,16 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
 
     ci_package_commands = "\n".join(_job_run_commands(ci, "package"))
     assert "uv build" in ci_package_commands
-    assert "uv run python -m venv .wheel-smoke" in ci_package_commands
-    assert ".wheel-smoke/bin/python -m pip install dist/*.whl" in ci_package_commands
-    assert ".wheel-smoke/bin/hermesd --version" in ci_package_commands
-    assert ".wheel-smoke/bin/python -I -m hermesd --version" in ci_package_commands
-    assert "uv run python -m venv .sdist-smoke" in ci_package_commands
-    assert ".sdist-smoke/bin/python -m pip install dist/*.tar.gz" in ci_package_commands
-    assert ".sdist-smoke/bin/hermesd --version" in ci_package_commands
-    assert ".sdist-smoke/bin/python -I -m hermesd --version" in ci_package_commands
+    # Smoke venvs must be created outside the checkout ($RUNNER_TEMP).
+    assert 'uv run python -m venv "$RUNNER_TEMP/wheel-smoke"' in ci_package_commands
+    assert '"$RUNNER_TEMP/wheel-smoke/bin/hermesd" --version' in ci_package_commands
+    assert '"$RUNNER_TEMP/wheel-smoke/bin/python" -I -m hermesd --version' in ci_package_commands
+    assert 'uv run python -m venv "$RUNNER_TEMP/sdist-smoke"' in ci_package_commands
+    assert '"$RUNNER_TEMP/sdist-smoke/bin/hermesd" --version' in ci_package_commands
+    assert '"$RUNNER_TEMP/sdist-smoke/bin/python" -I -m hermesd --version' in ci_package_commands
+    # No checkout-relative smoke paths may remain.
+    assert ".wheel-smoke" not in ci_package_commands.replace("$RUNNER_TEMP/wheel-smoke", "")
+    assert ".sdist-smoke" not in ci_package_commands.replace("$RUNNER_TEMP/sdist-smoke", "")
     assert "uv run twine check dist/*" in ci_package_commands
     macos_commands = set(_job_run_commands(ci, "macos"))
     assert (
@@ -357,12 +359,13 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
     assert "uv build" in release_commands
     assert "dist/hermesd-{version}.tar.gz" in release_commands
     assert "dist/hermesd-{version}-py3-none-any.whl" in release_commands
-    assert ".wheel-smoke/bin/hermesd --version" in release_commands
-    assert ".wheel-smoke/bin/python -I -m hermesd --version" in release_commands
-    assert "uv run python -m venv .sdist-smoke" in release_commands
-    assert ".sdist-smoke/bin/python -m pip install dist/*.tar.gz" in release_commands
-    assert ".sdist-smoke/bin/hermesd --version" in release_commands
-    assert ".sdist-smoke/bin/python -I -m hermesd --version" in release_commands
+    assert 'uv run python -m venv "$RUNNER_TEMP/wheel-smoke"' in release_commands
+    assert '"$RUNNER_TEMP/wheel-smoke/bin/hermesd" --version' in release_commands
+    assert '"$RUNNER_TEMP/wheel-smoke/bin/python" -I -m hermesd --version' in release_commands
+    assert 'uv run python -m venv "$RUNNER_TEMP/sdist-smoke"' in release_commands
+    assert '"$RUNNER_TEMP/sdist-smoke/bin/python" -m pip install dist/*.tar.gz' in release_commands
+    assert '"$RUNNER_TEMP/sdist-smoke/bin/hermesd" --version' in release_commands
+    assert '"$RUNNER_TEMP/sdist-smoke/bin/python" -I -m hermesd --version' in release_commands
     assert "uv run twine check dist/*" in release_commands
     upload_step = _action_step(publish, "release-build", UPLOAD_ARTIFACT_ACTION)
     assert upload_step["with"] == {

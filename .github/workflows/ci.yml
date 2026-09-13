@@ -131,15 +131,17 @@ jobs:
       - name: Verify wheel dependency pins match the lockfile
         run: uv run python scripts/check_wheel_pins.py
       - name: Smoke test built wheel
+        # Smoke venvs live outside the checkout so local and CI runs never
+        # leave accidental repository artifacts behind (audit CI-21).
         run: |
-          uv run python -m venv .wheel-smoke
-          .wheel-smoke/bin/python -m pip install dist/*.whl
-          .wheel-smoke/bin/hermesd --version
-          .wheel-smoke/bin/python -I -m hermesd --version
-          uv run python -m venv .sdist-smoke
-          .sdist-smoke/bin/python -m pip install dist/*.tar.gz
-          .sdist-smoke/bin/hermesd --version
-          .sdist-smoke/bin/python -I -m hermesd --version
+          uv run python -m venv "$RUNNER_TEMP/wheel-smoke"
+          "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip install dist/*.whl
+          "$RUNNER_TEMP/wheel-smoke/bin/hermesd" --version
+          "$RUNNER_TEMP/wheel-smoke/bin/python" -I -m hermesd --version
+          uv run python -m venv "$RUNNER_TEMP/sdist-smoke"
+          "$RUNNER_TEMP/sdist-smoke/bin/python" -m pip install dist/*.tar.gz
+          "$RUNNER_TEMP/sdist-smoke/bin/hermesd" --version
+          "$RUNNER_TEMP/sdist-smoke/bin/python" -I -m hermesd --version
       - name: Check package metadata
         run: uv run twine check dist/*
 
