@@ -7,6 +7,8 @@ from rich.console import Console
 
 from hermesd.models import (
     ActiveSurface,
+    ApiRunReservation,
+    ApiRunReservationsState,
     BackgroundProcessInfo,
     ChannelDirectoryState,
     ChannelPlatformInfo,
@@ -28,6 +30,8 @@ from hermesd.models import (
     GatewayState,
     GoalSummary,
     HookInfo,
+    HostedRoomState,
+    HostedRoomSummary,
     KanbanBoardSummary,
     KanbanRunSummary,
     KanbanState,
@@ -549,6 +553,21 @@ def _state_for(panel_num: int) -> DashboardState:
                         main_mode=INJECT,
                     ),
                     auto_maintenance_lock_file_present=True,
+                ),
+                hosted_rooms=HostedRoomState(
+                    db_present=True,
+                    active_room_count=1,
+                    # The reader allowlists event kinds against a closed enum, so
+                    # an injected key here is panel defence-in-depth rather than
+                    # a value a collector could produce.
+                    event_kind_counts={INJECT: 1},
+                    rooms=[HostedRoomSummary(room_id=INJECT, name=INJECT)],
+                ),
+                api_runs=ApiRunReservationsState(
+                    db_present=True,
+                    reservation_count=1,
+                    scope_count=1,
+                    reservations=[ApiRunReservation(run_id=INJECT)],
                 ),
             ),
         )

@@ -274,15 +274,17 @@ def _first_delegation_result(raw: object) -> dict[str, Any]:
     return {}
 
 
-def _json_object_capped(raw: object) -> dict[str, Any] | None:
-    """Decode a JSON object column, refusing payloads over _JSON_COLUMN_MAX_BYTES.
+def _json_object_capped(
+    raw: object, max_bytes: int = _JSON_COLUMN_MAX_BYTES
+) -> dict[str, Any] | None:
+    """Decode a JSON object column, refusing payloads over ``max_bytes``.
 
     None means "no usable object" — absent, over the cap, malformed, or not a
     JSON object — which lets callers distinguish that from a genuine ``{}``.
     """
     if not isinstance(raw, str) or not raw:
         return None
-    if len(raw.encode("utf-8", errors="replace")) > _JSON_COLUMN_MAX_BYTES:
+    if len(raw.encode("utf-8", errors="replace")) > max_bytes:
         return None
     with contextlib.suppress(json.JSONDecodeError, ValueError):
         decoded = json.loads(raw)

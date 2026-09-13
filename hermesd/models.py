@@ -1573,6 +1573,271 @@ class DbRecoveryState(BaseModel):
         )
 
 
+class HostedRoomEventKind(StrEnum):
+    """The closed hosted-room event vocabulary (``gateway/hosted_rooms.py:49-57``).
+
+    A ``kind`` is a protocol word, not content, so it is the one string from
+    ``hosted_room_events`` hermesd is allowed to carry. Anything outside this
+    vocabulary is counted as ``UNKNOWN`` rather than passed through: an event
+    table is untrusted input, and an unbounded histogram of arbitrary strings is
+    both a rendering hazard and a way to smuggle payload text into a model.
+    """
+
+    MESSAGE_USER = "message.user"
+    MESSAGE_MEMBER = "message.member"
+    TURN_STARTED = "turn.started"
+    TURN_SETTLED = "turn.settled"
+    TURN_FAILED = "turn.failed"
+    TURN_CANCELLED = "turn.cancelled"
+    TURN_DEFERRED = "turn.deferred"
+    TURN_REASSIGNED = "turn.reassigned"
+    ROOM_CREATED = "room.created"
+    ROOM_RENAMED = "room.renamed"
+    ROOM_DISBANDED = "room.disbanded"
+    ROOM_MEMBERS_CHANGED = "room.members_changed"
+    ROOM_ACTIVITY = "room.activity"
+    ROOM_STOP_REQUESTED = "room.stop_requested"
+    AUTHORITY_CLAIMED = "authority.claimed"
+    AUTHORITY_LOST = "authority.lost"
+    MEMBER_UNAVAILABLE = "member.unavailable"
+    UNKNOWN = "unknown"
+
+
+# The recognized kinds, as bound query parameters. ``UNKNOWN`` is not queried: it
+# is the complement of these inside ``event_count``, which keeps the histogram
+# exact without ever selecting an unrecognized string out of an untrusted table.
+KNOWN_HOSTED_ROOM_EVENT_KINDS: tuple[str, ...] = tuple(
+    kind.value for kind in HostedRoomEventKind if kind is not HostedRoomEventKind.UNKNOWN
+)
+
+# Upstream retention ceilings (``gateway/hosted_rooms.py:33-41``). Rendered beside
+# the counts so an operator can tell "two rooms" from "at the cap".
+MAX_ACTIVE_HOSTED_ROOMS: int = 256
+MAX_DISBANDED_HOSTED_ROOM_TOMBSTONES: int = 512
+HOSTED_ROOM_DISBANDED_RETENTION_SECONDS: int = 90 * 24 * 60 * 60
+MAX_EVENTS_PER_HOSTED_ROOM: int = 50_000
+
+
+class HostedRoomSummary(BaseModel):
+    """One hosted room, as counts and coordinates only.
+
+    There is deliberately no field that could hold what the room *said*: no
+    member list, no event payload, no actor, no link target. ``member_count`` is
+    the length of ``members_json``, never its contents; ``latest_seq`` is derived
+    from ``next_seq`` because upstream keeps ``next_seq`` one past the last
+    written sequence number.
+    """
+
+    room_id: str = ""
+    name: str = ""
+    member_count: int = 0
+    authority_epoch: int = 0
+    next_seq: int = 0
+    event_bytes: int = 0
+    revision: int = 0
+    created_at_age_seconds: float | None = None
+    updated_at_age_seconds: float | None = None
+    disbanded_at_age_seconds: float | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def latest_seq(self) -> int:
+        """Derived: ``next_seq - 1``, clamped so an empty room reads as 0."""
+        return max(0, self.next_seq - 1)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def disbanded(self) -> bool:
+        """Derived from the tombstone stamp, never stored beside it."""
+        return self.disbanded_at_age_seconds is not None
+
+
+class HostedRoomState(BaseModel):
+    """Hosted-room coordination, read from the ROOT ``shared-state.db``.
+
+    Two facts shape this model.
+
+    *Which file.* ``gateway/hosted_rooms.py:398-414`` resolves even a profile
+    gateway to the shared ROOT ``shared-state.db`` and explicitly not to the
+    master ``state.db``, because pointing profile gateways at the session store
+    makes every profile process a long-lived writer on it. The live ``state.db``
+    nonetheless still carries empty legacy ``hosted_room*`` tables, so reading
+    them would be reading a dead table.
+
+    *What may leave the file.* Grants, link catalogs and target URLs (which may
+    embed credentials), event payloads and actors, revoked-grant scope keys and
+    everything in the ``hosted_room_policy_transcript*`` conversation tables are
+    never selected. Only counts, ids, names, timestamps, epochs, revisions,
+    ``event_bytes`` and the closed ``HostedRoomEventKind`` histogram do.
+    """
+
+    db_present: bool = False
+    db_size_bytes: int = 0
+    # ``disbanded_at IS NULL`` is upstream's own active-room predicate
+    # (``gateway/hosted_rooms.py:867``); hermesd spells it ``COALESCE(..) > 0``
+    # for the disbanded side so the count and ``HostedRoomSummary.disbanded``
+    # cannot disagree about a stored 0.
+    active_room_count: int = 0
+    disbanded_room_count: int = 0
+    rooms: list[HostedRoomSummary] = Field(default_factory=list)
+    # True when ``rooms`` was cut short by the display cap. The counts here are
+    # whole-table aggregates and are never affected by that cap.
+    rooms_truncated: bool = False
+    event_count: int = 0
+    event_kind_counts: dict[str, int] = Field(default_factory=dict)
+    newest_event_age_seconds: float | None = None
+    # ``SUM(hosted_rooms.event_bytes)`` — upstream's own logical budget counter,
+    # which it compares against ``MAX_GATEWAY_EVENT_BYTES`` when admitting events.
+    accounted_event_bytes: int = 0
+    retired_id_count: int = 0
+    newest_retired_id_age_seconds: float | None = None
+    # A count only: every other column of ``hosted_room_links`` is either a
+    # credential-bearing URL, a grant or a tool catalog.
+    link_count: int = 0
+    remote_run_count: int = 0
+    newest_remote_run_age_seconds: float | None = None
+    revoked_grant_count: int = 0
+    live_peer_reservation_count: int = 0
+    expired_peer_reservation_count: int = 0
+    revoked_peer_reservation_count: int = 0
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def room_count(self) -> int:
+        """Derived: every row is either active or a tombstone, never both."""
+        return self.active_room_count + self.disbanded_room_count
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def peer_reservation_count(self) -> int:
+        """Derived: revoked wins, then expiry, so the buckets partition the table."""
+        return (
+            self.live_peer_reservation_count
+            + self.expired_peer_reservation_count
+            + self.revoked_peer_reservation_count
+        )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def unknown_event_kind_count(self) -> int:
+        """Derived: events whose kind is outside the closed vocabulary."""
+        return max(0, self.event_count - sum(self.event_kind_counts.values()))
+
+
+# Upstream's API-run replay window (``api_server_run_idempotency.py:58-59``).
+API_RUN_RETENTION_SECONDS: int = 24 * 60 * 60
+
+
+class ApiRunStatus(StrEnum):
+    """The ``/v1/runs`` status vocabulary hermesd will name.
+
+    Assembled from the statuses upstream actually sets — ``queued``
+    (``api_server_runs.py:475``), ``running`` (``:705``),
+    ``waiting_for_approval`` (``:592``), ``stopping`` (``:871``) and the four
+    terminal ones in ``TERMINAL_STATUSES``
+    (``api_server_run_idempotency.py:17``). Anything else becomes ``UNKNOWN``: a
+    status hermesd does not recognize is reported as unknown rather than dropped
+    or guessed, because the store outlives this enumeration.
+    """
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    WAITING_FOR_APPROVAL = "waiting_for_approval"
+    STOPPING = "stopping"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    INTERRUPTED = "interrupted"
+    UNKNOWN = "unknown"
+
+
+# Upstream's ``TERMINAL_STATUSES`` — the only statuses whose aged rows
+# ``_prune_stale_terminal_locked`` is allowed to delete.
+API_RUN_TERMINAL_STATUSES: frozenset[ApiRunStatus] = frozenset(
+    {
+        ApiRunStatus.COMPLETED,
+        ApiRunStatus.FAILED,
+        ApiRunStatus.CANCELLED,
+        ApiRunStatus.INTERRUPTED,
+    }
+)
+
+
+class ApiRunReservation(BaseModel):
+    """One retained ``POST /v1/runs`` reservation.
+
+    ``fingerprint``, ``idempotency_key`` and ``scope`` never leave the reader, and
+    ``status_json`` is parsed no further than the single allowlisted status word.
+    ``owner_started`` is deliberately *not* carried: upstream fills it from
+    ``gateway/status.get_process_start_time`` (``api_server_runs.py:81-87``),
+    which returns ``/proc`` ticks on Linux and psutil centiseconds elsewhere. It
+    is comparable only against the same host's own reading, so hermesd reduces it
+    to "was an identity recorded at all" instead of inventing a timestamp out of
+    a unit it cannot establish.
+    """
+
+    run_id: str = ""
+    status: ApiRunStatus = ApiRunStatus.UNKNOWN
+    created_at_age_seconds: float | None = None
+    updated_at_age_seconds: float | None = None
+    # ``retention_until - now``; None when the row carries no explicit deadline
+    # and upstream prunes it on ``updated_at + RETENTION_SECONDS`` instead.
+    retention_remaining_seconds: float | None = None
+    acknowledged: bool = False
+    owner_pid: int = 0
+    owner_started_recorded: bool = False
+    owner_alive: bool = False
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def owner_pid_present(self) -> bool:
+        """Derived: upstream stores 0 for "no owner recorded"."""
+        return self.owner_pid > 0
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def terminal(self) -> bool:
+        """Derived: only a terminal row is eligible for retention pruning."""
+        return self.status in API_RUN_TERMINAL_STATUSES
+
+
+class ApiRunReservationsState(BaseModel):
+    """Retained API run reservations, read from ``runs_idempotency.db``.
+
+    **An empty store is not an idle API.** ``_prune_stale_terminal_locked``
+    (``api_server_run_idempotency.py:168-186``) runs inside every ``reserve`` and
+    ``lookup`` and deletes an aged row only once its stored status is terminal,
+    and long room runs push ``retention_until`` out
+    (``api_server_runs.py:56-61,222-232``). On top of that, when the file cannot
+    be opened upstream logs and falls back to ``":memory:"`` (``:63-84``), setting
+    ``_db_path = None`` so ``durable`` is False — and that capability is only
+    served over HTTP (``api_server.py:2276``), never written to disk. hermesd
+    therefore cannot distinguish "nothing retained" from "the gateway is
+    reserving in process memory".
+
+    PROFILE-scoped: ``get_hermes_home()/"runs_idempotency.db"`` (``:67``) — the
+    opposite of the ROOT-scoped ``shared-state.db`` rendered beside it.
+    """
+
+    db_present: bool = False
+    db_size_bytes: int = 0
+    reservation_count: int = 0
+    # ``COUNT(DISTINCT scope)``: the tenant scope is counted, never carried.
+    scope_count: int = 0
+    reservations: list[ApiRunReservation] = Field(default_factory=list)
+    # True when ``reservations`` was cut short by the display cap; every count
+    # here is a whole-table aggregate and is unaffected by it.
+    reservations_truncated: bool = False
+    acknowledged_count: int = 0
+    owner_recorded_count: int = 0
+    # Rows already past ``retention_until`` that are still here because their
+    # status is not terminal — direct evidence for the caveat above.
+    retention_expired_count: int = 0
+    # Age of the most recently *updated* row, and of the oldest *created* one.
+    newest_age_seconds: float | None = None
+    oldest_age_seconds: float | None = None
+
+
 class OperationsState(BaseModel):
     dashboard_process_count: int = 0
     desktop_build_stamp: str = ""
@@ -1630,6 +1895,13 @@ class OperationsState(BaseModel):
     # Written by its own source (``db_recovery``), so a corrupt repair ledger or
     # retired-WAL manifest degrades only this field and keeps its last-good value.
     db_recovery: DbRecoveryState = Field(default_factory=DbRecoveryState)
+    # Each written by its own source (``hosted_rooms`` and ``api_runs``) for the
+    # same reason: these are two more SQLite databases, and a corrupt or vanished
+    # one must not take the rest of the panel's last-good values with it. They
+    # also resolve to different homes — ROOT and PROFILE respectively — so they
+    # are recorded as separate rows in .codex/rules/source-ownership.md.
+    hosted_rooms: HostedRoomState = Field(default_factory=HostedRoomState)
+    api_runs: ApiRunReservationsState = Field(default_factory=ApiRunReservationsState)
 
 
 class CuratorRun(BaseModel):

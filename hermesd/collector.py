@@ -24,6 +24,7 @@ from typing import Any, Literal, NamedTuple, Never, TypeVar
 
 from pydantic import BaseModel
 
+from hermesd.collect.api_runs import _read_api_runs
 from hermesd.collect.common import (
     _MAX_TEXT_READ_BYTES,
     _age_seconds,
@@ -92,6 +93,7 @@ from hermesd.collect.gateway import (
     _record_writer,
     _update_receipt_status,
 )
+from hermesd.collect.hosted_rooms import _read_hosted_rooms
 from hermesd.collect.kanban import (
     _kanban_claim_ttl_seconds,
     _read_kanban_board_summary,
@@ -297,6 +299,10 @@ _BLOCKED_SCRIPT_FIELDS = (
 # The recovery source owns exactly one nested field, so a corrupt repair ledger or
 # retired-WAL manifest restores that whole value from its own last-good read.
 _DB_RECOVERY_FIELDS = ("db_recovery",)
+# Same shape for the two coordination databases: each source owns one nested
+# field, so a corrupt shared-state.db or runs_idempotency.db degrades only itself.
+_HOSTED_ROOM_FIELDS = ("hosted_rooms",)
+_API_RUN_FIELDS = ("api_runs",)
 _STATE_SNAPSHOT_FIELDS = ("snapshot_count", "snapshot_total_bytes", "newest_snapshot_age_seconds")
 _LIFECYCLE_FIELDS = (
     "lifecycle_phase",
@@ -827,6 +833,30 @@ class Collector:
                 lambda: results["operations"],
                 fallback=lambda: self._last_source_fields(
                     "db_recovery", results["operations"], _DB_RECOVERY_FIELDS
+                ),
+            ),
+            # Fifth writer of `operations`: hosted-room coordination lives in its
+            # own ROOT-scoped database, so a corrupt shared-state.db must not take
+            # the rest of the panel's last-good values with it.
+            _SourceSpec(
+                "operations",
+                "hosted_rooms",
+                lambda: self._with_hosted_rooms(results["operations"]),
+                lambda: results["operations"],
+                fallback=lambda: self._last_source_fields(
+                    "hosted_rooms", results["operations"], _HOSTED_ROOM_FIELDS
+                ),
+            ),
+            # Sixth writer of `operations`: the API run replay window is a
+            # separate PROFILE-scoped database again, and it fails independently
+            # for the same reason.
+            _SourceSpec(
+                "operations",
+                "api_runs",
+                lambda: self._with_api_runs(results["operations"]),
+                lambda: results["operations"],
+                fallback=lambda: self._last_source_fields(
+                    "api_runs", results["operations"], _API_RUN_FIELDS
                 ),
             ),
             _SourceSpec("skills_memory", "skills", self._collect_skills_memory, SkillsMemory),
@@ -2279,6 +2309,85 @@ class Collector:
                 )
             }
         )
+
+    def _with_hosted_rooms(self, operations: OperationsState) -> OperationsState:
+        """Hosted-room coordination from the ROOT ``shared-state.db``.
+
+        ROOT-scoped *and* deliberately not the master ``state.db``:
+        ``gateway/hosted_rooms.py:398-414`` resolves the hosted-room database to
+        ``<root>/shared-state.db`` even for a profile gateway, because pointing
+        profile gateways at the session store makes every profile process a
+        long-lived writer on it. Upstream pins that with its own test
+        (``tests/gateway/test_hosted_rooms.py:1344-1364``). The live ``state.db``
+        still carries empty legacy ``hosted_room*`` tables, so reading *that*
+        file would report a dead table as the coordination state. See
+        ``.codex/rules/source-ownership.md``.
+
+        Content-free: grants, link catalogs and target URLs, event payloads and
+        actors, revoked-grant scope keys and the ``hosted_room_policy_*``
+        transcript tables are never selected. An absent database is not a
+        failure; one lost or made unsafe after a good read raises so this source
+        keeps its last-good value.
+        """
+        db_path = self._paths.shared_path("shared-state.db")
+        last = self._last_good_by_source.get("hosted_rooms")
+        if not _exists_strict(db_path):
+            if last is not None and last.hosted_rooms.db_present:
+                raise RuntimeError("shared-state.db disappeared")
+            return operations
+        # The symlink test is the load-bearing half: shared_path() can only
+        # resolve outside root_home through a link, and this source is ROOT-scoped
+        # so root_home is the confinement boundary (as in _with_response_store).
+        if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
+            if last is not None and last.hosted_rooms.db_present:
+                raise RuntimeError("shared-state.db replaced by unsafe path")
+            return operations
+        with _connect_readonly_sqlite(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+            hosted_rooms = _read_hosted_rooms(
+                conn, now=self._clock(), db_size_bytes=_file_size(db_path)
+            )
+        return operations.model_copy(update={"hosted_rooms": hosted_rooms})
+
+    def _with_api_runs(self, operations: OperationsState) -> OperationsState:
+        """Retained API run reservations from ``runs_idempotency.db``.
+
+        PROFILE-scoped, and it agrees with upstream:
+        ``gateway/platforms/api_server_run_idempotency.py:67`` resolves
+        ``get_hermes_home()/"runs_idempotency.db"``. That is the opposite of the
+        ROOT-scoped ``shared-state.db`` read beside it, and the two are documented
+        as separate rows in ``.codex/rules/source-ownership.md`` for exactly that
+        reason.
+
+        ``fingerprint``, ``idempotency_key`` and ``scope`` are never selected. An
+        absent or empty store is *not* reported as "no API activity": upstream
+        prunes an aged row only once its status is terminal, and falls back to
+        process memory when the file cannot be opened — a fallback hermesd cannot
+        observe, because the ``durable`` capability is only served over HTTP.
+        """
+        db_path = self._paths.profile_path("runs_idempotency.db")
+        last = self._last_good_by_source.get("api_runs")
+        if not _exists_strict(db_path):
+            if last is not None and last.api_runs.db_present:
+                raise RuntimeError("runs_idempotency.db disappeared")
+            return operations
+        # Confined to profile_home, not root_home: a sibling profile's store is
+        # still under the root, and this source is profile-scoped.
+        if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.profile_home):
+            if last is not None and last.api_runs.db_present:
+                raise RuntimeError("runs_idempotency.db replaced by unsafe path")
+            return operations
+        with _connect_readonly_sqlite(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+            api_runs = _read_api_runs(
+                conn,
+                now=self._clock(),
+                db_size_bytes=_file_size(db_path),
+                pid_exists=self._pid_exists,
+            )
+        return operations.model_copy(update={"api_runs": api_runs})
 
     def _collect_curator(self) -> CuratorRun:
         # Read the scheduler state and curator config once for the whole pass;

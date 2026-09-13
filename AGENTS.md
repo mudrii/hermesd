@@ -50,7 +50,7 @@ hermesd/
   collector.py    Collector orchestration + public facade over collect/
   collect/        Per-domain readers (sessions, kanban, cron, skills, plugins,
                   operations, config, gateway, migration, logs, redaction,
-                  sqlite_util, system, common)
+                  sqlite_util, system, common, recovery, hosted_rooms, api_runs)
   defaults.py     Shared refresh-rate and log-tail-bytes defaults
   db.py           Read-only SQLite with PRAGMA data_version caching
   file_cache.py   mtime-keyed JSON/YAML cache

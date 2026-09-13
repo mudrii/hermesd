@@ -8,6 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from hermesd.collect.common import _optional_epoch
 from hermesd.db import _SQLITE_TIMEOUT_SECONDS, snapshot_wal_database
 
 
@@ -53,9 +54,21 @@ _KNOWN_TABLES = frozenset(
         "discovered_repos",
         "executions",
         "gateway_heartbeats",
+        # shared-state.db (gateway/hosted_rooms.py:87-148). The
+        # hosted_room_policy_* tables beside these are deliberately absent: they
+        # hold conversation transcripts, which hermesd never reads.
+        "hosted_room_events",
+        "hosted_room_links",
+        "hosted_room_peer_reservations",
+        "hosted_room_remote_runs",
+        "hosted_room_retired_ids",
+        "hosted_room_revoked_grants",
+        "hosted_rooms",
         "project_folders",
         "projects",
         "responses",
+        # runs_idempotency.db (api_server_run_idempotency.py:86-99).
+        "run_idempotency",
         "task_attachments",
         "task_comments",
         "task_events",
@@ -120,14 +133,47 @@ def _column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) 
     return any(str(row[1] or "") == column_name for row in rows)
 
 
-def _count_rows(conn: sqlite3.Connection, sql: str) -> int:
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> frozenset[str]:
+    """Every column of a table, read once per connection by callers.
+
+    Column *order* is not stable across databases — this branch already found
+    the cron ``executions`` table with two different orders in two profiles — so
+    a reader that has to tolerate a schema migration resolves the names it wants
+    against this set and selects them explicitly, rather than reading
+    positionally or with ``SELECT *``.
+    """
+    # Same identifier-interpolation carve-out as _table_count.
+    rows = conn.execute(f"PRAGMA table_info({_checked_table(table_name)})").fetchall()
+    return frozenset(str(row[1] or "") for row in rows if str(row[1] or ""))
+
+
+def _select_columns(columns: frozenset[str], wanted: tuple[str, ...]) -> tuple[str, ...]:
+    """The wanted columns that actually exist, in the caller's order.
+
+    Keeps a reader that must tolerate both an added and a dropped column off
+    ``SELECT *``, whose result order is whatever the file happens to hold.
+    """
+    return tuple(name for name in wanted if name in columns)
+
+
+def _count_rows(conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = ()) -> int:
     """Count from a query over a table the caller has already confirmed to
     exist; read errors propagate so the source fails to its last-good value."""
-    cur = conn.execute(sql)
+    cur = conn.execute(sql, params)
     row = cur.fetchone()
     return int(row[0] or 0) if row is not None else 0
 
 
-def _count_by(conn: sqlite3.Connection, sql: str) -> dict[str, int]:
-    cur = conn.execute(sql)
+def _count_by(conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = ()) -> dict[str, int]:
+    cur = conn.execute(sql, params)
     return {str(row[0] or "unknown"): int(row[1] or 0) for row in cur.fetchall()}
+
+
+def _scalar_epoch(conn: sqlite3.Connection, sql: str) -> float | None:
+    """One persisted epoch from a single-column aggregate query.
+
+    NULL, 0 and anything non-finite all read as None, so an empty table yields
+    "no timestamp" rather than January 1970. Read errors propagate.
+    """
+    row = conn.execute(sql).fetchone()
+    return _optional_epoch(row[0]) if row is not None else None

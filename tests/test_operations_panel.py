@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from hermesd.models import (
+    ApiRunReservation,
+    ApiRunReservationsState,
     DashboardState,
     DelegationInfo,
     GoalSummary,
+    HostedRoomState,
+    HostedRoomSummary,
     ModelCacheSummary,
     OperationsState,
     PRMonitorSummary,
@@ -280,3 +284,282 @@ def test_operations_detail_goal_waiting_falls_back_to_session() -> None:
 
     assert "session sess_blocker" in text
     assert "pid " not in text
+
+
+# --- hosted rooms and retained API run reservations -------------------------
+
+
+def _hosted_rooms(**fields: object) -> HostedRoomState:
+    base: dict[str, object] = {
+        "db_present": True,
+        "db_size_bytes": 143_360,
+        "active_room_count": 1,
+        "disbanded_room_count": 1,
+        "event_count": 4,
+        "event_kind_counts": {"room.created": 1, "message.user": 1, "turn.settled": 1},
+        "newest_event_age_seconds": 90.0,
+        "accounted_event_bytes": 4096,
+        "retired_id_count": 1,
+        "newest_retired_id_age_seconds": 5 * 86_400.0,
+        "link_count": 1,
+        "remote_run_count": 1,
+        "newest_remote_run_age_seconds": 300.0,
+        "revoked_grant_count": 1,
+        "live_peer_reservation_count": 1,
+        "expired_peer_reservation_count": 1,
+        "revoked_peer_reservation_count": 1,
+        "rooms": [
+            HostedRoomSummary(
+                room_id="room-active",
+                name="Active Room",
+                member_count=2,
+                authority_epoch=1,
+                next_seq=6,
+                event_bytes=4096,
+                revision=1,
+                updated_at_age_seconds=60.0,
+            ),
+            HostedRoomSummary(
+                room_id="room-disbanded",
+                name="Disbanded Room",
+                member_count=3,
+                authority_epoch=4,
+                next_seq=2,
+                revision=7,
+                updated_at_age_seconds=3 * 86_400.0,
+                disbanded_at_age_seconds=2 * 86_400.0,
+            ),
+        ],
+    }
+    base.update(fields)
+    return HostedRoomState(**base)  # type: ignore[arg-type]
+
+
+def _api_runs(**fields: object) -> ApiRunReservationsState:
+    base: dict[str, object] = {
+        "db_present": True,
+        "db_size_bytes": 16_384,
+        "reservation_count": 2,
+        "scope_count": 1,
+        "acknowledged_count": 1,
+        "owner_recorded_count": 1,
+        "retention_expired_count": 1,
+        "newest_age_seconds": 60.0,
+        "oldest_age_seconds": 30 * 3_600.0,
+        "reservations": [
+            ApiRunReservation(
+                run_id="run-live",
+                status="running",
+                created_at_age_seconds=2 * 3_600.0,
+                updated_at_age_seconds=60.0,
+                retention_remaining_seconds=12 * 3_600.0,
+                owner_pid=4242,
+                owner_started_recorded=True,
+                owner_alive=True,
+            ),
+            ApiRunReservation(
+                run_id="run-terminal",
+                status="completed",
+                created_at_age_seconds=30 * 3_600.0,
+                updated_at_age_seconds=29 * 3_600.0,
+                acknowledged=True,
+            ),
+        ],
+    }
+    base.update(fields)
+    return ApiRunReservationsState(**base)  # type: ignore[arg-type]
+
+
+def test_operations_detail_renders_hosted_room_section() -> None:
+    state = _ops_state(hosted_rooms=_hosted_rooms())
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Hosted Rooms" in text
+    assert "1 active" in text
+    assert "1 disbanded" in text
+    assert "room-active" in text
+    assert "room-disbanded" in text
+    # latest_seq is derived from next_seq, never stored beside it.
+    assert "Latest Seq" in text
+    assert "1 live · 1 expired · 1 revoked" in text
+    # The scope note is part of the section, not a footnote elsewhere.
+    assert "shared-state.db" in text
+
+
+def test_operations_detail_omits_hosted_rooms_when_the_database_is_absent() -> None:
+    text = render_to_str(
+        render_operations(_ops_state(), Theme(), detail=True), width=200, no_color=True
+    )
+
+    assert "Hosted Rooms" not in text
+
+
+def test_operations_detail_marks_hosted_room_list_truncation() -> None:
+    rooms = [
+        HostedRoomSummary(room_id=f"room-{index:02d}", next_seq=index + 1) for index in range(8)
+    ]
+    state = _ops_state(
+        hosted_rooms=_hosted_rooms(
+            active_room_count=12,
+            disbanded_room_count=0,
+            rooms=rooms,
+            rooms_truncated=True,
+        )
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+
+    # The rendered list is capped; the count is not.
+    assert "showing 8 of 12" in text
+    assert "12 active" in text
+
+
+def test_operations_detail_renders_api_run_reservation_section() -> None:
+    state = _ops_state(api_runs=_api_runs())
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Retained API Run Reservations" in text
+    assert "run-live" in text
+    assert "running" in text
+    assert "completed" in text
+    assert "pid 4242" in text
+    assert "12h" in text
+
+
+def test_operations_detail_states_the_zero_row_caveat_for_an_empty_store() -> None:
+    """An empty store must not read as an idle API."""
+    state = _ops_state(api_runs=_api_runs(reservation_count=0, reservations=[]))
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Retained API Run Reservations" in text
+    assert "no reservations retained" in text
+    assert "not evidence that the API was idle" in text
+    assert "process memory" in text
+
+
+def test_operations_detail_omits_api_runs_when_the_database_is_absent() -> None:
+    text = render_to_str(
+        render_operations(_ops_state(), Theme(), detail=True), width=200, no_color=True
+    )
+
+    assert "Retained API Run Reservations" not in text
+
+
+def test_operations_detail_reports_an_unverifiable_run_owner() -> None:
+    state = _ops_state(
+        api_runs=_api_runs(
+            reservations=[
+                ApiRunReservation(run_id="run-no-owner", status="unknown"),
+                ApiRunReservation(
+                    run_id="run-stale-pid",
+                    status="queued",
+                    owner_pid=9999,
+                    owner_started_recorded=False,
+                ),
+            ]
+        )
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "no pid" in text
+    # A pid with no recorded start time cannot be told apart from a reused one.
+    assert "identity unverified" in text
+    assert "unknown" in text
+
+
+def test_operations_detail_marks_api_run_list_truncation() -> None:
+    state = _ops_state(
+        api_runs=_api_runs(
+            reservation_count=12,
+            reservations=[ApiRunReservation(run_id=f"run-{index}") for index in range(8)],
+            reservations_truncated=True,
+        )
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "showing 8 of 12" in text
+
+
+def test_operations_detail_escapes_hosted_room_names() -> None:
+    state = _ops_state(
+        hosted_rooms=_hosted_rooms(
+            rooms=[HostedRoomSummary(room_id="room-1", name="[/] desc [xy] tag")]
+        )
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "[/]" in text
+    assert "[xy]" in text
+
+
+def test_operations_detail_coordination_stores_are_artifacts() -> None:
+    hosted = render_to_str(
+        render_operations(_ops_state(hosted_rooms=_hosted_rooms()), Theme(), detail=True),
+        width=200,
+        no_color=True,
+    )
+    runs = render_to_str(
+        render_operations(_ops_state(api_runs=_api_runs()), Theme(), detail=True),
+        width=200,
+        no_color=True,
+    )
+
+    assert "No operations artifacts found" not in hosted
+    assert "No operations artifacts found" not in runs
+
+
+def test_operations_compact_shows_coordination_counts_only_when_present() -> None:
+    empty = render_to_str(render_operations(_ops_state(), Theme()), no_color=True)
+    assert "Hosted Rooms:" not in empty
+    assert "API Runs:" not in empty
+
+    populated = render_to_str(
+        render_operations(_ops_state(hosted_rooms=_hosted_rooms(), api_runs=_api_runs()), Theme()),
+        no_color=True,
+    )
+    assert "Hosted Rooms:" in populated
+    assert "1 active" in populated
+    assert "API Runs:" in populated
+    assert "2 retained" in populated
+
+
+def test_operations_detail_renders_a_present_but_empty_hosted_room_store() -> None:
+    """Presence is the fact worth showing even with no rooms; the note still runs."""
+    state = _ops_state(hosted_rooms=HostedRoomState(db_present=True, db_size_bytes=16_384))
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "Hosted Rooms" in text
+    assert "0 active · 0 disbanded" in text
+    # No room table is drawn, and no histogram row either.
+    assert "Latest Seq" not in text
+    assert "Event Kinds" not in text
+    assert "shared-state.db" in text
+
+
+def test_operations_detail_shows_an_overdue_retention_window() -> None:
+    state = _ops_state(
+        api_runs=_api_runs(
+            reservations=[
+                ApiRunReservation(
+                    run_id="run-overdue",
+                    status="waiting_for_approval",
+                    retention_remaining_seconds=-300.0,
+                )
+            ]
+        )
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "5m overdue" in text
+    assert "Past Retention" in text
+
+
+def test_operations_detail_shows_a_reservation_with_no_retention_deadline() -> None:
+    state = _ops_state(
+        api_runs=_api_runs(
+            reservations=[ApiRunReservation(run_id="run-no-deadline", status="queued")]
+        )
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "run-no-deadline" in text
+    assert "—" in text

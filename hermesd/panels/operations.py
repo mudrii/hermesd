@@ -7,9 +7,18 @@ from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import (
+    API_RUN_RETENTION_SECONDS,
+    HOSTED_ROOM_DISBANDED_RETENTION_SECONDS,
+    MAX_ACTIVE_HOSTED_ROOMS,
+    MAX_DISBANDED_HOSTED_ROOM_TOMBSTONES,
+    MAX_EVENTS_PER_HOSTED_ROOM,
     MAX_PERSISTENT_REPAIR_ATTEMPTS,
+    ApiRunReservation,
+    ApiRunReservationsState,
     DashboardState,
     DbRecoveryState,
+    HostedRoomState,
+    HostedRoomSummary,
     OperationsState,
 )
 from hermesd.panels.formatting import escape_terminal_text as escape
@@ -25,6 +34,45 @@ _RECOVERY_NOTE_LINES = (
     '"budget exhausted" counts the ledger\'s recorded failures; hermesd does not recompute the',
     "fingerprint upstream matches them against, so it cannot tell whether the file changed since.",
 )
+
+# Rendered under Hosted Rooms. The first block is the content-free contract, the
+# second is the ROOT scope (the one thing an operator is most likely to get
+# wrong, because every other database in this panel is profile-scoped or root
+# for a different reason), and the third is upstream's own ceilings.
+_HOSTED_ROOM_NOTE_LINES = (
+    "Content-free by construction: grants, link catalogs and target URLs, event payloads and",
+    "actors, revoked-grant scope keys and the hosted_room_policy_transcript* tables are never",
+    "selected. Only counts, ids, names, timestamps, epochs, revisions, event bytes and the",
+    "closed event-kind vocabulary leave the file.",
+    "ROOT-scoped: read from <root>/shared-state.db even under --profile, and never from the",
+    "master state.db — whose own hosted_room* tables are empty legacy leftovers, so reading",
+    "them would report a dead table as the coordination state.",
+    f"Upstream ceilings: {MAX_ACTIVE_HOSTED_ROOMS} active rooms, "
+    f"{MAX_DISBANDED_HOSTED_ROOM_TOMBSTONES} disbanded tombstones retained "
+    f"{HOSTED_ROOM_DISBANDED_RETENTION_SECONDS // 86400} days, "
+    f"{MAX_EVENTS_PER_HOSTED_ROOM:,} events per room.",
+)
+
+# Rendered under Retained API Run Reservations. The first two blocks are the
+# reason the section is not called "API Runs": an empty store is uninformative,
+# and hermesd cannot see upstream's in-memory fallback at all.
+_API_RUN_NOTE_LINES = (
+    '"Retained", not "recent": upstream prunes an aged row only once its run status',
+    f"is terminal, and long room runs extend the {API_RUN_RETENTION_SECONDS // 3600}h window — so",
+    "an empty store is not evidence that the API was idle.",
+    "The file may also be absent or stale while the gateway is actively reserving: when it",
+    "cannot be opened upstream falls back to process memory, and that capability is served over",
+    "HTTP only, never written to disk, so hermesd cannot detect the fallback.",
+    "fingerprint, idempotency_key and scope are never read; the tenant scope appears only as a",
+    "distinct count. An unrecognized run status is reported as unknown, never dropped or",
+    "guessed.",
+    "owner_started is platform-dependent units (/proc ticks on Linux, psutil centiseconds",
+    "elsewhere), so it is reduced to 'identity recorded' and never compared to a timestamp.",
+)
+
+# Rendered whenever a bounded list was cut short, so a display cap can never be
+# mistaken for the size of the table it came from.
+_TRUNCATION_LABEL = "showing {shown} of {total} — the counts above cover the whole table"
 
 
 def render_operations(state: DashboardState, theme: Theme, detail: bool = False) -> Panel:
@@ -52,6 +100,19 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     if delegation_line:
         lines.append("  Delegations: ", style=theme.ui_label)
         lines.append(f"{delegation_line}\n", style=theme.banner_text)
+    # Counts only, like every other compact row here: room names and run ids are
+    # untrusted free text and belong to the detail view.
+    if ops.hosted_rooms.db_present:
+        lines.append("  Hosted Rooms: ", style=theme.ui_label)
+        lines.append(
+            f"{ops.hosted_rooms.room_count} rooms · "
+            f"{ops.hosted_rooms.active_room_count} active · "
+            f"{ops.hosted_rooms.disbanded_room_count} disbanded\n",
+            style=theme.banner_text,
+        )
+    if ops.api_runs.db_present:
+        lines.append("  API Runs: ", style=theme.ui_label)
+        lines.append(f"{ops.api_runs.reservation_count} retained\n", style=theme.banner_text)
     if ops.blocked_script_count:
         lines.append("  Blocked scripts: ", style=theme.ui_label)
         lines.append(f"{ops.blocked_script_count}\n", style=theme.ui_warn)
@@ -119,6 +180,15 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     if ops.projects_db_present:
         sections.extend(_projects_sections(ops, theme))
 
+    # Both coordination stores render whether or not they hold rows: presence is
+    # the fact worth showing, and an empty one carries a caveat that must not be
+    # silently omitted.
+    if ops.hosted_rooms.db_present:
+        sections.extend(_hosted_room_sections(ops.hosted_rooms, theme))
+
+    if ops.api_runs.db_present:
+        sections.extend(_api_run_sections(ops.api_runs, theme))
+
     if _has_no_artifacts(ops):
         sections.append(Text("\n  No operations artifacts found\n", style=theme.banner_dim))
 
@@ -152,7 +222,210 @@ def _has_no_artifacts(ops: OperationsState) -> bool:
         and not ops.web_ui_build_hash
         and not ops.blocked_script_count
         and not ops.db_recovery.artifacts_present
+        and not ops.hosted_rooms.db_present
+        and not ops.api_runs.db_present
     )
+
+
+def _note(lines: tuple[str, ...], theme: Theme) -> Text:
+    """A dimmed block of caveats. Literal text, never markup-parsed."""
+    return Text("\n".join(f"  {line}" for line in lines), style=theme.banner_dim)
+
+
+def _truncation_label(shown: int, total: int) -> str:
+    return _TRUNCATION_LABEL.format(shown=shown, total=total)
+
+
+def _hosted_room_sections(hosted: HostedRoomState, theme: Theme) -> list[RenderableType]:
+    sections: list[RenderableType] = [
+        _heading("Hosted Rooms", theme),
+        _hosted_room_summary_table(hosted, theme),
+    ]
+    if hosted.rooms:
+        sections.append(_hosted_rooms_table(hosted, theme))
+    sections.append(_note(_HOSTED_ROOM_NOTE_LINES, theme))
+    return sections
+
+
+def _hosted_room_summary_table(hosted: HostedRoomState, theme: Theme) -> Table:
+    table = Table(box=None, show_header=False, padding=(0, 2))
+    table.add_column("Key", style=theme.ui_label)
+    table.add_column("Value", style=theme.banner_text)
+    table.add_row(
+        "Rooms",
+        f"{hosted.active_room_count} active · {hosted.disbanded_room_count} disbanded",
+    )
+    table.add_row(
+        "Events",
+        f"{hosted.event_count} · {_size_label(hosted.accounted_event_bytes)} accounted · "
+        f"newest {_age_span_label(hosted.newest_event_age_seconds)} ago",
+    )
+    kinds = _hosted_event_kind_label(hosted)
+    if kinds:
+        table.add_row("Event Kinds", kinds)
+    if hosted.retired_id_count:
+        table.add_row(
+            "Retired IDs",
+            f"{hosted.retired_id_count} · newest "
+            f"{_age_span_label(hosted.newest_retired_id_age_seconds)} ago",
+        )
+    if hosted.link_count:
+        # A count only: every other column of that table is a credential-bearing
+        # URL, a grant or a tool catalog.
+        table.add_row("Links", f"{hosted.link_count} (targets never read)")
+    if hosted.remote_run_count:
+        table.add_row(
+            "Remote Runs",
+            f"{hosted.remote_run_count} · newest "
+            f"{_age_span_label(hosted.newest_remote_run_age_seconds)} ago",
+        )
+    if hosted.revoked_grant_count:
+        table.add_row("Revoked Grants", f"{hosted.revoked_grant_count} (scope keys never read)")
+    if hosted.peer_reservation_count:
+        table.add_row(
+            "Peer Reservations",
+            f"{hosted.live_peer_reservation_count} live · "
+            f"{hosted.expired_peer_reservation_count} expired · "
+            f"{hosted.revoked_peer_reservation_count} revoked",
+        )
+    if hosted.rooms_truncated:
+        table.add_row("Room List", _truncation_label(len(hosted.rooms), hosted.room_count))
+    return table
+
+
+def _hosted_event_kind_label(hosted: HostedRoomState) -> str:
+    """The closed-vocabulary histogram; keys are escaped even though the reader
+    allowlists them, because a panel never trusts what a model can hold."""
+    parts = [f"{escape(kind)} {count}" for kind, count in sorted(hosted.event_kind_counts.items())]
+    if hosted.unknown_event_kind_count:
+        parts.append(f"unknown {hosted.unknown_event_kind_count}")
+    return " · ".join(parts)
+
+
+def _hosted_rooms_table(hosted: HostedRoomState, theme: Theme) -> Table:
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("Room", style=theme.ui_accent)
+    table.add_column("Name", style=theme.banner_text)
+    table.add_column("Members", justify="right", style=theme.banner_text)
+    table.add_column("Epoch", justify="right", style=theme.banner_dim)
+    table.add_column("Rev", justify="right", style=theme.banner_dim)
+    table.add_column("Latest Seq", justify="right", style=theme.banner_text)
+    table.add_column("Events", justify="right", style=theme.banner_dim)
+    table.add_column("Updated", style=theme.banner_dim)
+    table.add_column("State", style=theme.banner_text)
+    for room in hosted.rooms:
+        table.add_row(
+            escape(room.room_id) or "—",
+            escape(room.name) or "—",
+            str(room.member_count),
+            str(room.authority_epoch),
+            str(room.revision),
+            str(room.latest_seq),
+            _size_label(room.event_bytes),
+            _age_span_label(room.updated_at_age_seconds),
+            _hosted_room_state_label(room),
+        )
+    return table
+
+
+def _hosted_room_state_label(room: HostedRoomSummary) -> str:
+    if not room.disbanded:
+        return "active"
+    return f"disbanded {_age_span_label(room.disbanded_at_age_seconds)} ago"
+
+
+def _api_run_sections(api_runs: ApiRunReservationsState, theme: Theme) -> list[RenderableType]:
+    sections: list[RenderableType] = [
+        _heading("Retained API Run Reservations", theme),
+        _api_run_summary_table(api_runs, theme),
+    ]
+    if api_runs.reservations:
+        sections.append(_api_runs_table(api_runs, theme))
+    else:
+        # Stated in words rather than left as an empty table: the whole point of
+        # this section is that zero rows is not a verdict.
+        sections.append(
+            Text(
+                "  no reservations retained — not evidence that the API was idle\n",
+                style=theme.ui_warn,
+            )
+        )
+    sections.append(_note(_API_RUN_NOTE_LINES, theme))
+    return sections
+
+
+def _api_run_summary_table(api_runs: ApiRunReservationsState, theme: Theme) -> Table:
+    table = Table(box=None, show_header=False, padding=(0, 2))
+    table.add_column("Key", style=theme.ui_label)
+    table.add_column("Value", style=theme.banner_text)
+    table.add_row(
+        "Store",
+        f"{_size_label(api_runs.db_size_bytes)} · {api_runs.reservation_count} reservations · "
+        f"{api_runs.scope_count} scopes",
+    )
+    table.add_row(
+        "Ages",
+        f"newest {_age_span_label(api_runs.newest_age_seconds)} · "
+        f"oldest {_age_span_label(api_runs.oldest_age_seconds)}",
+    )
+    if api_runs.acknowledged_count:
+        table.add_row("Acknowledged", str(api_runs.acknowledged_count))
+    if api_runs.owner_recorded_count:
+        table.add_row("Owners", f"{api_runs.owner_recorded_count} with a pid recorded")
+    if api_runs.retention_expired_count:
+        table.add_row(
+            "Past Retention",
+            f"{api_runs.retention_expired_count} awaiting a terminal status",
+        )
+    if api_runs.reservations_truncated:
+        table.add_row(
+            "Reservation List",
+            _truncation_label(len(api_runs.reservations), api_runs.reservation_count),
+        )
+    return table
+
+
+def _api_runs_table(api_runs: ApiRunReservationsState, theme: Theme) -> Table:
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("Run ID", style=theme.ui_accent)
+    table.add_column("Status", style=theme.banner_text)
+    table.add_column("Created", style=theme.banner_dim)
+    table.add_column("Updated", style=theme.banner_dim)
+    table.add_column("Retention", style=theme.banner_dim)
+    table.add_column("Owner", style=theme.banner_text)
+    for item in api_runs.reservations:
+        table.add_row(
+            escape(item.run_id) or "—",
+            escape(item.status.value),
+            _age_span_label(item.created_at_age_seconds),
+            _age_span_label(item.updated_at_age_seconds),
+            _retention_label(item.retention_remaining_seconds),
+            _run_owner_label(item),
+        )
+    return table
+
+
+def _retention_label(seconds: float | None) -> str:
+    """Time until upstream may prune the row; None means no explicit deadline."""
+    if seconds is None:
+        return "—"
+    if seconds < 0:
+        return f"{_duration_label(-seconds)} overdue"
+    return f"{_duration_label(seconds)} left"
+
+
+def _run_owner_label(item: ApiRunReservation) -> str:
+    """Ownership, with the pid-reuse caveat made explicit.
+
+    A pid on its own cannot be told apart from a recycled one: upstream pairs it
+    with ``owner_started``, whose units are platform-dependent, so hermesd says
+    whether an identity was recorded rather than pretending to have verified one.
+    """
+    if not item.owner_pid_present:
+        return "no pid"
+    identity = "identity recorded" if item.owner_started_recorded else "identity unverified"
+    liveness = "alive" if item.owner_alive else "gone"
+    return f"pid {item.owner_pid} {liveness} · {identity}"
 
 
 def _summary_table(ops: OperationsState, theme: Theme) -> Table:
@@ -244,8 +517,7 @@ def _recovery_section(recovery: DbRecoveryState, theme: Theme) -> list[Renderabl
             "Scan",
             "truncated — counts above are a floor, not an inventory",
         )
-    note = Text("\n".join(f"  {line}" for line in _RECOVERY_NOTE_LINES), style=theme.banner_dim)
-    return [_heading("Database Recovery", theme), table, note]
+    return [_heading("Database Recovery", theme), table, _note(_RECOVERY_NOTE_LINES, theme)]
 
 
 def _repair_ledger_label(recovery: DbRecoveryState) -> str:
