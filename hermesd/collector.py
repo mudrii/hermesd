@@ -159,12 +159,18 @@ from hermesd.collect.redaction import (
     _safe_exception_text,
 )
 from hermesd.collect.sessions import (
+    _SessionCoordinationRows,
     _background_process_from_ledger,
     _context_limit_for,
     _count_cost_statuses,
     _estimate_cost,  # noqa: F401  # re-exported for hermesd.collector compatibility
+    _generation_fields,
+    _gateway_route_fields,
+    _hygiene_fields,
+    _read_session_coordination_rows,
     _read_session_tools,
     _resolved_session_cost,
+    _session_lease_fields,
     _summarize_breakdown,
     _summarize_tokens,
     _summarize_window,
@@ -237,11 +243,14 @@ from hermesd.models import (
     ProfileSummary,
     ProviderInfo,
     RuntimeStatus,
+    SessionCoordinationState,
     SessionInfo,
     SkillInfo,
     SkillsMemory,
     SkillsPromptSnapshot,
     SourceScope,
+    TerminalBreadcrumb,
+    TerminalSessionReadout,
     TokenAnalytics,
     TokenSummary,
     ToolGatewayRoute,
@@ -261,10 +270,12 @@ def _closing_source() -> Never:
 
 @dataclass(frozen=True, slots=True)
 class _StateDbReadout:
-    """One state.db pass: the operations tables plus the raw gateway ledgers."""
+    """One state.db pass: operations tables, gateway ledgers and the
+    session-side coordination rows."""
 
     state: StateDbRead
     ledgers: _GatewayLedgerRows
+    coordination: _SessionCoordinationRows
 
 
 def _state_db_readout(conn: sqlite3.Connection) -> _StateDbReadout:
@@ -272,6 +283,7 @@ def _state_db_readout(conn: sqlite3.Connection) -> _StateDbReadout:
     return _StateDbReadout(
         state=_read_state_db_tables(conn),
         ledgers=_read_gateway_ledger_rows(conn),
+        coordination=_read_session_coordination_rows(conn),
     )
 
 
@@ -335,6 +347,26 @@ _LEDGER_FIELDS = (
     "failed_delivery_count",
     "pending_deliveries",
 )
+
+
+# Fields each session-coordination sub-source owns within
+# SessionCoordinationState, so a corrupt coordination table degrades only its
+# own group instead of blanking the others.
+_SESSION_LEASE_FIELDS = ("leases", "lease_total")
+_HYGIENE_FIELDS = ("hygiene",)
+_GATEWAY_ROUTE_FIELDS = ("routes", "route_total")
+_GENERATION_FIELDS = (
+    "generations",
+    "generation_chat_total",
+    "generation_reset_total",
+    "generation_count_shrank",
+)
+# terminal-sessions/ scan bounds. One file per terminal identity upstream
+# (writer hermes_cli/terminal_breadcrumbs.py:85-92); the count is an upper
+# bound on live terminals, and only the newest rows are retained for display.
+_TERMINAL_SESSION_SCAN_LIMIT = 200
+_TERMINAL_SESSION_ROW_LIMIT = 12
+_TERMINAL_SESSION_WINDOW_SECONDS = 24 * 60 * 60
 # Bucket for the time-dependent part of derived-cache keys: sliding 7d/30d
 # window cutoffs recompute at most this often when nothing else changed
 # (matches the 60s cutoff bucketing in db.py's model-usage reads).
@@ -574,6 +606,11 @@ class Collector:
         # whole-state snapshot taken only on fully clean passes did).
         self._last_good_by_source: dict[str, Any] = {}
         self._last_session_rows: list[dict[str, Any]] = []
+        # conversation_generations is never pruned upstream, so its row count
+        # must never shrink between refreshes; remembering the last count is
+        # what turns a shrink into a visible warning instead of a silent
+        # "fewer chats than last tick".
+        self._last_generation_chat_count: int | None = None
         self._log_stream_cache: dict[str, tuple[float | None, int, LogStream]] = {}
         self._cron_excerpt_cache: dict[
             str,
@@ -919,6 +956,57 @@ class Collector:
                 "active_sessions",
                 self._collect_active_surfaces,
                 lambda: _EMPTY_ACTIVE_SURFACE_READOUT,
+            ),
+            # Four sources enrich the same `session_coordination` field: each
+            # fails (and falls back) independently, so one corrupt coordination
+            # table cannot blank the panel's other groups.
+            _SourceSpec(
+                "session_coordination",
+                "session_leases",
+                lambda: self._with_session_leases(
+                    results.get("session_coordination") or SessionCoordinationState()
+                ),
+                SessionCoordinationState,
+                fallback=lambda: self._last_source_fields(
+                    "session_leases",
+                    results.get("session_coordination") or SessionCoordinationState(),
+                    _SESSION_LEASE_FIELDS,
+                ),
+            ),
+            _SourceSpec(
+                "session_coordination",
+                "gateway_hygiene",
+                lambda: self._with_gateway_hygiene(
+                    results["session_coordination"], session_rows
+                ),
+                lambda: results["session_coordination"],
+                fallback=lambda: self._last_source_fields(
+                    "gateway_hygiene", results["session_coordination"], _HYGIENE_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "session_coordination",
+                "gateway_routes",
+                lambda: self._with_gateway_routes(results["session_coordination"], results["sessions"]),
+                lambda: results["session_coordination"],
+                fallback=lambda: self._last_source_fields(
+                    "gateway_routes", results["session_coordination"], _GATEWAY_ROUTE_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "session_coordination",
+                "generation_churn",
+                lambda: self._with_generation_churn(results["session_coordination"]),
+                lambda: results["session_coordination"],
+                fallback=lambda: self._last_source_fields(
+                    "generation_churn", results["session_coordination"], _GENERATION_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "terminal_sessions",
+                "terminal_sessions",
+                self._collect_terminal_sessions,
+                TerminalSessionReadout,
             ),
             _SourceSpec(
                 "runtime",
@@ -1539,6 +1627,10 @@ class Collector:
             pid = _coerce_int(entry.get("pid"))
             raw_start = entry.get("process_start_time")
             recorded = _coerce_float(raw_start) if raw_start is not None else 0.0
+            # Presence of metadata.shared_runtime_url is the whole joinable
+            # signal (hermes_cli/shared_session_attach.py:32-47): the value is
+            # never stored — only the boolean reaches the panel.
+            metadata = _as_dict(entry.get("metadata"))
             surfaces.append(
                 ActiveSurface(
                     session_id=str(entry.get("session_id") or ""),
@@ -1554,9 +1646,145 @@ class Collector:
                     started_at_age_seconds=_lease_age_seconds(entry.get("started_at"), now),
                     updated_at_age_seconds=_lease_age_seconds(entry.get("updated_at"), now),
                     track_liveness=bool(entry.get("track_liveness")),
+                    joinable=bool(str(metadata.get("shared_runtime_url") or "")),
                 )
             )
         return _ActiveSurfaceReadout(surfaces=tuple(surfaces), total_count=total_count)
+
+    def _with_session_leases(self, coord: SessionCoordinationState) -> SessionCoordinationState:
+        """Turn leases and compression locks from the profile's ``state.db``.
+
+        PROFILE-scoped: upstream opens ``get_hermes_home()/"state.db"`` for
+        both tables (``hermes_state.py:160,178``; writers
+        ``hermes_state_compression.py:433-605``). See
+        ``.codex/rules/source-ownership.md`` (``session_leases``).
+        """
+        readout = self._read_state_db()
+        if readout is None:
+            last = self._last_good_by_source.get("session_leases")
+            if last is not None and last.lease_total:
+                raise RuntimeError("state.db session leases disappeared or became unsafe")
+            return coord
+        return coord.model_copy(
+            update=_session_lease_fields(
+                readout.coordination, now=self._clock(), pid_exists=self._pid_exists
+            )
+        )
+
+    def _with_gateway_hygiene(
+        self, coord: SessionCoordinationState, session_rows: list[dict[str, Any]]
+    ) -> SessionCoordinationState:
+        """Per-chat hygiene failure streaks (PROFILE ``state.db``, table
+        ``gateway_hygiene_state`` — ``hermes_state.py:160,178``). The raw
+        session rows join the recorded compression failure to each streak."""
+        readout = self._read_state_db()
+        if readout is None:
+            last = self._last_good_by_source.get("gateway_hygiene")
+            if last is not None and last.hygiene:
+                raise RuntimeError("state.db gateway hygiene disappeared or became unsafe")
+            return coord
+        return coord.model_copy(
+            update=_hygiene_fields(readout.coordination.hygiene_rows, session_rows)
+        )
+
+    def _with_gateway_routes(
+        self, coord: SessionCoordinationState, sessions: list[SessionInfo]
+    ) -> SessionCoordinationState:
+        """Decoded routing entries (PROFILE ``state.db``, table
+        ``gateway_routing`` — ``hermes_state.py:160,178``; payload writer
+        ``gateway/session.py:535-545``). Dangling routes are those whose
+        session id has no row in the (possibly last-good) session list."""
+        readout = self._read_state_db()
+        if readout is None:
+            last = self._last_good_by_source.get("gateway_routes")
+            if last is not None and last.route_total:
+                raise RuntimeError("state.db gateway routes disappeared or became unsafe")
+            return coord
+        known = frozenset(session.session_id for session in sessions if session.session_id)
+        return coord.model_copy(
+            update=_gateway_route_fields(
+                readout.coordination.routing_rows,
+                route_total=readout.coordination.routing_total,
+                now=self._clock(),
+                known_session_ids=known,
+            )
+        )
+
+    def _with_generation_churn(self, coord: SessionCoordinationState) -> SessionCoordinationState:
+        """Conversation generations (PROFILE ``state.db`` —
+        ``hermes_state.py:160,178``). The table is deliberately never
+        garbage-collected upstream (``hermes_state_common.py:460-487``), so the
+        row count is remembered across refreshes and a shrink sets the panel's
+        invariant-break warning. The remembered count advances only on a
+        successful read; a failed source never invents a shrink."""
+        readout = self._read_state_db()
+        if readout is None:
+            last = self._last_good_by_source.get("generation_churn")
+            if last is not None and last.generation_chat_total:
+                raise RuntimeError("state.db generations disappeared or became unsafe")
+            return coord
+        rows = readout.coordination
+        shrank = (
+            self._last_generation_chat_count is not None
+            and rows.generation_chat_total < self._last_generation_chat_count
+        )
+        self._last_generation_chat_count = rows.generation_chat_total
+        return coord.model_copy(
+            update={
+                **_generation_fields(rows),
+                "generation_count_shrank": shrank,
+            }
+        )
+
+    def _collect_terminal_sessions(self) -> TerminalSessionReadout:
+        """Recent terminal breadcrumbs from ``terminal-sessions/``.
+
+        PROFILE-scoped, agreeing with upstream: the writer resolves the
+        directory through ``get_hermes_home()`` and prunes entries older than
+        30 days (``hermes_cli/terminal_breadcrumbs.py:19-21,26-28,63-73,85-92``).
+        Files within the last 24 hours are the "open CLI terminals" upper
+        bound — a breadcrumb proves the terminal *recorded* a session recently,
+        not that the terminal is still alive, so the copy says "at most".
+
+        The listing and every file read are bounded: dotfiles (the writer's
+        ``.{tid}.tmp`` intermediates) and symlinks are skipped, contents go
+        through the capped reader, and junk payloads read as absent.
+        """
+        directory = self._paths.profile_path("terminal-sessions")
+        home = self._paths.profile_home
+        if not _safe_child_path(directory, home) or not directory.is_dir():
+            return TerminalSessionReadout()
+        now = self._clock()
+        rows: list[TerminalBreadcrumb] = []
+        count = 0
+        for entry in sorted(directory.iterdir(), key=lambda path: path.name)[
+            :_TERMINAL_SESSION_SCAN_LIMIT
+        ]:
+            if entry.name.startswith(".") or not entry.is_file():
+                continue
+            if entry.is_symlink() or not _path_resolves_under(entry, home):
+                continue
+            try:
+                data = json.loads(_read_text_capped(entry, home))
+            except (json.JSONDecodeError, UnicodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            ts = _coerce_float(data.get("ts")) or _mtime(entry)
+            age = _age_seconds(ts or None, now)
+            if age is None or age > _TERMINAL_SESSION_WINDOW_SECONDS:
+                continue
+            count += 1
+            if len(rows) < _TERMINAL_SESSION_ROW_LIMIT:
+                rows.append(
+                    TerminalBreadcrumb(
+                        terminal=_sanitized_file_label(entry.name),
+                        session_id=str(data.get("session_id") or ""),
+                        cwd=str(data.get("cwd") or ""),
+                        age_seconds=age,
+                    )
+                )
+        return TerminalSessionReadout(sessions=rows, count=count)
 
     def _last_model_usage(self) -> _ModelUsageBundle:
         bundle: _ModelUsageBundle = self._last_good_by_source.get(

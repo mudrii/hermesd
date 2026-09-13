@@ -348,6 +348,9 @@ class HermesDB:
             "last_activity_description",
             "actual_cost_usd",
             "cost_source",
+            # Rotation-stable gateway chat key; the session-hygiene join reads
+            # it (hermes_state_gateway.py:513-529). Absent on older databases.
+            "session_key",
             # Durable anti-thrash guard (hermes_state_common.py:375-379);
             # absent on databases written before it landed.
             "compression_failure_cooldown_until",

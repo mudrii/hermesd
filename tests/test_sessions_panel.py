@@ -5,7 +5,20 @@ from __future__ import annotations
 import pytest
 
 import hermesd.panels.sessions as sessions_module
-from hermesd.models import ActiveSurface, DashboardState, ProcessLiveness, SessionInfo
+from hermesd.models import (
+    ActiveSurface,
+    ConversationGeneration,
+    DashboardState,
+    GatewayHygieneState,
+    GatewayRouteState,
+    ProcessLiveness,
+    SessionCoordinationState,
+    SessionInfo,
+    SessionLease,
+    SessionLeaseKind,
+    TerminalBreadcrumb,
+    TerminalSessionReadout,
+)
 from hermesd.panels.sessions import render_sessions
 from hermesd.theme import Theme
 from tests.conftest import render_to_str
@@ -591,3 +604,258 @@ def test_sessions_detail_preserves_fifty_row_table_cap() -> None:
     assert "… and 10 more" in rendered
     assert "sess0010" in rendered
     assert "sess0009" not in rendered
+
+
+# ── Session coordination sections (items 6-10, 22) ──────────────────────────
+
+
+def _lease(**overrides: object) -> SessionLease:
+    base: dict[str, object] = {
+        "kind": SessionLeaseKind.TURN_LEASE,
+        "key": "conv-root-1234",
+        "holder": "pid=101:tid=7:agent=1f:nonce=abcd1234",
+        "pid": 101,
+        "held_seconds": 60,
+        "expires_in_seconds": 240,
+        "liveness": ProcessLiveness.LIVE,
+    }
+    base.update(overrides)
+    return SessionLease(**base)  # type: ignore[arg-type]
+
+
+def _coordination_state(**overrides: object) -> DashboardState:
+    base: dict[str, object] = {"collected_at": _NOW}
+    base.update(overrides)
+    return DashboardState(**base)  # type: ignore[arg-type]
+
+
+def test_detail_labels_orphaned_and_expired_leases() -> None:
+    leases = [
+        _lease(),
+        _lease(
+            kind=SessionLeaseKind.COMPRESSION_LOCK,
+            key="sess-lock",
+            pid=102,
+            liveness=ProcessLiveness.DEAD,
+            expired=True,
+            expires_in_seconds=-45,
+        ),
+    ]
+    rendered = render_to_str(
+        render_sessions(
+            _coordination_state(
+                session_coordination=SessionCoordinationState(
+                    leases=leases, lease_total=2
+                )
+            ),
+            Theme(),
+            detail=True,
+        )
+    )
+    assert "Turn Leases" in rendered
+    assert "orphaned" in rendered
+    assert "expired" in rendered
+    assert "revive" in rendered  # upstream revives before stealing
+
+
+def test_detail_lease_note_explains_revivable_expiry() -> None:
+    rendered = render_to_str(
+        render_sessions(
+            _coordination_state(
+                session_coordination=SessionCoordinationState(
+                    leases=[_lease(expired=True, expires_in_seconds=-30)], lease_total=1
+                )
+            ),
+            Theme(),
+            detail=True,
+        )
+    )
+    assert "revive" in rendered
+
+
+def test_compact_counts_leases_and_flags() -> None:
+    coord = SessionCoordinationState(
+        leases=[
+            _lease(expired=True, expires_in_seconds=-120),
+            _lease(
+                kind=SessionLeaseKind.COMPRESSION_LOCK,
+                pid=102,
+                liveness=ProcessLiveness.DEAD,
+                key="s",
+            ),
+        ],
+        lease_total=2,
+    )
+    rendered = render_to_str(render_sessions(_coordination_state(session_coordination=coord), Theme()))
+    assert "2 lease(s)" in rendered
+    assert "1 expired" in rendered
+    assert "1 orphaned" in rendered
+
+
+def test_detail_hygiene_alert_row_for_suspended_compaction() -> None:
+    coord = SessionCoordinationState(
+        hygiene=[
+            GatewayHygieneState(
+                session_key="telegram:42:7",
+                failure_streak=4,
+                suspended=True,
+                compression_failure_error="summary model timeout",
+            )
+        ]
+    )
+    rendered = render_to_str(
+        render_sessions(_coordination_state(session_coordination=coord), Theme(), detail=True)
+    )
+    assert "telegram:42:7" in rendered
+    assert "4" in rendered
+    assert "compaction suspended" in rendered
+    assert "1h" in rendered
+    assert "summary model timeout" in rendered
+
+
+def test_compact_shows_hygiene_badge_with_streak() -> None:
+    coord = SessionCoordinationState(
+        hygiene=[GatewayHygieneState(session_key="telegram:42:7", failure_streak=4, suspended=True)]
+    )
+    rendered = render_to_str(render_sessions(_coordination_state(session_coordination=coord), Theme()))
+    assert "hygiene" in rendered
+    assert "1" in rendered
+
+
+def test_detail_route_table_flags_resume_dangling_and_stuck_turn() -> None:
+    coord = SessionCoordinationState(
+        routes=[
+            GatewayRouteState(
+                session_key="telegram:42:7",
+                session_id="ghost",
+                platform="telegram",
+                chat_type="group",
+                display_name="dev chat",
+                turn_age_seconds=900,
+                resume_pending=True,
+                dangling=True,
+            )
+        ],
+        route_total=1,
+    )
+    rendered = render_to_str(
+        render_sessions(_coordination_state(session_coordination=coord), Theme(), detail=True)
+    )
+    assert "Chat Routes" in rendered
+    assert "telegram:42:7" in rendered
+    assert "dangling" in rendered
+    assert "resume" in rendered
+    assert "never unwound" in rendered
+    assert "user message" in rendered
+
+
+def test_detail_reset_churn_totals_and_shrink_warning() -> None:
+    coord = SessionCoordinationState(
+        generations=[ConversationGeneration(source="cli", session_key="k2", generation=9)],
+        generation_chat_total=3,
+        generation_reset_total=16,
+        generation_count_shrank=True,
+    )
+    rendered = render_to_str(
+        render_sessions(_coordination_state(session_coordination=coord), Theme(), detail=True)
+    )
+    assert "Reset Churn" in rendered
+    assert "16" in rendered
+    assert "3" in rendered
+    assert "never prunes" in rendered or "never pruned" in rendered
+
+
+def test_detail_terminal_copy_says_upper_bound() -> None:
+    readout = TerminalSessionReadout(
+        sessions=[
+            TerminalBreadcrumb(
+                terminal="tty-dev-pts-3",
+                session_id="sess_t",
+                cwd="/repo/checkout",
+                age_seconds=7200,
+            )
+        ],
+        count=1,
+    )
+    rendered = render_to_str(
+        render_sessions(_coordination_state(terminal_sessions=readout), Theme(), detail=True)
+    )
+    assert "CLI Terminals" in rendered
+    assert "24 hours" in rendered
+    assert "upper bound" in rendered
+    assert "/repo/checkout" in rendered
+
+
+def test_detail_joinable_chip_on_surface_rows() -> None:
+    surfaces = [
+        ActiveSurface(
+            session_id="sess_abcdef12",
+            surface="cli",
+            pid=111,
+            liveness=ProcessLiveness.LIVE,
+            joinable=True,
+        )
+    ]
+    rendered = render_to_str(
+        render_sessions(
+            _coordination_state(
+                active_surfaces=surfaces, active_surface_count=1
+            ),
+            Theme(),
+            detail=True,
+        )
+    )
+    assert "joinable" in rendered
+
+
+def test_compact_shows_joinable_count() -> None:
+    surfaces = [
+        ActiveSurface(
+            session_id="sess_abcdef12",
+            surface="cli",
+            pid=111,
+            liveness=ProcessLiveness.LIVE,
+            joinable=True,
+        ),
+        ActiveSurface(
+            session_id="sess_abcdef34",
+            surface="gateway:telegram",
+            pid=112,
+            liveness=ProcessLiveness.LIVE,
+        ),
+    ]
+    rendered = render_to_str(
+        render_sessions(
+            _coordination_state(
+                active_surfaces=surfaces, active_surface_count=2
+            ),
+            Theme(),
+        )
+    )
+    assert "1 joinable" in rendered
+
+
+def test_coordination_free_text_is_escaped() -> None:
+    coord = SessionCoordinationState(
+        hygiene=[
+            GatewayHygieneState(
+                session_key="[b]evil[/b]",
+                failure_streak=5,
+                suspended=True,
+                compression_failure_error="[i]boom[/i]",
+            )
+        ],
+        routes=[
+            GatewayRouteState(
+                session_key="[u]k[/u]",
+                display_name="[red]name[/red]",
+                dangling=True,
+            )
+        ],
+    )
+    rendered = render_to_str(
+        render_sessions(_coordination_state(session_coordination=coord), Theme(), detail=True)
+    )
+    plain = rendered
+    for hostile in ("[b]evil", "[i]boom", "[red]name"):
+        assert hostile in plain  # escaped: markup text survives rendering

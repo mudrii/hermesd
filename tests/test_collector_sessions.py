@@ -6,6 +6,7 @@ import json
 import math
 import sqlite3
 import time
+from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
 
@@ -23,9 +24,20 @@ from hermesd.collector import (
     _summarize_tokens,
     _today_epoch,
 )
+from hermesd.models import (
+    ProcessLiveness,
+    SessionCoordinationState,
+    SessionLeaseKind,
+)
 from hermesd.panels.tokens import render_tokens
 from hermesd.theme import Theme
-from tests.conftest import create_state_db_tables, insert_model_usage
+from tests.conftest import (
+    create_session_coordination_tables,
+    create_state_db_tables,
+    insert_compression_lock,
+    insert_model_usage,
+    insert_turn_lease,
+)
 
 
 def test_today_epoch_is_midnight():
@@ -2021,3 +2033,491 @@ def test_collect_model_usage_populates_cost_split_fields(hermes_home: Path):
         assert usage.has_actual_cost is True
     finally:
         c.close()
+
+# ── Item 6: turn leases and compression locks ───────────────────────────────
+
+_COORD_NOW = 1_800_000_000.0
+_HOLDER_FMT = "pid={pid}:tid={tid}:agent={agent}:nonce={nonce}"
+
+
+def _make_coordination_db(hermes_home: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(hermes_home / "state.db")
+    create_state_db_tables(conn, include_schema_version=False)
+    create_session_coordination_tables(conn)
+    return conn
+
+
+def test_turn_leases_and_compression_locks_surface_with_liveness(hermes_home: Path) -> None:
+    conn = _make_coordination_db(hermes_home)
+    insert_turn_lease(
+        conn, "conv-root",
+        _HOLDER_FMT.format(pid=101, tid=7, agent="1f", nonce="abcd1234"),
+        _COORD_NOW - 60, _COORD_NOW + 240,
+    )
+    insert_compression_lock(
+        conn, "sess-lock",
+        _HOLDER_FMT.format(pid=102, tid=7, agent="2a", nonce="beefcafe"),
+        _COORD_NOW - 120, _COORD_NOW - 30,
+    )
+    conn.commit()
+    conn.close()
+    c = Collector(
+        hermes_home,
+        clock=lambda: _COORD_NOW,
+        pid_exists=lambda pid: pid == 101,
+    )
+    state = c.collect()
+    c.close()
+    coord = state.session_coordination
+    assert coord.lease_total == 2
+    by_kind = {lease.kind: lease for lease in coord.leases}
+    turn = by_kind[SessionLeaseKind.TURN_LEASE]
+    assert turn.key == "conv-root"
+    assert turn.holder.endswith("abcd1234")
+    assert turn.pid == 101
+    assert turn.liveness is ProcessLiveness.LIVE
+    assert turn.held_seconds == 60
+    assert turn.expires_in_seconds == 240
+    assert turn.expired is False
+    assert turn.orphaned is False
+    lock = by_kind[SessionLeaseKind.COMPRESSION_LOCK]
+    assert lock.key == "sess-lock"
+    assert lock.pid == 102
+    assert lock.liveness is ProcessLiveness.DEAD
+    assert lock.expired is True
+    assert lock.orphaned is True
+    assert lock.held_seconds == 120
+    assert lock.expires_in_seconds == -30
+
+
+def test_expired_lease_with_live_holder_is_not_orphaned(hermes_home: Path) -> None:
+    """An expired lease whose holder still matches is revived upstream, not
+    stolen (hermes_state_compression.py:433-439), so expiry alone is benign."""
+    conn = _make_coordination_db(hermes_home)
+    insert_compression_lock(
+        conn, "sess-lock",
+        _HOLDER_FMT.format(pid=101, tid=7, agent="2a", nonce="beefcafe"),
+        _COORD_NOW - 600, _COORD_NOW - 10,
+    )
+    conn.commit()
+    conn.close()
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    (lock,) = state.session_coordination.leases
+    assert lock.expired is True
+    assert lock.liveness is ProcessLiveness.LIVE
+    assert lock.orphaned is False
+
+
+def test_holder_without_parseable_pid_is_unverifiable_not_orphaned(hermes_home: Path) -> None:
+    """Upstream reclaims on kernel proof only (hermes_state.py:119-143): a holder
+    with no local pid keeps its lease until TTL and never reads as orphaned."""
+    conn = _make_coordination_db(hermes_home)
+    insert_turn_lease(conn, "conv-legacy", "legacy-holder", _COORD_NOW - 10, _COORD_NOW + 290)
+    conn.commit()
+    conn.close()
+    probed: list[int] = []
+    c = Collector(
+        hermes_home,
+        clock=lambda: _COORD_NOW,
+        pid_exists=lambda pid: probed.append(pid) or True,
+    )
+    state = c.collect()
+    c.close()
+    (lease,) = state.session_coordination.leases
+    assert lease.pid == 0
+    assert lease.liveness is ProcessLiveness.UNVERIFIABLE
+    assert lease.orphaned is False
+    assert probed == []  # a pid-less holder is never probed
+
+
+def test_absent_coordination_tables_read_as_empty(hermes_home: Path) -> None:
+    conn = sqlite3.connect(hermes_home / "state.db")
+    create_state_db_tables(conn, include_schema_version=False)
+    conn.commit()
+    conn.close()
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    assert state.session_coordination == SessionCoordinationState()
+    assert "session_leases" not in state.health.failed_sources
+    assert "gateway_hygiene" not in state.health.failed_sources
+    assert "gateway_routes" not in state.health.failed_sources
+    assert "generation_churn" not in state.health.failed_sources
+
+
+def test_junk_lease_columns_coerce_without_failing_the_source(hermes_home: Path) -> None:
+    """The writer's columns are NOT NULL, but legacy tooling can still put text
+    in epoch columns: coercion must degrade the row, never the source."""
+    conn = _make_coordination_db(hermes_home)
+    conn.execute(
+        "INSERT INTO session_turn_leases VALUES ('conv-null', '', 'not-a-number', 'x')"
+    )
+    conn.commit()
+    conn.close()
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    (lease,) = state.session_coordination.leases
+    assert lease.holder == ""
+    assert lease.pid == 0
+    assert lease.held_seconds is None
+    assert lease.expires_in_seconds is None
+    assert lease.expired is False
+
+
+# ── Item 7: hygiene failure streaks ─────────────────────────────────────────
+
+
+def test_hygiene_rows_join_session_error_and_mark_suspension(hermes_home: Path) -> None:
+    conn = sqlite3.connect(hermes_home / "state.db")
+    create_state_db_tables(
+        conn, include_schema_version=False, include_v021_columns=True, include_session_key=True
+    )
+    create_session_coordination_tables(conn)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, session_key, compression_failure_error) "
+        "VALUES ('sess_h', 'gateway', ?, 'telegram:42:7', 'summary model timeout')",
+        (_COORD_NOW - 30,),
+    )
+    conn.execute(
+        "INSERT INTO gateway_hygiene_state VALUES ('telegram:42:7', 4)"
+    )
+    conn.execute(
+        "INSERT INTO gateway_hygiene_state VALUES ('discord:9:1', 2)"
+    )
+    conn.commit()
+    conn.close()
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    hygiene = {row.session_key: row for row in state.session_coordination.hygiene}
+    assert hygiene["telegram:42:7"].failure_streak == 4
+    assert hygiene["telegram:42:7"].suspended is True
+    assert hygiene["telegram:42:7"].compression_failure_error == "summary model timeout"
+    assert hygiene["discord:9:1"].failure_streak == 2
+    assert hygiene["discord:9:1"].suspended is False
+    assert hygiene["discord:9:1"].compression_failure_error == ""
+
+
+def test_zero_streak_hygiene_rows_are_not_reported(hermes_home: Path) -> None:
+    conn = _make_coordination_db(hermes_home)
+    conn.execute("INSERT INTO gateway_hygiene_state VALUES ('telegram:42:7', 0)")
+    conn.commit()
+    conn.close()
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    assert state.session_coordination.hygiene == []
+
+
+def test_streak_three_is_the_suspension_threshold(hermes_home: Path) -> None:
+    conn = _make_coordination_db(hermes_home)
+    conn.execute("INSERT INTO gateway_hygiene_state VALUES ('k2', 3)")
+    conn.commit()
+    conn.close()
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    (row,) = state.session_coordination.hygiene
+    assert row.suspended is True
+
+
+# ── Item 8: routing entry state flags ───────────────────────────────────────
+
+
+def _iso(offset_seconds: float) -> str:
+    """ISO stamp relative to the frozen coordination clock."""
+    return datetime.fromtimestamp(_COORD_NOW - offset_seconds, tz=UTC).isoformat()
+
+
+def _route_entry(**overrides: object) -> dict:
+    entry: dict = {
+        "session_key": "telegram:42:7",
+        "session_id": "sess_r",
+        "created_at": _iso(9600),
+        "updated_at": _iso(30),
+        "display_name": "dev chat",
+        "platform": "telegram",
+        "chat_type": "group",
+        "metadata": {"watermark": 5},
+        "suspended": False,
+        "resume_pending": False,
+        "resume_reason": None,
+        "was_auto_reset": False,
+        "auto_reset_reason": None,
+        "active_turn_token": None,
+        "active_turn_started_at": None,
+        "input_tokens": 10,
+        "total_tokens": 12,
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _insert_route_with_session(hermes_home: Path, entry: dict) -> None:
+    conn = _make_coordination_db(hermes_home)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at) VALUES ('sess_r', 'gateway', ?)",
+        (_COORD_NOW - 60,),
+    )
+    conn.execute(
+        "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
+        "VALUES (?, ?, ?, ?)",
+        ("/sessions/dir", "telegram:42:7", json.dumps(entry), _COORD_NOW - 30),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_gateway_route_decodes_entry_state(hermes_home: Path) -> None:
+    _insert_route_with_session(
+        hermes_home,
+        _route_entry(
+            updated_at=_iso(30),
+            resume_pending=True,
+            resume_reason="restart_timeout",
+            was_auto_reset=True,
+            auto_reset_reason="idle",
+            active_turn_token="tok-1",
+            active_turn_started_at=_iso(700),
+        ),
+    )
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    (route,) = state.session_coordination.routes
+    assert state.session_coordination.route_total == 1
+    assert route.session_key == "telegram:42:7"
+    assert route.session_id == "sess_r"
+    assert route.platform == "telegram"
+    assert route.chat_type == "group"
+    assert route.display_name == "dev chat"
+    assert route.updated_at_age_seconds == 30
+    assert route.resume_pending is True
+    assert route.resume_reason == "restart_timeout"
+    assert route.was_auto_reset is True
+    assert route.auto_reset_reason == "idle"
+    assert route.turn_age_seconds == 700
+    assert route.turn_never_unwound is True
+    assert route.needs_user_message is True
+    assert route.dangling is False
+    # entry_json carries token counters and Slack watermarks; none of that
+    # reaches the model.
+    assert "watermark" not in str(route.model_dump())
+
+
+def test_gateway_route_turn_under_grace_is_not_a_crash_marker(hermes_home: Path) -> None:
+    _insert_route_with_session(
+        hermes_home,
+        _route_entry(
+            active_turn_token="tok-1",
+            active_turn_started_at=_iso(60),
+        ),
+    )
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    (route,) = state.session_coordination.routes
+    assert route.turn_age_seconds == 60
+    assert route.turn_never_unwound is False
+
+
+def test_gateway_route_without_token_has_no_turn_age(hermes_home: Path) -> None:
+    _insert_route_with_session(hermes_home, _route_entry())
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    (route,) = state.session_coordination.routes
+    assert route.turn_age_seconds is None
+    assert route.turn_never_unwound is False
+
+
+def test_gateway_route_with_unknown_session_is_dangling(hermes_home: Path) -> None:
+    _insert_route_with_session(
+        hermes_home, _route_entry(session_id="ghost-session")
+    )
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    (route,) = state.session_coordination.routes
+    assert route.dangling is True
+
+
+def test_gateway_route_display_name_is_redacted(hermes_home: Path) -> None:
+    _insert_route_with_session(
+        hermes_home, _route_entry(display_name="bot api_key: sk-live-abc123")
+    )
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    (route,) = state.session_coordination.routes
+    assert "sk-live-abc123" not in route.display_name
+    assert "[REDACTED]" in route.display_name
+
+
+def test_gateway_route_junk_entry_json_degrades_to_key_only(hermes_home: Path) -> None:
+    conn = _make_coordination_db(hermes_home)
+    conn.execute(
+        "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
+        "VALUES ('/sessions/dir', 'telegram:42:7', 'not-json{{', ?)",
+        (_COORD_NOW - 30,),
+    )
+    conn.commit()
+    conn.close()
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    (route,) = state.session_coordination.routes
+    assert route.session_key == "telegram:42:7"
+    assert route.session_id == ""
+    assert route.dangling is False
+    assert route.turn_age_seconds is None
+    assert "gateway_routes" not in state.health.failed_sources
+
+
+# ── Item 9: reset churn counter ─────────────────────────────────────────────
+
+
+def test_generation_churn_top_chats_and_lifetime_total(hermes_home: Path) -> None:
+    conn = _make_coordination_db(hermes_home)
+    conn.executemany(
+        "INSERT INTO conversation_generations VALUES (?,?,?)",
+        [("cli", "k1", 5), ("cli", "k2", 9), ("telegram", "k3", 2)],
+    )
+    conn.commit()
+    conn.close()
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    coord = state.session_coordination
+    assert [(g.session_key, g.generation) for g in coord.generations] == [
+        ("k2", 9),
+        ("k1", 5),
+        ("k3", 2),
+    ]
+    assert coord.generation_chat_total == 3
+    assert coord.generation_reset_total == 16
+    assert coord.generation_count_shrank is False
+
+
+def test_generation_churn_flags_a_shrinking_table(hermes_home: Path) -> None:
+    """conversation_generations is never pruned upstream
+    (hermes_state_common.py:460-487): a shrink between refreshes means
+    something broke the no-prune invariant, so it surfaces as a warning."""
+    conn = _make_coordination_db(hermes_home)
+    conn.executemany(
+        "INSERT INTO conversation_generations VALUES (?,?,?)",
+        [("cli", "k1", 5), ("cli", "k2", 9)],
+    )
+    conn.commit()
+    conn.close()
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    assert state.session_coordination.generation_count_shrank is False
+    conn = sqlite3.connect(hermes_home / "state.db")
+    conn.execute("DELETE FROM conversation_generations WHERE session_key = 'k2'")
+    conn.commit()
+    conn.close()
+    state = c.collect()
+    c.close()
+    assert state.session_coordination.generation_chat_total == 1
+    assert state.session_coordination.generation_count_shrank is True
+
+
+# ── Item 22 (sessions half): terminal breadcrumbs ───────────────────────────
+
+
+def _write_breadcrumb(directory: Path, name: str, payload: object) -> None:
+    directory.mkdir(exist_ok=True)
+    (directory / name).write_text(json.dumps(payload))
+
+
+def test_terminal_breadcrumbs_report_recent_cli_terminals(hermes_home: Path) -> None:
+    directory = hermes_home / "terminal-sessions"
+    _write_breadcrumb(
+        directory,
+        "tty-dev-pts-3",
+        {"session_id": "sess_t", "cwd": "/repo/checkout", "ts": _COORD_NOW - 7200},
+    )
+    _write_breadcrumb(
+        directory,
+        "tmux_pane-2",
+        {"session_id": "sess_old", "cwd": "/old", "ts": _COORD_NOW - 3 * 86400},
+    )
+    # The writer's intermediate temp file and junk must never surface.
+    (directory / ".tty-dev-pts-3.tmp").write_text("{")
+    (directory / "tty-broken").write_text("not json")
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    readout = state.terminal_sessions
+    assert readout.count == 1
+    (row,) = readout.sessions
+    assert row.terminal == "tty-dev-pts-3"
+    assert row.session_id == "sess_t"
+    assert row.cwd == "/repo/checkout"
+    assert row.age_seconds == 7200
+
+
+def test_terminal_breadcrumbs_absent_directory_is_empty(hermes_home: Path) -> None:
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    assert state.terminal_sessions.count == 0
+    assert state.terminal_sessions.sessions == []
+
+
+def test_terminal_breadcrumb_rows_are_bounded(hermes_home: Path) -> None:
+    directory = hermes_home / "terminal-sessions"
+    for i in range(15):
+        _write_breadcrumb(
+            directory,
+            f"tty-dev-pts-{i}",
+            {"session_id": f"s{i}", "cwd": "/r", "ts": _COORD_NOW - 60 * i},
+        )
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    assert state.terminal_sessions.count == 15
+    assert len(state.terminal_sessions.sessions) == 12
+
+
+# ── Item 10: joinable session chip ──────────────────────────────────────────
+
+
+def test_active_surface_joinable_chip_from_shared_runtime_url(hermes_home: Path) -> None:
+    registry = hermes_home / "runtime" / "active_sessions.json"
+    registry.parent.mkdir(exist_ok=True)
+    registry.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {
+                        "session_id": "sess_join",
+                        "surface": "cli",
+                        "pid": 4242,
+                        "lease_id": "lease-1",
+                        "metadata": {"shared_runtime_url": "http://127.0.0.1:8123"},
+                    },
+                    {
+                        "session_id": "sess_plain",
+                        "surface": "gateway:telegram",
+                        "pid": 4242,
+                        "lease_id": "lease-2",
+                        "metadata": {"live_session_id": "sess_plain"},
+                    },
+                ]
+            }
+        )
+    )
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    by_session = {s.session_id: s for s in state.active_surfaces}
+    assert by_session["sess_join"].joinable is True
+    assert by_session["sess_plain"].joinable is False
+    # The advertised URL must never be stored, let alone rendered.
+    assert "127.0.0.1" not in str(state.active_surfaces)
+    assert "8123" not in str(state.active_surfaces)
