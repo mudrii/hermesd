@@ -604,7 +604,10 @@ def test_an_out_of_range_stamp_is_never_an_age(
     ``datetime.max`` — so pin a far-east offset where both extremes provably
     overflow, making the assertion deterministic on every runner.
     """
-    monkeypatch.setenv("TZ", "Etc/GMT-14")  # UTC+14, the farthest positive offset
+    # POSIX TZ spelling (inverted sign: -14 means UTC+14): parsed directly by
+    # libc, so it works in sandboxes without a tzdata database, where a zone
+    # name like Etc/GMT-14 silently falls back to UTC.
+    monkeypatch.setenv("TZ", "XXX-14")
     time.tzset()
     try:
         assert _local_iso_to_epoch(moment.isoformat(timespec="seconds")) is None
