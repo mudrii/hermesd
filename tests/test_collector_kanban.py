@@ -1143,6 +1143,42 @@ def test_collect_kanban_completion_contract_and_breaker_state(hermes_home: Path)
     assert override.breaker_limit == 1
     assert override.breaker_tripped is True
     assert tasks["t_safe"].breaker_tripped is False
+
+
+def test_kanban_completion_contract_url_credentials_are_redacted(hermes_home: Path):
+    """The contract is a URL and reaches both panel and snapshot, so redact it.
+
+    Upstream's ``validate_contract`` only accepts ``OWNER/REPO`` or a clean
+    ``https://github.com/OWNER/REPO/pull/N`` (``hermes_cli/kanban_pr_acceptance.py:13-21``),
+    so a credentialed URL needs a direct SQL write — defense in depth, at the
+    same collection seam every other URL reader redacts at.
+    """
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, completion_contract) "
+        "VALUES ('t_leak', 'Leaky', 'review', 1, 'https://user:tok@github.com/o/r/pull/1')"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    task = next(
+        task
+        for task in [
+            *state.kanban.active_tasks,
+            *state.kanban.problem_tasks,
+            *state.kanban.recent_tasks,
+        ]
+        if task.task_id == "t_leak"
+    )
+    assert task.completion_contract == "https://[REDACTED]@github.com/o/r/pull/1"
+    assert "user:tok@" not in state.model_dump_json()
     # A review task with only a contract still surfaces through the
     # enrichment read so its contract can be displayed.
     assert "t_rev" in {task.task_id for task in state.kanban.recent_tasks}

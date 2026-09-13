@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from hermesd.collect.common import _coerce_int, _path_resolves_under
+from hermesd.collect.redaction import _redact_secret_url
 from hermesd.collect.sqlite_util import (
     _column_exists,
     _connect_readonly_sqlite,
@@ -275,7 +276,10 @@ def _kanban_task_from_row(row: dict[str, Any], *, failure_limit: int = 0) -> Kan
         workspace_path=str(row.get("workspace_path") or ""),
         goal_mode=str(row.get("goal_mode") or ""),
         current_step_key=str(row.get("current_step_key") or ""),
-        completion_contract=str(row.get("completion_contract") or ""),
+        # The contract may be a PR URL, so it goes through the same URL
+        # redactor as every other URL hermesd surfaces; a plain ``OWNER/REPO``
+        # has no credential shape and passes through unchanged.
+        completion_contract=_redact_secret_url(str(row.get("completion_contract") or "")),
         max_retries=max_retries or 0,
         breaker_limit=breaker_limit,
         # A breaker trips on failures: upstream increments the counter before it
