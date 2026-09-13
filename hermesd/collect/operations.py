@@ -895,7 +895,9 @@ def _curator_with_scheduler_state(
     return run.model_copy(
         update={
             "scheduler_state_present": bool(state),
-            "scheduler_paused": bool(state.get("paused")),
+            # ``.curator_state`` is machine-written with real booleans
+            # (``agent/curator.py:44,65``): a stringified flag is corruption.
+            "scheduler_paused": _coerce_bool(state.get("paused")),
             "scheduler_run_count": _coerce_int(state.get("run_count")),
             "scheduler_last_run_at": str(state.get("last_run_at") or ""),
             "scheduler_last_report_path": str(state.get("last_report_path") or ""),

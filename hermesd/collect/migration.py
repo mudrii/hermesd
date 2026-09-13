@@ -47,6 +47,7 @@ from hermesd.collect.common import (
     _age_seconds,
     _as_dict,
     _as_list,
+    _coerce_bool,
     _coerce_int,
     _iso_to_epoch,
 )
@@ -100,7 +101,9 @@ def _profile_record(
         profile=profile,
         home=_recorded_home(info.get("home")),
         service_kind=str(service.get("kind") or ""),
-        service_system=bool(service.get("system")),
+        # The manifest is machine-written with real booleans
+        # (``gateway_migrate.py:58,588``).
+        service_system=_coerce_bool(service.get("system")),
         served=profile in covered,
     )
 
@@ -161,7 +164,7 @@ def _migration_state(
         manifest_version=_coerce_int(manifest.get("version")),
         migrated_at=migrated_at,
         migrated_at_age_seconds=_age_seconds(_iso_to_epoch(migrated_at), now),
-        flag_was=bool(manifest.get("flag_was")),
+        flag_was=_coerce_bool(manifest.get("flag_was")),
         default_profile=_profile_record(manifest.get("default"), covered, fallback_name="default"),
         secondaries=[_profile_record(entry, covered) for entry in retained],
         secondary_count=len(raw_secondaries),

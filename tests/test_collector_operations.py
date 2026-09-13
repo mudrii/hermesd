@@ -2952,3 +2952,32 @@ def test_corrupt_ledger_marker_never_reads_the_parked_bytes(
     assert ops.spawn_ledger_corrupt_present is True
     assert ops.spawn_ledger_corrupt_age_seconds is not None
     assert "spawn-ledger.json.corrupt" not in read_paths
+
+
+def test_curator_paused_flag_is_read_strictly(hermes_home: Path):
+    """``.curator_state`` is machine-written: a stringified flag is not truth.
+
+    Upstream stores ``"paused": bool(paused)`` (``agent/curator.py:44,65``), so
+    ``bool("false")`` would report the scheduler as paused. The paired
+    ``projects.archived`` read is INTEGER-affinity safe — SQLite converts a TEXT
+    ``'0'`` on insert — and is asserted here as the reason it is left alone.
+    """
+    db_path = hermes_home / "projects.db"
+    conn = sqlite3.connect(str(db_path))
+    create_projects_db_tables(conn)
+    conn.execute(
+        "INSERT INTO projects VALUES ('p1','live','live','','','','main','/repo/live',"
+        "'2026-07-10T00:00:00Z','0')"
+    )
+    conn.commit()
+    conn.close()
+    skills = hermes_home / "skills"
+    skills.mkdir(exist_ok=True)
+    (skills / ".curator_state").write_text(json.dumps({"paused": "false", "run_count": 2}))
+
+    state = _collect_ops(hermes_home)
+
+    assert state.operations.project_archived_count == 0
+    assert state.operations.projects[0].archived is False
+    assert state.curator.scheduler_state_present is True
+    assert state.curator.scheduler_paused is False
