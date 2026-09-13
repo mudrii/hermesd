@@ -1513,3 +1513,33 @@ def test_loop_tick_witness_is_probed_from_the_root_home_under_a_profile(
     assert probed == [(4242, None)]
     assert gateway.loop_tick_armed is True
     assert gateway.loop_health is GatewayLoopHealth.ALIVE
+
+
+def test_probed_loop_tick_resolves_the_node_under_the_root_home(
+    profiled_hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The AF_UNIX node path is built from the root home, not the profile's.
+
+    ``_default_loop_tick_probe`` derives ``state/gateway.loop-tick.<pid>.sock``
+    from the home it is handed; upstream arms it under the *root* gateway's home
+    (``gateway/shutdown_watchdog.py:169``), so under ``--profile`` a profile home
+    here would interrogate a node nobody writes.
+    """
+    import hermesd.collector as collector_module
+
+    home = profiled_hermes_home
+    seen: list[Path] = []
+
+    def fake_probe(pid: int, tcp_port: int | None, probe_home: Path, **kwargs: object) -> bool:
+        seen.append(probe_home)
+        return True
+
+    monkeypatch.setattr(collector_module, "_default_loop_tick_probe", fake_probe)
+    c = Collector(home, profile_name="coding")
+    try:
+        assert c._probed_loop_tick(4242, None) is True
+    finally:
+        c.close()
+
+    assert seen == [home]
+    assert seen[0] != home / "profiles" / "coding"
