@@ -54,6 +54,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
 def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     c = state.config
     sections: list[RenderableType] = [_settings_table(c, theme)]
+    sections.extend(_session_capacity_section(c, theme))
     sections.extend(_kv_section("Agent limits", _agent_limit_rows(c), theme))
     sections.extend(_kv_section("Integrations", _integration_rows(c), theme))
 
@@ -127,6 +128,46 @@ def _kv_section(title: str, rows: list[tuple[str, str]], theme: Theme) -> list[R
     return [heading, table]
 
 
+# Both session caps are always listed, configured or not: an absent row would be
+# indistinguishable from a limit hermesd failed to read, and the two keys govern
+# different resources, so neither may be shown under the other's name.
+_CAPACITY_NOTE_LINES = (
+    "max_concurrent_sessions: a cross-process lease cap, checked when a surface attaches.",
+    "max_live_sessions: a soft LRU cap on the gateway's in-memory sessions; evicts detached.",
+    "Neither is a count of running turns, and neither stands in for the other.",
+)
+
+
+def _session_capacity_section(c: ConfigSummary, theme: Theme) -> list[RenderableType]:
+    """The two session caps, each named for the resource it actually governs."""
+    note = Text("\n".join(f"  {line}" for line in _CAPACITY_NOTE_LINES), style=theme.banner_dim)
+    return [
+        *_kv_section("Session Capacity", _session_capacity_rows(c), theme),
+        note,
+    ]
+
+
+def _session_capacity_rows(c: ConfigSummary) -> list[tuple[str, str]]:
+    return [
+        ("Active-Session Lease Cap", _concurrent_cap_label(c)),
+        ("In-Memory Live-Session Cap", _live_cap_label(c)),
+    ]
+
+
+def _concurrent_cap_label(c: ConfigSummary) -> str:
+    """Upstream enforces capacity only when an operator asked for one."""
+    if not c.active_session_cap_configured:
+        return "not configured (unbounded)"
+    return f"{c.max_concurrent_sessions} (max_concurrent_sessions)"
+
+
+def _live_cap_label(c: ConfigSummary) -> str:
+    """0/unset disables the LRU evictor, so it reads as not configured."""
+    if not c.live_session_cap_configured:
+        return "not configured (LRU eviction off)"
+    return f"{c.max_live_sessions} (max_live_sessions)"
+
+
 def _agent_limit_rows(c: ConfigSummary) -> list[tuple[str, str]]:
     rows: list[tuple[str, str]] = []
     delegation = [
@@ -148,8 +189,8 @@ def _agent_limit_rows(c: ConfigSummary) -> list[tuple[str, str]]:
     configured_guardrails = [part for part in guardrails if part]
     if configured_guardrails:
         rows.append(("Tool Loop Guard", " · ".join(configured_guardrails)))
-    if c.max_live_sessions:
-        rows.append(("Max Live Sessions", str(c.max_live_sessions)))
+    # max_live_sessions is a session cap, not an agent limit: it lives in the
+    # Session Capacity section beside the lease cap it must not be confused with.
     if c.streaming_enabled:
         rows.append(("Streaming", "on"))
     if c.logging_level:

@@ -146,6 +146,7 @@ from hermesd.collect.plugins import (
     requires_hermes_spec,
     resolve_plugin_kind,
 )
+from hermesd.collect.recovery import _read_db_recovery
 from hermesd.collect.redaction import (
     _has_secret_material,
     _redact_command_string,
@@ -187,6 +188,7 @@ from hermesd.collect.system import (
     _git_checkpoint_summary,
     _git_ref_signature,
     _latest_runtime_activity_age,
+    _lease_age_seconds,
     _observed_process_start_times,
     _pid_exists,
     _surface_liveness,
@@ -292,6 +294,9 @@ _BLOCKED_SCRIPT_FIELDS = (
     "newest_blocked_script_age_seconds",
     "blocked_script_names",
 )
+# The recovery source owns exactly one nested field, so a corrupt repair ledger or
+# retired-WAL manifest restores that whole value from its own last-good read.
+_DB_RECOVERY_FIELDS = ("db_recovery",)
 _STATE_SNAPSHOT_FIELDS = ("snapshot_count", "snapshot_total_bytes", "newest_snapshot_age_seconds")
 _LIFECYCLE_FIELDS = (
     "lifecycle_phase",
@@ -810,6 +815,18 @@ class Collector:
                 lambda: results["operations"],
                 fallback=lambda: self._last_source_fields(
                     "blocked_scripts", results["operations"], _BLOCKED_SCRIPT_FIELDS
+                ),
+            ),
+            # Fourth writer of `operations`: the state.db recovery artifacts are
+            # read as presence and metadata only, and a torn repair ledger or
+            # retired-WAL manifest must never read as "no failed repairs".
+            _SourceSpec(
+                "operations",
+                "db_recovery",
+                lambda: self._with_db_recovery(results["operations"]),
+                lambda: results["operations"],
+                fallback=lambda: self._last_source_fields(
+                    "db_recovery", results["operations"], _DB_RECOVERY_FIELDS
                 ),
             ),
             _SourceSpec("skills_memory", "skills", self._collect_skills_memory, SkillsMemory),
@@ -1400,13 +1417,26 @@ class Collector:
         )
 
     def _collect_active_surfaces(self) -> list[ActiveSurface]:
-        """Live agent surfaces from runtime/active_sessions.json.
+        """Lease entries from runtime/active_sessions.json.
 
         An existing pid is not the recorded process: pids get reused, so liveness
         compares the registry's ``process_start_time`` (epoch seconds — unlike
         gateway_state.json, which records centiseconds) against the start time
         observed for that pid on this host. Every pid is probed in one call rather
         than one per surface per tick.
+
+        The lease's own metadata is carried beside that verdict: ``lease_id``,
+        ``track_liveness``, and ``started_at``/``updated_at`` as *ages* against the
+        injected clock. Ages are recomputed on every pass and are never stored in
+        the mtime-keyed file cache, which only ever holds the raw JSON.
+
+        Scope note (``.codex/rules/source-ownership.md``): this reads the selected
+        profile's registry via ``profile_path``, matching upstream's
+        ``_state_path`` (``hermes_cli/active_sessions.py:164-168``). Upstream's
+        orphan reclamation sweeps the root home *and every profile home*
+        (``release_orphaned_leases``, ``:660-687``), so the occupancy hermesd
+        reports is one registry's — leases held under other profiles are invisible
+        here and a cross-profile capacity picture would need every home read.
         """
         data = self._read_json_confined(self._paths.profile_path("runtime", "active_sessions.json"))
         entries: list[dict[str, Any]] = []
@@ -1418,6 +1448,7 @@ class Collector:
                 break
         pids = sorted({_coerce_int(entry.get("pid")) for entry in entries} - {0})
         observed = self._process_start_times(pids) if pids else {}
+        now = self._clock()
         surfaces = []
         for entry in entries:
             pid = _coerce_int(entry.get("pid"))
@@ -1434,6 +1465,10 @@ class Collector:
                     liveness=_surface_liveness(
                         pid, recorded if recorded > 0 else None, observed, self._pid_exists
                     ),
+                    lease_id=str(entry.get("lease_id") or ""),
+                    started_at_age_seconds=_lease_age_seconds(entry.get("started_at"), now),
+                    updated_at_age_seconds=_lease_age_seconds(entry.get("updated_at"), now),
+                    track_liveness=bool(entry.get("track_liveness")),
                 )
             )
         return surfaces
@@ -2218,6 +2253,31 @@ class Collector:
                 self._paths.root_home,
                 now=self._clock(),
             )
+        )
+
+    def _with_db_recovery(self, operations: OperationsState) -> OperationsState:
+        """Recovery artifacts beside the profile-scoped ``state.db``.
+
+        PROFILE-scoped, and it agrees with upstream: the database hermes-agent
+        repairs is ``get_hermes_home()/"state.db"`` (``hermes_state.py:160``,
+        repair invoked at ``:535``), and every artifact is written as a sibling of
+        it (``hermes_state_repair.py:317``, ``hermes_state_dbfile.py:228``). The
+        scan is therefore confined to ``profile_home``, not ``root_home``: a
+        sibling profile's ledger is that profile's evidence, not this one's. See
+        ``.codex/rules/source-ownership.md``.
+
+        Nothing here repairs, checkpoints, integrity-checks or hashes the
+        database — only a bounded directory listing, ``stat`` on name-matched
+        entries, and two small JSON manifests. Read errors and corrupt manifests
+        propagate so this source alone falls back to its last-good value.
+        """
+        db_path = self._paths.profile_path("state.db")
+        return operations.model_copy(
+            update={
+                "db_recovery": _read_db_recovery(
+                    db_path, self._paths.profile_home, now=self._clock()
+                )
+            }
         )
 
     def _collect_curator(self) -> CuratorRun:

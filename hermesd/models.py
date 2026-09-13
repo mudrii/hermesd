@@ -30,6 +30,21 @@ MANIFEST_NAMES: tuple[str, ...] = (*YAML_MANIFEST_NAMES, PORTABLE_MANIFEST_NAME)
 # a pin, and comparing garbage against a real SHA would fabricate drift.
 _FULL_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
+# Slack allowed between an active-session lease's ``started_at`` and
+# ``updated_at`` ages before hermesd calls it transferred. Upstream writes both
+# from separate ``time.time()`` calls in one acquisition
+# (``hermes_cli/active_sessions.py:426-433``), so an exactly-equal pair can still
+# differ by a fraction of a second once rounded against the injected clock.
+_LEASE_TRANSFER_TOLERANCE_SECONDS = 1.0
+
+# Cross-restart schema-repair budget hermes-agent refuses to exceed on one
+# damaged file: ``_MAX_PERSISTENT_REPAIR_ATTEMPTS`` (``hermes_state_repair.py:48``).
+# Copied as a constant, never imported — hermesd reads hermes-agent's files and
+# never its code. Only ``SQLITE_CORRUPT``/``SQLITE_NOTADB`` failures burn it
+# (``_repair_failure_consumes_attempt``, ``:302-314``); locks, disk-full and I/O
+# errors deliberately do not.
+MAX_PERSISTENT_REPAIR_ATTEMPTS: int = 3
+
 
 def _remaining_seconds(deadline: float | None, now: float) -> float | None:
     """Seconds until ``deadline`` at ``now``; None when it is disarmed or past.
@@ -439,7 +454,25 @@ class ProcessLiveness(StrEnum):
 
 
 class ActiveSurface(BaseModel):
-    """A live agent surface attached to a session (runtime/active_sessions.json)."""
+    """One lease in ``runtime/active_sessions.json``.
+
+    A lease is a *slot*, not a process and not a running turn. Upstream records
+    one per attached surface (``_lease_entry``,
+    ``hermes_cli/active_sessions.py:421-439``), and several entries may name the
+    same pid — one process can hold leases for multiple sessions — so the entry
+    count is registry occupancy and never a process count.
+
+    There is no expiry and no renewal field: a lease lives until it is released
+    (``release_active_session``, ``:536-551``) or pruned because its owner is
+    provably dead (``_prune_dead``, ``:348-360``). ``updated_at`` moves past
+    ``started_at`` only when ``transfer_active_session`` (``:554-601``) moves the
+    lease to another session id.
+
+    Scope note: hermesd reads the *selected profile's* registry, while upstream's
+    orphan sweep covers the root home and every profile home
+    (``release_orphaned_leases``, ``:660-687``). Occupancy here is therefore one
+    registry's, not the install's. See ``.codex/rules/source-ownership.md``.
+    """
 
     session_id: str = ""
     surface: str = ""
@@ -448,12 +481,43 @@ class ActiveSurface(BaseModel):
     # centiseconds instead; the two must never be compared directly.
     process_start_time: float | None = None
     liveness: ProcessLiveness = ProcessLiveness.UNVERIFIABLE
+    # uuid4 hex as upstream mints it. Display data only: hermesd never uses it to
+    # decide ownership (that is upstream's ``(pid, metadata.live_session_id)``
+    # test, ``_is_same_writer`` ``:136-148``).
+    lease_id: str = ""
+    # Ages of ``started_at``/``updated_at`` against the injected clock, never the
+    # stored epochs: an age is wall-clock-relative and must not be frozen into an
+    # mtime-keyed cache (see the StateDbRead docstring rule in
+    # ``hermesd/collect/operations.py``). None when the stamp is absent or is not
+    # the epoch float upstream writes.
+    started_at_age_seconds: float | None = None
+    updated_at_age_seconds: float | None = None
+    # Upstream sets this only for desktop-surface leases
+    # (``tui_gateway/session_lifecycle.py:33-38``); it asks the registry to raise
+    # rather than warn when it cannot prove liveness.
+    track_liveness: bool = False
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def alive(self) -> bool:
         """Derived: not proven dead, which includes an unverifiable identity."""
         return self.liveness is not ProcessLiveness.DEAD
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def lease_renewed(self) -> bool:
+        """Derived: ``updated_at`` moved past acquisition, i.e. the lease moved.
+
+        Compared with a one-second tolerance because the two ages are rounded
+        against the same injected clock and upstream writes them from two
+        ``time.time()`` calls. False whenever either stamp was unusable: an
+        unrecorded ``updated_at`` is not evidence of a transfer.
+        """
+        started = self.started_at_age_seconds
+        updated = self.updated_at_age_seconds
+        if started is None or updated is None:
+            return False
+        return started - updated > _LEASE_TRANSFER_TOLERANCE_SECONDS
 
 
 class ModelUsage(BaseModel):
@@ -811,11 +875,49 @@ class ConfigSummary(BaseModel):
     plugin_disabled_count: int = 0
     tool_loop_warnings_enabled: bool = False
     tool_loop_hard_stop_enabled: bool = False
+    # Two different caps over two different resources. Never conflate them:
+    #
+    # ``max_concurrent_sessions`` is a cross-process **active-session lease cap**
+    # checked when a surface attaches (``try_acquire_active_session``,
+    # ``hermes_cli/active_sessions.py:524-532`` — "Capacity second, and only when
+    # an operator asked for one"). None means *not configured*: upstream resolves
+    # it to None for an absent key, ``0``, ``null`` and any invalid value alike
+    # (``resolve_max_concurrent_sessions`` ``:47-61``,
+    # ``coerce_max_concurrent_sessions`` ``:31-44``), and its default is None
+    # (``hermes_cli/config_defaults.py:38``). A refusal under it carries reason
+    # ``MAX_CONCURRENT_SESSIONS`` and names the holders per surface.
+    max_concurrent_sessions: int | None = None
+    # ``max_live_sessions`` is a soft **LRU cap on the gateway's in-memory
+    # sessions** — a different resource entirely. ``_enforce_session_cap``
+    # (``tui_gateway/session_reaper.py:250-265``) evicts the least-recently-active
+    # *detached* sessions with ``end_reason="lru_evict"`` and never a running,
+    # pending or live-transport one. 0 means not configured/disabled, which is
+    # what upstream's own reader returns for an unset key: ``_load_cfg()`` is
+    # documented as ``load_config_readonly`` *minus* the DEFAULT_CONFIG merge
+    # (``tui_gateway/server.py:1169-1176``), so the ``16`` in
+    # ``config_defaults.py:42`` never reaches ``_max_live_sessions``
+    # (``tui_gateway/session_reaper.py:237-247``).
     max_live_sessions: int = 0
     streaming_enabled: bool = False
     logging_level: str = ""
     # Presence only — a proxy URL can embed credentials.
     network_proxy_configured: bool = False
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def active_session_cap_configured(self) -> bool:
+        """Derived: an operator asked for a cross-process lease cap.
+
+        Upstream enforces capacity *only* when this is true, so a False here means
+        the active-session registry is unbounded — not that it is empty.
+        """
+        return self.max_concurrent_sessions is not None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def live_session_cap_configured(self) -> bool:
+        """Derived: the in-memory LRU cap is armed (``_enforce_session_cap``)."""
+        return self.max_live_sessions > 0
 
 
 class ProviderInfo(BaseModel):
@@ -1350,6 +1452,127 @@ class DelegationInfo(BaseModel):
     owner_alive: bool = False
 
 
+class RetiredWalGeneration(BaseModel):
+    """The newest ``state.db.retired-wal-*`` capture, from its ``manifest.json``.
+
+    Upstream writes the directory when a writer's ``-wal``/``-shm`` generation is
+    deleted or replaced underneath it, so the frames that lived only in the
+    unlinked inode are preserved before process exit drops them
+    (``hermes_state_dbfile.py:220-236``, ``capture_retired_wal_generation``
+    ``:334-425``). The manifest is published last, inside a ``.partial`` staging
+    directory that is ``os.replace``d into place, so a settled generation without
+    a manifest is anomalous but is still a directory on disk: it is counted, and
+    nothing is claimed about its contents.
+
+    ``captured_at`` is ``%Y-%m-%dT%H:%M:%SZ`` (UTC) — unlike the repair ledger's
+    ``last_attempt``, which is naive *local* time. The two are parsed differently
+    on purpose.
+    """
+
+    manifest_present: bool = False
+    captured_at: str = ""
+    captured_at_age_seconds: float | None = None
+    trigger: str = ""
+    # ``wal.bytes`` — the size of the retired WAL that was copied out.
+    wal_bytes: int = 0
+    # ``main.mode``: ``copied`` when the main image fit under upstream's 512 MiB
+    # cap (``RETIRED_GENERATION_MAIN_IMAGE_MAX_BYTES``, ``:236``), otherwise
+    # ``header_only`` for the 100-byte SQLite header.
+    main_mode: str = ""
+
+
+class DbRecoveryState(BaseModel):
+    """What hermes-agent's own repair code left beside ``state.db``.
+
+    Presence and metadata only. hermesd never runs a repair, a checkpoint or an
+    integrity check, and never hashes the database: the live ``state.db`` is
+    hundreds of megabytes, and hashing it is exactly the expensive work this
+    reader exists to avoid. The only reads are a bounded directory listing,
+    ``stat`` on the entries whose names match, and two small JSON documents.
+
+    Three traps this model is shaped around:
+
+    * **``~/.hermes/recovery/`` is not recovery evidence.** That directory holds
+      operator-made remediation bundles (``config.yaml.before``,
+      ``git-status.before.txt``, ``repository.bundle``, …); upstream's repair code
+      never writes it. Every artifact here is a *sibling of ``state.db``* named
+      after it, so ``recovery/`` never matches.
+    * **An absent ledger is not a healthy database.** ``_record_repair_outcome``
+      deletes the ledger on success (``hermes_state_repair.py:414-416``), so its
+      absence means "no failed repair outstanding OR never repaired" and nothing
+      stronger.
+    * **``repair_budget_exhausted`` is weaker than upstream's predicate.**
+      ``_persistent_repair_attempts_exhausted`` (``:487-500``) also requires the
+      ledger's fingerprint to match the *current* file, which hermesd cannot check
+      without hashing it. This flag therefore says "the ledger has recorded at
+      least ``MAX_PERSISTENT_REPAIR_ATTEMPTS`` failures", i.e. the budget upstream
+      would treat as exhausted for an unchanged file.
+
+    Staging artifacts are counted apart from settled ones and never inside them:
+    ``.backup-staging-*`` and ``*.incomplete*`` backups, and ``.partial`` retired
+    generations, are all mid-write and presenting one as a completed capture
+    would misreport the forensic record.
+    """
+
+    # ``state.db.repair-attempts.json`` — ``_repair_ledger_path``,
+    # ``hermes_state_repair.py:317-318``.
+    repair_ledger_present: bool = False
+    failed_attempts: int = 0
+    # ``datetime.now().isoformat(timespec="seconds")``: naive local time.
+    last_attempt: str = ""
+    last_attempt_age_seconds: float | None = None
+    # ``state.db.malformed-backup-<stamp>[_<seq>]`` — ``:503-513``, retained to
+    # ``_MAX_MALFORMED_BACKUPS`` by ``_prune_malformed_backups`` ``:443-451``.
+    # ``count`` is settled main copies only; ``bytes`` adds each settled copy's
+    # present ``-wal``/``-shm``/``-journal`` sidecars, which upstream prunes with
+    # it and which are the disk the bundle actually occupies.
+    malformed_backup_count: int = 0
+    malformed_backup_bytes: int = 0
+    newest_malformed_backup_age_seconds: float | None = None
+    malformed_backup_staging_count: int = 0
+    # ``state.db.retired-wal-<utc stamp>-<pid>[-n]/`` —
+    # ``RETIRED_GENERATION_DIR_SUFFIX``, ``hermes_state_dbfile.py:228``.
+    retired_wal_count: int = 0
+    retired_wal_staging_count: int = 0
+    newest_retired_wal: RetiredWalGeneration = Field(default_factory=RetiredWalGeneration)
+    # ``state.db.repair.lock`` and ``state.db.auto-maintenance.lock``
+    # (``_open_lock_file``, ``hermes_state_repair.py:176-229``). Presence of the
+    # *file* only: upstream opens both with ``"a+b"`` and never deletes them, so
+    # a file on disk is not proof anything currently holds the lock.
+    repair_lock_file_present: bool = False
+    auto_maintenance_lock_file_present: bool = False
+    # True when the bounded directory listing was cut short, so every count above
+    # is a floor and not an inventory.
+    scan_truncated: bool = False
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def repair_budget_exhausted(self) -> bool:
+        """Derived: the ledger has recorded the whole persistent-attempt budget.
+
+        See the class docstring — hermesd compares the recorded count against
+        ``MAX_PERSISTENT_REPAIR_ATTEMPTS`` and deliberately does not recompute the
+        fingerprint upstream also matches on. False whenever no ledger is present.
+        """
+        return self.repair_ledger_present and self.failed_attempts >= (
+            MAX_PERSISTENT_REPAIR_ATTEMPTS
+        )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def artifacts_present(self) -> bool:
+        """Derived: anything at all was found, settled or in progress."""
+        return bool(
+            self.repair_ledger_present
+            or self.malformed_backup_count
+            or self.malformed_backup_staging_count
+            or self.retired_wal_count
+            or self.retired_wal_staging_count
+            or self.repair_lock_file_present
+            or self.auto_maintenance_lock_file_present
+        )
+
+
 class OperationsState(BaseModel):
     dashboard_process_count: int = 0
     desktop_build_stamp: str = ""
@@ -1404,6 +1627,9 @@ class OperationsState(BaseModel):
     blocked_script_count: int = 0
     newest_blocked_script_age_seconds: float | None = None
     blocked_script_names: list[str] = Field(default_factory=list)
+    # Written by its own source (``db_recovery``), so a corrupt repair ledger or
+    # retired-WAL manifest degrades only this field and keeps its last-good value.
+    db_recovery: DbRecoveryState = Field(default_factory=DbRecoveryState)
 
 
 class CuratorRun(BaseModel):

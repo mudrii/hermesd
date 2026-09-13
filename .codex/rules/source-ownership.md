@@ -126,6 +126,7 @@ Upstream paths are relative to `/Users/mudrii/.hermes/hermes-agent/`.
 | `operations` | MIXED | `operations` | profile: `projects.db`, `verification_evidence.db`, `state.db`; root: `desktop-build-stamp.json`, `web-ui-build-stamp.json`, `response_store.db`, `moa-traces/`, `cache/delegation/live/`, `kanban.db`, `kanban/boards/*/kanban.db`, `config.yaml` | both | `hermes_cli/projects_db.py:23-25`; `agent/verification_evidence.py:111`; `hermes_state.py:160`; `hermes_cli/main_desktop.py:42-45`; `hermes_cli/main_web_build.py:187-190`; `gateway/platforms/api_server.py:688`; `agent/moa_trace.py:25-38`; `tools/delegation_live_log.py:40-43`; `hermes_cli/kanban_db.py:382-401` | agrees (`projects.db`, `verification_evidence.db`, `state.db`, `kanban*`); diverges (`response_store.db`, `moa-traces/`, `cache/delegation/live/`, both build stamps) | `test_profiled_operations_readers_confine_to_selected_profile_home`, `test_root_mode_operations_confinement_is_unchanged`, `test_profiled_collector_rejects_cross_profile_symlinked_projects_db` |
 | `state_snapshots` | ROOT | `operations.snapshot_count`, `operations.snapshot_total_bytes`, `operations.newest_snapshot_age_seconds` | `state-snapshots/` | `shared_path` | `home/"state-snapshots"` where `home = get_hermes_home()` — `hermes_cli/backup.py:35,1088-1090`; "each lands under its OWN `<home>/state-snapshots/`" `hermes_cli/backup.py:1380` | diverges | UNPINNED |
 | `blocked_scripts` | ROOT | `operations.blocked_script_count`, `operations.newest_blocked_script_age_seconds`, `operations.blocked_script_names` | `cache/blocked-scripts/` | `shared_path` | `tools/approval_floors.py:63-64` | diverges | UNPINNED |
+| `db_recovery` | PROFILE | `operations.db_recovery` | siblings of `state.db`: `state.db.repair-attempts.json`, `state.db.malformed-backup-*` (plus `-wal`/`-shm`/`-journal` sidecars), `state.db.backup-staging-*`, `state.db.retired-wal-*/` (incl. `manifest.json`), `state.db.repair.lock`, `state.db.auto-maintenance.lock` | `profile_path` | the repaired database is `get_hermes_home()/"state.db"` — `hermes_state.py:160,178`, repair invoked at `:535`; ledger `_repair_ledger_path` `hermes_state_repair.py:317-318`; forensic backups `_backup_db_file` `:481-513`; retired-WAL generations `hermes_state_dbfile.py:228,334-425`; locks `_open_lock_file` `hermes_state_repair.py:176-229` | agrees | `test_profiled_db_recovery_reads_the_selected_profile_home`, `test_profiled_db_recovery_refuses_a_cross_profile_symlink` |
 | `skills` | MIXED | `skills_memory` | profile: `skills/`, `memories/`; root: `auth.json`, `BOOT.md`, `hooks/`, `plugins/` (incl. `plugins/.install-metadata.json` and each plugin's `.hermes-catalog.json`), `config.yaml` | both | `hermes_constants.py:1137-1140` (`get_skills_dir()`); `tools/memory_tool.py:40`; `hermes_cli/auth.py:471-472` (profile) + `hermes_cli/auth.py:484-493` (root read-only fallback); `gateway/hooks.py:25,29-37`; `plugins/plugin_loader.py:28-34`; `hermes_cli/plugins_cmd.py:425-426`; `hermes_cli/plugins_cmd_catalog.py:24`; `hermes_constants.py:1132-1135` | agrees (`skills/`, `memories/`); diverges (`hooks/`, `plugins/` and both plugin sidecars); diverges — **intentional** (`auth.json`); ambiguous (`BOOT.md`) | `test_profiled_collector_reads_profile_scoped_skills`, `test_profiled_collector_keeps_shared_root_config_and_auth` |
 | `mcp_cache` | ROOT | `mcp_cache` | `cache/mcp_schema_cache.json`, `config.yaml` | `shared_path` | `tools/mcp_schema_cache.py:18,22-24` | diverges | UNPINNED |
 | `skills_prompt` | ROOT | `skills_prompt` | `.skills_prompt_snapshot.json` | `shared_path` | `agent/prompt_builder.py:1077-1078` | diverges | UNPINNED |
@@ -137,6 +138,34 @@ Upstream paths are relative to `/Users/mudrii/.hermes/hermes-agent/`.
 | `curator` | MIXED | `curator` | profile: `skills/.curator_state`; root: `logs/curator/`, `config.yaml` | both | `agent/curator.py:38`; `agent/curator.py:455-457` ("telemetry next to agent.log, not under skills/"); `hermes_cli/config.py:615-617,623` | agrees (`.curator_state`); diverges (`logs/curator/`) | UNPINNED |
 | `active_sessions` | PROFILE | `active_surfaces`, `active_surface_count` | `runtime/active_sessions.json` | `profile_path` | `hermes_cli/active_sessions.py:164-168` | agrees | `test_profiled_collector_does_not_read_root_scoped_profile_sources` |
 | `runtime` | MIXED | `runtime` | profile: `state.db`, `sessions/sessions.json`, `logs/agent.log`; root: `gateway_state.json` | both | `hermes_state.py:160`; `hermes_cli/status.py:295`; `hermes_logging.py:180-195`; `gateway/status.py:165-166` | agrees (profile paths); ambiguous (`gateway_state.json`) | UNPINNED |
+
+## Scope notes
+
+Consequences of a row's scope that are easy to misread in a panel. These are not
+divergences — the resolver matches upstream — but the *reach* of the read differs
+from the reach of upstream's own maintenance code.
+
+**`active_sessions` (PROFILE) reports one registry, not the install.** hermesd
+reads `profile_path("runtime", "active_sessions.json")`, exactly where upstream's
+`_state_path` puts it (`hermes_cli/active_sessions.py:164-168`), so the row
+agrees. But upstream's orphan reclamation sweeps the root home **and every profile
+home** (`release_orphaned_leases`, `:660-687`), because a multiplexed gateway
+leases across all of them. The occupancy the Sessions panel shows is therefore the
+selected profile's registry only: with no `--profile` that is the root registry,
+and leases held under any profile home are invisible. The `max_concurrent_sessions`
+cap it is compared against is read from the root `config.yaml` (see the `config`
+row), which is the file the root-registry acquirer resolves — but a profile-scoped
+backend passes its own profile home as `registry_home` while still resolving the
+cap through `get_hermes_home()`. Capacity and occupancy can therefore come from
+different homes under `--profile`. The resolver is deliberately unchanged: reading
+every profile's registry would make panel 2 an install-wide aggregate that no
+single upstream enforcement point corresponds to.
+
+**`db_recovery` (PROFILE) reports one database's artifacts.** Every recovery
+artifact is a sibling of the `state.db` upstream repairs, and that database is
+`get_hermes_home()/"state.db"`, so the scan is confined to `profile_home`. A root
+ledger is not reported for a selected profile and vice versa; unlike
+`active_sessions`, upstream has no cross-home sweep here to diverge from.
 
 ## Intentional-divergence register
 

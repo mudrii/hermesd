@@ -9,7 +9,14 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
-from hermesd.collect.common import _coerce_float, _coerce_int, _mtime, _mtime_ns
+from hermesd.collect.common import (
+    _age_seconds,
+    _coerce_float,
+    _coerce_int,
+    _mtime,
+    _mtime_ns,
+    _optional_epoch,
+)
 from hermesd.models import ProcessLiveness
 from hermesd.paths import HermesPaths
 
@@ -164,6 +171,17 @@ def _surface_liveness(
         return ProcessLiveness.LIVE
     # The pid exists but belongs to a different process: the recorded one is gone.
     return ProcessLiveness.DEAD
+
+
+def _lease_age_seconds(raw: object, now: float) -> float | None:
+    """Age of an active-session lease stamp, or None when it is not an epoch.
+
+    ``started_at``/``updated_at`` are ``time.time()`` floats upstream
+    (``_lease_entry``, ``hermes_cli/active_sessions.py:426-433``). Anything else
+    in that slot — an ISO string, ``null``, a non-positive number — reads as "no
+    usable stamp", never as January 1970 and never as an age of ``now``.
+    """
+    return _age_seconds(_optional_epoch(raw), now)
 
 
 def _git_ref_signature(repo_dir: Path) -> tuple[int, ...]:

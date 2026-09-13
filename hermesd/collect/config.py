@@ -42,11 +42,82 @@ def _config_agent_limits(cfg: dict[str, Any]) -> dict[str, Any]:
         "plugin_disabled_count": _name_list_count(plugins.get("disabled")),
         "tool_loop_warnings_enabled": bool(guardrails.get("warnings_enabled")),
         "tool_loop_hard_stop_enabled": bool(guardrails.get("hard_stop_enabled")),
-        "max_live_sessions": _coerce_int(cfg.get("max_live_sessions")),
+        "max_concurrent_sessions": resolve_max_concurrent_sessions(cfg),
+        "max_live_sessions": resolve_max_live_sessions(cfg),
         "streaming_enabled": bool(_as_dict(cfg.get("streaming")).get("enabled")),
         "logging_level": _plain_str(_as_dict(cfg.get("logging")).get("level")),
         "network_proxy_configured": _proxy_configured(_as_dict(cfg.get("network"))),
     }
+
+
+def _coerce_session_cap(value: object) -> int | None:
+    """Upstream's ``coerce_max_concurrent_sessions``: a positive int, else None.
+
+    Mirrors ``hermes_cli/active_sessions.py:31-44``, which both capacity keys
+    share. Booleans and fractional floats are rejected outright (upstream logs
+    ``Ignoring invalid …`` and disables the cap), a string is parsed base 10, and
+    ``0``/``None``/negative/invalid all collapse to None — *disabled*, which
+    hermesd reports as "not configured" rather than as a limit of zero.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        if not value.is_integer():
+            return None
+        parsed = int(value)
+    elif isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = int(value.strip(), 10)
+        except ValueError:
+            return None
+    else:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def resolve_max_concurrent_sessions(cfg: dict[str, Any]) -> int | None:
+    """The cross-process active-session lease cap, or None when not configured.
+
+    Mirrors ``resolve_max_concurrent_sessions``
+    (``hermes_cli/active_sessions.py:47-61``), which resolves on key *presence*:
+    a top-level ``max_concurrent_sessions`` wins even when its value is ``null``,
+    and only an absent top-level key falls through to
+    ``gateway.max_concurrent_sessions``.
+
+    This is a **different resource** from ``max_live_sessions`` — a lease cap
+    enforced when a surface attaches, not an LRU cap on in-memory sessions — so
+    the two are resolved by separate functions and never share a field.
+    """
+    if "max_concurrent_sessions" in cfg:
+        return _coerce_session_cap(cfg.get("max_concurrent_sessions"))
+    gateway_cfg = cfg.get("gateway")
+    if not isinstance(gateway_cfg, dict):
+        return None
+    return _coerce_session_cap(gateway_cfg.get("max_concurrent_sessions"))
+
+
+def resolve_max_live_sessions(cfg: dict[str, Any]) -> int:
+    """The gateway's in-memory LRU session cap; 0 when not configured/disabled.
+
+    Mirrors ``_max_live_sessions`` (``tui_gateway/session_reaper.py:237-247``),
+    which falls back on a *null value* rather than on key presence — so, unlike
+    ``resolve_max_concurrent_sessions``, an explicit top-level
+    ``max_live_sessions: null`` does reach ``gateway.max_live_sessions``. The
+    asymmetry is upstream's, and reproducing it is what keeps hermesd's number
+    equal to the one ``_enforce_session_cap`` acts on.
+
+    ``_load_cfg()`` there is ``load_config_readonly`` minus the DEFAULT_CONFIG
+    merge (``tui_gateway/server.py:1169-1176``), so an unset key really reads as
+    0/disabled and the ``16`` default in ``config_defaults.py:42`` never applies.
+    """
+    raw: Any = cfg.get("max_live_sessions")
+    if raw is None:
+        gateway_cfg = cfg.get("gateway")
+        if isinstance(gateway_cfg, dict):
+            raw = gateway_cfg.get("max_live_sessions")
+    return _coerce_session_cap(raw) or 0
 
 
 def _name_list_count(value: object) -> int:

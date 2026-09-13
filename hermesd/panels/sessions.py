@@ -8,7 +8,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from hermesd.models import DashboardState, ProcessLiveness, SessionInfo
+from hermesd.models import ActiveSurface, DashboardState, ProcessLiveness, SessionInfo
 from hermesd.panels.formatting import (
     escape_terminal_text as escape,
 )
@@ -41,6 +41,9 @@ _ACTIVE_TRUE_VALUES = {"1", "true", "yes", "active"}
 _ACTIVE_FALSE_VALUES = {"0", "false", "no", "inactive"}
 _DETAIL_MAX_SESSION_ROWS = 50
 _DETAIL_MAX_SURFACE_ROWS = 20
+# Display bound on an untrusted lease id: upstream mints a 32-hex uuid4, and the
+# panel only needs enough of it to grep the registry with.
+_LEASE_ID_CHARS = 8
 _PIN_MARKER = "📌"
 _MAX_NAME_CHARS = 30
 _MAX_BRANCH_CHARS = 24
@@ -49,6 +52,14 @@ _MAX_ERROR_CHARS = 60
 # Bound on the sessions examined for compression warnings, matching the other
 # per-section row caps in this panel.
 _COMPRESSION_WARNING_ROWS = 10
+
+# Rendered under the Live Surfaces section: the numbers beside it are a lease
+# count, a verified-activity count and a pid count, and reading any one of them
+# as another is the mistake worth pre-empting.
+_SURFACE_CAPACITY_NOTE = (
+    "Leases, not processes: entries can share a pid, and only an "
+    "identity-verified lease counts as executing."
+)
 
 # The render loop rebuilds the detail layout at 2 Hz while the collector
 # replaces state.sessions only once per collect, so the filter+sort result is
@@ -93,6 +104,16 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             lines.append(f" {live} live", style=f"bold {theme.ui_ok}")
         if unverified:
             lines.append(f" {unverified} unverified", style=theme.ui_warn)
+        # Capacity is a third number, not a restatement of either above: the
+        # configured cross-process lease cap. `max_live_sessions` caps a different
+        # resource (the gateway's in-memory sessions) and is never rendered here.
+        cap = state.config.max_concurrent_sessions
+        if cap is None:
+            lines.append("  no cap", style=theme.banner_dim)
+        elif state.active_surface_count >= cap:
+            lines.append(f"  cap {cap}", style=f"bold {theme.ui_warn}")
+        else:
+            lines.append(f"  cap {cap}", style=theme.banner_text)
     recovering = sum(1 for s in state.sessions if s.compression_recovery_active(state.collected_at))
     if recovering:
         # A live cooldown or an armed anti-thrash deadline: the compressor is
@@ -138,10 +159,14 @@ def _render_detail(
     if activity_table is not None:
         sections.append(section_heading("Activity", theme, leading_blank=False))
         sections.append(activity_table)
-    surfaces_table = _surfaces_table(state, sessions, filter_query, theme)
-    if surfaces_table is not None:
+    surfaces = _visible_surfaces(state, sessions, filter_query)
+    surfaces_table = _surfaces_table(surfaces, theme)
+    if surfaces or state.config.active_session_cap_configured:
         sections.append(section_heading("Live Surfaces", theme))
-        sections.append(surfaces_table)
+        sections.append(_capacity_line(state, surfaces, theme))
+        if surfaces_table is not None:
+            sections.append(surfaces_table)
+        sections.append(Text(f"  {_SURFACE_CAPACITY_NOTE}", style=theme.banner_dim))
     warnings = _compression_warnings(sessions, theme, now=state.collected_at)
     if warnings is not None:
         sections.append(section_heading("Warnings", theme))
@@ -508,37 +533,102 @@ def _activity_table(sessions: list[SessionInfo], theme: Theme, *, now: float) ->
     return table
 
 
-def _surfaces_table(
+def _visible_surfaces(
     state: DashboardState,
     sessions: list[SessionInfo],
     filter_query: str,
-    theme: Theme,
-) -> Table | None:
-    """Live surfaces attached to sessions (runtime/active_sessions.json).
+) -> list[ActiveSurface]:
+    """The leases this detail view lists.
 
     A filtered view lists only the surfaces of the sessions it shows; the
-    unfiltered view lists every surface, including ones whose session row is
-    not in the table.
+    unfiltered view lists every surface, including ones whose session row is not
+    in the table. The capacity numbers below are computed from *this* list, so a
+    filtered view never reports registry-wide occupancy beside a filtered table.
     """
-    surfaces = state.active_surfaces
-    if filter_query:
-        shown = {session.session_id for session in sessions}
-        surfaces = [surface for surface in surfaces if surface.session_id in shown]
+    if not filter_query:
+        return state.active_surfaces
+    shown = {session.session_id for session in sessions}
+    return [surface for surface in state.active_surfaces if surface.session_id in shown]
+
+
+def _capacity_line(state: DashboardState, surfaces: list[ActiveSurface], theme: Theme) -> Text:
+    """Three numbers that must never stand in for one another.
+
+    * the **configured** capacity — ``max_concurrent_sessions``, the cross-process
+      lease cap upstream checks at acquisition, and absent unless an operator set
+      it (its enforcement is "only when an operator asked for one");
+    * the **observed registry occupancy** — how many leases this registry holds;
+    * the **verified executing activity** — leases whose identity check passed.
+      An unverifiable lease is never counted here.
+
+    ``distinct pids`` is a fourth number again: several leases can share one
+    process, so occupancy is not a process count.
+    """
+    executing = sum(1 for surface in surfaces if surface.liveness is ProcessLiveness.LIVE)
+    unverified = sum(1 for surface in surfaces if surface.liveness is ProcessLiveness.UNVERIFIABLE)
+    dead = sum(1 for surface in surfaces if surface.liveness is ProcessLiveness.DEAD)
+    pids = len({surface.pid for surface in surfaces if surface.pid > 0})
+    line = Text()
+    cap = state.config.max_concurrent_sessions
+    if cap is None:
+        line.append("  no active-session cap configured", style=theme.banner_dim)
+    else:
+        style = f"bold {theme.ui_warn}" if len(surfaces) >= cap else theme.ui_accent
+        line.append(f"  cap {cap} leases", style=style)
+    line.append(
+        f" · {len(surfaces)} registry entries · {executing} verified executing"
+        f" · {unverified} unverified · {dead} dead · {pids} distinct pids",
+        style=theme.banner_text,
+    )
+    return line
+
+
+def _surfaces_table(surfaces: list[ActiveSurface], theme: Theme) -> Table | None:
+    """Leases recorded in ``runtime/active_sessions.json``, with their metadata."""
     if not surfaces:
         return None
     table = Table(box=None, show_header=True, padding=(0, 1))
     table.add_column("Session", style=theme.session_label)
     table.add_column("Surface", style=theme.banner_text)
     table.add_column("PID", justify="right", style=theme.banner_dim)
+    table.add_column("Lease", style=theme.banner_dim)
+    table.add_column("Held", justify="right", style=theme.banner_dim)
     table.add_column("State", style=theme.banner_dim)
     for surface in surfaces[:_DETAIL_MAX_SURFACE_ROWS]:
         table.add_row(
             escape(surface.session_id[-8:]),
             escape(surface.surface) if surface.surface else "—",
             str(surface.pid),
-            _liveness_label(surface.liveness, theme),
+            escape(surface.lease_id[:_LEASE_ID_CHARS]) if surface.lease_id else "—",
+            _lease_age_label(surface.started_at_age_seconds),
+            _surface_state_label(surface, theme),
         )
     return table
+
+
+def _lease_age_label(seconds: float | None) -> str:
+    """A lease's age; "—" when the registry recorded no usable epoch stamp."""
+    if seconds is None:
+        return "—"
+    return fmt_age_seconds(max(0, int(seconds)))
+
+
+def _surface_state_label(surface: ActiveSurface, theme: Theme) -> Text:
+    """Liveness plus the two lease facts that qualify it.
+
+    ``moved`` marks a lease upstream transferred to another session id
+    (``transfer_active_session`` refreshes ``updated_at`` and nothing else does),
+    so its acquisition age is not the age of the session it now holds.
+    ``tracked`` marks a desktop lease, for which upstream demands provable
+    liveness instead of warning.
+    """
+    label = _liveness_label(surface.liveness, theme)
+    if surface.lease_renewed:
+        label.append(" moved ", style=theme.banner_dim)
+        label.append(_lease_age_label(surface.updated_at_age_seconds), style=theme.ui_accent)
+    if surface.track_liveness:
+        label.append(" tracked", style=theme.banner_dim)
+    return label
 
 
 def _liveness_label(liveness: ProcessLiveness, theme: Theme) -> Text:

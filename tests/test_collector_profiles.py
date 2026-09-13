@@ -816,6 +816,64 @@ def test_profiled_operations_readers_confine_to_selected_profile_home(
         c.close()
 
 
+def test_profiled_db_recovery_reads_the_selected_profile_home(
+    profiled_hermes_home: Path,
+):
+    """state.db's recovery artifacts are profile-scoped, like the database itself.
+
+    Upstream repairs ``get_hermes_home()/"state.db"`` (``hermes_state.py:160``,
+    repair invoked at ``:535``) and writes every artifact as a sibling of it, so a
+    ledger at the root is the root home's evidence and must not be reported for a
+    selected profile — and vice versa.
+    """
+    ledger = json.dumps({"failed_attempts": 3, "last_attempt": "2026-09-12T21:48:03"})
+    (profiled_hermes_home / "state.db.repair-attempts.json").write_text(ledger)
+    profile_home = profiled_hermes_home / "profiles" / "coding"
+    (profile_home / "state.db.repair-attempts.json").write_text(
+        json.dumps({"failed_attempts": 1, "last_attempt": "2026-09-12T21:48:03"})
+    )
+
+    profiled = Collector(profiled_hermes_home, profile_name="coding")
+    try:
+        profiled_recovery = profiled._with_db_recovery(OperationsState()).db_recovery
+    finally:
+        profiled.close()
+
+    rooted = Collector(profiled_hermes_home)
+    try:
+        root_recovery = rooted._with_db_recovery(OperationsState()).db_recovery
+    finally:
+        rooted.close()
+
+    assert profiled_recovery.repair_ledger_present is True
+    assert profiled_recovery.failed_attempts == 1
+    assert profiled_recovery.repair_budget_exhausted is False
+    assert root_recovery.failed_attempts == 3
+    assert root_recovery.repair_budget_exhausted is True
+
+
+def test_profiled_db_recovery_refuses_a_cross_profile_symlink(
+    profiled_hermes_home: Path,
+):
+    """A ledger symlinked in from a sibling profile is refused, not followed."""
+    other = _make_sibling_profile(profiled_hermes_home)
+    (other / "state.db.repair-attempts.json").write_text(
+        json.dumps({"failed_attempts": 3, "last_attempt": "2026-09-12T21:48:03"})
+    )
+    (profiled_hermes_home / "profiles" / "coding" / "state.db.repair-attempts.json").symlink_to(
+        other / "state.db.repair-attempts.json"
+    )
+
+    c = Collector(profiled_hermes_home, profile_name="coding")
+    try:
+        recovery = c._with_db_recovery(OperationsState()).db_recovery
+    finally:
+        c.close()
+
+    assert recovery.repair_ledger_present is False
+    assert recovery.failed_attempts == 0
+
+
 def test_root_mode_operations_confinement_is_unchanged(hermes_home: Path):
     """Root mode confines against root_home because profile_home *is* root_home."""
     assert HermesPaths(hermes_home).profile_home == hermes_home

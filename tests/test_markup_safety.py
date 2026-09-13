@@ -22,6 +22,7 @@ from hermesd.models import (
     CronState,
     CuratorRun,
     DashboardState,
+    DbRecoveryState,
     DelegationInfo,
     DiscoveredRepoSummary,
     GatewayState,
@@ -49,6 +50,7 @@ from hermesd.models import (
     ProfileSummary,
     ProjectSummary,
     ProviderInfo,
+    RetiredWalGeneration,
     SessionInfo,
     SkillInfo,
     SkillsMemory,
@@ -164,7 +166,16 @@ def _state_for(panel_num: int) -> DashboardState:
             ],
             active_surface_count=1,
             active_surfaces=[
-                ActiveSurface(session_id="sess_injection_001", surface=INJECT, pid=42, alive=True)
+                ActiveSurface(
+                    session_id="sess_injection_001",
+                    surface=INJECT,
+                    pid=42,
+                    alive=True,
+                    lease_id=INJECT,
+                    started_at_age_seconds=60.0,
+                    updated_at_age_seconds=10.0,
+                    track_liveness=True,
+                )
             ],
         )
     if panel_num == 3:  # Tokens / Cost
@@ -522,6 +533,23 @@ def _state_for(panel_num: int) -> DashboardState:
                         waiting_reason=INJECT,
                     )
                 ],
+                db_recovery=DbRecoveryState(
+                    repair_ledger_present=True,
+                    failed_attempts=1,
+                    last_attempt=INJECT,
+                    last_attempt_age_seconds=60.0,
+                    malformed_backup_count=1,
+                    retired_wal_count=1,
+                    newest_retired_wal=RetiredWalGeneration(
+                        manifest_present=True,
+                        captured_at=INJECT,
+                        captured_at_age_seconds=60.0,
+                        trigger=INJECT,
+                        wal_bytes=4096,
+                        main_mode=INJECT,
+                    ),
+                    auto_maintenance_lock_file_present=True,
+                ),
             ),
         )
     if panel_num == 13:  # Curator

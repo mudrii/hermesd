@@ -6,10 +6,25 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from hermesd.models import DashboardState, OperationsState
+from hermesd.models import (
+    MAX_PERSISTENT_REPAIR_ATTEMPTS,
+    DashboardState,
+    DbRecoveryState,
+    OperationsState,
+)
 from hermesd.panels.formatting import escape_terminal_text as escape
 from hermesd.panels.formatting import fmt_age_seconds
 from hermesd.theme import Theme
+
+# Rendered under the Database Recovery section. Every line is a limit on what the
+# numbers above can mean, so the section is never read as a health verdict.
+_RECOVERY_NOTE_LINES = (
+    "Presence and metadata only: hermesd never repairs, checkpoints, integrity-checks or",
+    "hashes the database — the live state.db is hundreds of megabytes.",
+    'A successful repair deletes the ledger, so "none" is not evidence the database is healthy.',
+    '"budget exhausted" counts the ledger\'s recorded failures; hermesd does not recompute the',
+    "fingerprint upstream matches them against, so it cannot tell whether the file changed since.",
+)
 
 
 def render_operations(state: DashboardState, theme: Theme, detail: bool = False) -> Panel:
@@ -91,6 +106,12 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         sections.append(_heading("State DB", theme))
         sections.append(_state_db_table(ops, theme))
 
+    # Recovery evidence sits beside the State DB section because it describes
+    # artifacts of that same file. Rendered whenever there is a database to have
+    # left them, so "no ledger" is stated rather than silently omitted.
+    if ops.db_recovery.artifacts_present or ops.state_db_size_bytes:
+        sections.extend(_recovery_section(ops.db_recovery, theme))
+
     if ops.moa_trace_count:
         sections.append(_heading("MoA Traces", theme))
         sections.append(_moa_table(ops, theme, now=state.collected_at))
@@ -130,6 +151,7 @@ def _has_no_artifacts(ops: OperationsState) -> bool:
         and not ops.state_db_size_bytes
         and not ops.web_ui_build_hash
         and not ops.blocked_script_count
+        and not ops.db_recovery.artifacts_present
     )
 
 
@@ -197,6 +219,83 @@ def _blocked_scripts_label(ops: OperationsState) -> str:
         f"(newest {_age_span_label(ops.newest_blocked_script_age_seconds)} ago)"
     )
     return f"{label}: {names}" if names else label
+
+
+def _recovery_section(recovery: DbRecoveryState, theme: Theme) -> list[RenderableType]:
+    """What hermes-agent's repair code left beside ``state.db``.
+
+    The ledger row is always present, including when no ledger exists: absence is
+    the ambiguous case (a successful repair deletes the file), so it is stated in
+    words rather than left for the operator to infer from a missing row.
+    """
+    table = Table(box=None, show_header=False, padding=(0, 2))
+    table.add_column("Key", style=theme.ui_label)
+    table.add_column("Value", style=theme.banner_text)
+    table.add_row("Repair Ledger", _repair_ledger_label(recovery))
+    if recovery.malformed_backup_count:
+        table.add_row("Malformed Backups", _malformed_backup_label(recovery))
+    if recovery.retired_wal_count:
+        table.add_row("Retired WAL", _retired_wal_label(recovery))
+    table.add_row("Lock Files", _lock_files_label(recovery))
+    if recovery.malformed_backup_staging_count or recovery.retired_wal_staging_count:
+        table.add_row("In Progress", _staging_label(recovery))
+    if recovery.scan_truncated:
+        table.add_row(
+            "Scan",
+            "truncated — counts above are a floor, not an inventory",
+        )
+    note = Text("\n".join(f"  {line}" for line in _RECOVERY_NOTE_LINES), style=theme.banner_dim)
+    return [_heading("Database Recovery", theme), table, note]
+
+
+def _repair_ledger_label(recovery: DbRecoveryState) -> str:
+    """The attempt ledger, or the honest reading of its absence."""
+    if not recovery.repair_ledger_present:
+        return "none — no failed repair recorded"
+    if recovery.repair_budget_exhausted:
+        budget = f"budget exhausted (max {MAX_PERSISTENT_REPAIR_ATTEMPTS})"
+    else:
+        budget = f"budget {recovery.failed_attempts}/{MAX_PERSISTENT_REPAIR_ATTEMPTS}"
+    last = _age_span_label(recovery.last_attempt_age_seconds)
+    return f"{recovery.failed_attempts} failed · {budget} · last {last} ago"
+
+
+def _malformed_backup_label(recovery: DbRecoveryState) -> str:
+    """Settled forensic copies only; staging is its own row."""
+    return (
+        f"{recovery.malformed_backup_count} · {_size_label(recovery.malformed_backup_bytes)} · "
+        f"newest {_age_span_label(recovery.newest_malformed_backup_age_seconds)} ago"
+    )
+
+
+def _retired_wal_label(recovery: DbRecoveryState) -> str:
+    """Generation count plus the newest capture's own manifest metadata."""
+    parts = [f"{recovery.retired_wal_count} generation(s)"]
+    newest = recovery.newest_retired_wal
+    if not newest.manifest_present:
+        parts.append("newest has no readable manifest.json")
+        return " · ".join(parts)
+    age = _age_span_label(newest.captured_at_age_seconds)
+    parts.append(f"newest {escape(newest.captured_at) or '—'} ({age} ago)")
+    parts.append(f"trigger={escape(newest.trigger) or '—'}")
+    parts.append(f"wal {_size_label(newest.wal_bytes)}")
+    parts.append(f"main {escape(newest.main_mode) or '—'}")
+    return " · ".join(parts)
+
+
+def _lock_files_label(recovery: DbRecoveryState) -> str:
+    """File presence, which is not the same as a held lock."""
+    repair = "✓" if recovery.repair_lock_file_present else "✗"
+    maintenance = "✓" if recovery.auto_maintenance_lock_file_present else "✗"
+    return f"repair {repair} · auto-maintenance {maintenance} (file present, not held)"
+
+
+def _staging_label(recovery: DbRecoveryState) -> str:
+    """Mid-write artifacts, kept out of every settled count above."""
+    return (
+        f"{recovery.malformed_backup_staging_count} backup staging · "
+        f"{recovery.retired_wal_staging_count} retired-wal partial"
+    )
 
 
 def _delegation_summary_line(ops: OperationsState) -> str:
