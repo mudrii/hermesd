@@ -2,6 +2,11 @@
 
 Thanks for your interest in contributing to hermesd!
 
+CI/CD and release policy (branch protection, release eligibility, dependency
+pinning, update cadence) is documented canonically in
+[`docs/ci-release-policy.md`](docs/ci-release-policy.md); this guide links to
+it rather than restating it.
+
 ## Getting Started
 
 ```bash

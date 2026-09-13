@@ -25,10 +25,12 @@ python -m venv /tmp/hermesd-wheel-smoke
 /tmp/hermesd-wheel-smoke/bin/python -m pip install dist/hermesd-*.whl
 /tmp/hermesd-wheel-smoke/bin/hermesd --version
 /tmp/hermesd-wheel-smoke/bin/python -I -m hermesd --version
+/tmp/hermesd-wheel-smoke/bin/python scripts/installed_smoke.py
 python -m venv /tmp/hermesd-sdist-smoke
 /tmp/hermesd-sdist-smoke/bin/python -m pip install dist/hermesd-*.tar.gz
 /tmp/hermesd-sdist-smoke/bin/hermesd --version
 /tmp/hermesd-sdist-smoke/bin/python -I -m hermesd --version
+/tmp/hermesd-sdist-smoke/bin/python scripts/installed_smoke.py
 uv run twine check dist/*           # package metadata
 hermesd                              # run the dashboard
 hermesd --hermes-home /path          # custom hermes home
@@ -40,6 +42,11 @@ hermesd --snapshot-panel 12          # one-shot detail snapshot for any register
 hermesd --snapshot-format json       # machine-readable full-state snapshot
 hermesd --log-tail-bytes 8192        # cap per-refresh log reads for large files
 ```
+
+CI/CD and release policy (branch protection, release eligibility, dependency
+pinning, update cadence) is documented canonically in
+[`docs/ci-release-policy.md`](docs/ci-release-policy.md); the command list
+above mirrors the CI gates rather than defining them.
 
 ## Architecture
 

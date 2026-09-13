@@ -417,6 +417,10 @@ hermesd inherits the active skin from Hermes Agent's `config.yaml`:
 
 ## Development
 
+CI/CD and release policy — branch protection, release eligibility, dependency
+pinning, and update cadence — is documented canonically in
+[`docs/ci-release-policy.md`](docs/ci-release-policy.md).
+
 ```bash
 git clone https://github.com/mudrii/hermesd.git
 cd hermesd
@@ -430,18 +434,20 @@ uv run ruff check .
 uv run ruff format --check .
 uv run mypy hermesd
 uv run python -m compileall hermesd
-uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
-uv run pip-audit
+uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
+uv run python scripts/pip_audit_gate.py
 uv lock --check
 uv build
 python -m venv /tmp/hermesd-wheel-smoke
 /tmp/hermesd-wheel-smoke/bin/python -m pip install dist/hermesd-*.whl
 /tmp/hermesd-wheel-smoke/bin/hermesd --version
 /tmp/hermesd-wheel-smoke/bin/python -I -m hermesd --version
+/tmp/hermesd-wheel-smoke/bin/python scripts/installed_smoke.py
 python -m venv /tmp/hermesd-sdist-smoke
 /tmp/hermesd-sdist-smoke/bin/python -m pip install dist/hermesd-*.tar.gz
 /tmp/hermesd-sdist-smoke/bin/hermesd --version
 /tmp/hermesd-sdist-smoke/bin/python -I -m hermesd --version
+/tmp/hermesd-sdist-smoke/bin/python scripts/installed_smoke.py
 uv run twine check dist/*
 
 # Run the dashboard
