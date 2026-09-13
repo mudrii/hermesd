@@ -114,6 +114,38 @@ def _assert_ci_uses_locked_env(ci: dict, job_name: str, python_version: str) -> 
     assert step["with"]["python-version"] == python_version
 
 
+def test_scheduled_security_workflow_blocks_and_reports() -> None:
+    security = _workflow(".github/workflows/security.yml")
+
+    # Scheduled execution plus manual dispatch (audit CI-12).
+    assert "schedule" in security["on"]
+    assert security["on"]["schedule"] == [{"cron": "23 6 * * 1"}]
+    assert "workflow_dispatch" in security["on"]
+    assert security["permissions"] == {"contents": "read"}
+
+    installed_commands = "\n".join(_job_run_commands(security, "installed-audit"))
+    scan_commands = "\n".join(_job_run_commands(security, "lockfile-scan"))
+    gate_commands = "\n".join(_job_run_commands(security, "gate"))
+
+    # Installed-environment audit on every supported interpreter.
+    assert security["jobs"]["installed-audit"]["strategy"]["matrix"]["python-version"] == [
+        "3.11",
+        "3.12",
+        "3.13",
+        "3.14",
+    ]
+    assert "uv run python scripts/pip_audit_gate.py" in installed_commands
+
+    # Direct lockfile scan complements the installed audit.
+    assert "uv export" in scan_commands
+    assert "--no-deps --disable-pip" in scan_commands
+
+    # Aggregate gate: any non-success outcome fails the security check.
+    assert security["jobs"]["gate"]["if"] == "always()"
+    assert set(security["jobs"]["gate"]["needs"]) == {"installed-audit", "lockfile-scan"}
+    assert '!= "success"' in gate_commands
+
+
 def test_ci_change_classification_and_gate() -> None:
     ci = _workflow(".github/workflows/ci.yml")
 
@@ -190,7 +222,7 @@ def test_ci_splits_static_security_and_interpreter_gates() -> None:
 
     expected_matrix = ["3.11", "3.12", "3.13", "3.14"]
     assert ci["jobs"]["security"]["strategy"]["matrix"]["python-version"] == expected_matrix
-    assert "uv run pip-audit" in _job_run_commands(ci, "security")
+    assert "uv run python scripts/pip_audit_gate.py" in _job_run_commands(ci, "security")
 
     assert ci["jobs"]["test"]["strategy"]["matrix"]["python-version"] == expected_matrix
     test_commands = set(_job_run_commands(ci, "test"))
@@ -269,7 +301,7 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
         "uv run mypy hermesd",
         "uv run python -m compileall hermesd",
         "uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing",
-        "uv run pip-audit",
+        "uv run python scripts/pip_audit_gate.py",
     }
     assert required_release_gate_commands <= set(_job_run_commands(publish, "test"))
 
