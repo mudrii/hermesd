@@ -773,8 +773,9 @@ def _live_manifest_sections(ops: OperationsState, theme: Theme) -> list[Renderab
 def _live_tasks_text(manifest: DelegationLiveManifest, theme: Theme) -> Text:
     """Per-task status lines with the optional redacted log tail.
 
-    Rich Text is literal (never markup-parsed), but the strings are escaped
-    anyway so the model layer stays untrusted end to end.
+    Rich ``Text`` is literal — it never parses markup — so the strings are
+    *sanitized* (ANSI and control codes stripped) rather than escaped:
+    escaping here would render literal backslashes.
     """
     lines = Text()
     if not manifest.tasks:

@@ -22,6 +22,7 @@ from hermesd.collect.common import (
     _coerce_int,
     _exists_strict,
     _iso_to_epoch,
+    _json_object_capped,
     _path_resolves_under,
     _read_tail_text,
     _read_text_capped,
@@ -141,9 +142,6 @@ def _goal_state_update(conn: sqlite3.Connection) -> dict[str, Any]:
 _DELEGATION_TERMINAL_STATES = ("completed", "error", "failed", "cancelled")
 _DELEGATION_FAILED_STATES = ("error", "failed")
 # Cap on any JSON object column decoded whole (delegation task/result payloads
-# and goal records). 64 KiB comfortably holds a real goal — which carries the
-# full contract and subgoal list — while still refusing a runaway blob.
-_JSON_COLUMN_MAX_BYTES = 64 * 1024
 _DELEGATION_TEXT_MAX_CHARS = 80
 _BOUNDED_SCAN_LIMIT = 200
 _STATE_META_MAINTENANCE_KEYS = (
@@ -311,27 +309,6 @@ def _first_delegation_result(result_object: dict[str, Any]) -> dict[str, Any]:
     if results and isinstance(results[0], dict):
         return results[0]
     return {}
-
-
-def _json_object_capped(
-    raw: object, max_bytes: int = _JSON_COLUMN_MAX_BYTES
-) -> dict[str, Any] | None:
-    """Decode a JSON object column, refusing payloads over ``max_bytes``.
-
-    None means "no usable object" — absent, over the cap, malformed, or not a
-    JSON object — which lets callers distinguish that from a genuine ``{}``.
-    ``RecursionError`` joins the suppressed set because nesting deep enough to
-    exhaust the decoder is just more junk: it must not fail the source.
-    """
-    if not isinstance(raw, str) or not raw:
-        return None
-    if len(raw.encode("utf-8", errors="replace")) > max_bytes:
-        return None
-    with contextlib.suppress(json.JSONDecodeError, ValueError, RecursionError):
-        decoded = json.loads(raw)
-        if isinstance(decoded, dict):
-            return decoded
-    return None
 
 
 def _clip_single_line(value: str) -> str:

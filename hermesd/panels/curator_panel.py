@@ -167,14 +167,7 @@ def _append_hygiene_compact(cur: CuratorRun, lines: Text, theme: Theme) -> None:
     else:
         lines.append("all re-used", style=theme.banner_text)
     lines.append("\n  States: ", style=theme.ui_label)
-    states = [
-        f"{cur.state_active_count} active",
-        f"{cur.state_stale_count} stale",
-        f"{cur.state_archived_count} archived",
-    ]
-    if cur.state_unknown_count:
-        states.append(f"{cur.state_unknown_count} unknown")
-    lines.append(" · ".join(states), style=theme.banner_text)
+    lines.append(_state_counts_label(cur), style=theme.banner_text)
     if cur.pinned_count:
         lines.append(f" · {cur.pinned_count} pinned", style=theme.banner_text)
 
@@ -188,7 +181,7 @@ def _hygiene_table(cur: CuratorRun, theme: Theme) -> Table:
     table.add_row("Pinned", str(cur.pinned_count))
     table.add_row("Thresholds", _threshold_label(cur))
     if cur.skill_windows:
-        table.add_row("Windows", _window_summary(cur))
+        table.add_row("Windows", _state_counts_label(cur))
         table.add_row("", _window_table(cur, theme))
     return table
 
@@ -209,7 +202,12 @@ def _threshold_label(cur: CuratorRun) -> str:
     return f"{label} (defaults)"
 
 
-def _window_summary(cur: CuratorRun) -> str:
+def _state_counts_label(cur: CuratorRun) -> str:
+    """The state rollup, in one place: the compact line and the table share it.
+
+    ``unknown`` is appended only when it is non-zero, so a healthy home reads
+    as three buckets rather than four with a permanent zero.
+    """
     states = [
         f"{cur.state_active_count} active",
         f"{cur.state_stale_count} stale",

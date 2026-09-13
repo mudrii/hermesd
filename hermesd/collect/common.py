@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import math
 import time
 from datetime import UTC, datetime
@@ -271,3 +273,32 @@ def _optional_epoch(value: object) -> float | None:
     """
     coerced = _coerce_float(value)
     return coerced if coerced > 0.0 else None
+
+
+# Bound on a JSON column read out of a database. The column itself can hold
+# megabytes (SQLite does not enforce a length), and the payload is rendered, so
+# anything past this reads as absent rather than being parsed.
+# and goal records). 64 KiB comfortably holds a real goal — which carries the
+# full contract and subgoal list — while still refusing a runaway blob.
+_JSON_COLUMN_MAX_BYTES = 64 * 1024
+
+
+def _json_object_capped(
+    raw: object, max_bytes: int = _JSON_COLUMN_MAX_BYTES
+) -> dict[str, Any] | None:
+    """Decode a JSON object column, refusing payloads over ``max_bytes``.
+
+    None means "no usable object" — absent, over the cap, malformed, or not a
+    JSON object — which lets callers distinguish that from a genuine ``{}``.
+    ``RecursionError`` joins the suppressed set because nesting deep enough to
+    exhaust the decoder is just more junk: it must not fail the source.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    if len(raw.encode("utf-8", errors="replace")) > max_bytes:
+        return None
+    with contextlib.suppress(json.JSONDecodeError, ValueError, RecursionError):
+        decoded = json.loads(raw)
+        if isinstance(decoded, dict):
+            return decoded
+    return None

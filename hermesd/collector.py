@@ -1086,11 +1086,7 @@ class Collector:
                     "api_runs", results["operations"], _API_RUN_FIELDS
                 ),
             ),
-            # Seventh writer of `operations`: the live delegation manifests are a
-            # ROOT-scoped cache directory (the same open divergence as the
-            # delegation_live_log_count read inside `operations`), and a torn
-            # manifest must keep the last-good cards instead of blanking them.
-            # Eighth writer of `operations`: process receipts live under the
+            # Seventh writer of `operations`: process receipts live under the
             # profile's logs/, upstream's own location, so a vanished receipt
             # (7-day retention) keeps the last-good list instead of a false zero.
             _SourceSpec(
@@ -1102,6 +1098,10 @@ class Collector:
                     "process_receipts", results["operations"], _PROCESS_RECEIPT_FIELDS
                 ),
             ),
+            # Eighth writer of `operations`: the live delegation manifests are a
+            # ROOT-scoped cache directory (the same open divergence as the
+            # delegation_live_log_count read inside `operations`), and a torn
+            # manifest must keep the last-good cards instead of blanking them.
             _SourceSpec(
                 "operations",
                 "delegation_live",

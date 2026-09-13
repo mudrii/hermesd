@@ -18,8 +18,8 @@ from hermesd.collect.common import (
     _coerce_float,
     _coerce_int,
     _iso_to_epoch,
+    _json_object_capped,
 )
-from hermesd.collect.operations import _json_object_capped
 from hermesd.collect.redaction import (
     _redact_bare_credentials,
     _redact_secret_url,
@@ -330,9 +330,12 @@ def _holder_pid(holder: str) -> int:
 
 
 def _holder_liveness(pid: int, pid_exists: Callable[[int], bool]) -> ProcessLiveness:
-    """Upstream's reclaim conservatism, mirrored: only kernel proof the pid is
-    gone marks a holder dead; a reused pid reads as alive (the wrong-alive
-    answer self-heals at TTL, the wrong-dead answer would fork a lineage)."""
+    """Whether a lease holder's pid is provably gone, upstream's conservative way.
+
+    Only kernel proof the pid is gone marks a holder dead; a reused pid reads as
+    alive, because the wrong-alive answer self-heals at the TTL while the
+    wrong-dead answer would fork a lineage.
+    """
     if pid <= 0:
         return ProcessLiveness.UNVERIFIABLE
     return ProcessLiveness.LIVE if pid_exists(pid) else ProcessLiveness.DEAD
