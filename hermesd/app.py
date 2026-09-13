@@ -57,11 +57,17 @@ _CRON_PANEL_NUM = _panel_num_by_name("Cron")
 _SKILLS_PANEL_NUM = _panel_num_by_name("Skills / Integrations")
 _PROFILES_PANEL_NUM = _panel_num_by_name("Profiles")
 _OPERATIONS_PANEL_NUM = _panel_num_by_name("Operations")
+_CONFIG_PANEL_NUM = _panel_num_by_name("Config")
 _RENDERED_VIEWPORT_PANEL_NUMS = frozenset(
     {
         _GATEWAY_PANEL_NUM,
         _SESSIONS_PANEL_NUM,
         _CRON_PANEL_NUM,
+        # Config renders ~72 lines at a default terminal (settings, session
+        # capacity, agent limits, integrations, backups, tool gateway), so the
+        # sections it appends last — including the corrupt-snapshot alert — are
+        # only reachable through the viewport.
+        _CONFIG_PANEL_NUM,
         _SKILLS_PANEL_NUM,
         _OPERATIONS_PANEL_NUM,
     }
@@ -929,14 +935,10 @@ class DashboardApp:
         if panel == _SESSIONS_PANEL_NUM:
             self._append_footer_action(text, theme, "[s]", " Sort  ")
             text.append(f"sort={sort_mode}  ", style=f"{theme.banner_dim} on {theme.status_bar_bg}")
-        if panel in {
-            _GATEWAY_PANEL_NUM,
-            _SESSIONS_PANEL_NUM,
-            _CRON_PANEL_NUM,
-            _SKILLS_PANEL_NUM,
-            _LOG_PANEL_NUM,
-            _OPERATIONS_PANEL_NUM,
-        }:
+        if scrollable:
+            # Same condition as [j/k]: every scrollable detail answers to g/G, so
+            # the hint follows the capability instead of a panel list that can
+            # drift away from _RENDERED_VIEWPORT_PANEL_NUMS.
             self._append_footer_action(text, theme, "[g/G]", " Top/bottom  ")
         if panel == _PROFILES_PANEL_NUM:
             self._append_footer_action(text, theme, "[p]", " Cycle profile  ")
