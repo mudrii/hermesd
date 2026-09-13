@@ -507,7 +507,8 @@ def _session_lease_fields(
     return {"leases": leases, "lease_total": rows.lease_total}
 
 
-# The hygiene cooldown ladder: multipliers over the 300s base cooldown, clamped
+# The hygiene cooldown ladder: multipliers over the default 300s base cooldown
+# (``hygiene_failure_cooldown_seconds``), clamped
 # at one hour (gateway/run.py:101-103,147-149). Streak 3+ is effectively
 # "pre-turn compaction off" for that chat.
 _HYGIENE_SUSPENSION_STREAK = 3

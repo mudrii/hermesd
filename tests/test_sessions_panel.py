@@ -1018,3 +1018,43 @@ def test_route_counts_carry_the_exact_denominator_when_the_list_is_capped() -> N
     )
     assert "1 chat(s) need a user message to recover" in detail
     assert "of 1 routed chats" not in detail
+
+
+def test_hygiene_effect_label_follows_the_models_derived_flag() -> None:
+    """The panel must not re-derive the suspension threshold from the streak.
+
+    ``GatewayHygieneState.suspended`` is the reader's verdict (streak >= the
+    ladder's suspension point); a panel that re-checked ``streak >= 3`` would
+    silently disagree with the model the moment that ladder changes.
+    """
+    coord = SessionCoordinationState(
+        hygiene=[
+            GatewayHygieneState(session_key="chat-low", failure_streak=5, suspended=False),
+            GatewayHygieneState(session_key="chat-flagged", failure_streak=1, suspended=True),
+        ],
+        hygiene_total=2,
+    )
+    detail = render_to_str(
+        render_sessions(DashboardState(session_coordination=coord), Theme(), detail=True),
+        width=160,
+        no_color=True,
+    )
+    low_row = next(line for line in detail.splitlines() if "chat-low" in line)
+    flagged_row = next(line for line in detail.splitlines() if "chat-flagged" in line)
+    assert "compaction cooldown backoff" in low_row
+    assert "compaction suspended" in flagged_row
+
+
+def test_hygiene_note_names_the_configurable_default_base() -> None:
+    """The 300 s base is a *default*: the ladder's base is configurable upstream."""
+    coord = SessionCoordinationState(
+        hygiene=[GatewayHygieneState(session_key="chat-1", failure_streak=1)],
+        hygiene_total=1,
+    )
+    detail = render_to_str(
+        render_sessions(DashboardState(session_coordination=coord), Theme(), detail=True),
+        width=160,
+        no_color=True,
+    )
+    assert "default 300s base" in detail
+    assert "hygiene_failure_cooldown_seconds" in detail

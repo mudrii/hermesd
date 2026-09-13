@@ -925,8 +925,9 @@ _LEASE_NOTE = (
 
 _HYGIENE_NOTE = (
     "Failure streaks are per rotation-stable chat key; cooldowns climb x1/x3/x9 "
-    "over the 300s base, clamped at 1h, so streak 3 suspends pre-turn "
-    "compaction. A row clears only when compaction recovers."
+    "over the default 300s base (config `hygiene_failure_cooldown_seconds`), "
+    "clamped at 1h, so streak 3 suspends pre-turn compaction. A row clears only "
+    "when compaction recovers."
 )
 
 
@@ -977,8 +978,15 @@ def _leases_table(leases: list[SessionLease], theme: Theme) -> Table:
     return table
 
 
-def _hygiene_effect_label(streak: int) -> str:
-    if streak >= 3:
+def _hygiene_effect_label(suspended: bool) -> str:
+    """Effect wording from the model's derived flag, not a re-derived threshold.
+
+    ``GatewayHygieneState.suspended`` is the reader's verdict
+    (``failure_streak >= _HYGIENE_SUSPENSION_STREAK``); re-checking the streak
+    here would duplicate the ladder and silently disagree with the model if the
+    suspension point ever moves.
+    """
+    if suspended:
         return "compaction suspended, cooldown up to 1h"
     return "compaction cooldown backoff"
 
@@ -993,7 +1001,7 @@ def _hygiene_table(rows: list[GatewayHygieneState], theme: Theme) -> Table:
         table.add_row(
             escape(row.session_key[-_COORDINATION_KEY_CHARS:]),
             str(row.failure_streak),
-            escape(_hygiene_effect_label(row.failure_streak)),
+            escape(_hygiene_effect_label(row.suspended)),
             escape(_truncate(row.compression_failure_error, _MAX_COORDINATION_ERROR_CHARS))
             if row.compression_failure_error
             else "—",

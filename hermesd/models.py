@@ -589,7 +589,8 @@ class GatewayHygieneState(BaseModel):
 
     Writers increment the streak per failed hygiene run
     (``hermes_state_gateway.py:513-529``); the consumer escalates a cooldown
-    ladder x1/x3/x9 over the 300s base, clamped at 3600s
+    ladder x1/x3/x9 over the default 300s base (``hygiene_failure_cooldown_seconds``),
+    clamped at 3600s
     (``gateway/run.py:101-149``), so a streak of 3+ effectively disables
     pre-turn compaction for up to an hour. Rows are deleted only when a
     compression actually recovers the chat (``gateway/run.py:152-167``).
