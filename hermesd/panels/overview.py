@@ -558,6 +558,14 @@ def _append_catalog_note(sm: SkillsMemory, note: Text, theme: Theme) -> None:
             style=theme.banner_dim,
         )
         return
+    if not sm.plugin_catalog_cache_usable:
+        age = sm.plugin_catalog_cache_age_seconds
+        cache_line = "catalog cache" if age is None else f"catalog cache {_age_label(age)} old"
+        note.append(
+            f"  {cache_line} is unreadable — update/removal checks unavailable\n",
+            style=theme.banner_dim,
+        )
+        return
     age = sm.plugin_catalog_cache_age_seconds
     cache_line = "catalog cache observed" if age is None else f"catalog cache {_age_label(age)} old"
     note.append(f"  {cache_line}: ", style=theme.banner_dim)

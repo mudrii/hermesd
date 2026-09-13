@@ -93,10 +93,27 @@ def test_parse_catalog_cache_reads_entries_and_removed():
     ]
 
 
-def test_parse_catalog_cache_tolerates_wrong_shapes():
-    assert parse_catalog_cache({}) == ({}, [])
-    assert parse_catalog_cache({"entries": "junk", "removed": 4}) == ({}, [])
-    assert parse_catalog_cache("junk") == ({}, [])
+def test_parse_catalog_cache_rejects_payloads_upstream_would_refuse():
+    """No usable catalog is None, never an empty one.
+
+    Upstream validates the live payload with
+    ``isinstance(data, dict) and isinstance(data.get("entries"), list)``
+    (``hermes_cli/plugin_catalog.py:238-239``), so anything else is an
+    unreadable cache whose absence of drift findings means "unavailable",
+    not "everything matches".
+    """
+    assert parse_catalog_cache({}) is None
+    assert parse_catalog_cache({"entries": "junk", "removed": 4}) is None
+    assert parse_catalog_cache("junk") is None
+    assert parse_catalog_cache([]) is None
+    assert parse_catalog_cache({"removed": []}) is None
+    assert parse_catalog_cache(None) is None
+
+
+def test_parse_catalog_cache_tolerates_junk_rows_inside_a_valid_payload():
+    """A valid payload stays usable; malformed rows are skipped, not fatal."""
+    assert parse_catalog_cache({"entries": [], "removed": None}) == ({}, [])
+    assert parse_catalog_cache({"entries": [1, "junk", {"name": 5}], "removed": 4}) == ({}, [])
 
 
 def test_normalize_repo_is_git_and_slash_insensitive():
@@ -266,8 +283,31 @@ def test_collector_junk_cache_payload_makes_no_update_claims(hermes_home: Path):
 
     sm = state.skills_memory
     assert sm.plugin_catalog_cache_present is True
+    assert sm.plugin_catalog_cache_usable is False
     assert sm.plugin_catalog_update_count == 0
     assert "plugin_catalog" not in state.health.failed_sources
+
+    # The panel must not answer "everything matches" from a cache it could not read.
+    rendered = render_to_str(render_panel(7, state, Theme(), detail=True))
+    assert "unreadable" in rendered
+    assert "plugins match the catalog" not in rendered
+
+
+def test_panel_still_reports_a_readable_empty_cache_as_a_match(hermes_home: Path):
+    """A cache that parsed and holds nothing is real evidence of no drift."""
+    _write_plugin(hermes_home, "weather", sidecar={"catalog_name": "weather", "sha": _SHA_OLD})
+    _write_catalog_cache(hermes_home, entries=[], removed=[])
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.skills_memory.plugin_catalog_cache_usable is True
+    rendered = render_to_str(render_panel(7, state, Theme(), detail=True))
+    assert "plugins match the catalog" in rendered
+    assert "unreadable" not in rendered
 
 
 def test_panel_shows_catalog_state_column_and_notes(hermes_home: Path):

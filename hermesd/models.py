@@ -1461,8 +1461,11 @@ class SkillsMemory(BaseModel):
     skills: list[SkillInfo] = Field(default_factory=list)
     # cache/plugin-catalog.json — the live catalog's view of the installed
     # plugins above. Absent cache means the drift/removal checks made no
-    # claims this pass, which must not read as "everything is current".
+    # claims this pass, which must not read as "everything is current" — and
+    # neither may a present-but-unreadable one (`usable` False: the payload is
+    # not the ``{"entries": [...]}`` object upstream writes).
     plugin_catalog_cache_present: bool = False
+    plugin_catalog_cache_usable: bool = False
     plugin_catalog_cache_age_seconds: float | None = None
     plugin_catalog_update_count: int = 0
     plugin_catalog_removed_count: int = 0

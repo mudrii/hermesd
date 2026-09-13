@@ -344,6 +344,7 @@ _CONFIG_BACKUP_FIELDS = (
 _PLUGIN_CATALOG_FIELDS = (
     "plugins",
     "plugin_catalog_cache_present",
+    "plugin_catalog_cache_usable",
     "plugin_catalog_cache_age_seconds",
     "plugin_catalog_update_count",
     "plugin_catalog_removed_count",
@@ -3482,13 +3483,18 @@ class Collector:
         comparison describe one home (see .codex/rules/source-ownership.md).
 
         No cache means no claims: update/removal flags stay False and the panel
-        says the checks are unavailable, never "everything is current".
+        says the checks are unavailable, never "everything is current". The same
+        rule applies to a cache that is present but unreadable: upstream refuses
+        any payload that is not ``{"entries": [...], ...}``
+        (``plugin_catalog.py:238-239``), so ``parse_catalog_cache`` returns None
+        and the panel reports the cache as unreadable rather than as agreement.
         """
         cache_path = self._paths.shared_path("cache", "plugin-catalog.json")
         if not _exists_strict(cache_path) or not cache_path.is_file():
             return current.model_copy(
                 update={
                     "plugin_catalog_cache_present": False,
+                    "plugin_catalog_cache_usable": False,
                     "plugin_catalog_cache_age_seconds": None,
                     "plugin_catalog_update_count": 0,
                     "plugin_catalog_removed_count": 0,
@@ -3496,7 +3502,20 @@ class Collector:
             )
         if cache_path.is_symlink() or not _path_resolves_under(cache_path, self._paths.root_home):
             raise RuntimeError(f"unsafe plugin catalog cache: {cache_path.name}")
-        entries, removed = parse_catalog_cache(self._read_json_cached(cache_path))
+        parsed = parse_catalog_cache(self._read_json_cached(cache_path))
+        if parsed is None:
+            # Present but unusable: keep the discovered plugins unevaluated and
+            # make the panel say so instead of claiming a match.
+            return current.model_copy(
+                update={
+                    "plugin_catalog_cache_present": True,
+                    "plugin_catalog_cache_usable": False,
+                    "plugin_catalog_cache_age_seconds": self._file_age_seconds(cache_path),
+                    "plugin_catalog_update_count": 0,
+                    "plugin_catalog_removed_count": 0,
+                }
+            )
+        entries, removed = parsed
         plugins = [
             self._flag_plugin_with_catalog(plugin, entries, removed) for plugin in current.plugins
         ]
@@ -3504,6 +3523,7 @@ class Collector:
             update={
                 "plugins": plugins,
                 "plugin_catalog_cache_present": True,
+                "plugin_catalog_cache_usable": True,
                 "plugin_catalog_cache_age_seconds": self._file_age_seconds(cache_path),
                 "plugin_catalog_update_count": sum(
                     1 for plugin in plugins if plugin.catalog_update_available
