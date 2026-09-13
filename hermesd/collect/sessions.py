@@ -453,7 +453,7 @@ def _read_session_coordination_rows(conn: Any) -> _SessionCoordinationRows:
     # canonical bot chats are born hidden — so a route to a hidden session is a
     # live route, not a dangling one. Only ids are read: 64-bit integers plus the
     # id string, one indexed column scan on the same cached connection.
-    session_ids = frozenset()
+    session_ids: frozenset[str] = frozenset()
     if _table_exists(conn, "sessions"):
         session_ids = frozenset(
             str(row.get("id"))

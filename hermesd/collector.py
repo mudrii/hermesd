@@ -382,6 +382,7 @@ _KANBAN_NOTIFY_FIELDS = (
 _DELEGATION_LIVE_FIELDS = (
     "delegation_live_manifests",
     "delegation_live_manifest_count",
+    "delegation_live_unparsed_count",
 )
 _PROCESS_RECEIPT_FIELDS = ("process_receipts",)
 _STATE_SNAPSHOT_FIELDS = ("snapshot_count", "snapshot_total_bytes", "newest_snapshot_age_seconds")

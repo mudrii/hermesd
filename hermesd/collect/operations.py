@@ -439,7 +439,11 @@ def _read_delegation_live_manifests(live_root: Path, home: Path, *, now: float) 
     batch rather than the displayed slice. A torn manifest still counts its
     delegation but yields no card; it must never fail the source.
     """
-    empty = {"delegation_live_manifests": [], "delegation_live_manifest_count": 0}
+    empty = {
+        "delegation_live_manifests": [],
+        "delegation_live_manifest_count": 0,
+        "delegation_live_unparsed_count": 0,
+    }
     if not _safe_child_path(live_root, home) or not live_root.is_dir():
         return empty
     candidates: list[tuple[float, Path]] = []
@@ -461,15 +465,22 @@ def _read_delegation_live_manifests(live_root: Path, home: Path, *, now: float) 
             candidates.append((_safe_mtime(run_dir), run_dir))
     candidates.sort(key=lambda item: item[0], reverse=True)
     manifests: list[DelegationLiveManifest] = []
+    unparsed = 0
     for mtime, run_dir in candidates:
         manifest = _live_manifest_from_dir(run_dir, home, mtime=mtime, now=now)
         if manifest is not None:
             manifests.append(manifest)
             if len(manifests) >= _MAX_LIVE_MANIFESTS:
                 break
+        else:
+            # Counted by the presence-based scan, but no card: over the parse
+            # cap, torn, or not JSON. Reported so the two numbers cannot
+            # silently disagree.
+            unparsed += 1
     return {
         "delegation_live_manifests": manifests,
         "delegation_live_manifest_count": count,
+        "delegation_live_unparsed_count": unparsed,
     }
 
 

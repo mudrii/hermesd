@@ -2414,6 +2414,10 @@ class OperationsState(BaseModel):
     # the last-good card list instead of blanking the panel.
     delegation_live_manifests: list[DelegationLiveManifest] = Field(default_factory=list)
     delegation_live_manifest_count: int = 0
+    # Counted run dirs whose manifest could not be read into a card (over the
+    # parse cap, torn, or not JSON). The count above is presence-based, so
+    # without this the difference is invisible.
+    delegation_live_unparsed_count: int = 0
     state_db_schema_version: int = 0
     state_db_size_bytes: int = 0
     state_db_wal_size_bytes: int = 0

@@ -2958,6 +2958,8 @@ def test_delegation_live_manifest_caps_are_literal(hermes_home: Path, sample_db:
     ops = _collect_ops(hermes_home).operations
     assert ops.delegation_live_manifest_count == 1
     assert ops.delegation_live_manifests == []
+    # The counted-but-unreadable manifest is reported, not silently dropped.
+    assert ops.delegation_live_unparsed_count == 1
 
     huge = live / "deleg_huge"
     huge.mkdir()
@@ -2965,6 +2967,33 @@ def test_delegation_live_manifest_caps_are_literal(hermes_home: Path, sample_db:
     ops = _collect_ops(hermes_home).operations
     assert ops.delegation_live_manifest_count == 1  # only the 70 KiB one qualifies
     assert ops.delegation_live_manifests == []
+    assert ops.delegation_live_unparsed_count == 1
+
+
+def test_live_manifest_counted_but_unparsed_is_explained(hermes_home: Path, sample_db: Path):
+    """A counted manifest with no card must be explained, not just omitted.
+
+    The scan counts every run dir holding a capped ``manifest.json`` while the
+    card parser refuses anything past 64 KiB, so a home whose only manifest is
+    oversized renders nothing at all — the count survived only in the JSON
+    snapshot, and in a mixed home the "showing N of M — newest first" label
+    blamed ordering instead of the parse cap.
+    """
+    live = hermes_home / "cache" / "delegation" / "live"
+    big = live / "deleg_oversized"
+    big.mkdir(parents=True)
+    (big / "manifest.json").write_text("{not json" + " " * (70 * 1024))
+
+    c = Collector(hermes_home, clock=_fixed_clock)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.operations.delegation_live_manifest_count == 1
+    text = render_to_str(render_panel(12, state, Theme(), detail=True), width=200, no_color=True)
+    assert "1 manifest" in text
+    assert "too large" in text
 
 
 def test_corrupt_ledger_marker_never_reads_the_parked_bytes(

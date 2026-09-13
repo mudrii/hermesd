@@ -126,14 +126,14 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     if delegation_line:
         lines.append("  Delegations: ", style=theme.ui_label)
         lines.append(f"{delegation_line}\n", style=theme.banner_text)
-    if ops.delegation_live_manifests:
+    if ops.delegation_live_manifest_count:
         running = sum(m.running_task_count for m in ops.delegation_live_manifests)
         lines.append("  Live delegations: ", style=theme.ui_label)
         lines.append(
             # The count covers every run directory — finished delegations
             # included, since only the parsed cards carry `completed` — so it is
             # labelled "manifests". "running" is the parsed slice, marked as
-            # such.
+            # such. A count with no cards (an unreadable manifest) still shows.
             f"{ops.delegation_live_manifest_count} manifests · {running} running (shown)\n",
             style=theme.banner_text,
         )
@@ -217,7 +217,9 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         )
         sections.append(_delegations_table(ops, theme))
 
-    if ops.delegation_live_manifests:
+    if ops.delegation_live_manifests or ops.delegation_live_unparsed_count:
+        # The heading also appears when every counted manifest was unreadable:
+        # otherwise an oversized-only home rendered nothing at all.
         sections.append(_heading("Live Delegation Transcripts", theme))
         sections.extend(_live_manifest_sections(ops, theme))
         sections.append(_note(_LIVE_MANIFEST_NOTE_LINES, theme))
@@ -749,6 +751,17 @@ def _live_manifest_sections(ops: OperationsState, theme: Theme) -> list[Renderab
                 + _truncation_label(shown, ops.delegation_live_manifest_count)
                 + " — newest first\n",
                 style=theme.banner_dim,
+            )
+        )
+    if ops.delegation_live_unparsed_count:
+        # The count is presence-based while the cards need a readable manifest,
+        # so the gap is named instead of left to look like silent truncation.
+        noun = "manifest" if ops.delegation_live_unparsed_count == 1 else "manifests"
+        parts.append(
+            Text(
+                f"  {ops.delegation_live_unparsed_count} {noun} counted but not shown: "
+                "too large to read or unreadable\n",
+                style=theme.ui_warn,
             )
         )
     return parts
