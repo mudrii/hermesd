@@ -17,7 +17,6 @@ from hermesd.collector import (
     _ACTIVE_SURFACE_LIMIT,
     Collector,
     _estimate_cost,
-    _pid_exists,
     _resolved_session_cost,
     _summarize_breakdown,
     _summarize_tokens,
