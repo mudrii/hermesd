@@ -21,15 +21,10 @@ jobs:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: ./.github/actions/locked-env
         with:
           python-version: ${{ matrix.python-version }}
-          version: "0.12.10"
-          enable-cache: true
-      - name: Check lockfile
-        run: uv lock --check
-      - name: Install locked dependencies
-        run: uv sync --locked --all-extras --dev
+          enable-cache: "true"
       - name: Lint (ruff)
         run: uv run ruff check .
       - name: Format check (ruff)
@@ -50,14 +45,12 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      # Release builds keep uv caching disabled (audit CI-16): publication
+      # inputs must not acquire a cache trust dependency.
+      - uses: ./.github/actions/locked-env
         with:
           python-version: "3.11"
-          version: "0.12.10"
-      - name: Check lockfile
-        run: uv lock --check
-      - name: Install locked dependencies
-        run: uv sync --locked --all-extras --dev
+          enable-cache: "false"
       - name: Verify release metadata
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}

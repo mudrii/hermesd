@@ -55,16 +55,16 @@ def _action_step(workflow: dict, job_name: str, action: str) -> dict:
     return step
 
 
-def _assert_setup_uv_is_pinned(workflow: dict, job_name: str) -> None:
-    setup_step = _action_step(workflow, job_name, SETUP_UV_ACTION)
-    assert setup_step["with"]["version"] == UV_VERSION
-
-
 def _assert_all_actions_are_sha_pinned(workflow: dict) -> None:
     for job in workflow["jobs"].values():
         for step in job["steps"]:
             if "uses" in step:
-                assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", step["uses"])
+                # Third-party actions must be commit-SHA pinned. Local
+                # composite actions (./.github/actions/*) are in-repo by
+                # definition and have their own pinning test.
+                assert re.fullmatch(
+                    r"[^@]+@[0-9a-f]{40}|\./\.github/actions/[a-z0-9/-]+", step["uses"]
+                )
 
 
 def test_flake_version_matches_project_version() -> None:
@@ -91,6 +91,64 @@ def test_readme_images_use_package_metadata_safe_urls() -> None:
     assert relative_image_links == []
 
 
+def test_locked_env_composite_action_is_pinned() -> None:
+    action = _workflow(".github/actions/locked-env/action.yml")
+
+    steps = action["runs"]["steps"]
+    for step in steps:
+        if "uses" in step:
+            assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", step["uses"])
+    setup_step = next(step for step in steps if step["uses"].startswith(f"{SETUP_UV_ACTION}@"))
+    assert setup_step["with"]["version"] == UV_VERSION
+    commands = "\n".join(step["run"] for step in steps if "run" in step)
+    assert "uv lock --check" in commands
+    assert "uv sync --locked --all-extras --dev" in commands
+
+
+def _assert_ci_uses_locked_env(ci: dict, job_name: str, python_version: str) -> None:
+    step = next(
+        step
+        for step in ci["jobs"][job_name]["steps"]
+        if step.get("uses", "").startswith("./.github/actions/locked-env")
+    )
+    assert step["with"]["python-version"] == python_version
+
+
+def test_ci_splits_static_security_and_interpreter_gates() -> None:
+    ci = _workflow(".github/workflows/ci.yml")
+
+    # Separated, independently visible gates (audit CI-11).
+    for job_name in ("static", "security", "test", "macos", "package", "docker", "nix"):
+        assert job_name in ci["jobs"]
+
+    static_commands = set(_job_run_commands(ci, "static"))
+    assert {
+        "uv run ruff check .",
+        "uv run ruff format --check .",
+        "uv run mypy hermesd",
+        "uv run python -m compileall hermesd",
+    } <= static_commands
+
+    expected_matrix = ["3.11", "3.12", "3.13", "3.14"]
+    assert ci["jobs"]["security"]["strategy"]["matrix"]["python-version"] == expected_matrix
+    assert "uv run pip-audit" in _job_run_commands(ci, "security")
+
+    assert ci["jobs"]["test"]["strategy"]["matrix"]["python-version"] == expected_matrix
+    test_commands = set(_job_run_commands(ci, "test"))
+    assert (
+        "uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing"
+        in test_commands
+    )
+    for job_name, python_version in (
+        ("static", "3.11"),
+        ("security", "${{ matrix.python-version }}"),
+        ("test", "${{ matrix.python-version }}"),
+        ("macos", "3.14"),
+        ("package", "3.11"),
+    ):
+        _assert_ci_uses_locked_env(ci, job_name, python_version)
+
+
 def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
     ci = _workflow(".github/workflows/ci.yml")
     publish = _workflow(".github/workflows/python-publish.yml")
@@ -109,7 +167,6 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
     assert publish["permissions"] == {"contents": "read"}
 
     expected_matrix = ["3.11", "3.12", "3.13", "3.14"]
-    assert ci["jobs"]["test"]["strategy"]["matrix"]["python-version"] == expected_matrix
     assert publish["jobs"]["test"]["strategy"]["matrix"]["python-version"] == expected_matrix
     assert ci["jobs"]["test"]["runs-on"] == "ubuntu-24.04"
     assert ci["jobs"]["macos"]["runs-on"] == "macos-15"
@@ -128,29 +185,34 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
     }
     _assert_all_actions_are_sha_pinned(ci)
     _assert_all_actions_are_sha_pinned(publish)
-    _action_step(ci, "test", CHECKOUT_ACTION)
-    _action_step(ci, "package", CHECKOUT_ACTION)
-    _action_step(ci, "macos", CHECKOUT_ACTION)
+    for job_name in ("test", "package", "macos"):
+        _action_step(ci, job_name, CHECKOUT_ACTION)
     _action_step(publish, "test", CHECKOUT_ACTION)
     _action_step(publish, "release-build", CHECKOUT_ACTION)
-    _assert_setup_uv_is_pinned(ci, "test")
-    _assert_setup_uv_is_pinned(ci, "package")
-    _assert_setup_uv_is_pinned(ci, "macos")
-    _assert_setup_uv_is_pinned(publish, "test")
-    _assert_setup_uv_is_pinned(publish, "release-build")
 
-    required_test_commands = {
-        "uv sync --locked --all-extras --dev",
+    # The release test matrix explicitly opts into uv caching; the release
+    # build keeps caching disabled (audit CI-16 trust boundary).
+    publish_locked_env = {
+        step["with"]["python-version"]: step["with"]["enable-cache"]
+        for job in ("test", "release-build")
+        for step in publish["jobs"][job]["steps"]
+        if step.get("uses", "").startswith("./.github/actions/locked-env")
+    }
+    assert publish_locked_env == {
+        "${{ matrix.python-version }}": "true",
+        "3.11": "false",
+    }
+
+    # The publication workflow re-runs the full gate on the release commit.
+    required_release_gate_commands = {
         "uv run ruff check .",
         "uv run ruff format --check .",
         "uv run mypy hermesd",
         "uv run python -m compileall hermesd",
         "uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing",
         "uv run pip-audit",
-        "uv lock --check",
     }
-    for workflow in (ci, publish):
-        assert required_test_commands <= set(_job_run_commands(workflow, "test"))
+    assert required_release_gate_commands <= set(_job_run_commands(publish, "test"))
 
     ci_package_commands = "\n".join(_job_run_commands(ci, "package"))
     assert "uv build" in ci_package_commands
@@ -163,12 +225,13 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
     assert ".sdist-smoke/bin/hermesd --version" in ci_package_commands
     assert ".sdist-smoke/bin/python -I -m hermesd --version" in ci_package_commands
     assert "uv run twine check dist/*" in ci_package_commands
-    assert {
-        "uv sync --locked --all-extras --dev",
-        "uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing",
-    } <= set(_job_run_commands(ci, "macos"))
+    macos_commands = set(_job_run_commands(ci, "macos"))
+    assert (
+        "uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing"
+        in macos_commands
+    )
     assert "docker run --rm hermesd-ci --version" in "\n".join(_job_run_commands(ci, "docker"))
-    assert "nix flake check --no-write-lock-file" in _job_run_commands(ci, "nix")
+    assert "nix flake check --no-write-lock-file" in "\n".join(_job_run_commands(ci, "nix"))
 
     release_steps = publish["jobs"]["release-build"]["steps"]
     metadata_step = next(
@@ -178,7 +241,8 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
 
     release_commands = "\n".join(_job_run_commands(publish, "release-build"))
     assert "CHANGELOG.md" in release_commands
-    assert "uv lock --check" in release_commands
+    # uv lock --check and uv sync run inside the composite locked-env action
+    # (asserted by test_locked_env_composite_action_is_pinned).
     assert "uv build" in release_commands
     assert "dist/hermesd-{version}.tar.gz" in release_commands
     assert "dist/hermesd-{version}-py3-none-any.whl" in release_commands

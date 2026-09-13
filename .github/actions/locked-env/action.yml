@@ -1,0 +1,28 @@
+name: Locked development environment
+description: Install hermesd's locked uv environment (lockfile check + sync)
+
+# Single definition of the "install the locked toolchain" gate so CI and the
+# publication workflow cannot drift apart (audit CI-11). Every `uses:` here
+# must stay SHA-pinned; tests/test_package_metadata.py enforces it.
+inputs:
+  python-version:
+    description: Python interpreter for the uv-managed environment
+    required: true
+  enable-cache:
+    description: Whether uv caching is enabled for this job
+    required: false
+    default: "true"
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      with:
+        python-version: ${{ inputs.python-version }}
+        version: "0.12.10"
+        enable-cache: ${{ inputs.enable-cache }}
+    - name: Check lockfile
+      shell: bash
+      run: uv lock --check
+    - name: Install locked dependencies
+      shell: bash
+      run: uv sync --locked --all-extras --dev

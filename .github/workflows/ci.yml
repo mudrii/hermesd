@@ -14,24 +14,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  static:
+    name: Static analysis
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: ./.github/actions/locked-env
         with:
-          python-version: ${{ matrix.python-version }}
-          version: "0.12.10"
-          enable-cache: true
-      - name: Check lockfile
-        run: uv lock --check
-      - name: Install locked dependencies
-        run: uv sync --locked --all-extras --dev
+          python-version: "3.11"
       - name: Lint (ruff)
         run: uv run ruff check .
       - name: Format check (ruff)
@@ -40,40 +31,62 @@ jobs:
         run: uv run mypy hermesd
       - name: Compile check
         run: uv run python -m compileall hermesd
-      - name: Test
-        run: uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
+
+  security:
+    name: Dependency audit (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/locked-env
+        with:
+          python-version: ${{ matrix.python-version }}
       - name: Audit dependencies (pip-audit)
         run: uv run pip-audit
 
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/locked-env
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile check
+        run: uv run python -m compileall hermesd
+      - name: Test
+        run: uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
+
   macos:
+    name: Tests (macOS)
     runs-on: macos-15
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: ./.github/actions/locked-env
         with:
           python-version: "3.14"
-          version: "0.12.10"
-          enable-cache: true
-      - name: Install locked dependencies
-        run: uv sync --locked --all-extras --dev
       - name: Test on macOS
         run: uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
 
   package:
+    name: Package
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: ./.github/actions/locked-env
         with:
           python-version: "3.11"
-          version: "0.12.10"
-          enable-cache: true
-      - name: Check lockfile
-        run: uv lock --check
-      - name: Install locked dependencies
-        run: uv sync --locked --all-extras --dev
       - name: Build package
         run: uv build
       - name: Verify wheel dependency pins match the lockfile
@@ -92,6 +105,7 @@ jobs:
         run: uv run twine check dist/*
 
   docker:
+    name: Docker
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -122,6 +136,7 @@ jobs:
           PY
 
   nix:
+    name: Nix (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
