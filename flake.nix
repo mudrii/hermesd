@@ -56,6 +56,15 @@
 
           build-system = [ (mkHatchling pkgs) ];
 
+          # The published wheel pins its runtime requirements exactly (audit
+          # CI-06); this Nix derivation deliberately satisfies them from
+          # nixpkgs instead, whose in-tree versions (e.g. rich 15) can run
+          # ahead of the locked baseline. The build-time pytest suite and the
+          # installed-CLI smoke are what validate those nixpkgs versions here,
+          # so the wheel-metadata runtime-deps check, which would demand the
+          # uv.lock pins verbatim, does not apply to this channel.
+          dontCheckRuntimeDeps = true;
+
           dependencies = with python.pkgs; [
             rich
             pyyaml
