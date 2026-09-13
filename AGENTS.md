@@ -12,7 +12,7 @@
 uv venv .venv --python 3.11
 source .venv/bin/activate
 uv sync --locked --all-extras --dev
-uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing  # full suite
+uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing  # full suite
 uv run pytest tests/ -q --cov=hermesd --cov-report=term-missing  # coverage (CI gate: 96%)
 uv run ruff check .                 # lint
 uv run ruff format --check .        # format check

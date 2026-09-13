@@ -253,9 +253,22 @@ def test_ci_splits_static_security_and_interpreter_gates() -> None:
     assert ci["jobs"]["test"]["strategy"]["matrix"]["python-version"] == expected_matrix
     test_commands = set(_job_run_commands(ci, "test"))
     assert (
-        "uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing"
-        in test_commands
+        "uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd "
+        '--cov-report=term-missing --junitxml="$RUNNER_TEMP/pytest-results.xml"' in test_commands
     )
+
+    # Failure diagnostics: JUnit and coverage data are uploaded whether the
+    # job succeeded or not (audit CI-20).
+    diagnostics_steps = [
+        step
+        for step in ci["jobs"]["test"]["steps"]
+        if step.get("name") == "Upload test diagnostics"
+    ]
+    assert len(diagnostics_steps) == 1
+    assert diagnostics_steps[0]["if"] == "always()"
+    assert diagnostics_steps[0]["uses"].startswith(f"{UPLOAD_ARTIFACT_ACTION}@")
+    assert diagnostics_steps[0]["with"]["if-no-files-found"] == "ignore"
+
     for job_name, python_version in (
         ("static", "3.11"),
         ("security", "${{ matrix.python-version }}"),
@@ -326,7 +339,7 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
         "uv run ruff format --check .",
         "uv run mypy hermesd",
         "uv run python -m compileall hermesd",
-        "uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing",
+        'uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing --junitxml="$RUNNER_TEMP/pytest-results.xml"',
         "uv run python scripts/pip_audit_gate.py",
     }
     assert required_release_gate_commands <= set(_job_run_commands(publish, "test"))
@@ -349,7 +362,7 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
     assert "uv run twine check dist/*" in ci_package_commands
     macos_commands = set(_job_run_commands(ci, "macos"))
     assert (
-        "uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing"
+        'uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing --junitxml="$RUNNER_TEMP/pytest-results.xml"'
         in macos_commands
     )
     assert "docker run --rm hermesd-ci --version" in "\n".join(_job_run_commands(ci, "docker"))

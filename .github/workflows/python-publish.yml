@@ -34,7 +34,17 @@ jobs:
       - name: Compile check
         run: uv run python -m compileall hermesd
       - name: Test
-        run: uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
+        run: uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing --junitxml="$RUNNER_TEMP/pytest-results.xml"
+      - name: Upload test diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-test-diagnostics-${{ matrix.python-version }}
+          path: |
+            ${{ runner.temp }}/pytest-results.xml
+            .coverage
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Audit dependencies (pip-audit, classified gate)
         run: uv run python scripts/pip_audit_gate.py
 

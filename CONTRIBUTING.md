@@ -10,7 +10,7 @@ cd hermesd
 uv venv .venv --python 3.11
 source .venv/bin/activate
 uv sync --locked --all-extras --dev
-uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
+uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
 ```
 
 ## Development Workflow
@@ -21,7 +21,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 2. **Write the failing test first** — acceptance-level if user-visible, unit-level otherwise
 3. **Implement the minimum change** that makes the test pass
 4. **Refactor while green** — improve naming/cohesion without changing behavior
-5. **Run the full suite** — `uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing`
+5. **Run the full suite** — `uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing`
 6. **Run lint + type + audit + lock + build + package smoke**:
 
    ```bash
@@ -92,7 +92,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 
 ```bash
 # Full suite
-uv run pytest tests/ -v -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
+uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
 
 # Single file
 uv run pytest tests/test_collector.py -v
