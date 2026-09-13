@@ -2678,7 +2678,7 @@ class Collector:
             platforms=platform_infos,
         )
 
-    def _kanban_read_path(self, db_path: Path) -> Path:
+    def _kanban_read_path(self, db_path: Path) -> tuple[Path, bool]:
         """A path to read kanban.db from, copying its WAL at most once per change.
 
         Three readers touch this database in a refresh — the board state, one
@@ -2687,11 +2687,20 @@ class Collector:
         The snapshot is keyed by the source's mtime (db plus sidecar) and shared
         by all of them; without a WAL there is nothing to copy and the real path
         is returned.
+
+        The second element says whether the first is that shared snapshot. A
+        snapshot may be opened ``mode=ro`` directly (``resolved=True``). A real
+        path must go through the ordinary route (``resolved=False``), whose
+        sidecar check re-runs and whose immutable open neither recreates
+        ``-wal``/``-shm`` beside the monitored database — a write into the
+        Hermes home, and a failure on SQLite builds that refuse read-only WAL
+        opens — nor serves stale data when a WAL appears mid-refresh.
         """
         key = _db_source_mtime_ns(db_path)
         cached = self._kanban_snapshots.get(db_path)
         if cached is not None and key is not None and cached[0] == key:
-            return cached[1]
+            # owner is a TemporaryDirectory exactly when the path is a snapshot.
+            return cached[1], cached[2] is not None
         if cached is not None:
             owner = cached[2]
             if owner is not None:
@@ -2700,10 +2709,10 @@ class Collector:
         snapshot = _snapshot_wal_if_present(db_path)
         if snapshot is None:
             self._kanban_snapshots[db_path] = (key, db_path, None)
-            return db_path
+            return db_path, False
         snapshot_dir, snapshot_db = snapshot
         self._kanban_snapshots[db_path] = (key, snapshot_db, snapshot_dir)
-        return snapshot_db
+        return snapshot_db, True
 
     def _collect_kanban(self) -> KanbanState:
         cfg = self._read_yaml_reporting_stale()
@@ -2727,12 +2736,13 @@ class Collector:
             if last_kanban is not None and last_kanban.db_present:
                 raise RuntimeError("kanban.db replaced by unsafe path")
             return self._with_kanban_boards(base_state)
+        read_path, snapshotted = self._kanban_read_path(db_path)
         return self._with_kanban_boards(
             _read_kanban_state(
-                self._kanban_read_path(db_path),
+                read_path,
                 base_state,
                 now=self._clock(),
-                resolved=True,
+                resolved=snapshotted,
             )
         )
 
@@ -2792,13 +2802,14 @@ class Collector:
                 ):
                     continue
                 try:
+                    read_path, snapshotted = self._kanban_read_path(db_path)
                     summary = _read_kanban_board_summary(
-                        self._kanban_read_path(db_path),
+                        read_path,
                         slug=board_dir.name,
                         current=board_dir.name == state.current_board,
                         claim_ttl_seconds=state.claim_ttl_seconds,
                         now=self._clock(),
-                        resolved=True,
+                        resolved=snapshotted,
                     )
                 except (sqlite3.Error, OSError) as exc:
                     self._kanban_board_errors.append(
@@ -2832,11 +2843,12 @@ class Collector:
             or not _path_resolves_under(db_path, self._paths.root_home)
         ):
             return state
+        read_path, snapshotted = self._kanban_read_path(db_path)
         return state.model_copy(
             update=_read_kanban_notify(
-                self._kanban_read_path(db_path),
+                read_path,
                 known_profiles=self._kanban_notifier_profile_names(),
-                resolved=True,
+                resolved=snapshotted,
             )
         )
 

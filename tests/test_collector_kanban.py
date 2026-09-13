@@ -350,6 +350,71 @@ def test_read_kanban_state_reads_wal_database(hermes_home: Path):
     assert state.status_counts == {"in_progress": 1}
 
 
+def test_collect_kanban_sidecar_free_wal_board_reads_without_writing_sidecars(
+    hermes_home: Path,
+):
+    """A checkpointed WAL board — writer closed, -wal/-shm removed — is the
+    normal idle state: SQLite deletes the sidecars when the last writer exits.
+
+    Reading it must go through the immutable route. A plain ``mode=ro`` open of
+    a sidecar-free WAL database makes SQLite recreate ``-wal``/``-shm`` beside
+    the monitored file (a write into the Hermes home) and fails outright on
+    SQLite builds that refuse read-only WAL opens, so every kanban figure must
+    still read correctly with no sidecar appearing.
+    """
+    db_path = hermes_home / "kanban.db"
+    writer = sqlite3.connect(str(db_path))
+    create_kanban_db_tables(writer)
+    assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    writer.execute(
+        "INSERT INTO tasks (id, title, status, created_at) "
+        "VALUES ('t_idle', 'Idle WAL task', 'review', 1)"
+    )
+    writer.execute(
+        "INSERT INTO task_events (task_id, kind, created_at) VALUES ('t_idle', 'status', 1)"
+    )
+    _insert_notify_sub(writer, "t_idle", "discord", last_event_id=0)
+    writer.commit()
+    writer.close()
+    # Closing the last writer checkpointed and removed the sidecars — the state
+    # the kept-open-writer WAL tests never exercise.
+    assert not db_path.with_name("kanban.db-wal").exists()
+    assert not db_path.with_name("kanban.db-shm").exists()
+
+    board_dir = hermes_home / "kanban" / "boards" / "idle"
+    board_dir.mkdir(parents=True)
+    board_db = board_dir / "kanban.db"
+    board_writer = sqlite3.connect(str(board_db))
+    create_kanban_db_tables(board_writer)
+    assert board_writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    board_writer.execute(
+        "INSERT INTO tasks (id, title, status, created_at) "
+        "VALUES ('b_idle', 'Board task', 'todo', 1)"
+    )
+    board_writer.commit()
+    board_writer.close()
+    assert not board_db.with_name("kanban.db-wal").exists()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    # No sidecars may appear beside either monitored database.
+    assert not db_path.with_name("kanban.db-wal").exists()
+    assert not db_path.with_name("kanban.db-shm").exists()
+    assert not board_db.with_name("kanban.db-wal").exists()
+    assert not board_db.with_name("kanban.db-shm").exists()
+    assert "kanban" not in state.health.failed_sources
+    assert "kanban_notify" not in state.health.failed_sources
+    assert state.kanban.task_count == 1
+    assert state.kanban.status_counts == {"review": 1}
+    assert state.kanban.notify_sub_count == 1
+    boards = {board.slug: board for board in state.kanban.boards}
+    assert boards["idle"].task_count == 1
+
+
 def test_collect_kanban_null_columns_coerced(populated_hermes_home: Path):
     c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
     state = c.collect()
