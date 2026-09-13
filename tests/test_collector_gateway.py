@@ -5,8 +5,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import socket
 import sqlite3
+import tempfile
 import time
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -779,7 +783,7 @@ def _write_heartbeat(home: Path, **extra: object) -> Path:
         "updated_at": _iso(NOW - 30),
         "monotonic": 1234.5,
         "start_time": NOW - 5000,
-        "loop_tick_socket": "/tmp/gw.sock",
+        "loop_tick_socket": True,
         "loop_tick_tcp_port": None,
     }
     payload.update(extra)
@@ -893,7 +897,10 @@ def test_heartbeat_future_timestamp_clamps_to_zero(hermes_home: Path):
         (90.0, "running", GatewayLoopHealth.TICKING),
         (91.0, "running", GatewayLoopHealth.STALE),
         (300.0, "running", GatewayLoopHealth.STALE),
-        (301.0, "running", GatewayLoopHealth.WEDGED),
+        # Armed witness but no node to probe (the default probe finds none in a
+        # bare fixture home): upstream's classify calls that ambiguity, and a
+        # WEDGED verdict now requires sustained witness silence instead.
+        (301.0, "running", GatewayLoopHealth.UNKNOWN),
         (301.0, "stopped", GatewayLoopHealth.STALE),
     ],
 )
@@ -2409,3 +2416,677 @@ def test_a_malformed_ingress_url_fails_closed(hermes_home: Path):
     assert state.gateway.platforms[0].ingress_url == (
         "https://[REDACTED]@[::1/p/dev?api_key=[REDACTED]"
     )
+
+
+# --------------------------------------------------------------------------
+# J. loop-tick witness probe (item: authoritative loop health)
+# --------------------------------------------------------------------------
+
+
+def _write_heartbeat_v2(home: Path, payload: dict[str, object]) -> Path:
+    """Write an exact heartbeat payload (the legacy helper always arms a witness)."""
+    state_dir = home / "state"
+    state_dir.mkdir(exist_ok=True)
+    path = state_dir / "gateway.heartbeat"
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def _collect_probed(home: Path, probe: object, *, live_pid: int = 4242) -> object:
+    collector = Collector(
+        home,
+        pid_exists=lambda pid: pid == live_pid,
+        clock=_clock,
+        loop_tick_probe=probe,  # type: ignore[arg-type]
+    )
+    try:
+        return collector.collect()
+    finally:
+        collector.close()
+
+
+def _armed_heartbeat(age: float, **extra: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "pid": 4242,
+        "updated_at": _iso(NOW - age),
+        "monotonic": 1234.5,
+        "start_time": NOW - 5000,
+        "loop_tick_socket": True,
+        "loop_tick_tcp_port": None,
+    }
+    payload.update(extra)
+    return payload
+
+
+def test_loop_tick_probe_answer_says_alive_even_when_heartbeat_is_stale(hermes_home: Path):
+    """A witness answer is direct loop evidence: a stalled heartbeat write is not a wedge."""
+    probes: list[tuple[int, int | None]] = []
+
+    def probe(pid: int, tcp_port: int | None) -> bool | None:
+        probes.append((pid, tcp_port))
+        return True
+
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(hermes_home, _armed_heartbeat(400.0))
+
+    gateway = _collect_probed(hermes_home, probe).gateway  # type: ignore[attr-defined]
+
+    assert gateway.loop_health is GatewayLoopHealth.ALIVE
+    assert gateway.loop_tick_armed is True
+    assert probes == [(4242, None)]
+
+
+def test_loop_tick_fresh_heartbeat_with_silent_socket_is_unknown(hermes_home: Path):
+    """Fresh heartbeat but a silent witness: an off-loop write can land after a freeze."""
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(hermes_home, _armed_heartbeat(30.0))
+
+    gateway = _collect_probed(hermes_home, lambda pid, tcp_port: False).gateway  # type: ignore[attr-defined]
+
+    assert gateway.loop_health is GatewayLoopHealth.UNKNOWN
+
+
+def test_loop_tick_sustained_silence_escalates_to_wedged(hermes_home: Path):
+    """One silent probe is never evidence; escalation needs silence across refreshes."""
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(hermes_home, _armed_heartbeat(400.0))
+
+    collector = Collector(
+        hermes_home,
+        pid_exists=lambda pid: pid == 4242,
+        clock=_clock,
+        loop_tick_probe=lambda pid, tcp_port: False,  # type: ignore[arg-type,return-value]
+    )
+    try:
+        first = collector.collect().gateway
+        second = collector.collect().gateway
+        third = collector.collect().gateway
+    finally:
+        collector.close()
+
+    assert first.loop_health is GatewayLoopHealth.STALE
+    assert second.loop_health is GatewayLoopHealth.STALE
+    assert third.loop_health is GatewayLoopHealth.WEDGED
+
+
+def test_loop_tick_legacy_heartbeat_staleness_alone_is_proof(hermes_home: Path):
+    """A payload without the witness key is an on-loop writer: stale means wedged."""
+    legacy = {
+        key: value for key, value in _armed_heartbeat(400.0).items() if key != "loop_tick_socket"
+    }
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(hermes_home, legacy)
+
+    gateway = _collect_probed(hermes_home, lambda pid, tcp_port: None).gateway  # type: ignore[attr-defined]
+
+    assert gateway.loop_health is GatewayLoopHealth.LEGACY
+    assert gateway.loop_tick_armed is None
+
+
+def test_loop_tick_witness_absent_node_is_ambiguity_never_a_wedge(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(hermes_home, _armed_heartbeat(400.0))
+
+    collector = Collector(
+        hermes_home,
+        pid_exists=lambda pid: pid == 4242,
+        clock=_clock,
+        loop_tick_probe=lambda pid, tcp_port: None,  # type: ignore[arg-type,return-value]
+    )
+    try:
+        for _ in range(5):
+            gateway = collector.collect().gateway
+    finally:
+        collector.close()
+
+    assert gateway.loop_health is GatewayLoopHealth.UNKNOWN
+
+
+def test_loop_tick_disarmed_witness_never_escalates(hermes_home: Path):
+    """loop_tick_socket: false means the bind failed upstream: staleness is not proof."""
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(hermes_home, _armed_heartbeat(400.0, loop_tick_socket=False))
+
+    collector = Collector(
+        hermes_home,
+        pid_exists=lambda pid: pid == 4242,
+        clock=_clock,
+        loop_tick_probe=lambda pid, tcp_port: False,  # type: ignore[arg-type,return-value]
+    )
+    try:
+        for _ in range(5):
+            gateway = collector.collect().gateway
+    finally:
+        collector.close()
+
+    assert gateway.loop_health is GatewayLoopHealth.UNKNOWN
+    assert gateway.loop_tick_armed is False
+
+
+def test_loop_tick_tcp_port_is_probed_instead_of_the_socket(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(hermes_home, _armed_heartbeat(400.0, loop_tick_tcp_port=5555))
+
+    gateway = _collect_probed(hermes_home, lambda pid, tcp_port: tcp_port == 5555).gateway  # type: ignore[attr-defined]
+
+    assert gateway.loop_health is GatewayLoopHealth.ALIVE
+
+
+def test_loop_tick_heartbeat_pid_mismatch_is_not_evidence(hermes_home: Path):
+    """The socket node is PID-suffixed: never probe a witness another process owns."""
+    probes: list[tuple[int, int | None]] = []
+
+    def probe(pid: int, tcp_port: int | None) -> bool | None:
+        probes.append((pid, tcp_port))
+        return True
+
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(hermes_home, _armed_heartbeat(400.0, pid=999999))
+
+    gateway = _collect_probed(hermes_home, probe).gateway  # type: ignore[attr-defined]
+
+    assert probes == []
+    # Without witness evidence the age-only verdict stands.
+    assert gateway.loop_health is GatewayLoopHealth.WEDGED
+    assert gateway.loop_tick_armed is None
+
+
+def test_loop_tick_stopped_gateway_is_never_probed(hermes_home: Path):
+    probes: list[tuple[int, int | None]] = []
+
+    def probe(pid: int, tcp_port: int | None) -> bool | None:
+        probes.append((pid, tcp_port))
+        return True
+
+    _write_gateway_state(hermes_home, gateway_state="stopped")
+    _write_heartbeat_v2(hermes_home, _armed_heartbeat(400.0))
+
+    gateway = _collect_probed(hermes_home, probe).gateway  # type: ignore[attr-defined]
+
+    assert probes == []
+    assert gateway.loop_health is GatewayLoopHealth.STALE
+
+
+def test_loop_tick_strikes_reset_after_a_witness_answer(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(hermes_home, _armed_heartbeat(400.0))
+    answers: list[bool | None] = [False, False, True, False, False]
+
+    def probe(pid: int, tcp_port: int | None) -> bool | None:
+        return answers.pop(0) if answers else False
+
+    collector = Collector(
+        hermes_home,
+        pid_exists=lambda pid: pid == 4242,
+        clock=_clock,
+        loop_tick_probe=probe,  # type: ignore[arg-type]
+    )
+    try:
+        first = collector.collect().gateway
+        second = collector.collect().gateway
+        third = collector.collect().gateway
+        fourth = collector.collect().gateway
+        fifth = collector.collect().gateway
+    finally:
+        collector.close()
+
+    assert first.loop_health is GatewayLoopHealth.STALE
+    assert second.loop_health is GatewayLoopHealth.STALE
+    assert third.loop_health is GatewayLoopHealth.ALIVE
+    # The strike counter reset on the answer: two fresh silences are not a wedge.
+    assert fourth.loop_health is GatewayLoopHealth.STALE
+    assert fifth.loop_health is GatewayLoopHealth.STALE
+
+
+def _serve_one_byte(listener: socket.socket) -> None:
+    """Accept one connection and send the witness byte, like _tick_socket_handler."""
+    conn, _ = listener.accept()
+    with conn:
+        conn.sendall(b"1")
+
+
+def _short_socket_dir() -> Iterator[Path]:
+    """AF_UNIX node paths are capped at ~104 chars on macOS: keep the dir short."""
+    for parent in (None, "/tmp"):
+        path = Path(tempfile.mkdtemp(prefix="hermesd-lt-", dir=parent))
+        try:
+            probe = path / "probe.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(probe))
+            listener.close()
+            probe.unlink(missing_ok=True)
+            return path
+        except OSError:
+            shutil.rmtree(path, ignore_errors=True)
+    pytest.skip("no usable short AF_UNIX temp directory")
+
+
+@pytest.mark.parametrize("use_tcp", [False, True])
+def test_default_loop_tick_probe_answers_from_a_real_witness(hermes_home: Path, use_tcp: bool):
+    import socket
+    import threading
+
+    from hermesd.collect.gateway import _default_loop_tick_probe
+
+    if use_tcp:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        tcp_port: int | None = listener.getsockname()[1]
+        home = hermes_home
+    else:
+        home = _short_socket_dir()
+        (home / "state").mkdir()
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(home / "state" / "gateway.loop-tick.4242.sock"))
+        listener.listen(1)
+        tcp_port = None
+    try:
+        watcher = threading.Thread(target=_serve_one_byte, args=(listener,), daemon=True)
+        watcher.start()
+        assert _default_loop_tick_probe(4242, tcp_port, home) is True
+        watcher.join(timeout=5)
+        # No node / invalid port / silent witness are all "no evidence" or "silent".
+        assert _default_loop_tick_probe(999999, None, home) is None
+        assert _default_loop_tick_probe(4242, 0, home) is None
+        assert _default_loop_tick_probe(4242, 70000, home) is None
+        assert _default_loop_tick_probe(4242, None, hermes_home) is None
+    finally:
+        listener.close()
+        if not use_tcp:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+def test_default_loop_tick_probe_silent_witness_is_false(hermes_home: Path):
+    import socket
+
+    from hermesd.collect.gateway import _default_loop_tick_probe
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    try:
+        # A listening witness that never answers reads as silent, not absent.
+        assert _default_loop_tick_probe(4242, port, hermes_home) is False
+    finally:
+        listener.close()
+
+
+def test_default_loop_tick_probe_never_writes_to_the_home(hermes_home: Path):
+    from hermesd.collect.gateway import _default_loop_tick_probe
+
+    before = sorted(str(p) for p in hermes_home.rglob("*"))
+    _default_loop_tick_probe(4242, None, hermes_home)
+    after = sorted(str(p) for p in hermes_home.rglob("*"))
+
+    assert before == after
+
+
+# --------------------------------------------------------------------------
+# K. lifecycle OOM + unclean-exit carry flags
+# --------------------------------------------------------------------------
+
+
+def test_lifecycle_carries_prior_unclean_exit_and_oom_flags(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_lifecycle(
+        hermes_home,
+        phase="running",
+        pid=4242,
+        prior_unclean_exit=True,
+        prior_suspected_oom=True,
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.prior_unclean_exit is True
+    assert gateway.prior_suspected_oom is True
+
+
+def test_lifecycle_oom_flags_absent_on_clean_records(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_lifecycle(hermes_home)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.prior_unclean_exit is False
+    assert gateway.prior_suspected_oom is False
+
+
+def test_lifecycle_oom_flags_ignore_non_boolean_junk(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_lifecycle(
+        hermes_home,
+        phase="running",
+        pid=4242,
+        prior_unclean_exit="yes",
+        prior_suspected_oom=1,
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.prior_unclean_exit is False
+    assert gateway.prior_suspected_oom is False
+
+
+# --------------------------------------------------------------------------
+# L. restart-storm ledger (gateway-starts.log)
+# --------------------------------------------------------------------------
+
+
+def _write_starts_log(home: Path, epochs: list[float]) -> Path:
+    path = home / "gateway-starts.log"
+    path.write_text("".join(f"{epoch!r}\n" for epoch in epochs))
+    return path
+
+
+def test_restart_storm_counts_window_and_cap(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_starts_log(
+        hermes_home,
+        [NOW - 30, NOW - 60, NOW - 400, NOW - 3600, NOW - 7200, NOW - 100000],
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.gateway_starts_recorded is True
+    assert gateway.gateway_starts_2m == 2
+    assert gateway.gateway_starts_1h == 4
+    assert gateway.seconds_since_last_gateway_start == pytest.approx(30.0)
+    assert gateway.in_respawn_backoff is False
+    assert gateway.restart_storm_cap == 5
+
+
+def test_restart_storm_backoff_when_cap_is_exceeded(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_starts_log(hermes_home, [NOW - 10 * i for i in range(1, 7)])
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.gateway_starts_2m == 6
+    assert gateway.in_respawn_backoff is True
+
+
+def test_restart_storm_absent_file_is_not_evidence_of_zero_restarts(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.gateway_starts_recorded is False
+    assert gateway.gateway_starts_2m == 0
+    assert gateway.in_respawn_backoff is False
+
+
+def test_restart_storm_garbage_and_future_lines_are_ignored(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    path = hermes_home / "gateway-starts.log"
+    path.write_text(f"{NOW - 30!r}\nnot-a-float\n{NOW + 5000!r}\n{NOW - 60!r}\n\n")
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.gateway_starts_recorded is True
+    assert gateway.gateway_starts_2m == 2
+    assert gateway.seconds_since_last_gateway_start == pytest.approx(30.0)
+
+
+def test_restart_storm_empty_file_records_nothing(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    (hermes_home / "gateway-starts.log").write_text("")
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.gateway_starts_recorded is True
+    assert gateway.gateway_starts_2m == 0
+    assert gateway.seconds_since_last_gateway_start is None
+
+
+# --------------------------------------------------------------------------
+# M. dashboard client attachment marker
+# --------------------------------------------------------------------------
+
+
+def _touch_client_heartbeat(home: Path, age: float | None) -> Path | None:
+    path = home / "state" / "dashboard_clients.heartbeat"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
+    os.utime(path, (NOW - age, NOW - age) if age is not None else None)
+    return path
+
+
+def test_dashboard_client_attached_when_marker_is_fresh(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _touch_client_heartbeat(hermes_home, 10.0)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.dashboard_client_attached is True
+    assert gateway.dashboard_client_last_frame_age_seconds == pytest.approx(10.0)
+
+
+def test_dashboard_client_stale_marker_keeps_age_but_not_attached(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _touch_client_heartbeat(hermes_home, 600.0)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.dashboard_client_attached is False
+    assert gateway.dashboard_client_last_frame_age_seconds == pytest.approx(600.0)
+
+
+def test_dashboard_client_missing_marker_means_never(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.dashboard_client_attached is False
+    assert gateway.dashboard_client_last_frame_age_seconds is None
+
+
+def test_dashboard_client_future_mtime_clamps_to_now(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    path = hermes_home / "state" / "dashboard_clients.heartbeat"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
+    os.utime(path, (NOW + 5000, NOW + 5000))
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.dashboard_client_last_frame_age_seconds == 0.0
+    assert gateway.dashboard_client_attached is True
+
+
+# --------------------------------------------------------------------------
+# N. exit diagnostics ledger (logs/gateway-exit-diag.log + companions)
+# --------------------------------------------------------------------------
+
+
+def _write_exit_diag(home: Path, records: list[dict[str, object]]) -> Path:
+    logs = home / "logs"
+    logs.mkdir(exist_ok=True)
+    path = logs / "gateway-exit-diag.log"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    return path
+
+
+def test_exit_diag_last_tag_age_and_unclean_count(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_exit_diag(
+        hermes_home,
+        [
+            {"ts": _iso(NOW - 7200), "tag": "gateway.previous_unclean_exit", "pid": 9},
+            {"ts": _iso(NOW - 60), "tag": "gateway.asyncio_main_return", "pid": 10},
+            {"ts": _iso(NOW - 30), "tag": "gateway.previous_unclean_exit", "pid": 11},
+        ],
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.exit_diag_recorded is True
+    assert gateway.exit_diag_last_tag == "gateway.previous_unclean_exit"
+    assert gateway.exit_diag_last_age_seconds == pytest.approx(30.0)
+    assert gateway.exit_diag_unclean_24h == 2
+    assert gateway.exit_diag_size_bytes > 0
+    assert gateway.exit_diag_oversized is False
+
+
+def test_exit_diag_absent_file_is_not_evidence_of_clean_exits(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.exit_diag_recorded is False
+    assert gateway.exit_diag_last_tag == ""
+    assert gateway.exit_diag_unclean_24h == 0
+
+
+def test_exit_diag_oversized_file_warns(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    path = hermes_home / "logs" / "gateway-exit-diag.log"
+    path.write_text("x" * (2 * 1024 * 1024 + 1))
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.exit_diag_oversized is True
+    assert gateway.exit_diag_size_bytes == 2 * 1024 * 1024 + 1
+
+
+def test_exit_diag_tail_reads_only_the_cap(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    path = _write_exit_diag(
+        hermes_home,
+        [
+            {"ts": _iso(NOW - 60), "tag": "gateway.previous_unclean_exit", "pid": 9},
+        ],
+    )
+    path.write_text(
+        path.read_text()
+        + json.dumps({"ts": _iso(NOW - 30), "tag": "gateway.asyncio_main_return", "pid": 10})
+        + "\n"
+    )
+
+    collector = Collector(
+        hermes_home, pid_exists=lambda pid: pid == 4242, clock=_clock, log_tail_bytes=96
+    )
+    try:
+        gateway = collector.collect().gateway
+    finally:
+        collector.close()
+
+    # The unclean record fell out of the tiny tail window: only the visible
+    # records are counted, never the whole unbounded file.
+    assert gateway.exit_diag_last_tag == "gateway.asyncio_main_return"
+    assert gateway.exit_diag_unclean_24h == 0
+
+
+def test_exit_diag_junk_lines_are_ignored(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    logs = hermes_home / "logs"
+    logs.mkdir(exist_ok=True)
+    (logs / "gateway-exit-diag.log").write_text(
+        "not json\n"
+        + json.dumps({"ts": "junk", "tag": "gateway.asyncio_main_return"})
+        + "\n"
+        + json.dumps({"ts": _iso(NOW - 45), "tag": "x" * 500, "traceback": "secret"})
+        + "\n"
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.exit_diag_last_tag == "x" * 120
+    assert gateway.exit_diag_last_age_seconds == pytest.approx(45.0)
+    assert "secret" not in json.dumps(gateway.model_dump(mode="json"))
+
+
+def test_forensic_companion_files_reported_when_present(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    logs = hermes_home / "logs"
+    logs.mkdir(exist_ok=True)
+    shutdown = logs / "gateway-shutdown-diag.log"
+    shutdown.write_text("signal block")
+    os.utime(shutdown, (NOW - 600, NOW - 600))
+    fault = logs / "gateway_faulthandler.log"
+    fault.write_text("z" * 2048)
+    os.utime(fault, (NOW - 7200, NOW - 7200))
+
+    gateway = _collect(hermes_home).gateway
+
+    names = {entry.name: entry for entry in gateway.forensic_files}
+    assert set(names) == {"gateway-shutdown-diag.log", "gateway_faulthandler.log"}
+    assert names["gateway-shutdown-diag.log"].size_bytes == len("signal block")
+    assert names["gateway-shutdown-diag.log"].age_seconds == pytest.approx(600.0)
+    assert names["gateway_faulthandler.log"].size_bytes == 2048
+    assert "launchd-reload.log" not in names
+
+
+# --------------------------------------------------------------------------
+# O. shared-listener mirror URLs (listener_base on default-profile entries)
+# --------------------------------------------------------------------------
+
+
+def test_listener_base_mirrors_are_synthesized_for_served_profiles(hermes_home: Path):
+    _write_gateway_state(
+        hermes_home,
+        served_profiles=["dev", "default"],
+        platforms={
+            "api_server": {"state": "connected", "listener_base": "http://127.0.0.1:8088"},
+            "webhook": {"state": "connected", "listener_base": "http://127.0.0.1:8089"},
+            "telegram": {"state": "connected", "listener_base": "http://127.0.0.1:9000"},
+        },
+    )
+
+    platforms = {p.name: p for p in _collect(hermes_home).gateway.platforms}
+
+    assert platforms["api_server"].mirror_urls == {"dev": "http://127.0.0.1:8088/p/dev/v1"}
+    assert platforms["webhook"].mirror_urls == {
+        "dev": "http://127.0.0.1:8089/p/dev/webhooks/<route>"
+    }
+    # Not a port binder: never mirrored.
+    assert platforms["telegram"].mirror_urls == {}
+
+
+def test_listener_base_mirrors_need_a_live_writer_and_a_serving_state(hermes_home: Path):
+    _write_gateway_state(
+        hermes_home,
+        served_profiles=["dev"],
+        pid=999_999_999,
+        platforms={
+            "api_server": {"state": "connected", "listener_base": "http://127.0.0.1:8088"},
+        },
+    )
+    assert _collect(hermes_home).gateway.platforms[0].mirror_urls == {}
+
+    _write_gateway_state(
+        hermes_home,
+        served_profiles=["dev"],
+        platforms={
+            "api_server": {"state": "fatal", "listener_base": "http://127.0.0.1:8088"},
+        },
+    )
+    assert _collect(hermes_home).gateway.platforms[0].mirror_urls == {}
+
+    _write_gateway_state(
+        hermes_home,
+        platforms={
+            "api_server": {"state": "connected", "listener_base": "http://127.0.0.1:8088"},
+        },
+    )
+    assert _collect(hermes_home).gateway.platforms[0].mirror_urls == {}
+
+
+def test_listener_base_mirrors_are_redacted(hermes_home: Path):
+    _write_gateway_state(
+        hermes_home,
+        served_profiles=["dev"],
+        platforms={
+            "api_server": {
+                "state": "connected",
+                "listener_base": "http://bob:hunter2@127.0.0.1:8088",
+            },
+        },
+    )
+
+    platform = _collect(hermes_home).gateway.platforms[0]
+
+    assert "hunter2" not in json.dumps(platform.model_dump(mode="json"))
+    assert platform.mirror_urls["dev"].startswith("http://[REDACTED]@127.0.0.1:8088/p/dev/v1")

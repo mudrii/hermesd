@@ -61,12 +61,38 @@ def _remaining_seconds(deadline: float | None, now: float) -> float | None:
 
 
 class GatewayLoopHealth(StrEnum):
-    """Event-loop liveness derived from the gateway watchdog heartbeat."""
+    """Event-loop liveness for the gateway, heartbeat age refined by the loop-tick witness.
 
+    The heartbeat file is rewritten off-loop since #90502, so freshness alone no longer
+    proves the loop dispatches. When the heartbeat advertises a witness
+    (``loop_tick_socket``), one probe of that witness is direct evidence and the
+    verdict upgrades to :attr:`ALIVE` (answered) or escalates to :attr:`WEDGED`
+    (stale heartbeat plus witness silence sustained across refreshes). A stale
+    heartbeat from a writer that predates the witness key is :attr:`LEGACY`:
+    an on-loop writer, so staleness alone is proof.
+    """
+
+    ALIVE = "alive"
     TICKING = "ticking"
     STALE = "stale"
     WEDGED = "wedged"
+    # Stale heartbeat from a gateway old enough to predate ``loop_tick_socket``:
+    # the heartbeat was written on-loop, so its age is direct (absence of) evidence.
+    LEGACY = "legacy"
     UNKNOWN = "unknown"
+
+
+class ForensicFile(BaseModel):
+    """An event-only diagnostics file: presence metadata, contents never read.
+
+    Upstream appends to these only on signal shutdowns, freeze dumps or supervisor
+    reloads, and nothing prunes them, so absence is the healthy state and growth
+    is the signal worth surfacing.
+    """
+
+    name: str
+    size_bytes: int = 0
+    age_seconds: float | None = None
 
 
 class PlatformOwnership(StrEnum):
@@ -104,6 +130,11 @@ class PlatformStatus(BaseModel):
     needs_attention: bool = False
     retrying_since: str = ""
     retrying_since_age_seconds: float | None = None
+    # Per-served-profile mirror URLs synthesized from this port-binder's
+    # listener_base (``<listener_base>/p/<profile><mirror_path>``,
+    # gateway/status.py:951-974), where a client reaches the profile on the
+    # default listener. Empty unless the writer is live and the adapter serves.
+    mirror_urls: dict[str, str] = Field(default_factory=dict)
     # Per-entry writer provenance. Absent on a gateway that predates the stamps,
     # which is why ownership defaults to unverifiable rather than current.
     writer_pid: int | None = None
@@ -173,11 +204,47 @@ class GatewayState(BaseModel):
     # Event-loop liveness (state/gateway.heartbeat)
     heartbeat_age_seconds: float | None = None
     loop_health: GatewayLoopHealth = GatewayLoopHealth.UNKNOWN
+    # Witness armed on the heartbeat that produced loop_health: True when the
+    # payload advertised ``loop_tick_socket`` truthy, False when it wrote the key
+    # with any other value (the witness could not be armed), and None when the
+    # payload predates the key (a legacy on-loop writer) or no verdict was made.
+    loop_tick_armed: bool | None = None
     # Lifecycle (state/gateway.lifecycle.json)
     lifecycle_phase: str = ""
     last_exit_code: int | None = None
     last_exit_reason: str = ""
     unclean_previous_exit: bool = False
+    # Carry flags from the running record (gateway/lifecycle_ledger.py record_startup):
+    # the verdict on the *previous* life, stamped onto this life's sentinel. Strict
+    # booleans upstream; any other value means the key was never really written.
+    prior_unclean_exit: bool = False
+    prior_suspected_oom: bool = False
+    # Respawn-storm ledger (gateway-starts.log). The file records one epoch per
+    # start; an absent file is NOT evidence of zero restarts, because
+    # HERMES_GATEWAY_MAX_STARTS<=0 disables the writer.
+    gateway_starts_recorded: bool = False
+    gateway_starts_2m: int = 0
+    gateway_starts_1h: int = 0
+    restart_storm_cap: int = 0
+    seconds_since_last_gateway_start: float | None = None
+    in_respawn_backoff: bool = False
+    # Exit diagnostics ledger (logs/gateway-exit-diag.log): one JSON object per
+    # asyncio.run() return path plus one gateway.previous_unclean_exit per unclean
+    # boot. Nothing prunes it upstream; HERMES_GATEWAY_EXIT_DIAG=0 disables the
+    # writer, so an absent file is no evidence of clean exits.
+    exit_diag_recorded: bool = False
+    exit_diag_last_tag: str = ""
+    exit_diag_last_age_seconds: float | None = None
+    exit_diag_unclean_24h: int = 0
+    exit_diag_size_bytes: int = 0
+    exit_diag_oversized: bool = False
+    # Event-only companion logs (shutdown blocks, freeze dumps, supervisor
+    # reloads): metadata only, present files only.
+    forensic_files: list[ForensicFile] = Field(default_factory=list)
+    # Web dashboard client attachment (state/dashboard_clients.heartbeat): a
+    # 0-byte marker whose mtime is the whole payload. Absent means never, not idle.
+    dashboard_client_attached: bool = False
+    dashboard_client_last_frame_age_seconds: float | None = None
     # Code and config identity (gateway_state.json)
     code_sha: str = ""
     code_version: str = ""

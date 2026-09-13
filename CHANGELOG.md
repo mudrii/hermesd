@@ -7,6 +7,12 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ## [Unreleased]
 
+### Added
+
+- Gateway panel (1) now probes the loop-tick witness socket (`state/gateway.loop-tick.<pid>.sock`, or its 127.0.0.1 TCP port on Windows) and shows an authoritative `alive` badge when the gateway's own loop answers — the heartbeat file has been written off-loop since #90502, so freshness alone no longer proves the loop dispatches. Escalation to `wedged` requires silence across consecutive probes plus a stale heartbeat, mirroring upstream's sustained window; a heartbeat that predates the witness key renders as `legacy heartbeat`, where staleness alone is evidence. The detail view explains which witness decided the verdict.
+- Gateway panel (1) shows crash forensics: `previous exit unclean` and `suspected OOM` carry flags from the lifecycle sentinel, the respawn-storm ledger (`gateway-starts.log`) as starts-per-2-minutes against the cap with a `respawn backoff` badge, the tail of the `gateway-exit-diag.log` crash ledger (last exit tag, unclean exits in 24h, size with an oversized warning — upstream never prunes it), and stat-only metadata for the event-only companion logs (`gateway-shutdown-diag.log`, `gateway_faulthandler.log`, `launchd-reload.log`), where growth, not absence, is the signal.
+- Gateway panel (1) shows web-dashboard attachment from the `state/dashboard_clients.heartbeat` marker (mtime only; a `web client` chip when one attached in the last minute), respawn-storm counts, and per-served-profile mirror URLs synthesized from the default profile's `listener_base` (`Inbound callback URLs on the shared listener`), redacted and suppressed exactly like recorded ingress URLs.
+
 ### CI/CD
 
 - Hardened the whole pipeline per the consolidated CI/CD audit. Nix now proves buildability: the flake derives its version from `pyproject.toml` (single source of truth), declares `checks` outputs that build the package, run its pytest suite, and smoke the installed CLI, and CI builds `.#hermesd` on Linux and macOS instead of merely evaluating. Published runtime requirements are exact pins matching `uv.lock` (`rich==14.3.3`, `pyyaml==6.0.3`, `pydantic==2.13.4`), enforced against wheel metadata by `scripts/check_wheel_pins.py`; the pydantic upgrade itself was validated on hermesd's own full Python 3.11–3.14 matrix, mypy, and snapshot/threading surfaces before landing (decision and evidence in `docs/dependency-decisions.md`).

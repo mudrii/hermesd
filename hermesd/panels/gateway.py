@@ -47,6 +47,8 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         lines.append("Stopped", style=theme.banner_text)
     lines.append("  loop:", style=theme.ui_label)
     lines.append(gw.loop_health.value, style=_loop_style(gw.loop_health, theme))
+    if gw.dashboard_client_attached:
+        lines.append("  ⌁ web client", style=theme.ui_accent)
 
     if gw.hermes_version:
         lines.append(f"  v{sanitize_terminal_text(gw.hermes_version)}", style=theme.banner_dim)
@@ -159,15 +161,37 @@ def _ingress_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
     upstream suppresses (dead gateway, falsy value, fatal/disconnected/stopped
     adapter) and redacted credentials, so the panel renders the value as stored.
     """
+    mirror_rows = [
+        (profile, url, platform.name)
+        for platform in gw.platforms
+        for profile, url in platform.mirror_urls.items()
+    ]
     entries = [platform for platform in gw.platforms if platform.ingress_url]
-    if not entries:
+    if not entries and not mirror_rows:
         return []
+    sections: list[RenderableType] = []
+    if mirror_rows:
+        mirrors = Text()
+        mirrors.append(
+            "\nInbound callback URLs on the shared listener\n", style=f"bold {theme.ui_label}"
+        )
+        mirrors.append(
+            "  synthesized from the default profile's live listener — hermesd never requests these\n",
+            style=theme.banner_dim,
+        )
+        for profile, url, platform_name in mirror_rows:
+            mirrors.append(f"  {escape(platform_name)} / {escape(profile)}: ", style=theme.ui_label)
+            mirrors.append(f"{escape(url)}\n", style=theme.banner_text)
+        sections.append(mirrors)
+    if not entries:
+        return sections
     header = Text()
     header.append("\nShared-Listener Ingress\n", style=f"bold {theme.ui_label}")
     header.append(
         "  recorded by the gateway — hermesd never requests these URLs\n",
         style=theme.banner_dim,
     )
+    sections.append(header)
     table = Table(box=None, show_header=True, padding=(0, 2))
     table.add_column("Profile", style=theme.ui_label)
     table.add_column("Platform", style=theme.banner_text)
@@ -178,7 +202,7 @@ def _ingress_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
             escape(platform.name),
             escape(platform.ingress_url),
         )
-    sections: list[RenderableType] = [header, table]
+    sections.append(table)
     if any(platform.ingress_url_is_path_only for platform in entries):
         sections.append(
             Text(
@@ -270,11 +294,86 @@ def _append_served_profiles(header: Text, gw: GatewayState, theme: Theme) -> Non
 
 def _loop_style(loop_health: GatewayLoopHealth, theme: Theme) -> str:
     return {
+        GatewayLoopHealth.ALIVE: theme.ui_ok,
         GatewayLoopHealth.TICKING: theme.ui_ok,
         GatewayLoopHealth.STALE: theme.ui_warn,
         GatewayLoopHealth.WEDGED: theme.ui_error,
+        # A legacy heartbeat that aged out is the same absence of on-loop evidence
+        # as a wedge, just from a gateway too old to carry the witness key.
+        GatewayLoopHealth.LEGACY: theme.ui_error,
         GatewayLoopHealth.UNKNOWN: theme.banner_dim,
     }[loop_health]
+
+
+def _witness_label(gw: GatewayState, theme: Theme) -> Text:
+    """Why the loop verdict is what it is, in one bounded line.
+
+    The witness (``state/gateway.loop-tick.<pid>.sock`` or a 127.0.0.1 TCP port) is
+    served by the gateway loop itself, so its answer is the only direct evidence
+    that the loop dispatches; the heartbeat file is written off-loop and can go
+    stale or fresh independently of the loop. A LEGACY verdict means the heartbeat
+    predates the witness key entirely: the writer was on-loop, so staleness alone
+    is proof the loop stopped.
+    """
+    label = Text("  Witness: ", style=theme.ui_label)
+    if gw.loop_health is GatewayLoopHealth.ALIVE:
+        label.append("loop-tick witness answered", style=theme.ui_ok)
+    elif gw.loop_health is GatewayLoopHealth.WEDGED:
+        label.append("witness silent across probes", style=theme.ui_error)
+    elif gw.loop_health is GatewayLoopHealth.LEGACY:
+        label.append(
+            "legacy heartbeat — no witness key, staleness alone is evidence",
+            style=theme.ui_error,
+        )
+    elif gw.loop_tick_armed is True:
+        label.append("witness silent or no node (ambiguity)", style=theme.banner_dim)
+    elif gw.loop_tick_armed is False:
+        label.append("witness not armed (off-loop heartbeat only)", style=theme.banner_dim)
+    else:
+        label.append("—", style=theme.banner_dim)
+    return label
+
+
+def _restart_storm_text(gw: GatewayState, theme: Theme) -> Text:
+    """Start-ledger facts; an absent ledger is never rendered as zero restarts.
+
+    ``gateway-starts.log`` is written by the gateway itself as a ring of epochs.
+    ``HERMES_GATEWAY_MAX_STARTS<=0`` disables the writer upstream, so a missing
+    file proves nothing either way and the line is omitted.
+    """
+    text = Text()
+    text.append("  Starts: ", style=theme.ui_label)
+    text.append(
+        f"2m {gw.gateway_starts_2m}/{gw.restart_storm_cap}  1h {gw.gateway_starts_1h}",
+        style=theme.banner_text,
+    )
+    last = gw.seconds_since_last_gateway_start
+    if last is not None:
+        text.append(f"  last start {_duration_label(last)} ago", style=theme.banner_dim)
+    if gw.in_respawn_backoff:
+        text.append(
+            "  ⚠ respawn backoff (the supervisor pauses between restarts)",
+            style=theme.ui_warn,
+        )
+    return text
+
+
+def _dashboard_client_text(gw: GatewayState, theme: Theme) -> Text:
+    """Web dashboard attachment from the marker file's mtime; absent means never."""
+    text = Text("  Web client: ", style=theme.ui_label)
+    age = gw.dashboard_client_last_frame_age_seconds
+    if gw.dashboard_client_attached:
+        text.append("web dashboard client attached", style=theme.ui_ok)
+        if age is not None:
+            text.append(f"  last frame {_duration_label(age)} ago", style=theme.banner_dim)
+    elif age is not None:
+        text.append(
+            f"no client attached (last frame {_duration_label(age)} ago)",
+            style=theme.banner_dim,
+        )
+    else:
+        text.append("no dashboard client marker (never attached)", style=theme.banner_dim)
+    return text
 
 
 def _duration_label(seconds: float | None) -> str:
@@ -310,6 +409,14 @@ def _append_compact_warnings(lines: Text, state: DashboardState, theme: Theme) -
     preserved = sum(1 for p in gw.platforms if p.ownership is PlatformOwnership.PRESERVED)
     if preserved:
         warnings.append(f"⚠ {preserved} platform record(s) outlived their writer")
+    if gw.prior_unclean_exit:
+        warnings.append("⚠ previous exit unclean")
+    if gw.exit_diag_oversized:
+        warnings.append("⚠ exit-diag log oversized")
+    if gw.prior_suspected_oom:
+        warnings.append("⚠ suspected OOM")
+    if gw.in_respawn_backoff:
+        warnings.append("⚠ respawn backoff")
     if warnings:
         lines.append("\n  " + escape("  ".join(warnings)), style=theme.ui_warn)
     if gw.pending_delivery_count or gw.failed_delivery_count:
@@ -330,6 +437,10 @@ def _liveness_text(gw: GatewayState, theme: Theme) -> Text:
         f"  uptime {_duration_label(gw.current_incarnation_uptime_seconds)}",
         style=theme.banner_dim,
     )
+    text.append_text(_witness_label(gw, theme))
+    if gw.gateway_starts_recorded:
+        text.append_text(_restart_storm_text(gw, theme))
+    text.append_text(_dashboard_client_text(gw, theme))
     text.append("\n  Code: ", style=theme.ui_label)
     text.append(_or_dash(gw.code_version), style=theme.banner_text)
     text.append(
@@ -341,6 +452,8 @@ def _liveness_text(gw: GatewayState, theme: Theme) -> Text:
     if gw.config_stale:
         text.append("\n  ⚠ config changed, restart needed", style=theme.ui_warn)
     _append_lifecycle(text, gw, theme)
+    text.append_text(_exit_diag_text(gw, theme))
+    text.append_text(_forensic_files_text(gw, theme))
     text.append("\n")
     return text
 
@@ -357,6 +470,67 @@ def _append_lifecycle(text: Text, gw: GatewayState, theme: Theme) -> None:
             "\n  ⚠ previous gateway life ended without recording an exit",
             style=theme.ui_warn,
         )
+    if gw.prior_unclean_exit:
+        text.append("\n  ⚠ previous exit unclean", style=theme.ui_warn)
+    if gw.prior_suspected_oom:
+        text.append("\n  ⚠ suspected OOM", style=theme.ui_warn)
+
+
+def _size_label(size_bytes: int) -> str:
+    if size_bytes >= 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    if size_bytes >= 1024:
+        return f"{size_bytes / 1024:.0f} KB"
+    return f"{size_bytes} B"
+
+
+def _exit_diag_text(gw: GatewayState, theme: Theme) -> Text:
+    """Crash forensics from the exit-diag ledger: tags and counts only.
+
+    Upstream appends one record per ``asyncio.run()`` return path and one
+    ``gateway.previous_unclean_exit`` per unclean boot, and never prunes the
+    file — so size is health information, not bookkeeping. ``HERMES_GATEWAY_EXIT_DIAG=0``
+    disables the writer, which is why an absent ledger reads as "no evidence"
+    rather than "clean".
+    """
+    text = Text("  Exit diagnostics: ", style=theme.ui_label)
+    if not gw.exit_diag_recorded:
+        text.append("no exit-diag ledger (writer may be disabled)", style=theme.banner_dim)
+        return text
+    text.append(_or_dash(gw.exit_diag_last_tag), style=theme.banner_text)
+    if gw.exit_diag_last_age_seconds is not None:
+        text.append(
+            f"  {_duration_label(gw.exit_diag_last_age_seconds)} ago",
+            style=theme.banner_dim,
+        )
+    text.append(f"  unclean exits 24h: {gw.exit_diag_unclean_24h}", style=theme.banner_dim)
+    text.append(f"  ledger {_size_label(gw.exit_diag_size_bytes)}", style=theme.banner_dim)
+    if gw.exit_diag_oversized:
+        text.append(
+            "  ⚠ past a few MB and nothing prunes it",
+            style=theme.ui_warn,
+        )
+    return text
+
+
+def _forensic_files_text(gw: GatewayState, theme: Theme) -> Text:
+    """Event-only companion logs; growth — never absence — is the signal."""
+    if not gw.forensic_files:
+        return Text()
+    text = Text("  Event logs: ", style=theme.ui_label)
+    parts = [
+        f"{escape(file.name)} ({_size_label(file.size_bytes)}, "
+        f"{_duration_label(file.age_seconds)} ago)"
+        if file.age_seconds is not None
+        else f"{escape(file.name)} ({_size_label(file.size_bytes)})"
+        for file in gw.forensic_files
+    ]
+    text.append("; ".join(parts), style=theme.banner_dim)
+    text.append(
+        "  growth, not absence, is the signal",
+        style=theme.banner_dim,
+    )
+    return text
 
 
 def _updates_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:

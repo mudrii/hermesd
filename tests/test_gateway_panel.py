@@ -7,6 +7,7 @@ import pytest
 from hermesd.models import (
     DashboardState,
     DeliveryObligationSummary,
+    ForensicFile,
     GatewayLoopHealth,
     GatewayState,
     MigrationProfileRecord,
@@ -740,3 +741,157 @@ def test_gateway_detail_survives_markup_hostile_migration_values() -> None:
 
     assert "\x1b[2J" not in rendered
     assert "[/] boom" in rendered
+
+
+def test_gateway_compact_renders_alive_and_legacy_loop_badges() -> None:
+    alive = _liveness_state(loop_health=GatewayLoopHealth.ALIVE, loop_tick_armed=True)
+    rendered = render_to_str(render_gateway(alive, Theme()), width=200, no_color=True)
+    assert "loop:alive" in rendered.replace(" ", "")
+
+    legacy = _liveness_state(
+        loop_health=GatewayLoopHealth.LEGACY,
+        loop_tick_armed=None,
+        heartbeat_age_seconds=400.0,
+    )
+    rendered = render_to_str(render_gateway(legacy, Theme()), width=200, no_color=True)
+    assert "legacy" in rendered
+
+
+def test_gateway_detail_explains_the_loop_witness() -> None:
+    state = _liveness_state(loop_health=GatewayLoopHealth.ALIVE, loop_tick_armed=True)
+    rendered = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+    assert "witness answered" in rendered
+
+    legacy = _liveness_state(loop_health=GatewayLoopHealth.LEGACY, loop_tick_armed=None)
+    rendered = render_to_str(render_gateway(legacy, Theme(), detail=True), width=200, no_color=True)
+    assert "legacy heartbeat" in rendered
+    assert "staleness alone" in rendered
+
+
+def test_gateway_renders_lifecycle_carry_flags() -> None:
+    state = _liveness_state(prior_unclean_exit=True, prior_suspected_oom=True)
+    compact = render_to_str(render_gateway(state, Theme()), width=200, no_color=True)
+    detail = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+    assert "previous exit unclean" in compact
+    assert "suspected OOM" in compact
+    assert "previous exit unclean" in detail
+    assert "suspected OOM" in detail
+
+
+def test_gateway_renders_restart_storm_line_and_backoff() -> None:
+    state = _liveness_state(
+        gateway_starts_recorded=True,
+        gateway_starts_2m=2,
+        gateway_starts_1h=9,
+        restart_storm_cap=5,
+        seconds_since_last_gateway_start=45.0,
+    )
+    detail = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+    assert "2m 2/5" in detail
+    assert "1h 9" in detail
+    assert "last start 45s ago" in detail
+
+    storm = _liveness_state(
+        gateway_starts_recorded=True,
+        gateway_starts_2m=6,
+        gateway_starts_1h=11,
+        restart_storm_cap=5,
+        seconds_since_last_gateway_start=12.0,
+        in_respawn_backoff=True,
+    )
+    compact = render_to_str(render_gateway(storm, Theme()), width=200, no_color=True)
+    detail = render_to_str(render_gateway(storm, Theme(), detail=True), width=200, no_color=True)
+    assert "respawn backoff" in compact
+    assert "2m 6/5" in detail
+    assert "respawn backoff" in detail
+
+
+def test_gateway_compact_hides_restart_line_when_no_ledger() -> None:
+    state = _liveness_state(gateway_starts_recorded=False)
+    rendered = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+    assert "Starts:" not in rendered
+
+
+def test_gateway_renders_dashboard_client_attachment() -> None:
+    attached = _liveness_state(
+        dashboard_client_attached=True,
+        dashboard_client_last_frame_age_seconds=8.0,
+    )
+    compact = render_to_str(render_gateway(attached, Theme()), width=200, no_color=True)
+    detail = render_to_str(render_gateway(attached, Theme(), detail=True), width=200, no_color=True)
+    assert "web client" in compact
+    assert "web dashboard client attached" in detail
+    assert "last frame 8s ago" in detail
+
+    never = _liveness_state(
+        dashboard_client_attached=False,
+        dashboard_client_last_frame_age_seconds=None,
+    )
+    detail = render_to_str(render_gateway(never, Theme(), detail=True), width=200, no_color=True)
+    assert "no dashboard client marker" in detail
+
+
+def test_gateway_renders_exit_diagnostics_ledger() -> None:
+    state = _liveness_state(
+        exit_diag_recorded=True,
+        exit_diag_last_tag="gateway.asyncio_main_return",
+        exit_diag_last_age_seconds=90.0,
+        exit_diag_unclean_24h=2,
+        exit_diag_size_bytes=2048,
+    )
+    detail = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+    assert "Exit diagnostics:" in detail
+    assert "gateway.asyncio_main_return" in detail
+    assert "unclean exits 24h: 2" in detail
+    assert "oversized" not in detail
+
+    oversized = _liveness_state(
+        exit_diag_recorded=True,
+        exit_diag_last_tag="t",
+        exit_diag_size_bytes=3 * 1024 * 1024,
+        exit_diag_oversized=True,
+    )
+    detail = render_to_str(
+        render_gateway(oversized, Theme(), detail=True), width=200, no_color=True
+    )
+    assert "nothing prunes it" in detail
+    compact = render_to_str(render_gateway(oversized, Theme()), no_color=True)
+    assert "exit-diag log oversized" in compact
+
+
+def test_gateway_renders_missing_exit_ledger_as_no_evidence() -> None:
+    state = _liveness_state(exit_diag_recorded=False)
+    detail = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+    assert "no exit-diag ledger" in detail
+
+
+def test_gateway_renders_forensic_companion_files() -> None:
+    state = _liveness_state(
+        exit_diag_recorded=True,
+        forensic_files=[
+            ForensicFile(name="gateway_faulthandler.log", size_bytes=4096, age_seconds=3600.0),
+        ],
+    )
+    detail = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+    assert "gateway_faulthandler.log" in detail
+    assert "growth, not absence, is the signal" in detail
+
+
+def test_gateway_renders_shared_listener_mirrors() -> None:
+    state = _liveness_state(
+        platforms=[
+            PlatformStatus(
+                name="api_server",
+                state="connected",
+                mirror_urls={"dev": "http://127.0.0.1:8088/p/dev/v1"},
+            )
+        ]
+    )
+    detail = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+    assert "shared listener" in detail
+    assert "dev" in detail
+    assert "http://127.0.0.1:8088/p/dev/v1" in detail
+
+    plain = _liveness_state(platforms=[PlatformStatus(name="telegram", state="connected")])
+    detail = render_to_str(render_gateway(plain, Theme(), detail=True), width=200, no_color=True)
+    assert "shared listener" not in detail

@@ -9,7 +9,10 @@ writing or imports hermes-agent.
 
 from __future__ import annotations
 
+import contextlib
+import json
 import re
+import socket
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -22,7 +25,12 @@ from hermesd.collect.common import (
     _as_list,
     _coerce_float,
     _coerce_int,
+    _file_size,
     _iso_to_epoch,
+    _mtime,
+    _read_tail_text,
+    _read_text_capped,
+    _safe_child_path,
 )
 from hermesd.collect.redaction import _redact_secret_url
 from hermesd.collect.sqlite_util import (
@@ -35,6 +43,7 @@ from hermesd.file_cache import JsonMapping
 from hermesd.models import (
     ConfigSourceStamp,
     DeliveryObligationSummary,
+    ForensicFile,
     GatewayLoopHealth,
     PlatformOwnership,
     PlatformStatus,
@@ -44,6 +53,42 @@ from hermesd.models import (
 # writes is stale, ten is a wedged event loop.
 _HEARTBEAT_TICKING_SECONDS = 90.0
 _HEARTBEAT_STALE_SECONDS = 300.0
+# Loop-tick witness probe (hermes_cli/gateway.py:363-424): one byte, one second.
+_LOOP_TICK_PROBE_TIMEOUT_SECONDS = 1.0
+# Never escalate on a single silent probe (hermes_cli/gateway.py
+# _probe_loop_tick_socket_sustained): the loop may be in a transient synchronous
+# stall. hermesd spreads the strikes across collector refreshes instead of sleeping
+# inside one pass, so a wedge verdict needs silence on this many consecutive probes.
+_LOOP_TICK_SILENCE_STRIKES = 3
+# Respawn-storm ledger policy (gateway/status.py record_start_and_check_storm:57-83):
+# upstream defaults, overridable there by HERMES_GATEWAY_MAX_STARTS /
+# HERMES_GATEWAY_START_WINDOW_S — hermesd reads only the file, so it renders these
+# defaults and labels the count against them.
+_RESTART_STORM_WINDOW_SECONDS = 120.0
+_RESTART_STORM_CAP = 5
+# state/dashboard_clients.heartbeat younger than this means a web client is
+# attached right now (gateway/scale_to_zero.py:100-111 touches it per frame).
+_DASHBOARD_CLIENT_ATTACHED_SECONDS = 60.0
+# logs/gateway-exit-diag.log grows forever upstream (one JSON object per
+# asyncio.run() return path plus one gateway.previous_unclean_exit per unclean
+# boot; writer hermes_cli/gateway.py:4643-4665, HERMES_GATEWAY_EXIT_DIAG=0 opts
+# out). Warn once the file is past a couple of megabytes; read only the tail.
+_EXIT_DIAG_SIZE_WARN_BYTES = 2 * 1024 * 1024
+_EXIT_DIAG_TAG_CHARS = 120
+_UNCLEAN_EXIT_TAG = "gateway.previous_unclean_exit"
+# Event-only companion logs. Signal-initiated shutdown blocks (POSIX), freeze
+# dumps, and macOS supervisor reload attempts: metadata only, never contents.
+_FORENSIC_COMPANION_FILES = (
+    "gateway-shutdown-diag.log",
+    "gateway_faulthandler.log",
+    "launchd-reload.log",
+)
+# Port binders whose /p/<profile>/ surface is a MIRROR served by the default
+# profile's own adapter; a secondary never gets an instance of these. Copied
+# from gateway/config.py (SHARED_LISTENER_MIRROR_*), never imported.
+_SHARED_LISTENER_MIRROR_PLATFORMS = frozenset({"api_server", "webhook"})
+_SHARED_LISTENER_MIRROR_PATHS = {"api_server": "/v1", "webhook": "/webhooks/<route>"}
+_MIRROR_PROFILE_LIMIT = 16
 _DAY_SECONDS = 86400.0
 # Undelivered obligations still in flight; "delivered" is done and "failed" is
 # counted separately.
@@ -166,6 +211,41 @@ def _recorded_ingress_url(info: dict[str, Any], *, state: str, record_current: b
     return _redact_secret_url(url) if url else ""
 
 
+def _listener_mirror_urls(
+    name: str,
+    info: dict[str, Any],
+    state: str,
+    *,
+    record_current: bool,
+    served_profiles: list[str],
+) -> dict[str, str]:
+    """Mirror URLs a served profile reaches through this default-listener binder.
+
+    Mirrors ``shared_listener_mirror_platforms`` (``gateway/status.py:951-974``):
+    the multiplexer never builds api_server/webhook adapters for a secondary, so
+    every reader must synthesize ``<listener_base>/p/<profile><mirror_path>``
+    from the default profile's own entry. The same suppression rules as recorded
+    ingress URLs apply — a dead writer, a suppressed state, or a missing base
+    mean the URL is history rather than an endpoint — and the value is redacted
+    at the data boundary. Only a bounded roster of served profiles is synthesized.
+    """
+    if not record_current or state in _INGRESS_SUPPRESSED_STATES:
+        return {}
+    if name not in _SHARED_LISTENER_MIRROR_PLATFORMS:
+        return {}
+    base = info.get("listener_base")
+    if not isinstance(base, str) or not base:
+        return {}
+    mirrors: dict[str, str] = {}
+    for profile in served_profiles[:_MIRROR_PROFILE_LIMIT]:
+        if not profile or profile == "default":
+            # "default" owns the listener; it needs no mirror of itself.
+            continue
+        path = _SHARED_LISTENER_MIRROR_PATHS.get(name, "")
+        mirrors[profile] = _redact_secret_url(f"{base}/p/{profile}{path}")
+    return mirrors
+
+
 def _platform_status(
     key: str,
     info: dict[str, Any],
@@ -173,6 +253,7 @@ def _platform_status(
     writer: _RecordWriter,
     *,
     record_current: bool,
+    served_profiles: list[str] | None = None,
 ) -> PlatformStatus:
     profile, name = _split_platform_key(key)
     state = str(info.get("state") or "unknown")
@@ -180,6 +261,13 @@ def _platform_status(
     return PlatformStatus(
         name=name,
         profile=profile,
+        mirror_urls=_listener_mirror_urls(
+            name,
+            info,
+            state,
+            record_current=record_current,
+            served_profiles=served_profiles or [],
+        ),
         ingress_url=_recorded_ingress_url(info, state=state, record_current=record_current),
         state=state,
         updated_at=str(info.get("updated_at") or ""),
@@ -215,16 +303,163 @@ def _heartbeat_liveness(
     return age, GatewayLoopHealth.WEDGED if running else GatewayLoopHealth.STALE
 
 
+# ---------------------------------------------------------------------------
+# Loop-tick witness (state/gateway.loop-tick.<pid>.sock, or a 127.0.0.1 TCP port)
+#
+# The heartbeat moved off-loop (#90502), so a fresh file no longer proves the loop
+# dispatches. The gateway arms a witness served *by the loop itself*
+# (gateway/shutdown_watchdog.py:288-302) and advertises it on the heartbeat as
+# ``loop_tick_socket`` (POSIX) or ``loop_tick_tcp_port`` (Windows). The protocol is
+# one byte: connect, expect b"1", close — the client sends nothing, so probing is
+# non-mutating and safe for a read-only tool. Verdict vocabulary mirrors
+# ``classify`` in hermes_cli/gateway.py:425-497.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _LoopTickPlan:
+    """Which witness to probe, and what the heartbeat promised about it."""
+
+    pid: int
+    tcp_port: int | None
+    # True = advertised and armed; False = the key was written but the witness is
+    # not usable (upstream bind failed); None = the payload predates the key.
+    armed: bool | None
+
+
+def _loop_tick_probe_plan(
+    heartbeat: JsonMapping,
+    gateway_pid: int,
+    *,
+    running: bool,
+) -> _LoopTickPlan | None:
+    """Whether a probe would be evidence, and which node to hit.
+
+    A stopped gateway's stale file is history, not a wedged loop, so it is never
+    probed. The socket node carries the writer's PID in its name and stale sibling
+    nodes from dead PIDs are swept only at gateway start
+    (``_sweep_stale_tick_sockets``), so the heartbeat PID must match the gateway's
+    own before any node is touched — otherwise the probe would interrogate another
+    process's witness. A missing or non-positive PID is no match.
+    """
+    if not running or not heartbeat:
+        return None
+    pid = _coerce_int(heartbeat.get("pid"))
+    if pid <= 0 or gateway_pid <= 0 or pid != gateway_pid:
+        return None
+    raw_port = heartbeat.get("loop_tick_tcp_port")
+    tcp_port: int | None = None
+    if raw_port is not None and not isinstance(raw_port, bool):
+        port = _coerce_int(raw_port)
+        if 0 < port <= 65535:
+            tcp_port = port
+    raw_armed = heartbeat.get("loop_tick_socket")
+    armed: bool | None
+    if "loop_tick_socket" not in heartbeat:
+        armed = None
+    elif raw_armed is True:
+        armed = True
+    else:
+        # Malformed or explicitly false: never a reason to escalate.
+        armed = False
+    return _LoopTickPlan(pid=pid, tcp_port=tcp_port, armed=armed)
+
+
+def _loop_tick_verdict(
+    current: GatewayLoopHealth,
+    age: float | None,
+    plan: _LoopTickPlan | None,
+    probe_result: bool | None,
+    *,
+    sustained_silence: bool,
+) -> GatewayLoopHealth:
+    """Refine the heartbeat-age verdict with witness evidence.
+
+    Mirrors ``probe_gateway_loop_liveness`` (hermes_cli/gateway.py:425-497): an
+    answer proves the loop alive no matter how old the file is; a fresh file with a
+    silent witness is ambiguity (the off-loop write may land after a freeze); a
+    stale file escalates only when the witness was armed *and* stayed silent across
+    refreshes. A legacy payload (no witness key) means the heartbeat was still
+    written on-loop, so staleness alone is proof. Every other stale combination is
+    ambiguity, never a wedge — the socket handler swallows errors, so connection
+    refused and timeout mean the same thing and a vanished node is no evidence.
+    """
+    if plan is None or age is None:
+        return current
+    if probe_result is True:
+        return GatewayLoopHealth.ALIVE
+    if age <= _HEARTBEAT_TICKING_SECONDS:
+        return GatewayLoopHealth.UNKNOWN if probe_result is False else current
+    if age <= _HEARTBEAT_STALE_SECONDS:
+        return GatewayLoopHealth.STALE if probe_result is False else current
+    if plan.armed is None:
+        return GatewayLoopHealth.LEGACY
+    if plan.armed is False:
+        return GatewayLoopHealth.UNKNOWN
+    if probe_result is False:
+        return GatewayLoopHealth.WEDGED if sustained_silence else GatewayLoopHealth.STALE
+    return GatewayLoopHealth.UNKNOWN
+
+
+def _default_loop_tick_probe(
+    pid: int,
+    tcp_port: int | None,
+    home: Path,
+    *,
+    timeout: float = _LOOP_TICK_PROBE_TIMEOUT_SECONDS,
+) -> bool | None:
+    """One witness probe: True answered, False silent, None no node to ask.
+
+    Mirrors ``_ping_loop_tick_witness`` (hermes_cli/gateway.py:363-376): the
+    handler swallows its own errors, so refusal and timeout are both just
+    "silent". Sends nothing and reads at most one byte.
+    """
+    if tcp_port is not None:
+        if not 0 < tcp_port <= 65535:
+            return None
+        family: int = socket.AF_INET
+        address: object = ("127.0.0.1", tcp_port)
+    else:
+        node = home / "state" / f"gateway.loop-tick.{pid}.sock"
+        try:
+            if not node.is_socket():
+                return None
+        except OSError:
+            return None
+        family = socket.AF_UNIX
+        address = str(node)
+    sock: socket.socket | None = None
+    try:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        sock.settimeout(max(float(timeout), 0.0))
+        sock.connect(address)  # type: ignore[arg-type]
+        return sock.recv(1) == b"1"
+    except OSError:
+        return False
+    finally:
+        if sock is not None:
+            with contextlib.suppress(OSError):
+                sock.close()
+
+
 @dataclass(frozen=True, slots=True)
 class _LifecycleStatus:
     phase: str = ""
     last_exit_code: int | None = None
     last_exit_reason: str = ""
     unclean_previous_exit: bool = False
+    prior_unclean_exit: bool = False
+    prior_suspected_oom: bool = False
 
 
 def _lifecycle_status(data: JsonMapping, pid_exists: Callable[[int], bool]) -> _LifecycleStatus:
-    """A ``running`` phase whose pid is gone means the previous life never wrote an exit."""
+    """A ``running`` phase whose pid is gone means the previous life never wrote an exit.
+
+    The running record can also carry the previous life's verdict
+    (``record_startup``, gateway/lifecycle_ledger.py:84-93): ``prior_unclean_exit``
+    and ``prior_suspected_oom``. Strict boolean reads — the sentinel is written by
+    the live gateway, so only a literal True is evidence.
+    """
     if not data:
         return _LifecycleStatus()
     phase = str(data.get("phase") or "")
@@ -234,6 +469,8 @@ def _lifecycle_status(data: JsonMapping, pid_exists: Callable[[int], bool]) -> _
         last_exit_code=_optional_int(data.get("exit_code")),
         last_exit_reason=str(data.get("exit_reason") or ""),
         unclean_previous_exit=phase == "running" and pid > 0 and not pid_exists(pid),
+        prior_unclean_exit=data.get("prior_unclean_exit") is True,
+        prior_suspected_oom=data.get("prior_suspected_oom") is True,
     )
 
 
@@ -444,6 +681,157 @@ def _fleet_state_counts(fleet: list[object]) -> dict[str, int]:
             continue
         counts[state] = counts.get(state, 0) + 1
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Respawn-storm ledger (gateway-starts.log, gateway/status.py:57-83)
+#
+# One repr(float) UTC epoch per line, rewritten atomically as a ring of
+# max(max_starts*4, 40) entries. An absent file is NOT evidence of zero
+# restarts: HERMES_GATEWAY_MAX_STARTS<=0 disables the writer upstream. Kept on
+# the ROOT resolver like the other gateway launch files (recorded divergence).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _StartStorm:
+    """Start ledger facts for the dashboard window."""
+
+    recorded: bool = False
+    starts_2m: int = 0
+    starts_1h: int = 0
+    last_start_age_seconds: float | None = None
+
+    def model_fields(self, now: float) -> dict[str, Any]:
+        return {
+            "gateway_starts_recorded": self.recorded,
+            "gateway_starts_2m": self.starts_2m,
+            "gateway_starts_1h": self.starts_1h,
+            "seconds_since_last_gateway_start": self.last_start_age_seconds,
+            "restart_storm_cap": _RESTART_STORM_CAP if self.recorded else 0,
+            "in_respawn_backoff": self.recorded and self.starts_2m > _RESTART_STORM_CAP,
+        }
+
+
+def _read_start_storm(path: Path, root: Path, now: float) -> _StartStorm:
+    """Count recorded gateway starts in the storm-detection windows."""
+    if not path.is_file():
+        return _StartStorm()
+    text = _read_text_capped(path, root)
+    if not text and _file_size(path) > 0:
+        return _StartStorm()
+    starts: list[float] = []
+    for line in text.splitlines():
+        try:
+            epoch = float(line.strip())
+        except ValueError:
+            continue
+        # A future stamp is clock skew, not a restart that has not happened yet.
+        if 0.0 < epoch <= now:
+            starts.append(epoch)
+    if not starts:
+        return _StartStorm(recorded=True)
+    return _StartStorm(
+        recorded=True,
+        starts_2m=sum(1 for start in starts if now - start <= _RESTART_STORM_WINDOW_SECONDS),
+        starts_1h=sum(1 for start in starts if now - start <= _DAY_SECONDS / 24.0),
+        last_start_age_seconds=now - max(starts),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dashboard client attachment (state/dashboard_clients.heartbeat)
+#
+# A 0-byte file touched on every websocket connect and inbound frame, throttled
+# to once per 5s per process (gateway/scale_to_zero.py:100-111). The mtime is
+# the whole payload; a missing file means "never", not "idle". Stat only — the
+# websocket itself is never contacted.
+# ---------------------------------------------------------------------------
+
+
+def _dashboard_client_status(path: Path, root: Path, now: float) -> tuple[bool, float | None]:
+    attached = False
+    age: float | None = None
+    if _safe_child_path(path, root):
+        stamp = _mtime(path)
+        if stamp is not None:
+            age = max(0.0, now - stamp)
+            attached = age <= _DASHBOARD_CLIENT_ATTACHED_SECONDS
+    return attached, age
+
+
+# ---------------------------------------------------------------------------
+# Exit diagnostics ledger (logs/gateway-exit-diag.log)
+#
+# JSONL: {"ts", "tag", "pid", "python", "platform", ...extras such as code,
+# traceback, argv}. Only the tag and timestamp are ever surfaced — extras stay
+# unread, and the tail read is capped by the same log-tail-bytes knob that
+# bounds log panels.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _ExitDiag:
+    recorded: bool = False
+    last_tag: str = ""
+    last_age_seconds: float | None = None
+    unclean_24h: int = 0
+    size_bytes: int = 0
+    oversized: bool = False
+    forensic_files: list[ForensicFile] = field(default_factory=list)
+
+
+def _read_exit_diag(path: Path, root: Path, now: float, tail_bytes: int) -> _ExitDiag:
+    """Ledger facts from the tail of the exit-diag JSONL; absent is no evidence."""
+    if not _safe_child_path(path, root) or not path.is_file():
+        return _ExitDiag()
+    size = _file_size(path)
+    text = _read_tail_text(path, max(1, tail_bytes))
+    last_tag = ""
+    last_age: float | None = None
+    unclean_24h = 0
+    for line in text.splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue  # includes a line the tail cut in half
+        if not isinstance(record, dict):
+            continue
+        tag = str(record.get("tag") or "")
+        if not tag:
+            continue
+        last_tag = tag[:_EXIT_DIAG_TAG_CHARS]
+        stamp = _iso_to_epoch(record.get("ts"))
+        if stamp is not None:
+            last_age = _age_seconds(stamp, now)
+            if tag == _UNCLEAN_EXIT_TAG and now - stamp <= _DAY_SECONDS:
+                unclean_24h += 1
+    return _ExitDiag(
+        recorded=True,
+        last_tag=last_tag,
+        last_age_seconds=last_age,
+        unclean_24h=unclean_24h,
+        size_bytes=size,
+        oversized=size > _EXIT_DIAG_SIZE_WARN_BYTES,
+    )
+
+
+def _read_forensic_companions(logs_dir: Path, root: Path, now: float) -> list[ForensicFile]:
+    """Stat the event-only companion logs; a missing file is the healthy state."""
+    files: list[ForensicFile] = []
+    for name in _FORENSIC_COMPANION_FILES:
+        path = logs_dir / name
+        if not _safe_child_path(path, root) or not path.is_file():
+            continue
+        stamp = _mtime(path)
+        files.append(
+            ForensicFile(
+                name=name,
+                size_bytes=_file_size(path),
+                age_seconds=max(0.0, now - stamp) if stamp is not None else None,
+            )
+        )
+    return files
 
 
 @dataclass(frozen=True, slots=True)

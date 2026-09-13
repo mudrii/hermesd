@@ -1152,3 +1152,56 @@ def test_source_ownership_doc_covers_every_process_env_read():
         "PROCESS-ENV keys missing from "
         f"{_RULE_FILE.name}: {sorted(_collector_env_keys(trees) - documented)}"
     )
+
+
+def test_gateway_launch_files_are_root_scoped_under_a_profile(
+    profiled_hermes_home: Path,
+):
+    """gateway-starts.log and the dashboard-client marker join the root launch files.
+
+    Upstream resolves all three through ``get_hermes_home()`` (PROFILE), but they
+    describe the ROOT gateway's launch, the same process whose heartbeat and
+    lifecycle sentinel hermesd already reads from the root. The storm ledger sits
+    beside them so the restart count and the liveness clock describe one process;
+    the dashboard-client marker belongs to the web dashboard that gateway serves.
+    """
+    home = profiled_hermes_home
+    profile_home = home / "profiles" / "coding"
+
+    now = time.time()
+    root_state = home / "state"
+    root_state.mkdir(exist_ok=True)
+    (home / "gateway-starts.log").write_text(f"{now - 1800.0!r}\n")
+    (root_state / "dashboard_clients.heartbeat").touch()
+    os.utime(root_state / "dashboard_clients.heartbeat", (now - 120.0, now - 120.0))
+    (root_state / "gateway.heartbeat").write_text(
+        json.dumps({"pid": 12345, "updated_at": "2027-01-15T00:00:00+00:00"})
+    )
+    (home / "logs").mkdir(exist_ok=True)
+    (home / "logs" / "gateway-exit-diag.log").write_text(
+        json.dumps({"ts": "2027-01-15T00:00:00+00:00", "tag": "gateway.asyncio_main_return"}) + "\n"
+    )
+    (profile_home / "logs").mkdir(parents=True, exist_ok=True)
+    (profile_home / "logs" / "gateway-exit-diag.log").write_text(
+        json.dumps({"ts": "2027-01-15T00:00:00+00:00", "tag": "profile_only_tag"}) + "\n"
+    )
+
+    profile_state = profile_home / "state"
+    profile_state.mkdir(parents=True)
+    (profile_home / "gateway-starts.log").write_text(f"{now - 30.0!r}\n" * 9)
+    (profile_state / "dashboard_clients.heartbeat").touch()
+
+    c = Collector(home, profile_name="coding")
+    try:
+        gateway = c.collect().gateway
+    finally:
+        c.close()
+
+    # The root copy: one start, marker mtime at 2027-01-15. The nine profile
+    # entries (which would trip the storm cap) and the profile marker are ignored.
+    assert gateway.gateway_starts_recorded is True
+    assert gateway.gateway_starts_2m == 0
+    assert gateway.gateway_starts_1h == 1
+    assert gateway.dashboard_client_last_frame_age_seconds is not None
+    assert gateway.exit_diag_recorded is True
+    assert gateway.exit_diag_last_tag == "gateway.asyncio_main_return"

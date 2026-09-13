@@ -82,15 +82,23 @@ from hermesd.collect.cron import (
 )
 from hermesd.collect.desktop_plugins import read_desktop_plugins
 from hermesd.collect.gateway import (
+    _LOOP_TICK_SILENCE_STRIKES,
     _config_generation,
     _config_stale,
+    _dashboard_client_status,
+    _default_loop_tick_probe,
     _gateway_ledger_fields,
     _gateway_start_epoch,
     _GatewayLedgerRows,
     _heartbeat_liveness,
     _lifecycle_status,
+    _loop_tick_probe_plan,
+    _loop_tick_verdict,
     _platform_status,
+    _read_exit_diag,
+    _read_forensic_companions,
     _read_gateway_ledger_rows,
+    _read_start_storm,
     _record_writer,
     _update_receipt_status,
 )
@@ -278,6 +286,8 @@ def _state_db_readout(conn: sqlite3.Connection) -> _StateDbReadout:
 # Fields each gateway sub-source owns, used to restore just that source's
 # values from the last good state when it fails.
 _HEARTBEAT_FIELDS = ("heartbeat_age_seconds", "loop_health")
+# The probe refines the same verdict the heartbeat ages into, plus the armed stamp.
+_LOOP_TICK_FIELDS = ("loop_health", "loop_tick_armed")
 # Upper bound on runtime/active_sessions.json entries turned into surfaces. Each
 # entry costs a liveness syscall per refresh, so an oversized file must not be
 # able to stall the collector thread.
@@ -314,6 +324,33 @@ _LIFECYCLE_FIELDS = (
     "last_exit_code",
     "last_exit_reason",
     "unclean_previous_exit",
+    "prior_unclean_exit",
+    "prior_suspected_oom",
+)
+# gateway-starts.log: the respawn-storm ledger's fields.
+_RESTART_STORM_FIELDS = (
+    "gateway_starts_recorded",
+    "gateway_starts_2m",
+    "gateway_starts_1h",
+    "restart_storm_cap",
+    "seconds_since_last_gateway_start",
+    "in_respawn_backoff",
+)
+# state/dashboard_clients.heartbeat: web client attachment by mtime only.
+_DASHBOARD_CLIENT_FIELDS = (
+    "dashboard_client_attached",
+    "dashboard_client_last_frame_age_seconds",
+)
+# logs/gateway-exit-diag.log: crash forensics tail plus the event-only
+# companion logs that are stat'd but never read.
+_EXIT_DIAG_FIELDS = (
+    "exit_diag_recorded",
+    "exit_diag_last_tag",
+    "exit_diag_last_age_seconds",
+    "exit_diag_unclean_24h",
+    "exit_diag_size_bytes",
+    "exit_diag_oversized",
+    "forensic_files",
 )
 _UPDATE_RECEIPT_FIELDS = (
     "last_update_outcome",
@@ -538,12 +575,18 @@ class Collector:
         file_cache: LastGoodFileCache | None = None,
         clock: Callable[[], float] = time.time,
         env: Mapping[str, str] | None = None,
+        loop_tick_probe: Callable[[int, int | None], bool | None] | None = None,
     ):
         self._root_home = hermes_home
         self._file_cache = file_cache if file_cache is not None else LastGoodFileCache()
         self._log_cache: dict[str, list[LogLine]] = {}
         self._pid_exists = pid_exists or _pid_exists
         self._process_start_times = process_start_times or _observed_process_start_times
+        # Loop-tick witness probe (state/gateway.loop-tick.<pid>.sock or 127.0.0.1
+        # TCP): True answered, False silent, None no node. Injectable so the suite
+        # never opens real sockets; the default probe is read-only by protocol.
+        self._loop_tick_probe = loop_tick_probe or self._probed_loop_tick
+        self._loop_tick_silent_strikes = 0
         self._log_tail_bytes = max(1, log_tail_bytes)
         self._paths = HermesPaths(hermes_home, profile_name)
         if db_factory is None:
@@ -717,11 +760,47 @@ class Collector:
             ),
             _SourceSpec(
                 "gateway",
+                "gateway_loop_tick",
+                lambda: self._with_loop_tick(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "gateway_loop_tick", results["gateway"], _LOOP_TICK_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "gateway",
                 "gateway_lifecycle",
                 lambda: self._with_lifecycle(results["gateway"]),
                 lambda: results["gateway"],
                 fallback=lambda: self._last_source_fields(
                     "gateway_lifecycle", results["gateway"], _LIFECYCLE_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "gateway",
+                "gateway_restart_storm",
+                lambda: self._with_restart_storm(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "gateway_restart_storm", results["gateway"], _RESTART_STORM_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "gateway",
+                "gateway_exit_diag",
+                lambda: self._with_exit_diag(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "gateway_exit_diag", results["gateway"], _EXIT_DIAG_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "gateway",
+                "dashboard_client",
+                lambda: self._with_dashboard_client(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "dashboard_client", results["gateway"], _DASHBOARD_CLIENT_FIELDS
                 ),
             ),
             _SourceSpec(
@@ -1192,13 +1271,6 @@ class Collector:
                     pid = launchd_pid
                 else:
                     running = False
-        # Built after liveness resolution because a platform entry's recorded
-        # ingress URL is surfaced only while the state-file writer is still live.
-        platforms = [
-            _platform_status(str(name), info, now, writer, record_current=recorded_writer_live)
-            for name, raw_info in _as_dict(data.get("platforms")).items()
-            if (info := _as_dict(raw_info))
-        ]
         # Tri-state: an absent or non-list `served_profiles` is no record at all,
         # while a real list (even []) from a live gateway is authoritative — the
         # distinction upstream's recorded_served_profiles() makes by returning
@@ -1206,6 +1278,22 @@ class Collector:
         # gated on state-writer liveness, so an old writer's record stays preserved.
         raw_served = data.get("served_profiles")
         served_recorded = recorded_writer_live and isinstance(raw_served, list)
+        served_names = [str(profile) for profile in _as_list(raw_served) if profile]
+        # Built after liveness resolution because a platform entry's recorded
+        # ingress URL (and its synthesized listener mirrors) are surfaced only
+        # while the state-file writer is still live.
+        platforms = [
+            _platform_status(
+                str(name),
+                info,
+                now,
+                writer,
+                record_current=recorded_writer_live,
+                served_profiles=served_names,
+            )
+            for name, raw_info in _as_dict(data.get("platforms")).items()
+            if (info := _as_dict(raw_info))
+        ]
         version, behind = self._collect_hermes_version()
         cfg = self._read_yaml_reporting_stale()
         gateway_cfg = _as_dict(cfg.get("gateway"))
@@ -1238,7 +1326,7 @@ class Collector:
                 drain_request.get("principal") or drain_request.get("requested_by") or ""
             ),
             drain_suppress_notification=bool(drain_request.get("suppress_notification")),
-            served_profiles=[str(profile) for profile in _as_list(raw_served) if profile],
+            served_profiles=served_names,
             served_profiles_recorded=served_recorded,
             scale_to_zero_idle_timeout_minutes=_coerce_int(scale_cfg.get("idle_timeout_minutes")),
             scale_to_zero_relay_only=_scale_to_zero_relay_only(scale_cfg, platforms),
@@ -1286,6 +1374,94 @@ class Collector:
         )
         return gateway.model_copy(update={"heartbeat_age_seconds": age, "loop_health": health})
 
+    def _probed_loop_tick(self, pid: int, tcp_port: int | None) -> bool | None:
+        return _default_loop_tick_probe(pid, tcp_port, self._paths.root_home)
+
+    def _with_loop_tick(self, gateway: GatewayState) -> GatewayState:
+        """Refine the loop verdict with one loop-tick witness probe.
+
+        The witness is served by the gateway's event loop itself, so its answer is
+        direct dispatch evidence that the off-loop heartbeat write lost. Escalation
+        to ``wedged`` needs silence on this many consecutive refreshes
+        (``_LOOP_TICK_SILENCE_STRIKES``): one silent probe is never destructive
+        evidence, mirroring upstream's sustained window without sleeping in the
+        collector thread. Any answer, ambiguity, or non-probing pass resets the
+        strike count.
+        """
+        path = self._paths.shared_path("state", "gateway.heartbeat")
+        heartbeat = (
+            self._read_json_cached(path) if _safe_child_path(path, self._paths.root_home) else {}
+        )
+        plan = _loop_tick_probe_plan(
+            heartbeat,
+            gateway.pid,
+            running=gateway.state == "running",
+        )
+        if plan is None:
+            self._loop_tick_silent_strikes = 0
+            return gateway
+        probe_result = self._loop_tick_probe(plan.pid, plan.tcp_port)
+        if probe_result is False:
+            self._loop_tick_silent_strikes += 1
+        else:
+            self._loop_tick_silent_strikes = 0
+        health = _loop_tick_verdict(
+            gateway.loop_health,
+            gateway.heartbeat_age_seconds,
+            plan,
+            probe_result,
+            sustained_silence=self._loop_tick_silent_strikes >= _LOOP_TICK_SILENCE_STRIKES,
+        )
+        return gateway.model_copy(update={"loop_health": health, "loop_tick_armed": plan.armed})
+
+    def _with_restart_storm(self, gateway: GatewayState) -> GatewayState:
+        """Respawn-storm ledger facts from gateway-starts.log (read-only ring file)."""
+        path = self._paths.shared_path("gateway-starts.log")
+        storm = _read_start_storm(path, self._paths.root_home, self._clock())
+        return gateway.model_copy(update=storm.model_fields(self._clock()))
+
+    def _with_exit_diag(self, gateway: GatewayState) -> GatewayState:
+        """Crash forensics from the tail of the exit-diag ledger; metadata only.
+
+        The extras each record carries (tracebacks, argv, cwd) are never parsed,
+        so nothing secret-bearing reaches the model: only tags, timestamps,
+        counts and file sizes. The tail cap is the same log-tail-bytes budget
+        the log panels use, because upstream never rotates this file.
+        """
+        now = self._clock()
+        diag = _read_exit_diag(
+            self._paths.shared_path("logs", "gateway-exit-diag.log"),
+            self._paths.root_home,
+            now,
+            self._log_tail_bytes,
+        )
+        # Companion logs are stat'd whether or not the ledger exists: the
+        # ledger's writer can be disabled while the companions still grow.
+        return gateway.model_copy(
+            update={
+                "exit_diag_recorded": diag.recorded,
+                "exit_diag_last_tag": diag.last_tag,
+                "exit_diag_last_age_seconds": diag.last_age_seconds,
+                "exit_diag_unclean_24h": diag.unclean_24h,
+                "exit_diag_size_bytes": diag.size_bytes,
+                "exit_diag_oversized": diag.oversized,
+                "forensic_files": _read_forensic_companions(
+                    self._paths.shared_path("logs"), self._paths.root_home, now
+                ),
+            }
+        )
+
+    def _with_dashboard_client(self, gateway: GatewayState) -> GatewayState:
+        """Web dashboard attachment from the marker file's mtime; the socket is never touched."""
+        path = self._paths.shared_path("state", "dashboard_clients.heartbeat")
+        attached, age = _dashboard_client_status(path, self._paths.root_home, self._clock())
+        return gateway.model_copy(
+            update={
+                "dashboard_client_attached": attached,
+                "dashboard_client_last_frame_age_seconds": age,
+            }
+        )
+
     def _with_lifecycle(self, gateway: GatewayState) -> GatewayState:
         path = self._paths.shared_path("state", "gateway.lifecycle.json")
         last = self._last_good_by_source.get("gateway_lifecycle")
@@ -1297,6 +1473,8 @@ class Collector:
                 "last_exit_code": status.last_exit_code,
                 "last_exit_reason": status.last_exit_reason,
                 "unclean_previous_exit": status.unclean_previous_exit,
+                "prior_unclean_exit": status.prior_unclean_exit,
+                "prior_suspected_oom": status.prior_suspected_oom,
             }
         )
 
