@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import stat
 import time
 from collections.abc import Iterator
@@ -19,6 +20,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+import hermesd.collect.sessions as sessions_module
+import hermesd.collector as collector_module
 from hermesd.collector import Collector
 from hermesd.models import ConfigSummary
 
@@ -660,5 +663,34 @@ def test_removed_state_db_keeps_last_good_delegations(hermes_home: Path, sample_
         good = c.collect().operations
         sample_db.unlink()
         assert c.collect().operations.delegations == good.delegations
+    finally:
+        c.close()
+
+
+def test_hygiene_last_good_restores_the_total_with_the_rows(
+    forensic_hermes_home: Path, monkeypatch
+):
+    """A failed hygiene read must restore ``hygiene_total``, not only the rows.
+
+    The state model's contract is that the row list is capped while the total is
+    exact; restoring one without the other would render "0 hygiene cooldown(s)"
+    above the very rows that are still displayed.
+    """
+    c = Collector(forensic_hermes_home, pid_exists=lambda pid: pid == 12345)
+    try:
+        first = c.collect()
+        assert first.session_coordination.hygiene_total == 1
+        assert len(first.session_coordination.hygiene) == 1
+
+        def boom(*args: object, **kwargs: object) -> object:
+            raise sqlite3.OperationalError("simulated hygiene read failure")
+
+        monkeypatch.setattr(sessions_module, "_hygiene_fields", boom)
+        monkeypatch.setattr(collector_module, "_hygiene_fields", boom, raising=False)
+        second = c.collect()
+
+        assert "gateway_hygiene" in second.health.failed_sources
+        assert second.session_coordination.hygiene == first.session_coordination.hygiene
+        assert second.session_coordination.hygiene_total == first.session_coordination.hygiene_total
     finally:
         c.close()

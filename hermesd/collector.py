@@ -445,7 +445,7 @@ _LEDGER_FIELDS = (
 # SessionCoordinationState, so a corrupt coordination table degrades only its
 # own group instead of blanking the others.
 _SESSION_LEASE_FIELDS = ("leases", "lease_total")
-_HYGIENE_FIELDS = ("hygiene",)
+_HYGIENE_FIELDS = ("hygiene", "hygiene_total")
 _GATEWAY_ROUTE_FIELDS = ("routes", "route_total")
 _GENERATION_FIELDS = (
     "generations",
