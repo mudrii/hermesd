@@ -121,6 +121,7 @@ from hermesd.collect.operations import (
     _moa_latest_record_summary,
     _model_cache_counts,
     _read_delegation_live_manifests,
+    _read_process_receipts,
     _read_projects_state,
     _read_state_snapshots,
     _read_verification_evidence,
@@ -890,6 +891,18 @@ class Collector:
             # ROOT-scoped cache directory (the same open divergence as the
             # delegation_live_log_count read inside `operations`), and a torn
             # manifest must keep the last-good cards instead of blanking them.
+            # Eighth writer of `operations`: process receipts live under the
+            # profile's logs/, upstream's own location, so a vanished receipt
+            # (7-day retention) keeps the last-good list instead of a false zero.
+            _SourceSpec(
+                "operations",
+                "process_receipts",
+                lambda: self._with_process_receipts(results["operations"]),
+                lambda: results["operations"],
+                fallback=lambda: self._last_source_fields(
+                    "process_receipts", results["operations"], _PROCESS_RECEIPT_FIELDS
+                ),
+            ),
             _SourceSpec(
                 "operations",
                 "delegation_live",
@@ -2486,6 +2499,31 @@ class Collector:
                 self._paths.root_home,
                 now=self._clock(),
             )
+        )
+
+    def _with_process_receipts(self, operations: OperationsState) -> OperationsState:
+        """Recently finished background processes from ``logs/process-results/``.
+
+        PROFILE-scoped, and it agrees with upstream:
+        ``tools/process_registry_results.py:30,58`` resolves
+        ``get_hermes_home()/"logs"/"process-results"`` — the same
+        ``get_hermes_home()`` anchor as the registry checkpoint at
+        ``tools/process_registry.py:41,45-50`` that the ownership table already
+        records. That is the opposite of the ROOT ``spawn-ledger.json``: the two
+        registries are deliberately not the same scope.
+
+        Absence is normal (7-day retention, 64-file cap), so a missing or
+        unsafe directory reads as an empty state rather than a failed source.
+        """
+        receipts_dir = self._paths.profile_path("logs", "process-results")
+        return operations.model_copy(
+            update={
+                "process_receipts": _read_process_receipts(
+                    receipts_dir,
+                    self._paths.profile_home,
+                    now=self._clock(),
+                )
+            }
         )
 
     def _collect_curator(self) -> CuratorRun:

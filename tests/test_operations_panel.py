@@ -15,6 +15,8 @@ from hermesd.models import (
     ModelCacheSummary,
     OperationsState,
     PRMonitorSummary,
+    ProcessReceipt,
+    ProcessReceiptsState,
 )
 from hermesd.panels.operations import render_operations
 from hermesd.theme import Theme
@@ -411,6 +413,87 @@ def test_compact_shows_live_delegation_line_when_present():
     assert "Live delegations:" in populated
     assert "2 live · 1 running" in populated
     assert "Live delegations:" not in absent
+
+
+# --- process completion receipts (item 13) ----------------------------------
+
+
+def _receipts(**fields: object) -> ProcessReceiptsState:
+    base: dict[str, object] = {
+        "dir_present": True,
+        "receipt_count": 2,
+        "newest_receipt_age_seconds": 120.0,
+        "receipts": [
+            ProcessReceipt(
+                process_id="proc_abc123",
+                command="curl -H 'Authorization: Bearer [REDACTED]' https://api.example.dev",
+                exit_code=2,
+                completion_reason="exited",
+                started_age_seconds=600.0,
+                finished_age_seconds=120.0,
+                output_tail="AUTH Bearer [REDACTED]\ndone, exit 2",
+            ),
+            ProcessReceipt(
+                process_id="proc_def456",
+                command="npm run build",
+                exit_code=0,
+                completion_reason="completed",
+                started_age_seconds=3600.0,
+                finished_age_seconds=900.0,
+                output_tail="built in 42s",
+            ),
+        ],
+    }
+    base.update(fields)
+    return ProcessReceiptsState(**base)  # type: ignore[arg-type]
+
+
+def test_detail_renders_process_receipt_section():
+    state = _ops_state(process_receipts=_receipts())
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+    assert "Process Receipts" in text
+    assert "proc_abc123" in text
+    assert "proc_def456" in text
+    assert "Bearer [REDACTED]" in text
+    assert "done, exit 2" in text
+
+
+def test_detail_receipt_section_states_no_receipts_yet_when_dir_absent():
+    state = _ops_state(process_receipts=ProcessReceiptsState())
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=160, no_color=True)
+    assert "no receipts yet" in text
+
+
+def test_detail_receipts_escape_hostile_text():
+    state = _ops_state(
+        process_receipts=_receipts(
+            receipts=[
+                ProcessReceipt(
+                    process_id="proc_[link]evil[/link]",
+                    command="[bold]rm -rf[/bold] /tmp/x",
+                    exit_code=1,
+                    output_tail="\x1b[2J [italic]boom[/italic]",
+                )
+            ]
+        )
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+    assert "proc_[link]evil[/link]" in text
+    assert "[italic]boom[/italic]" in text
+    assert "\x1b[2J" not in text
+
+
+def test_compact_shows_finished_proc_count_when_present():
+    populated = render_to_str(
+        render_operations(_ops_state(process_receipts=_receipts()), Theme()), no_color=True
+    )
+    absent = render_to_str(
+        render_operations(_ops_state(process_receipts=ProcessReceiptsState()), Theme()),
+        no_color=True,
+    )
+    assert "Finished procs:" in populated
+    assert "2 receipts" in populated
+    assert "Finished procs:" not in absent
 
 
 # --- hosted rooms and retained API run reservations -------------------------

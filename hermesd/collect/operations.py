@@ -28,7 +28,7 @@ from hermesd.collect.common import (
     _safe_mtime,
 )
 from hermesd.collect.kanban import _kanban_board_present
-from hermesd.collect.redaction import _redact_secret_text
+from hermesd.collect.redaction import _redact_command_string, _redact_secret_text
 from hermesd.collect.sqlite_util import (
     _count_rows,
     _query_rows,
@@ -44,6 +44,8 @@ from hermesd.models import (
     DiscoveredRepoSummary,
     GoalSummary,
     OperationsState,
+    ProcessReceipt,
+    ProcessReceiptsState,
     ProjectSummary,
     VerificationEventSummary,
     VerificationRootSummary,
@@ -527,6 +529,87 @@ def _live_log_tail(log_path: Path, home: Path) -> list[str]:
         if line.strip()
     ]
     return lines[-_LIVE_TAIL_MAX_LINES:]
+
+
+# Process receipt bounds. Upstream keeps 64 receipts of at most 200 KiB of
+# output each (``tools/process_registry_results.py:19-24``, ``:54``); hermesd
+# counts every receipt in the bounded scan but parses only the newest few, and
+# refuses files over the shared text cap instead of reading them whole.
+_MAX_PROCESS_RECEIPTS = 8
+_PROCESS_RECEIPT_TAIL_MAX_CHARS = 400
+
+
+def _read_process_receipts(receipts_dir: Path, home: Path, *, now: float) -> ProcessReceiptsState:
+    """Bounded read of PROFILE ``logs/process-results/proc_*.json`` receipts.
+
+    Upstream writes one 0600 JSON receipt per finished terminal process
+    (``tools/process_registry_results.py:48-61``) and prunes to 7 days / 64
+    files (``:28-45``). Everything here is presence-first: a missing directory,
+    junk JSON and oversized files are counted but never raise, and only the
+    newest ``_MAX_PROCESS_RECEIPTS`` parseable receipts are listed. Command and
+    output are redacted again through hermesd's own layer before they reach a
+    panel, though upstream already redacts both at write time (``:56-57``).
+    """
+    if (
+        receipts_dir.is_symlink()
+        or not _path_resolves_under(receipts_dir, home)
+        or not receipts_dir.is_dir()
+    ):
+        return ProcessReceiptsState()
+    candidates: list[tuple[float, Path]] = []
+    count = 0
+    newest: float | None = None
+    with contextlib.suppress(OSError):
+        for path in islice(receipts_dir.glob("proc_*.json"), _BOUNDED_SCAN_LIMIT):
+            if path.is_symlink() or not _path_resolves_under(path, home):
+                continue
+            mtime = _safe_mtime(path)
+            count += 1
+            candidates.append((mtime, path))
+            if newest is None or mtime > newest:
+                newest = mtime
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    receipts: list[ProcessReceipt] = []
+    for mtime, path in candidates:
+        if len(receipts) >= _MAX_PROCESS_RECEIPTS:
+            break
+        receipt = _process_receipt_from_file(path, home, mtime=mtime, now=now)
+        if receipt is not None:
+            receipts.append(receipt)
+    return ProcessReceiptsState(
+        dir_present=True,
+        receipt_count=count,
+        newest_receipt_age_seconds=_age_seconds(newest, now),
+        receipts=receipts,
+        receipts_truncated=count > len(receipts),
+    )
+
+
+def _process_receipt_from_file(
+    path: Path, home: Path, *, mtime: float, now: float
+) -> ProcessReceipt | None:
+    """One parsed receipt, or None when the file is unreadable or over the cap.
+
+    The text cap (256 KiB) doubles as the oversize refusal: upstream receipts
+    can legitimately approach 200 KiB of output, so refusing at the shared cap
+    keeps a worst-case file from being read whole while counting it above.
+    """
+    data = _json_object_capped(_read_text_capped(path, home))
+    if data is None:
+        return None
+    output = str(data.get("output") or "")
+    started_at = _coerce_float(data.get("started_at"))
+    exit_code = _coerce_int(data.get("exit_code"))
+    return ProcessReceipt(
+        process_id=str(data.get("id") or path.stem),
+        command=_redact_command_string(str(data.get("command") or "")),
+        exit_code=exit_code if data.get("exit_code") is not None else None,
+        completion_reason=str(data.get("completion_reason") or ""),
+        termination_source=str(data.get("termination_source") or ""),
+        started_age_seconds=_age_seconds(started_at if started_at > 0 else None, now),
+        finished_age_seconds=_age_seconds(mtime, now),
+        output_tail=_redact_secret_text(output[-_PROCESS_RECEIPT_TAIL_MAX_CHARS:]),
+    )
 
 
 def _read_state_snapshots(root: Path, home: Path, *, now: float) -> dict[str, Any]:

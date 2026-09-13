@@ -1908,6 +1908,48 @@ class ApiRunReservationsState(BaseModel):
     oldest_age_seconds: float | None = None
 
 
+# Upstream's receipt retention ceiling (``tools/process_registry_results.py:19-20``).
+PROCESS_RECEIPT_RETENTION_SECONDS: int = 7 * 24 * 60 * 60
+PROCESS_RECEIPT_MAX_FILES: int = 64
+
+
+class ProcessReceipt(BaseModel):
+    """One finished background process, from ``logs/process-results/proc_*.json``.
+
+    Fields mirror upstream's ``_RESULT_FIELDS`` plus the redacted output tail
+    (``tools/process_registry_results.py:21-25,48-61``). Upstream redacts the
+    command and output before writing and marks the file 0600; hermesd redacts
+    both again at the collector boundary and never carries ``cwd``,
+    ``session_key`` or ``parent_session_id``.
+    """
+
+    process_id: str = ""
+    command: str = ""
+    exit_code: int | None = None
+    completion_reason: str = ""
+    termination_source: str = ""
+    started_age_seconds: float | None = None
+    finished_age_seconds: float | None = None
+    output_tail: str = ""
+
+
+class ProcessReceiptsState(BaseModel):
+    """Recently finished background processes, read from PROFILE
+    ``logs/process-results/``.
+
+    Upstream prunes receipts to 7 days / 64 files
+    (``tools/process_registry_results.py:28-45``), so an absent directory or an
+    empty store is normal on any machine that has not run detachable processes
+    lately — the panel says "no receipts yet" rather than implying a failure.
+    """
+
+    dir_present: bool = False
+    receipt_count: int = 0
+    newest_receipt_age_seconds: float | None = None
+    receipts: list[ProcessReceipt] = Field(default_factory=list)
+    receipts_truncated: bool = False
+
+
 class OperationsState(BaseModel):
     dashboard_process_count: int = 0
     desktop_build_stamp: str = ""
@@ -1976,6 +2018,9 @@ class OperationsState(BaseModel):
     # are recorded as separate rows in .codex/rules/source-ownership.md.
     hosted_rooms: HostedRoomState = Field(default_factory=HostedRoomState)
     api_runs: ApiRunReservationsState = Field(default_factory=ApiRunReservationsState)
+    # Written by its own source (``process_receipts``): a receipt directory that
+    # disappears (7-day retention) must keep the last-good list, not blank it.
+    process_receipts: ProcessReceiptsState = Field(default_factory=ProcessReceiptsState)
 
 
 class CuratorRun(BaseModel):

@@ -8,6 +8,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import time
 from pathlib import Path
 from subprocess import CompletedProcess
 
@@ -2505,3 +2506,123 @@ def test_delegation_live_manifest_task_list_is_capped(hermes_home: Path, sample_
     assert manifest.task_count == 12
     assert len(manifest.tasks) < 12
     assert manifest.running_task_count == 12  # counted over every entry, not the cap
+
+
+# --- process completion receipts (item 13) -----------------------------------
+
+
+def _write_receipt(home: Path, name: str, record: dict[str, object]) -> Path:
+    receipts_dir = home / "logs" / "process-results"
+    receipts_dir.mkdir(parents=True, exist_ok=True)
+    path = receipts_dir / name
+    path.write_text(json.dumps(record))
+    return path
+
+
+def _receipt_record(**overrides: object) -> dict[str, object]:
+    record: dict[str, object] = {
+        "id": "proc_abc123",
+        "command": "curl -H 'Authorization: Bearer sk-live-token-9' https://api.example.dev",
+        "exit_code": 2,
+        "completion_reason": "exited",
+        "termination_source": "",
+        "started_at": time.time() - 300,
+        "output": "building...\nAUTH Bearer sk-super-secret-77\ndone, exit 2\n",
+    }
+    record.update(overrides)
+    return record
+
+
+def test_process_receipts_are_parsed_and_redacted(hermes_home: Path, sample_db: Path):
+    _write_receipt(hermes_home, "proc_abc123.json", _receipt_record())
+    _write_receipt(
+        hermes_home,
+        "proc_def456.json",
+        _receipt_record(id="proc_def456", exit_code=0, completion_reason="completed"),
+    )
+
+    c = Collector(hermes_home, clock=_fixed_clock)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "process_receipts" not in state.health.failed_sources
+    receipts = state.operations.process_receipts
+    assert receipts.dir_present is True
+    assert receipts.receipt_count == 2
+    assert receipts.newest_receipt_age_seconds is not None
+    assert receipts.receipts_truncated is False
+    by_id = {r.process_id: r for r in receipts.receipts}
+    abc = by_id["proc_abc123"]
+    assert abc.exit_code == 2
+    assert abc.completion_reason == "exited"
+    assert abc.started_age_seconds is not None and abc.started_age_seconds > 0
+    tail = abc.output_tail
+    assert "sk-super-secret-77" not in tail
+    assert "REDACTED" in tail
+    assert "sk-live-token-9" not in abc.command
+    assert "REDACTED" in abc.command
+
+
+def test_process_receipts_newest_first_and_truncation_flag(hermes_home: Path, sample_db: Path):
+    for index in range(11):
+        path = _write_receipt(
+            hermes_home,
+            f"proc_{index:02d}.json",
+            _receipt_record(id=f"proc_{index:02d}"),
+        )
+        stamp = time.time() - (20 - index) * 60
+        os.utime(path, (stamp, stamp))
+
+    ops = _collect_ops(hermes_home).operations
+    receipts = ops.process_receipts
+    assert receipts.receipt_count == 11
+    assert len(receipts.receipts) == 8
+    assert receipts.receipts_truncated is True
+    # Newest mtime first.
+    assert receipts.receipts[0].process_id == "proc_10"
+    assert receipts.receipts[-1].process_id == "proc_03"
+
+
+def test_process_receipts_absent_dir_is_healthy(hermes_home: Path, sample_db: Path):
+    ops = _collect_ops(hermes_home).operations
+    receipts = ops.process_receipts
+    assert receipts.dir_present is False
+    assert receipts.receipt_count == 0
+    assert receipts.receipts == []
+
+
+def test_process_receipts_junk_and_oversized_are_counted_not_listed(
+    hermes_home: Path, sample_db: Path
+):
+    receipts_dir = hermes_home / "logs" / "process-results"
+    receipts_dir.mkdir(parents=True, exist_ok=True)
+    (receipts_dir / "proc_junk.json").write_text("{not json")
+    oversized = receipts_dir / "proc_big.json"
+    oversized.write_text(json.dumps({"id": "proc_big", "output": "x" * 300_000}))
+
+    ops = _collect_ops(hermes_home).operations
+    receipts = ops.process_receipts
+    # Presence count includes unreadable/oversized files; only parseable ones list.
+    assert receipts.receipt_count == 2
+    assert receipts.receipts == []
+
+
+def test_process_receipts_symlinked_dir_reads_as_absent(
+    hermes_home: Path, sample_db: Path, tmp_path: Path
+):
+    outside = tmp_path / "outside-receipts"
+    outside.mkdir()
+    _write_receipt(outside, "proc_out.json", _receipt_record(id="proc_out"))
+    receipts_dir = hermes_home / "logs" / "process-results"
+    receipts_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        (receipts_dir / "linked").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are not supported here")
+
+    ops = _collect_ops(hermes_home).operations
+    assert ops.process_receipts.dir_present is True  # the real dir exists
+    assert ops.process_receipts.receipt_count == 0  # symlinked children are skipped
+    assert ops.process_receipts.receipts == []

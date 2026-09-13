@@ -13,6 +13,8 @@ from hermesd.models import (
     MAX_DISBANDED_HOSTED_ROOM_TOMBSTONES,
     MAX_EVENTS_PER_HOSTED_ROOM,
     MAX_PERSISTENT_REPAIR_ATTEMPTS,
+    PROCESS_RECEIPT_MAX_FILES,
+    PROCESS_RECEIPT_RETENTION_SECONDS,
     ApiRunReservation,
     ApiRunReservationsState,
     DashboardState,
@@ -22,6 +24,7 @@ from hermesd.models import (
     HostedRoomState,
     HostedRoomSummary,
     OperationsState,
+    ProcessReceiptsState,
 )
 from hermesd.panels.formatting import escape_terminal_text as escape
 from hermesd.panels.formatting import fmt_age_seconds, sanitize_terminal_text
@@ -69,6 +72,17 @@ _API_RUN_NOTE_LINES = (
     "guessed.",
     "owner_started is platform-dependent units (/proc ticks on Linux, psutil centiseconds",
     "elsewhere), so it is reduced to 'identity recorded' and never compared to a timestamp.",
+)
+
+# Rendered under Process Receipts: the two lines an operator needs to not
+# over-read an empty list — retention empties it legitimately, and the scope
+# differs from every other registry in this panel.
+_RECEIPT_NOTE_LINES = (
+    f"Receipts are retained upstream for {PROCESS_RECEIPT_RETENTION_SECONDS // 86400} days / "
+    f'{PROCESS_RECEIPT_MAX_FILES} files, so "no receipts yet" is normal on a quiet machine.',
+    "PROFILE-scoped: <home>/logs/process-results/ — the ROOT spawn-ledger.json is a different",
+    "registry. Command and output are redacted again before rendering; cwd and session keys",
+    "are never read.",
 )
 
 # Rendered under Live Delegation Transcripts. The first block is the thing an
@@ -132,6 +146,9 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     if ops.api_runs.db_present:
         lines.append("  API Runs: ", style=theme.ui_label)
         lines.append(f"{ops.api_runs.reservation_count} retained\n", style=theme.banner_text)
+    if ops.process_receipts.receipt_count:
+        lines.append("  Finished procs: ", style=theme.ui_label)
+        lines.append(f"{ops.process_receipts.receipt_count} receipts\n", style=theme.banner_text)
     if ops.blocked_script_count:
         lines.append("  Blocked scripts: ", style=theme.ui_label)
         lines.append(f"{ops.blocked_script_count}\n", style=theme.ui_warn)
@@ -186,6 +203,10 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         sections.append(_heading("Live Delegation Transcripts", theme))
         sections.extend(_live_manifest_sections(ops, theme))
         sections.append(_note(_LIVE_MANIFEST_NOTE_LINES, theme))
+
+    # Always stated, even when the directory has never existed: an absent
+    # receipt store is the normal case on a quiet machine, not a failure.
+    sections.extend(_receipt_sections(ops.process_receipts, theme))
 
     if ops.state_db_size_bytes or ops.state_db_schema_version:
         sections.append(_heading("State DB", theme))
@@ -242,6 +263,7 @@ def _has_no_artifacts(ops: OperationsState) -> bool:
         and not ops.goal_count
         and not ops.delegation_count
         and not ops.delegation_live_manifests
+        and not ops.process_receipts.receipt_count
         and not ops.snapshot_count
         and not ops.state_db_size_bytes
         and not ops.web_ui_build_hash
@@ -694,6 +716,56 @@ def _live_tasks_text(manifest: DelegationLiveManifest, theme: Theme) -> Text:
         for tail_line in task.log_tail:
             lines.append(f"    {sanitize_terminal_text(tail_line)}\n", style=theme.banner_dim)
     return lines
+
+
+def _receipt_sections(receipts: ProcessReceiptsState, theme: Theme) -> list[RenderableType]:
+    parts: list[RenderableType] = [_heading("Process Receipts", theme)]
+    if receipts.receipts:
+        parts.append(_receipts_table(receipts, theme))
+        if receipts.receipts_truncated:
+            parts.append(
+                Text(
+                    "  "
+                    + _truncation_label(len(receipts.receipts), receipts.receipt_count)
+                    + " — newest first\n",
+                    style=theme.banner_dim,
+                )
+            )
+    else:
+        parts.append(
+            Text(
+                "  no receipts yet — background processes that finish while unwatched land here\n",
+                style=theme.banner_dim,
+            )
+        )
+    parts.append(_note(_RECEIPT_NOTE_LINES, theme))
+    return parts
+
+
+def _receipts_table(receipts: ProcessReceiptsState, theme: Theme) -> Table:
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("Process", style=theme.ui_accent)
+    table.add_column("Exit", justify="right", style=theme.banner_text)
+    table.add_column("Reason", style=theme.banner_dim)
+    table.add_column("Finished", style=theme.banner_dim)
+    table.add_column("Command", style=theme.banner_text)
+    table.add_column("Output Tail", style=theme.banner_dim)
+    for receipt in receipts.receipts:
+        table.add_row(
+            escape(receipt.process_id) or "—",
+            "—" if receipt.exit_code is None else str(receipt.exit_code),
+            escape(receipt.completion_reason) or escape(receipt.termination_source) or "—",
+            _age_span_label(receipt.finished_age_seconds),
+            escape(receipt.command) or "—",
+            escape(_single_line(receipt.output_tail)) or "—",
+        )
+    return table
+
+
+def _single_line(value: str) -> str:
+    """Collapse a multi-line tail to one table cell, keeping the newest text."""
+    collapsed = " ⏎ ".join(part for part in value.splitlines() if part.strip())
+    return collapsed[-120:] if len(collapsed) > 120 else collapsed
 
 
 def _delegation_procs_label(delegation: DelegationInfo) -> str:

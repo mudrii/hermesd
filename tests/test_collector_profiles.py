@@ -874,6 +874,91 @@ def test_profiled_db_recovery_refuses_a_cross_profile_symlink(
     assert recovery.failed_attempts == 0
 
 
+def test_process_receipts_are_profile_scoped_under_a_profile(
+    profiled_hermes_home: Path,
+):
+    """Receipts follow upstream's get_hermes_home() anchor: PROFILE, not ROOT.
+
+    The writer resolves ``get_hermes_home()/"logs"/"process-results"``
+    (``tools/process_registry_results.py:30,58``) — the same home as the
+    registry checkpoint the ownership table already records. Under a selected
+    profile, root-mode receipts are invisible, exactly like every PROFILE row.
+    """
+    import time as _time
+
+    def _write_receipt(base: Path, process_id: str) -> None:
+        receipts_dir = base / "logs" / "process-results"
+        receipts_dir.mkdir(parents=True, exist_ok=True)
+        (receipts_dir / f"{process_id}.json").write_text(
+            json.dumps(
+                {
+                    "id": process_id,
+                    "command": "sleep 5",
+                    "exit_code": 0,
+                    "started_at": _time.time() - 60,
+                }
+            )
+        )
+
+    profile_home = profiled_hermes_home / "profiles" / "coding"
+    _write_receipt(profiled_hermes_home, "proc_root_receipt")
+    _write_receipt(profile_home, "proc_profile_receipt")
+
+    profiled = Collector(profiled_hermes_home, profile_name="coding")
+    try:
+        profiled_receipts = profiled.collect().operations.process_receipts
+    finally:
+        profiled.close()
+    assert profiled_receipts.dir_present is True
+    assert [r.process_id for r in profiled_receipts.receipts] == ["proc_profile_receipt"]
+
+    rooted = Collector(profiled_hermes_home)
+    try:
+        root_receipts = rooted.collect().operations.process_receipts
+    finally:
+        rooted.close()
+    assert [r.process_id for r in root_receipts.receipts] == ["proc_root_receipt"]
+
+
+def test_delegation_live_is_root_scoped_under_a_profile(profiled_hermes_home: Path):
+    """Behaviour pin: live manifests read the ROOT cache/delegation/live copy.
+
+    hermesd keeps the whole delegation cluster (count inside `operations`, the
+    `delegation_live` source here) on the root resolver, an open divergence from
+    upstream's profile-safe ``live_transcript_root()``
+    (``tools/delegation_live_log.py:40-43``). The pin records what the code does
+    so a change is deliberate, not an endorsement.
+    """
+
+    def _write_manifest(base: Path, delegation_id: str) -> None:
+        run_dir = base / "cache" / "delegation" / "live" / delegation_id
+        run_dir.mkdir(parents=True)
+        (run_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "delegation_id": delegation_id,
+                    "task_count": 1,
+                    "model": "m",
+                    "provider": "p",
+                    "tasks": [{"index": 0, "goal": "g", "status": "running"}],
+                }
+            )
+        )
+
+    profile_home = profiled_hermes_home / "profiles" / "coding"
+    _write_manifest(profiled_hermes_home, "deleg_root01")
+    _write_manifest(profile_home, "deleg_prof01")
+
+    c = Collector(profiled_hermes_home, profile_name="coding")
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+    assert "delegation_live" not in state.health.failed_sources
+    assert [m.delegation_id for m in state.operations.delegation_live_manifests] == ["deleg_root01"]
+    assert state.operations.delegation_live_manifest_count == 1
+
+
 def test_root_mode_operations_confinement_is_unchanged(hermes_home: Path):
     """Root mode confines against root_home because profile_home *is* root_home."""
     assert HermesPaths(hermes_home).profile_home == hermes_home
