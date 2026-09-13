@@ -26,6 +26,10 @@ and this project uses date-based versions in `YYYY.M.D` form.
   curator's stale/archive thresholds (14/30 days by default, honoring
   `curator.stale_after_days` / `curator.archive_after_days` overrides). Windows run
   from the last use/view/patch; `created_at` stays excluded upstream.
+- Skills/Integrations panel: a "Nous free tier" badge now marks the free-tier
+  identity (`providers.nous` with `auth_method`/`account_tier` "anonymous" in
+  auth.json), next to the provider list in both views. Key names only — no
+  credential values are read or shown.
 
 ### CI/CD
 

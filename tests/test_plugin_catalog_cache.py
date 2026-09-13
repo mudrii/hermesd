@@ -320,3 +320,70 @@ def test_panel_notes_absent_catalog_cache(hermes_home: Path):
     detail = render_to_str(render_panel(7, state, Theme(), detail=True), width=220)
 
     assert "no catalog cache observed" in detail
+
+
+def test_collect_free_tier_provider_marker(hermes_home: Path):
+    """providers.nous with auth_method/account_tier "anonymous" is the free tier.
+
+    Mirrors ``is_guest_state`` + ``ANON_ACCOUNT_TIER``
+    (``hermes_cli/anon_auth.py:39-41,88-89,271-272``). Key names only: the
+    state's token fields are never read.
+    """
+    (hermes_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "nous": {
+                        "auth_method": "anonymous",
+                        "account_tier": "anonymous",
+                        "anon_token": "anon-secret-value-never-read",
+                        "access_token": "jwt-value-never-read",
+                    },
+                    "openai-codex": {"auth_method": "api_key", "account_tier": "paid"},
+                    "half-anon": {"auth_method": "anonymous"},
+                },
+                "active_provider": "nous",
+            }
+        )
+    )
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    providers = {provider.name: provider for provider in state.skills_memory.providers}
+    assert providers["nous"].free_tier is True
+    assert providers["nous"].is_active is True
+    assert providers["openai-codex"].free_tier is False
+    assert providers["half-anon"].free_tier is False
+    # Key names only: no token value may surface anywhere in the state.
+    assert "anon-secret-value-never-read" not in state.model_dump_json()
+    assert "jwt-value-never-read" not in state.model_dump_json()
+
+
+def test_free_tier_badge_renders_next_to_the_provider_list(hermes_home: Path):
+    (hermes_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "nous": {"auth_method": "anonymous", "account_tier": "anonymous"},
+                    "openai-codex": {"auth_method": "api_key"},
+                }
+            }
+        )
+    )
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    detail = render_to_str(render_panel(7, state, Theme(), detail=True), width=160)
+    compact = render_to_str(render_panel(7, state, Theme(), detail=False), width=120)
+
+    assert "Nous free tier" in detail
+    assert "Nous free tier" in compact
+    assert "nous" in compact

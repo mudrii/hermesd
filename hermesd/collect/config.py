@@ -239,6 +239,16 @@ def _config_backup_groups(
     return groups[:_CONFIG_BACKUP_GROUP_LIMIT], truncated
 
 
+def _provider_free_tier(entry: dict[str, Any]) -> bool:
+    """The Nous free-tier identity: ``auth_method`` and ``account_tier`` both
+    "anonymous" (``hermes_cli/anon_auth.py:39-41``, ``is_guest_state`` at
+    ``:88-89``, minted state at ``:271-272``). Key names only — the entry's
+    token values are never read, and a dead guest credential is removed rather
+    than marked, so the tier simply disappears when it lapses.
+    """
+    return entry.get("auth_method") == "anonymous" and entry.get("account_tier") == "anonymous"
+
+
 def _provider_model_label(cfg: dict[str, Any]) -> str:
     provider = str(cfg.get("provider") or "")
     model = str(cfg.get("model") or "")

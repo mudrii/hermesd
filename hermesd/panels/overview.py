@@ -86,6 +86,8 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         color = theme.ui_ok if p.is_active else theme.banner_dim
         lines.append(f"  {sym} ", style=color)
         lines.append(f"{sanitize_terminal_text(p.name)} ", style=theme.banner_text)
+        if p.free_tier:
+            lines.append("Nous free tier", style=theme.ui_ok)
 
     return Panel(
         lines,
@@ -303,13 +305,14 @@ def _providers_table(sm: SkillsMemory, theme: Theme) -> Table:
     prov_table = Table(box=None, show_header=False, padding=(0, 2))
     prov_table.add_column("Status", width=3)
     prov_table.add_column("Name", style=theme.banner_text)
+    prov_table.add_column("Identity", style=theme.ui_ok)
     for p in sm.providers:
         sym = (
             Text("●", style=f"bold {theme.ui_ok}")
             if p.is_active
             else Text("○", style=theme.banner_dim)
         )
-        prov_table.add_row(sym, escape(p.name))
+        prov_table.add_row(sym, escape(p.name), "Nous free tier" if p.free_tier else "")
     return prov_table
 
 

@@ -59,6 +59,7 @@ from hermesd.collect.config import (
     _mcp_tool_filter_summary,
     _moa_config_summary,
     _platform_family_label,
+    _provider_free_tier,
     _provider_model_label,
     _provider_routing_summary,
     _scale_to_zero_relay_only,
@@ -3225,7 +3226,14 @@ class Collector:
         pool = _as_dict(data.get("credential_pool"))
         providers_section = _as_dict(data.get("providers"))
         all_names = set(pool.keys()) | set(providers_section.keys())
-        return [ProviderInfo(name=name, is_active=(name == active)) for name in sorted(all_names)]
+        return [
+            ProviderInfo(
+                name=name,
+                is_active=(name == active),
+                free_tier=_provider_free_tier(_as_dict(providers_section.get(name))),
+            )
+            for name in sorted(all_names)
+        ]
 
     def _collect_credential_pools(self, data: dict[str, Any]) -> list[CredentialPoolEntry]:
         if not data:
