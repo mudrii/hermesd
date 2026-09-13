@@ -130,9 +130,11 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         running = sum(m.running_task_count for m in ops.delegation_live_manifests)
         lines.append("  Live delegations: ", style=theme.ui_label)
         lines.append(
-            # "live" counts every run dir; "running" only the cards parsed into
-            # this list, so the copy marks which side is the displayed slice.
-            f"{ops.delegation_live_manifest_count} live · {running} running (shown)\n",
+            # The count covers every run directory — finished delegations
+            # included, since only the parsed cards carry `completed` — so it is
+            # labelled "manifests". "running" is the parsed slice, marked as
+            # such.
+            f"{ops.delegation_live_manifest_count} manifests · {running} running (shown)\n",
             style=theme.banner_text,
         )
     # Counts only, like every other compact row here: room names and run ids are

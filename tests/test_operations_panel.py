@@ -505,7 +505,7 @@ def test_compact_shows_live_delegation_line_when_present():
     )
     absent = render_to_str(render_operations(_ops_state(), Theme()), no_color=True)
     assert "Live delegations:" in populated
-    assert "2 live · 1 running" in populated
+    assert "2 manifests · 1 running" in populated
     assert "Live delegations:" not in absent
 
 
@@ -522,7 +522,31 @@ def test_compact_live_line_marks_the_running_sum_as_displayed():
     )
     # The manifest count covers every run dir; the running sum only covers the
     # cards the collector parsed, so the copy has to say which is which.
-    assert "2 live · 1 running (shown)" in text
+    assert "2 manifests · 1 running (shown)" in text
+
+
+def test_compact_live_line_does_not_call_every_run_dir_live():
+    """The count covers run directories, and finished ones are not live.
+
+    Only the parsed cards carry ``completed``/``running_task_count``, so the
+    total cannot be filtered by liveness without parsing every counted
+    manifest; calling the total "live" claimed nine July delegations were
+    running on the live home, where every parsed manifest had completed.
+    """
+    finished = _live_manifest()
+    finished = finished.model_copy(update={"completed": 1_700_000_000, "running_task_count": 0})
+    text = render_to_str(
+        render_operations(
+            _ops_state(
+                delegation_live_manifest_count=9,
+                delegation_live_manifests=[finished],
+            ),
+            Theme(),
+        ),
+        no_color=True,
+    )
+    assert "9 manifests · 0 running (shown)" in text
+    assert "9 live" not in text
 
 
 # --- process completion receipts (item 13) ----------------------------------
