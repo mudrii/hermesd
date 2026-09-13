@@ -1704,10 +1704,11 @@ class KanbanTaskSummary(BaseModel):
     # (tools/kanban_tools_schemas.py:461-464), so a done-looking review card
     # may be waiting on CI rather than finished.
     completion_contract: str = ""
-    # Per-task breaker trip count (NULL upstream -> 0 here). This is the
+    # Per-task breaker trip threshold: the raw column, so NULL ("no override")
+    # stays distinct from a stored 0 ("trip on the first failure"). This is the
     # failure count at which the breaker trips, not a retry budget
     # (hermes_cli/kanban_db.py:908-914).
-    max_retries: int = 0
+    max_retries: int | None = None
     # Effective trip threshold and verdict for this task, computed against the
     # configured kanban.failure_limit at collect time.
     breaker_limit: int = 0

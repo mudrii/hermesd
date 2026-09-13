@@ -280,7 +280,7 @@ def _kanban_task_from_row(row: dict[str, Any], *, failure_limit: int = 0) -> Kan
         # redactor as every other URL hermesd surfaces; a plain ``OWNER/REPO``
         # has no credential shape and passes through unchanged.
         completion_contract=_redact_secret_url(str(row.get("completion_contract") or "")),
-        max_retries=max_retries or 0,
+        max_retries=max_retries,
         breaker_limit=breaker_limit,
         # A breaker trips on failures: upstream increments the counter before it
         # compares, so a fresh task under a 0 limit is not "0/0 tripped".

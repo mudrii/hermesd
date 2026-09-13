@@ -1314,9 +1314,45 @@ def test_collect_kanban_breaker_null_max_retries_uses_config_limit(hermes_home: 
         c.close()
 
     task = state.kanban.active_tasks[0]
-    assert task.max_retries == 0
+    assert task.max_retries is None
     assert task.breaker_limit == 5
     assert task.breaker_tripped is False
+
+
+def test_kanban_max_retries_preserves_null_versus_zero(hermes_home: Path):
+    """NULL is "no override"; a stored 0 is an explicit trip-on-first-failure one.
+
+    Upstream keeps the two apart at the row and dispatch layers — ``_opt_int``
+    passes 0 through (``kanban_db.py:1892-1894``) and the override is selected
+    with ``is not None`` (``kanban_db_dispatch.py:1027-1032``) — and the
+    snapshot is the only place the raw column is visible, so collapsing NULL to
+    0 there erased the distinction the collector's breaker logic relies on.
+    """
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, consecutive_failures) "
+        "VALUES ('t_null', 'No override', 'in_progress', 1, 0)"
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, consecutive_failures, max_retries) "
+        "VALUES ('t_zero', 'Zero override', 'in_progress', 1, 0, 0)"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    tasks = {task.task_id: task for task in state.kanban.active_tasks}
+    assert tasks["t_null"].max_retries is None
+    assert tasks["t_zero"].max_retries == 0
+    # Both fall back to the default limit, but only 0 is an override.
+    assert tasks["t_null"].breaker_limit == 2
+    assert tasks["t_zero"].breaker_limit == 0
 
 
 def test_collect_kanban_breaker_task_max_retries_overrides_config_limit(hermes_home: Path):
