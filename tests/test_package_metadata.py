@@ -114,6 +114,26 @@ def _assert_ci_uses_locked_env(ci: dict, job_name: str, python_version: str) -> 
     assert step["with"]["python-version"] == python_version
 
 
+def test_dependency_review_gate_policy() -> None:
+    review = _workflow(".github/workflows/dependency-review.yml")
+
+    assert review["on"] == {"pull_request": None}
+    # Read-only: posting PR comments would need pull-requests: write for no
+    # control benefit (audit CI-13).
+    assert review["permissions"] == {"contents": "read"}
+
+    job = review["jobs"]["dependency-review"]
+    step = next(
+        step
+        for step in job["steps"]
+        if step.get("uses", "").startswith("actions/dependency-review-action@")
+    )
+    assert re.fullmatch(r"actions/dependency-review-action@[0-9a-f]{40}", step["uses"])
+    assert step["with"]["fail-on-severity"] == "moderate"
+    assert step["with"]["retry-on-snapshot-warnings"] is True
+    assert "comment-summary-in-pr" not in step["with"]
+
+
 def test_scheduled_security_workflow_blocks_and_reports() -> None:
     security = _workflow(".github/workflows/security.yml")
 
