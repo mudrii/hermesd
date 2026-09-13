@@ -3444,32 +3444,30 @@ def test_exit_diag_future_stamp_is_not_counted_as_unclean(hermes_home: Path):
     assert gateway.exit_diag_unclean_24h == 1
 
 
-def test_forensic_companions_are_stat_only(hermes_home: Path, monkeypatch: pytest.MonkeyPatch):
-    """Companion logs are reported by size alone; their contents are never read."""
+def test_forensic_companions_are_stat_only(hermes_home: Path):
+    """Companion logs are reported by size alone; their contents are never read.
+
+    The files are made unreadable, which is the strongest fixture available: the
+    rows are still reported with their sizes, so nothing opened them — either
+    reader would have failed on the permission bits.
+    """
     _write_gateway_state(hermes_home)
     logs = hermes_home / "logs"
     logs.mkdir(exist_ok=True)
     companions = ("gateway-shutdown-diag.log", "gateway_faulthandler.log", "launchd-reload.log")
-    for name in companions:
-        (logs / name).write_text("SECRET-COMPANION-BODY")
+    paths = [logs / name for name in companions]
+    for path in paths:
+        path.write_text("SECRET-COMPANION-BODY")
+        path.chmod(0o000)
 
-    import hermesd.collect.gateway as gateway_module
-
-    read_paths: list[str] = []
-    for helper in ("_read_text_capped", "_read_tail_text"):
-        real = getattr(gateway_module, helper)
-
-        def spy(path: Path, *args: object, _real: object = real, **kwargs: object) -> object:
-            read_paths.append(Path(path).name)
-            return _real(path, *args, **kwargs)  # type: ignore[operator]
-
-        monkeypatch.setattr(gateway_module, helper, spy)
-
-    gateway = _collect(hermes_home).gateway
+    try:
+        gateway = _collect(hermes_home).gateway
+    finally:
+        for path in paths:
+            path.chmod(0o600)
 
     assert {f.name for f in gateway.forensic_files} == set(companions)
     assert all(size > 0 for size in (f.size_bytes for f in gateway.forensic_files))
-    assert read_paths == [] or not set(read_paths) & set(companions)
 
 
 def test_restart_storm_exactly_at_the_cap_is_not_backoff(hermes_home: Path):

@@ -2540,7 +2540,7 @@ def test_live_manifest_task_count_derives_from_the_entries(hermes_home: Path, sa
 
 
 def test_delegation_live_manifest_tails_only_the_displayed_tasks(
-    hermes_home: Path, sample_db: Path, monkeypatch: pytest.MonkeyPatch
+    hermes_home: Path, sample_db: Path
 ):
     """Log tails are read for the displayed slice only; counts still cover all."""
     live = hermes_home / "cache" / "delegation" / "live"
@@ -2570,8 +2570,13 @@ def test_delegation_live_manifest_tails_only_the_displayed_tasks(
         calls.append(path)
         return real_tail(path, home)
 
-    monkeypatch.setattr(operations_module, "_live_log_tail", counting_tail)
-    ops = _collect_ops(hermes_home).operations
+    # Injected through the collector rather than patched onto the module: the
+    # property is a read *count*, which no fixture can observe from outside.
+    c = Collector(hermes_home, clock=_fixed_clock, live_log_tail=counting_tail)
+    try:
+        ops = c.collect().operations
+    finally:
+        c.close()
     card = ops.delegation_live_manifests[0]
 
     assert len(calls) == cap
@@ -2996,28 +3001,25 @@ def test_live_manifest_counted_but_unparsed_is_explained(hermes_home: Path, samp
     assert "too large" in text
 
 
-def test_corrupt_ledger_marker_never_reads_the_parked_bytes(
-    hermes_home: Path, sample_db: Path, monkeypatch: pytest.MonkeyPatch
-):
-    """The parking bay is stat'd for its mtime; its contents are corrupt bytes."""
-    import hermesd.collect.operations as operations_module
+def test_corrupt_ledger_marker_never_reads_the_parked_bytes(hermes_home: Path, sample_db: Path):
+    """The parking bay is stat'd for its mtime; its contents are corrupt bytes.
 
+    The file is made unreadable, which is the strongest available fixture: the
+    row is still reported with its age, so the bytes were never opened — a read
+    would have failed on the permission bits (and the byte count is never
+    surfaced either way).
+    """
     path = hermes_home / "spawn-ledger.json.corrupt"
     path.write_text("SECRET-PARKED-BYTES")
+    path.chmod(0o000)
 
-    read_paths: list[str] = []
-    real_read = operations_module._read_text_capped
-
-    def spy(source: Path, *args: object, **kwargs: object) -> str:
-        read_paths.append(Path(source).name)
-        return real_read(source, *args, **kwargs)
-
-    monkeypatch.setattr(operations_module, "_read_text_capped", spy)
-    ops = _collect_ops(hermes_home).operations
+    try:
+        ops = _collect_ops(hermes_home).operations
+    finally:
+        path.chmod(0o600)
 
     assert ops.spawn_ledger_corrupt_present is True
     assert ops.spawn_ledger_corrupt_age_seconds is not None
-    assert "spawn-ledger.json.corrupt" not in read_paths
 
 
 def test_curator_paused_flag_is_read_strictly(hermes_home: Path):

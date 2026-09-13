@@ -1028,23 +1028,23 @@ def test_collect_config_backups_symlinked_dir_is_not_present(hermes_home: Path, 
     assert "config_backups" in state.health.failed_sources
 
 
-def test_collect_config_backups_failure_keeps_last_good_fields(
-    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_collect_config_backups_failure_keeps_last_good_fields(hermes_home: Path):
+    """A failure AFTER a good scan keeps the last-good fields, not zeroes.
+
+    The failure is a real one — the backups directory becomes unreadable — so
+    the pin exercises the reader instead of a patched helper.
+    """
     _write_config_backup(hermes_home, "config.yaml.good.20260907-143000")
+    backups = hermes_home / "backups" / "config"
     c = Collector(hermes_home)
     try:
         first = c.collect()
         assert first.config.config_backups_present is True
 
-        import hermesd.collector as collector_module
-
-        def boom(names, *, now):
-            raise RuntimeError("scan exploded")
-
-        monkeypatch.setattr(collector_module, "_config_backup_groups", boom)
+        backups.chmod(0o000)
         second = c.collect()
     finally:
+        backups.chmod(0o700)
         c.close()
 
     assert "config_backups" in second.health.failed_sources

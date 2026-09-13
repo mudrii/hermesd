@@ -601,9 +601,7 @@ def test_kanban_task_links_missing_table_is_an_empty_success(hermes_home: Path):
     assert state.kanban.link_count == 0
 
 
-def test_kanban_task_links_read_error_fails_source_and_keeps_last_good(
-    hermes_home: Path, monkeypatch
-):
+def test_kanban_task_links_read_error_fails_source_and_keeps_last_good(hermes_home: Path):
     """A failing task_links read is a source failure, not an empty list."""
     conn = sqlite3.connect(str(hermes_home / "kanban.db"))
     create_kanban_db_tables(conn)
@@ -618,19 +616,23 @@ def test_kanban_task_links_read_error_fails_source_and_keeps_last_good(
         assert len(first.kanban.task_links) == 1
         assert "kanban" not in first.health.failed_sources
 
-        real_query_rows = kanban_module._query_rows
-
-        def flaky_query_rows(conn, sql, *args):
-            if "FROM task_links" in sql:
-                raise sqlite3.OperationalError("simulated task_links read failure")
-            return real_query_rows(conn, sql, *args)
-
-        monkeypatch.setattr(kanban_module, "_query_rows", flaky_query_rows)
+        # A real hostile schema: the links table keeps its name but loses the
+        # column the reader selects, so the read fails instead of the table
+        # reading as pre-links (which is a documented, healthy degradation).
+        broken = sqlite3.connect(str(hermes_home / "kanban.db"))
+        broken.execute("DROP TABLE task_links")
+        broken.execute("CREATE TABLE task_links (parent_id TEXT)")
+        broken.commit()
+        broken.close()
         second = c.collect()
         assert "kanban" in second.health.failed_sources
         assert second.kanban == first.kanban
 
-        monkeypatch.setattr(kanban_module, "_query_rows", real_query_rows)
+        restored = sqlite3.connect(str(hermes_home / "kanban.db"))
+        restored.execute("ALTER TABLE task_links ADD COLUMN child_id TEXT")
+        restored.execute("INSERT INTO task_links VALUES ('t_parent', 't_child')")
+        restored.commit()
+        restored.close()
         third = c.collect()
         assert "kanban" not in third.health.failed_sources
         assert len(third.kanban.task_links) == 1
@@ -658,10 +660,14 @@ def test_kanban_pre_enrichment_schema_has_no_recent_tasks(hermes_home: Path):
     assert state.kanban.recent_tasks == []
 
 
-def test_kanban_enriched_tasks_read_error_fails_source_and_keeps_last_good(
-    hermes_home: Path, monkeypatch
-):
-    """A failing enriched-tasks read is a source failure, not an empty list."""
+def test_kanban_read_error_fails_source_and_keeps_last_good(hermes_home: Path):
+    """A failing read is a source failure, not an empty board.
+
+    The failure is real — the tasks table is dropped and later restored — so the
+    pin covers the reader's own error handling rather than a patched query
+    helper. The enriched-tasks read's degraded shapes (no completed_at, no
+    enrichment columns at all) have their own unit tests below.
+    """
     now = int(time.time())
     conn = sqlite3.connect(str(hermes_home / "kanban.db"))
     create_kanban_db_tables(conn)
@@ -680,19 +686,31 @@ def test_kanban_enriched_tasks_read_error_fails_source_and_keeps_last_good(
         assert [task.task_id for task in first.kanban.recent_tasks] == ["t_done"]
         assert "kanban" not in first.health.failed_sources
 
-        real_query_rows = kanban_module._query_rows
-
-        def flaky_query_rows(conn, sql, *args):
-            if "completed_at IS NOT NULL" in sql:
-                raise sqlite3.OperationalError("simulated enriched-tasks read failure")
-            return real_query_rows(conn, sql, *args)
-
-        monkeypatch.setattr(kanban_module, "_query_rows", flaky_query_rows)
+        broken = sqlite3.connect(str(hermes_home / "kanban.db"))
+        broken.execute("DROP TABLE tasks")
+        broken.commit()
+        broken.close()
         second = c.collect()
         assert "kanban" in second.health.failed_sources
         assert second.kanban == first.kanban
 
-        monkeypatch.setattr(kanban_module, "_query_rows", real_query_rows)
+        restored = sqlite3.connect(str(hermes_home / "kanban.db"))
+        # Only the dropped table comes back; the sibling tables were never
+        # touched, and the schema helper is not re-runnable.
+        restored.execute(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, "
+            "created_at INTEGER, completed_at INTEGER, workspace_path TEXT, "
+            "assignee TEXT, priority INTEGER, consecutive_failures INTEGER, "
+            "last_failure_error TEXT, last_heartbeat_at INTEGER, started_at INTEGER, "
+            "current_run_id INTEGER, worker_pid INTEGER)"
+        )
+        restored.execute(
+            "INSERT INTO tasks (id, title, status, created_at, completed_at, workspace_path) "
+            "VALUES ('t_done', 'Done task', 'done', ?, ?, '/work/repo')",
+            (now - 100, now),
+        )
+        restored.commit()
+        restored.close()
         third = c.collect()
         assert "kanban" not in third.health.failed_sources
         assert [task.task_id for task in third.kanban.recent_tasks] == ["t_done"]
@@ -1034,7 +1052,7 @@ def test_kanban_notify_missing_table_reads_healthy_empty(hermes_home: Path):
     assert state.kanban.notify_orphan_profiles == []
 
 
-def test_kanban_notify_read_error_restores_only_notify_fields(hermes_home: Path, monkeypatch):
+def test_kanban_notify_read_error_restores_only_notify_fields(hermes_home: Path):
     """A failing subscription read degrades only the notify fields; the board
     itself keeps its fresh values and the notify fields keep their last good."""
     conn = sqlite3.connect(str(hermes_home / "kanban.db"))
@@ -1059,14 +1077,16 @@ def test_kanban_notify_read_error_restores_only_notify_fields(hermes_home: Path,
         conn.commit()
         conn.close()
 
-        real_query_rows = kanban_module._query_rows
-
-        def flaky_query_rows(conn, sql, *args):
-            if "FROM kanban_notify_subs" in sql:
-                raise sqlite3.OperationalError("simulated notify-sub read failure")
-            return real_query_rows(conn, sql, *args)
-
-        monkeypatch.setattr(kanban_module, "_query_rows", flaky_query_rows)
+        # A real hostile schema: task_events without the columns the notify
+        # reader's correlated subqueries need. The board's own COUNT(*) over the
+        # table still works, so exactly one reader fails — which a patched query
+        # helper could only pretend to do.
+        broken = sqlite3.connect(str(hermes_home / "kanban.db"))
+        broken.execute("DROP TABLE task_events")
+        broken.execute("CREATE TABLE task_events (kind TEXT, created_at INTEGER)")
+        broken.execute("INSERT INTO task_events VALUES ('status', 1)")
+        broken.commit()
+        broken.close()
         second = c.collect()
         assert "kanban_notify" in second.health.failed_sources
         # Every field the source owns is restored, not just the headline count:

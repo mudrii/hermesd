@@ -12,8 +12,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from hermesd.collect.plugins import (
     RemovedCatalogEntry,
     normalize_repo,
@@ -233,30 +231,34 @@ def test_collector_catalog_cache_symlink_fails_its_own_source(hermes_home: Path,
     assert state.skills_memory.plugin_catalog_cache_present is False
 
 
-def test_collector_catalog_drift_failure_keeps_last_good_flags(
-    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_collector_catalog_drift_failure_keeps_last_good_flags(hermes_home: Path, tmp_path: Path):
+    """A failure AFTER a good read keeps the last-good flags, not just zeroes.
+
+    The failure is a real one — the catalog cache is replaced by a symlink
+    pointing outside the home, which the reader refuses — rather than a patched
+    method, so the property is pinned against the code path that actually runs.
+    """
     _write_plugin(
         hermes_home,
         "weather",
         sidecar={"catalog_name": "weather", "sha": _SHA_OLD},
     )
-    _write_catalog_cache(
+    cache_path = _write_catalog_cache(
         hermes_home,
         entries=[{"name": "weather", "sha": _SHA_NEW}],
         removed=[],
     )
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "plugin-catalog.json").write_text("{}")
+
     c = Collector(hermes_home)
     try:
         first = c.collect()
         assert first.skills_memory.plugin_catalog_update_count == 1
 
-        import hermesd.collector as collector_module
-
-        def boom(current):
-            raise RuntimeError("scan exploded")
-
-        monkeypatch.setattr(collector_module.Collector, "_with_plugin_catalog", boom)
+        cache_path.unlink()
+        cache_path.symlink_to(outside / "plugin-catalog.json")
         second = c.collect()
     finally:
         c.close()

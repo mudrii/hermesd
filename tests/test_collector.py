@@ -2200,11 +2200,11 @@ def test_terminal_breadcrumb_scan_is_bounded_and_flags_truncation(hermes_home: P
             reads += 1
         return real_read(path, root)
 
-    c = Collector(hermes_home)
+    # The reader is injected rather than patched onto the module: the property
+    # is a read *count*, which no fixture can observe from the outside.
+    c = Collector(hermes_home, text_reader=counting_read)
     try:
-        with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(collector_module, "_read_text_capped", counting_read)
-            state = c.collect()
+        state = c.collect()
     finally:
         c.close()
 

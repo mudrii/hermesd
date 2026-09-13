@@ -138,6 +138,7 @@ from hermesd.collect.operations import (
     _curator_with_scheduler_state,
     _is_dashboard_process,
     _iso_age_seconds,
+    _live_log_tail,
     _moa_latest_record_summary,
     _model_cache_counts,
     _read_checkpoint_prune_marker,
@@ -667,6 +668,8 @@ class Collector:
         env: Mapping[str, str] | None = None,
         loop_tick_probe: Callable[[int, int | None], bool | None] | None = None,
         hostname: str | None = None,
+        text_reader: Callable[[Path, Path | None], str] | None = None,
+        live_log_tail: Callable[[Path, Path], list[str]] | None = None,
     ):
         self._root_home = hermes_home
         self._file_cache = file_cache if file_cache is not None else LastGoodFileCache()
@@ -696,6 +699,13 @@ class Collector:
         # the claim parser is testable off a fixed host instead of the machine
         # running the suite.
         self._hostname = hostname or socket.gethostname()
+        # Capped text reader for untrusted files. Injectable for the same reason
+        # as the clock and pid check: a test that pins "this scanner stopped at
+        # its bound" has to count the reads without patching a module attribute.
+        self._text_reader = text_reader or _read_text_capped
+        # Same reason: a test that pins "tails are read only for the displayed
+        # slice" has to count the reads, and a count is not a fixture.
+        self._live_log_tail = live_log_tail or _live_log_tail
         self._available_tools_cache_key: (
             tuple[
                 tuple[str, int, int] | None,
@@ -2106,7 +2116,7 @@ class Collector:
             if entry.is_symlink() or not _path_resolves_under(entry, home):
                 continue
             try:
-                data = json.loads(_read_text_capped(entry, home))
+                data = json.loads(self._text_reader(entry, home))
             except (json.JSONDecodeError, UnicodeError, RecursionError):
                 # RecursionError is the deep-nesting refusal, not a parse error:
                 # a nesting bomb is junk like any other unreadable breadcrumb.
@@ -3198,6 +3208,7 @@ class Collector:
                 live_root,
                 self._paths.root_home,
                 now=self._clock(),
+                log_tail=self._live_log_tail,
             )
         )
 

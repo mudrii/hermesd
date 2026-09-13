@@ -394,7 +394,44 @@ _LIVE_TAIL_MAX_LINES = 4
 _LIVE_TAIL_LINE_MAX_CHARS = 160
 
 
-def _read_delegation_live_manifests(live_root: Path, home: Path, *, now: float) -> dict[str, Any]:
+def _live_log_tail(log_path: Path, home: Path) -> list[str]:
+    """The last few redacted lines of one task log; [] when absent or unsafe.
+
+    The log is a regular file inside the run dir (checked, never taken from the
+    manifest), capped by bytes and lines before redaction so a hostile tail
+    cannot spend unbounded redaction work.
+    """
+    if log_path.is_symlink() or not _path_resolves_under(log_path, home):
+        return []
+    try:
+        if not log_path.is_file() or log_path.stat().st_size == 0:
+            return []
+        text = _read_tail_text(log_path, _LIVE_TAIL_MAX_BYTES)
+    except OSError:
+        return []
+    lines = [
+        _redact_secret_text(line.strip())[:_LIVE_TAIL_LINE_MAX_CHARS]
+        for line in text.splitlines()
+        if line.strip()
+    ]
+    return lines[-_LIVE_TAIL_MAX_LINES:]
+
+
+# Process receipt bounds. Upstream keeps 64 receipts of at most 200 KiB of
+# output each (``tools/process_registry_results.py:19-24``, ``:54``); hermesd
+# counts every receipt in the bounded scan but parses only the newest few, and
+# refuses files over the shared text cap instead of reading them whole.
+_MAX_PROCESS_RECEIPTS = 8
+_PROCESS_RECEIPT_TAIL_MAX_CHARS = 400
+
+
+def _read_delegation_live_manifests(
+    live_root: Path,
+    home: Path,
+    *,
+    now: float,
+    log_tail: Callable[[Path, Path], list[str]] = _live_log_tail,
+) -> dict[str, Any]:
     """Parse ``cache/delegation/live/<id>/manifest.json`` into per-delegation cards.
 
     Upstream writes the manifest at dispatch and amends per-task statuses after
@@ -444,7 +481,7 @@ def _read_delegation_live_manifests(live_root: Path, home: Path, *, now: float) 
     manifests: list[DelegationLiveManifest] = []
     unparsed = 0
     for mtime, run_dir in candidates:
-        manifest = _live_manifest_from_dir(run_dir, home, mtime=mtime, now=now)
+        manifest = _live_manifest_from_dir(run_dir, home, mtime=mtime, now=now, log_tail=log_tail)
         if manifest is not None:
             manifests.append(manifest)
             if len(manifests) >= _MAX_LIVE_MANIFESTS:
@@ -462,7 +499,12 @@ def _read_delegation_live_manifests(live_root: Path, home: Path, *, now: float) 
 
 
 def _live_manifest_from_dir(
-    run_dir: Path, home: Path, *, mtime: float, now: float
+    run_dir: Path,
+    home: Path,
+    *,
+    mtime: float,
+    now: float,
+    log_tail: Callable[[Path, Path], list[str]] = _live_log_tail,
 ) -> DelegationLiveManifest | None:
     """One delegation card, or None when the manifest is absent or unusable."""
     data = _json_object_capped(
@@ -476,7 +518,10 @@ def _live_manifest_from_dir(
     # bounded by _MAX_LIVE_TASKS instead of the (unbounded) manifest size; the
     # counts below are still derived from every raw entry.
     entries = [_as_dict(entry) for entry in task_entries]
-    tasks = [_live_task_from_entry(entry, run_dir, home) for entry in entries[:_MAX_LIVE_TASKS]]
+    tasks = [
+        _live_task_from_entry(entry, run_dir, home, log_tail=log_tail)
+        for entry in entries[:_MAX_LIVE_TASKS]
+    ]
     # The run dir IS the delegation id upstream (the writer names it so); the
     # manifest's own field is ignored, so a doctored id cannot mislabel a card.
     return DelegationLiveManifest(
@@ -500,10 +545,16 @@ def _live_manifest_from_dir(
     )
 
 
-def _live_task_from_entry(entry: dict[str, Any], run_dir: Path, home: Path) -> DelegationLiveTask:
+def _live_task_from_entry(
+    entry: dict[str, Any],
+    run_dir: Path,
+    home: Path,
+    *,
+    log_tail: Callable[[Path, Path], list[str]] = _live_log_tail,
+) -> DelegationLiveTask:
     index = _coerce_int(entry.get("index"))
     log_name = f"task-{index}.log"
-    tail = _live_log_tail(run_dir / log_name, home)
+    tail = log_tail(run_dir / log_name, home)
     return DelegationLiveTask(
         index=index,
         goal=_redact_secret_text(_clip_single_line(str(entry.get("goal") or ""))),
@@ -512,37 +563,6 @@ def _live_task_from_entry(entry: dict[str, Any], run_dir: Path, home: Path) -> D
         log_name=log_name if tail else "",
         log_tail=tail,
     )
-
-
-def _live_log_tail(log_path: Path, home: Path) -> list[str]:
-    """The last few redacted lines of one task log; [] when absent or unsafe.
-
-    The log is a regular file inside the run dir (checked, never taken from the
-    manifest), capped by bytes and lines before redaction so a hostile tail
-    cannot spend unbounded redaction work.
-    """
-    if log_path.is_symlink() or not _path_resolves_under(log_path, home):
-        return []
-    try:
-        if not log_path.is_file() or log_path.stat().st_size == 0:
-            return []
-        text = _read_tail_text(log_path, _LIVE_TAIL_MAX_BYTES)
-    except OSError:
-        return []
-    lines = [
-        _redact_secret_text(line.strip())[:_LIVE_TAIL_LINE_MAX_CHARS]
-        for line in text.splitlines()
-        if line.strip()
-    ]
-    return lines[-_LIVE_TAIL_MAX_LINES:]
-
-
-# Process receipt bounds. Upstream keeps 64 receipts of at most 200 KiB of
-# output each (``tools/process_registry_results.py:19-24``, ``:54``); hermesd
-# counts every receipt in the bounded scan but parses only the newest few, and
-# refuses files over the shared text cap instead of reading them whole.
-_MAX_PROCESS_RECEIPTS = 8
-_PROCESS_RECEIPT_TAIL_MAX_CHARS = 400
 
 
 def _read_process_receipts(receipts_dir: Path, home: Path, *, now: float) -> ProcessReceiptsState:
