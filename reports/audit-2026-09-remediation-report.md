@@ -9,10 +9,12 @@ worktrees (`fix/kanban-findings`, `fix/operations-findings`, `fix/config-finding
 each original commit survives.
 
 **Result:** 54 non-merge commits (fix/test/docs) + 10 merges, 47 files, +12 272/−119.
-`2798 passed, 2 skipped` with the CI flags (`-W error::ResourceWarning`), **98.29 %
-coverage** (gate 96 %), ruff check/format, mypy and compileall all green; live
-read-only validation against the real `~/.hermes` reports `failed_sources: []`.
-Every fix was additionally proven pinned by backing it out again — see §8.
+At the time of writing the suite was `2798 passed, 2 skipped`; the branch has since
+grown to **74 fix/test/docs commits** and the numbers moved — the *current* measured
+values are in §6 and are the only ones to quote. Every fix was additionally proven
+pinned by backing it out again — see §8; §9 records the follow-up flag sweep, and
+`reports/audit-2026-09-consolidated-review-report.md` covers the review that followed
+this report, including the findings raised against it.
 
 ---
 
@@ -58,7 +60,7 @@ Every fix was additionally proven pinned by backing it out again — see §8.
 | --- | --- | --- |
 | README untouched for the whole batch | Panel sections for 1, 2, 5, 7, 11, 12, 13 and the feature table updated; panel 1's source list extended | `31c2c2d` |
 | `gateway_loop_tick` credited a pin that never armed a witness; register preamble contradicted six decided rows; missing lifecycle fields; stale `gateway_starts_2m`; wrong citations; stale mixed-model register; rule-3 citation missing in the coordination reader | Rule file corrected, six rows marked **decided** with pins, citations fixed, register extended, docstring cited | `e53f5a1` |
-| Enforcement test checked scope only | Now requires an upstream citation on every row and a resolvable `test_*` in every "pinned by" cell (verified to fail on both mutations) | `e53f5a1` |
+| Enforcement test checked scope only | Now requires an upstream citation on every row and, *where a "pinned by" cell names tests*, a resolvable `test_*` in it (verified to fail on both mutations). It does not require a non-empty cell: divergence rows are exempt by design, which `gateway_lifecycle` and `curator` used. The consolidated review called that out; `gateway_lifecycle` now has a real behaviour pin (`test_gateway_launch_files_are_root_scoped_under_a_profile` reports the root sentinel's exit code, not the profile's) and its register row carries the **Decided.** marker its siblings had. | `e53f5a1`, `083a37a` |
 | CHANGELOG | New `### Fixed` section covering all 22 user-visible fixes | `5fa7491` |
 
 ## 5. Test-suite strength
@@ -95,25 +97,33 @@ tests, each verified by re-running the mutation in a scratch clone:
 
 ## 6. Verification
 
+Measured at the head of the branch after the consolidated-review round (this is the
+figure §1's summary and §9 quote; the earlier per-round counts in this file's history
+are stale by construction):
+
 ```
 ruff check .                          All checks passed!
 ruff format --check .                 109 files already formatted
-mypy hermesd                          Success: no issues found in 44 source files
+mypy hermesd                          Success: no issues found in 45 source files
 python -m compileall -q hermesd       OK
-pytest tests/ -q --cov=hermesd        2793 passed, 2 skipped — 98.29% (gate 96%)
+pytest tests/ -q -W error::ResourceWarning --cov=hermesd   2842 passed, 2 skipped — 98.37% (gate 96%)
 ```
 
 Live read-only run against the real `~/.hermes`:
 `failed_sources: []`; witness `alive`/armed; 13 routes of 13; 2 CLI terminals;
-9 live manifests; config backups present (1 good); catalog cache absent, reported
-as unavailable rather than as a match. Panels 1, 2, 5, 7, 11, 12 and 13 all render.
+**9 delegation run directories, 5 parsed into cards and none running** (the label
+says `manifests`, not "live"); config backups present (1 good); catalog cache absent,
+reported as unavailable rather than as a match. Panels 1, 2, 5, 7, 11, 12 and 13 all
+render.
 
 ## 7. Deliberately not changed
 
-- **Structural refactors** beyond the findings: `ConfigBackupGroup.kind` as a
-  `StrEnum`, merging the two near-identical operations scan readers, the
-  `_dashboard_client_status` tuple → dataclass, and the four repeated last-good
-  prologues in `collector.py`. They are smells, not defects.
+- **Structural refactors** beyond the findings. Three of the four listed here have
+  since been done in the consolidated-review round: `ConfigBackupGroup.kind` is a
+  `StrEnum` answered in one panel pass, `_dashboard_client_status` returns a frozen
+  dataclass, and the curator readers moved to `collect/curator.py`. Still open: the
+  four repeated last-good prologues in `collector.py` and a full assertion tightening
+  of panel 2's compact strings.
 - **Env overrides** (`HERMES_GATEWAY_MAX_STARTS`, `HERMES_GATEWAY_START_WINDOW_S`)
   are not read: they belong to the gateway's environment, and the panel says the
   policy is "as recorded in config".
@@ -137,10 +147,11 @@ conflicted with later work, a targeted mutation re-created the original bug inst
 
 | Method | Commits | Result |
 | --- | --- | --- |
-| clean `git revert` of the fix, tests kept | `92cb8ff`, `01fc6ec`, `e88d83f`, `5c4d57c`, `001b66c`, `f722d2c`, `dfc0682`, `3ab2f77`, `e8399c7`, `3a9e9a9` | **RED-OK** — e.g. `5c4d57c` → `test_collect_kanban_notify_backlog_counts_only_this_tasks_unseen_events`; `3ab2f77` → 3 failures; `001b66c` → 4 failures |
+| clean `git revert` of the fix, tests kept | `01fc6ec`, `e88d83f`, `5c4d57c`, `001b66c`, `f722d2c`, `dfc0682`, `3ab2f77`, `e8399c7`, `3a9e9a9` | **RED-OK** — e.g. `5c4d57c` → `test_collect_kanban_notify_backlog_counts_only_this_tasks_unseen_events`; `3ab2f77` → 3 failures; `001b66c` → 4 failures |
 | pre-fix files restored (`git checkout <sha>^`) | `a6df530`, `d936145`, `1568ed7`, `1a3615d` | **RED-OK** — 3, 15, 6 and 3 failures respectively |
 | targeted mutation (revert conflicted) | `ae28cdb`, `b07b221`, `e5612dc`, `a912c8b`, `0a08eec`, `7840c34`, `86ebb6d` | **RED-OK** — 5, 1, 2, 1, 2, 3 and 4 failures |
 | docs-only (`e53f5a1`) | — | enforcement test verified separately: blanking a citation or naming a nonexistent pin fails it |
+| (correction) `92cb8ff` | — | listed here in an earlier revision of this report; it is the free-tier badge **feature** commit, not a reverted fix. Removed from the table. |
 | test-only commits | — | each new pin verified against the mutation it was written for (witness byte, mirror roster, caps, boundaries, symlinks) |
 
 No fix relies on a test that passes without it.
@@ -179,7 +190,7 @@ No fix relies on a test that passes without it.
 | 4.19 strict bool | `bool("false") is True` | **`"false"→False`, `1→True`, `1.0→True`** |
 
 Live run against the real `~/.hermes`: `failed_sources: []`; witness `alive`/armed;
-storm `0/5 in 120 s`; routes `13/13`; terminals 2 (not truncated); 9 live manifests;
+storm `0/5 in 120 s`; routes `13/13`; terminals 2 (not truncated); 9 delegation run directories (5 parsed, 0 running);
 prune interval 24 h, not overdue; catalog cache absent → `usable=False` (no match claim);
 one `good` backup group. Panels 1, 2, 5, 7, 11, 12, 13 all render.
 
@@ -198,6 +209,13 @@ string/URL presence tests, and INTEGER-affinity SQLite columns.
 ---
 
 ## 9. Follow-up sweep: strict reads for every machine-written flag
+
+**Out of the audited scope.** These commits go beyond the 25-item spec in
+`reports/audit-2026-09-implementation-review.md` — that document names none of these
+payloads (`needs_attention`, channel aliases, migration records, drain request,
+`processes.json`, `no_agent`) — so they are recorded here as follow-up work rather
+than as remediation of an audited item. The one exception is `skills/.usage.json`
+`pinned`, which belongs to item 20, whose subject was already ✅.
 
 After the deep dive, the same `"false"`-is-truthy hazard was swept across the whole
 tree instead of just the batch's six sites. One commit per area, each with a test
@@ -221,10 +239,16 @@ that reads a stringified flag through the real reader:
   would describe a policy the agent does not apply.
 - *Presence tests, not flags* — `stop_reason`, proxy/chronos URLs, env credentials,
   `shared_runtime_url`.
-- *INTEGER-affinity columns* — `projects.archived`, `cron_executions.handoff_pending`,
-  the sessions `archived` pair. SQLite converts a TEXT `'0'` on insert, so `bool()`
-  already agrees; a test asserts this so the reasoning is not lost.
+- *INTEGER-affinity columns* — this exception was **retired** in the consolidated
+  review round: affinity converts a well-formed numeric spelling but leaves the text
+  `'false'` as TEXT, and `bool('false')` is True. `projects.archived`, the sessions
+  `archived` pair and `cron_executions.handoff_pending` now go through `_coerce_bool`
+  too, so the rule is uniform: every flag read out of a payload or a row is strict.
+- *Strict reads describe the record, not the agent's decision* — for `cron/jobs.json`
+  `enabled`, upstream itself reads the value truthily (`cron/jobs.py:486`), so a
+  corrupted string would still fire the job while hermesd renders it disabled. That is
+  the honest reading of the file, and it is the only case where the two differ.
 
-Verification after the sweep: `2808 passed, 2 skipped`; coverage 98.29 %; ruff
-check/format, mypy and compileall clean; live snapshot unchanged
+Verification after the sweep (superseded by §6): `2808 passed, 2 skipped`; coverage
+98.29 %; ruff check/format, mypy and compileall clean; live snapshot unchanged
 (`failed_sources: []`).

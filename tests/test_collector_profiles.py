@@ -1328,13 +1328,14 @@ def test_source_ownership_doc_covers_every_process_env_read():
 def test_gateway_launch_files_are_root_scoped_under_a_profile(
     profiled_hermes_home: Path,
 ):
-    """gateway-starts.log and the dashboard-client marker join the root launch files.
+    """gateway-starts.log, the lifecycle sentinel and the dashboard marker are root.
 
-    Upstream resolves all three through ``get_hermes_home()`` (PROFILE), but they
-    describe the ROOT gateway's launch, the same process whose heartbeat and
-    lifecycle sentinel hermesd already reads from the root. The storm ledger sits
-    beside them so the restart count and the liveness clock describe one process;
-    the dashboard-client marker belongs to the web dashboard that gateway serves.
+    Upstream resolves all of them through ``get_hermes_home()`` (PROFILE), but
+    they describe the ROOT gateway's launch, the same process whose heartbeat
+    hermesd already reads from the root. The storm ledger sits beside them so the
+    restart count and the liveness clock describe one process; the lifecycle
+    sentinel is that process's own exit record; the dashboard-client marker
+    belongs to the web dashboard that gateway serves.
     """
     home = profiled_hermes_home
     profile_home = home / "profiles" / "coding"
@@ -1361,6 +1362,13 @@ def test_gateway_launch_files_are_root_scoped_under_a_profile(
     profile_state.mkdir(parents=True)
     (profile_home / "gateway-starts.log").write_text(f"{now - 30.0!r}\n" * 9)
     (profile_state / "dashboard_clients.heartbeat").touch()
+    # Lifecycle sentinels on both sides, distinguishable by their exit code.
+    (root_state / "gateway.lifecycle.json").write_text(
+        json.dumps({"phase": "exited", "exit_code": 3, "exit_reason": "root_sentinel"})
+    )
+    (profile_state / "gateway.lifecycle.json").write_text(
+        json.dumps({"phase": "exited", "exit_code": 9, "exit_reason": "profile_sentinel"})
+    )
 
     c = Collector(home, profile_name="coding")
     try:
@@ -1379,6 +1387,10 @@ def test_gateway_launch_files_are_root_scoped_under_a_profile(
     assert gateway.dashboard_client_attached is False
     assert gateway.exit_diag_recorded is True
     assert gateway.exit_diag_last_tag == "gateway.asyncio_main_return"
+    # The lifecycle sentinel is the root gateway's too: the profile copy beside
+    # it records a different exit code and reason.
+    assert gateway.last_exit_code == 3
+    assert gateway.last_exit_reason == "root_sentinel"
 
 
 def test_profiled_collector_reads_session_coordination_from_the_profile_db(
