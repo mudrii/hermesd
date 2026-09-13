@@ -21,7 +21,7 @@
 
       mkHermesd = pkgs:
         let
-          python = pkgs.python311;
+          python = pkgs.python312;
         in
         python.pkgs.buildPythonApplication {
           pname = "hermesd";
@@ -67,7 +67,7 @@
       });
 
       devShells = forAllSystems (pkgs:
-        let python = pkgs.python311;
+        let python = pkgs.python312;
         in {
           default = pkgs.mkShell {
             packages = [
