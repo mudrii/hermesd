@@ -160,6 +160,12 @@ _CONFIG_BACKUP_ENTRY_LIMIT = 512
 _GOOD_REASON = "good"
 _CORRUPT_REASON = "corrupt"
 
+# Display ranking for the group cap. "good" and "corrupt" are single reasons,
+# so ranking them first means the cap can never evict the "last changed" stamp
+# or the corrupt alert; the bulk audit trail (setup/migration/other) absorbs
+# the truncation instead.
+_KIND_RANK = {"good": 0, "corrupt": 1, "setup": 2, "migration": 3, "other": 4}
+
 
 def _backup_reason_kind(reason: str) -> str:
     """Coarse bucket for the audit trail: setup/migration stamps vs the rest."""
@@ -200,7 +206,9 @@ def _config_backup_groups(
     (``config.yaml.bak-my-note``) are skipped — only the writer's own naming
     scheme carries a reason. Both caps are display hygiene for a hostile
     directory: the entry cap bounds the scan, the group cap bounds the model,
-    and either firing marks the result truncated.
+    and either firing marks the result truncated. Groups come back ranked by
+    kind (``_KIND_RANK``) so the cap always keeps the load-bearing ``good`` and
+    ``corrupt`` rows and drops audit-trail bulk instead.
     """
     kept: list[str] = []
     scan_truncated = False
@@ -222,8 +230,8 @@ def _config_backup_groups(
             continue
         stamps_by_reason.setdefault(reason, []).append((stamp, epoch))
 
-    groups = []
-    for reason, stamps in sorted(stamps_by_reason.items()):
+    groups: list[ConfigBackupGroup] = []
+    for reason, stamps in stamps_by_reason.items():
         stamps.sort()
         newest_stamp, newest_epoch = stamps[-1]
         groups.append(
@@ -235,6 +243,7 @@ def _config_backup_groups(
                 newest_age_seconds=_age_seconds(newest_epoch, now),
             )
         )
+    groups.sort(key=lambda group: (_KIND_RANK.get(group.kind, 99), group.reason))
     truncated = scan_truncated or len(groups) > _CONFIG_BACKUP_GROUP_LIMIT
     return groups[:_CONFIG_BACKUP_GROUP_LIMIT], truncated
 

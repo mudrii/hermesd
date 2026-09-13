@@ -48,6 +48,8 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         lines.append(_newest_good_backup_stamp(c) or "no good copy", style=theme.banner_text)
         if corrupt_count:
             lines.append(f" · corrupt {corrupt_count}", style=theme.ui_error)
+        if c.config_backup_groups_truncated:
+            lines.append(" · truncated", style=theme.banner_dim)
 
     return Panel(
         lines,
