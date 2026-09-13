@@ -2044,7 +2044,7 @@ _HOLDER_FMT = "pid={pid}:tid={tid}:agent={agent}:nonce={nonce}"
 
 def _make_coordination_db(hermes_home: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(hermes_home / "state.db")
-    create_state_db_tables(conn, include_schema_version=False)
+    create_state_db_tables(conn, include_schema_version=False, include_session_key=True)
     create_session_coordination_tables(conn)
     return conn
 
@@ -2651,3 +2651,90 @@ def test_route_total_is_reported_beside_capped_route_rows(hermes_home: Path) -> 
 
     assert len(coord.routes) == 50
     assert coord.route_total == 55
+
+
+def test_lease_expiry_boundary_is_inclusive(hermes_home: Path) -> None:
+    """``expires_at <= now`` is already expired when the holder is alive.
+
+    Upstream's reclaim boundary is inclusive for turn leases
+    (``hermes_state_compression.py:519-536``); an exclusive comparison would
+    report a lease live for one more refresh than the writer honours.
+    """
+    conn = _make_coordination_db(hermes_home)
+    insert_turn_lease(
+        conn,
+        "conv-edge",
+        _HOLDER_FMT.format(pid=101, tid=7, agent="1f", nonce="abcd1234"),
+        _COORD_NOW - 300,
+        _COORD_NOW,
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: pid == 101)
+    try:
+        lease = c.collect().session_coordination.leases[0]
+    finally:
+        c.close()
+
+    assert lease.expires_in_seconds == 0.0
+    assert lease.expired is True
+    assert lease.liveness is ProcessLiveness.LIVE
+
+
+def test_lease_list_is_capped_while_the_total_stays_exact(hermes_home: Path) -> None:
+    conn = _make_coordination_db(hermes_home)
+    for index in range(45):
+        insert_turn_lease(
+            conn,
+            f"conv-{index}",
+            _HOLDER_FMT.format(pid=101, tid=index, agent="1f", nonce="abcd1234"),
+            _COORD_NOW - 10,
+            _COORD_NOW + 290,
+        )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: pid == 101)
+    try:
+        coord = c.collect().session_coordination
+    finally:
+        c.close()
+
+    assert len(coord.leases) == 40
+    assert coord.lease_total == 45
+
+
+def test_gateway_route_suspended_flag_survives_the_decode_path(hermes_home: Path) -> None:
+    """``suspended`` must be read from entry_json, not only painted by the panel."""
+    conn = _make_coordination_db(hermes_home)
+    insert_gateway_route(
+        conn,
+        "telegram:404",
+        {
+            "session_id": "sess-1",
+            "platform": "telegram",
+            "chat_type": "private",
+            "display_name": "Ops",
+            "suspended": True,
+            "resume_pending": False,
+            "was_auto_reset": False,
+        },
+        _COORD_NOW - 30,
+    )
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, session_key) VALUES (?,?,?,?)",
+        ("sess-1", "telegram", _COORD_NOW - 1000, "telegram:404"),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: False)
+    try:
+        route = c.collect().session_coordination.routes[0]
+    finally:
+        c.close()
+
+    assert route.suspended is True
+    assert route.needs_user_message is True
+    assert route.dangling is False

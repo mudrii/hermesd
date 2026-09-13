@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 import yaml
 
-from hermesd.collect.operations import _SKILL_WINDOW_LIMIT
 from hermesd.collector import (
     Collector,
     _count_skills,
@@ -1197,7 +1196,7 @@ def test_curator_usage_hygiene_counts(hermes_home: Path):
 def test_curator_usage_windows_are_soonest_first_and_bounded(hermes_home: Path):
     now = time.time()
     records = {}
-    for index in range(_SKILL_WINDOW_LIMIT + 5):
+    for index in range(25):  # literal: _SKILL_WINDOW_LIMIT is 20 (bounded windows)
         age_days = index + 1  # later index = older = sooner to go stale
         records[f"skill-{index:02d}"] = {
             "state": "active",
@@ -1212,8 +1211,8 @@ def test_curator_usage_windows_are_soonest_first_and_bounded(hermes_home: Path):
         c.close()
 
     cur = state.curator
-    assert cur.managed_skill_count == _SKILL_WINDOW_LIMIT + 5
-    assert len(cur.skill_windows) == _SKILL_WINDOW_LIMIT
+    assert cur.managed_skill_count == 25
+    assert len(cur.skill_windows) == 20
     stale_days = [window.days_until_stale for window in cur.skill_windows]
     assert stale_days == sorted(stale_days)
     # The soonest skills survive the cap; the youngest are the ones cut.

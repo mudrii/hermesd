@@ -19,7 +19,6 @@ import hermesd.collect.cron as cron_module
 from hermesd.collect.common import _EXCERPT_MAX_CHARS
 from hermesd.collect.cron import (
     _EXECUTIONS_RECENT_LIMIT,
-    _FIRE_CLAIM_TTL_SECONDS,
     _INCIDENTS_LIMIT,
 )
 from hermesd.collect.logs import _MAX_LOG_LINE_CHARS
@@ -2664,7 +2663,9 @@ def test_collect_cron_fire_claim_ttl_boundary_and_unusable_claims(hermes_home: P
     _write_jobs_json(
         hermes_home,
         [
-            {"id": "job-edge", "fire_claim": {"at": iso_ago(_FIRE_CLAIM_TTL_SECONDS, now=now)}},
+            # Literal 300s: importing the constant under test would move the fixture
+            # with the mutation (upstream FIRE_CLAIM_TTL_SECONDS, cron/jobs.py:889-892).
+            {"id": "job-edge", "fire_claim": {"at": iso_ago(300.0, now=now)}},
             {"id": "job-none", "fire_claim": None},
             {"id": "job-junk", "fire_claim": {"at": "not-a-timestamp"}},
         ],

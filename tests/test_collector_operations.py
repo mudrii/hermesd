@@ -2860,3 +2860,71 @@ def test_checkpoint_prune_interval_ignores_unusable_config_values(
     (hermes_home / "config.yaml").write_text(f"checkpoints:\n  min_interval_hours: {value!r}\n")
     ops = _collect_ops(hermes_home).operations
     assert ops.checkpoint_prune_interval_seconds == pytest.approx(24 * 3600)
+
+
+def test_process_receipts_symlinked_root_reads_as_absent(
+    hermes_home: Path, sample_db: Path, tmp_path: Path
+):
+    """The receipts *directory itself* replaced by a symlink is not followed."""
+    outside = tmp_path / "outside-results"
+    outside.mkdir()
+    _write_receipt(outside, "proc_out.json", _receipt_record(id="proc_out"))
+    logs = hermes_home / "logs"
+    logs.mkdir(exist_ok=True)
+    try:
+        (logs / "process-results").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are not supported here")
+
+    ops = _collect_ops(hermes_home).operations
+
+    assert ops.process_receipts.dir_present is False
+    assert ops.process_receipts.receipt_count == 0
+
+
+def test_delegation_live_manifest_reader_ignores_a_symlinked_live_root(
+    hermes_home: Path, sample_db: Path, tmp_path: Path
+):
+    """The manifest reader shares the count reader's escape guard."""
+    outside = tmp_path / "live"
+    run_dir = outside / "deleg_done"
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text(json.dumps({"tasks": [{"index": 0, "status": "done"}]}))
+    cache = hermes_home / "cache" / "delegation"
+    cache.mkdir(parents=True)
+    (cache / "live").symlink_to(outside, target_is_directory=True)
+
+    ops = _collect_ops(hermes_home).operations
+
+    assert ops.delegation_live_manifest_count == 0
+    assert ops.delegation_live_manifests == []
+
+
+def test_delegation_live_manifest_caps_are_literal(hermes_home: Path, sample_db: Path):
+    """A 70 KiB manifest is counted but not parsed; a 300 KiB one is not counted.
+
+    The parse cap is 64 KiB and the shared file cap 256 KiB; asserting both with
+    literal sizes keeps a widened cap from passing unnoticed.
+    """
+    live = hermes_home / "cache" / "delegation" / "live"
+    big = live / "deleg_big"
+    big.mkdir(parents=True)
+    payload = {"tasks": [{"index": 0, "status": "done"}]}
+    filler = {"index": 0, "status": "done", "goal": "x" * 900}
+    while True:
+        payload["tasks"].append(dict(filler))
+        encoded = json.dumps(payload)
+        if len(encoded) > 70 * 1024:
+            break
+    (big / "manifest.json").write_text(encoded)
+
+    ops = _collect_ops(hermes_home).operations
+    assert ops.delegation_live_manifest_count == 1
+    assert ops.delegation_live_manifests == []
+
+    huge = live / "deleg_huge"
+    huge.mkdir()
+    (huge / "manifest.json").write_text(json.dumps({"tasks": []}) + " " * (300 * 1024))
+    ops = _collect_ops(hermes_home).operations
+    assert ops.delegation_live_manifest_count == 1  # only the 70 KiB one qualifies
+    assert ops.delegation_live_manifests == []
