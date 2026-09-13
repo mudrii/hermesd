@@ -8,6 +8,7 @@ import json
 import os
 import sqlite3
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,7 @@ from hermesd.collector import (
     Collector,
     _read_soul_excerpt,
 )
-from hermesd.models import LogStream, OperationsState, SourceScope
+from hermesd.models import GatewayLoopHealth, LogStream, OperationsState, SourceScope
 from hermesd.paths import HermesPaths
 from tests.conftest import (
     _assert_cached_until_changed,
@@ -1371,7 +1372,10 @@ def test_gateway_launch_files_are_root_scoped_under_a_profile(
     assert gateway.gateway_starts_recorded is True
     assert gateway.gateway_starts_window == 0
     assert gateway.gateway_starts_1h == 1
+    # The root marker was aged 120 s and the profile marker touched now: only a
+    # root read can call this detached (the age alone is non-None either way).
     assert gateway.dashboard_client_last_frame_age_seconds is not None
+    assert gateway.dashboard_client_attached is False
     assert gateway.exit_diag_recorded is True
     assert gateway.exit_diag_last_tag == "gateway.asyncio_main_return"
 
@@ -1430,3 +1434,82 @@ def test_profiled_collector_reads_session_coordination_from_the_profile_db(
     root.close()
     assert [lease.key for lease in state.session_coordination.leases] == ["profile-conv"]
     assert [row.cwd for row in state.terminal_sessions.sessions] == ["/root"]
+
+
+def _iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=UTC).isoformat()
+
+
+def test_loop_tick_witness_is_probed_from_the_root_home_under_a_profile(
+    profiled_hermes_home: Path,
+):
+    """The witness belongs to the root gateway, node and heartbeat alike.
+
+    Upstream arms the witness on the heartbeat the gateway writes
+    (``gateway/shutdown_watchdog.py:169``) and a served profile owns no gateway
+    of its own, so under ``--profile`` the plan must come from the root
+    heartbeat and the node must resolve under the root home. A profile read would
+    silently interrogate a node nobody writes and report "no witness" forever.
+    """
+    home = profiled_hermes_home
+    profile_home = home / "profiles" / "coding"
+    now = time.time()
+
+    root_state = home / "state"
+    root_state.mkdir(exist_ok=True)
+    (root_state / "gateway.heartbeat").write_text(
+        json.dumps(
+            {
+                "pid": 4242,
+                "updated_at": _iso(now - 400),
+                "loop_tick_socket": True,
+                "loop_tick_tcp_port": None,
+            }
+        )
+    )
+    # A conflicting profile-local heartbeat: fresh, and owned by a different pid
+    # so a profile read would answer "not my witness" instead.
+    profile_state = profile_home / "state"
+    profile_state.mkdir(parents=True, exist_ok=True)
+    (profile_state / "gateway.heartbeat").write_text(
+        json.dumps(
+            {
+                "pid": 9999,
+                "updated_at": _iso(now),
+                "loop_tick_socket": True,
+                "loop_tick_tcp_port": None,
+            }
+        )
+    )
+    (home / "gateway_state.json").write_text(
+        json.dumps(
+            {
+                "pid": 4242,
+                "start_time": now - 5000,
+                "kind": "hermes-gateway",
+                "gateway_state": "running",
+                "platforms": {},
+            }
+        )
+    )
+
+    probed: list[tuple[int, int | None]] = []
+
+    def probe(pid: int, tcp_port: int | None) -> bool:
+        probed.append((pid, tcp_port))
+        return True
+
+    c = Collector(
+        home,
+        profile_name="coding",
+        pid_exists=lambda pid: pid == 4242,
+        loop_tick_probe=probe,
+    )
+    try:
+        gateway = c.collect().gateway
+    finally:
+        c.close()
+
+    assert probed == [(4242, None)]
+    assert gateway.loop_tick_armed is True
+    assert gateway.loop_health is GatewayLoopHealth.ALIVE
