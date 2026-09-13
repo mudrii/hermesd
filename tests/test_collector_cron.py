@@ -3013,3 +3013,23 @@ def test_collect_cron_small_future_skew_is_still_no_state(hermes_home: Path):
         c.close()
 
     assert job.fire_claim_state is None
+
+
+def test_cron_no_agent_flag_is_read_strictly(hermes_home: Path):
+    """``cron/jobs.json`` is machine-written: a stringified ``"false"`` is not set."""
+    _write_jobs_json(
+        hermes_home,
+        [
+            {"id": "job-script", "name": "Scripted", "no_agent": "false"},
+            {"id": "job-agentless", "name": "Agentless", "no_agent": True},
+        ],
+    )
+
+    c = Collector(hermes_home, clock=lambda: 1_800_000_000.0)
+    try:
+        by_id = {job.job_id: job for job in c.collect().cron.jobs}
+    finally:
+        c.close()
+
+    assert by_id["job-script"].no_agent is False
+    assert by_id["job-agentless"].no_agent is True

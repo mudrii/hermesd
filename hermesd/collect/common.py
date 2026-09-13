@@ -223,10 +223,16 @@ def _coerce_bool(value: object) -> bool:
 
     ``bool("false")`` is True, so a corrupted or foreign payload could flip a
     warning on with a stringified flag. Only the shapes the writers actually
-    produce count as truth: JSON ``true``, SQLite ``1`` (or a float), and the ``"1"`` /
-    ``"true"`` / ``"yes"`` / ``"on"`` spellings upstream itself accepts
+    produce count as truth: JSON ``true``, SQLite ``1`` (or a float), and the
+    ``"1"`` / ``"true"`` / ``"yes"`` / ``"on"`` spellings upstream itself accepts
     (``gateway/scale_to_zero.py:38``). Everything else — including ``"false"``,
     ``"0"``, ``None`` and junk — is False.
+
+    Use it for values read out of *state payloads and database rows* — files and
+    tables a program writes, where a string in a boolean slot is corruption. Do
+    **not** use it for settings a human authored (``config.yaml``, SKILL.md
+    frontmatter): upstream reads those truthily when it decides what to do, so a
+    strict read here would describe a policy the agent does not actually apply.
     """
     if isinstance(value, bool):
         return value

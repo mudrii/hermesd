@@ -2525,7 +2525,7 @@ class Collector:
                         dispatch_kind=dispatch_kind,
                         repeat_times=repeat_times,
                         repeat_completed=repeat_completed,
-                        no_agent=bool(j.get("no_agent")),
+                        no_agent=_coerce_bool(j.get("no_agent")),
                         model=str(j.get("model") or ""),
                         provider=str(j.get("provider") or ""),
                         fire_claim_age_seconds=fire_claim_age,
