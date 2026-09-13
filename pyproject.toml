@@ -37,7 +37,7 @@ dependencies = [
     # CI by comparing wheel metadata against uv.lock.
     "rich==14.3.3",
     "pyyaml==6.0.3",
-    "pydantic==2.12.5",
+    "pydantic==2.13.4",
 ]
 
 [project.optional-dependencies]
