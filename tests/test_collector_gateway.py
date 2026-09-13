@@ -3404,3 +3404,24 @@ def test_mirror_roster_is_bounded(hermes_home: Path):
     assert "p00" in platform.mirror_urls
     assert "p15" in platform.mirror_urls
     assert "p16" not in platform.mirror_urls
+
+
+def test_restart_storm_keeps_defaults_when_config_is_unreadable(hermes_home: Path):
+    """A torn config.yaml must not take the storm verdict down with it.
+
+    The policy read is an enrichment of the ledger read: with no usable config
+    the upstream defaults apply and the source stays healthy, rather than the
+    whole restart-storm source failing over an unrelated file.
+    """
+    _write_gateway_state(hermes_home)
+    _write_starts_log(hermes_home, [NOW - 10 * index for index in range(1, 7)])
+    (hermes_home / "config.yaml").write_text("[1, 2, 3]")
+
+    state = _collect(hermes_home)
+
+    assert "gateway_restart_storm" not in state.health.failed_sources
+    gateway = state.gateway
+    assert gateway.restart_storm_cap == 5
+    assert gateway.restart_storm_window_seconds == pytest.approx(120.0)
+    assert gateway.gateway_starts_window == 6
+    assert gateway.in_respawn_backoff is True
