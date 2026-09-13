@@ -305,6 +305,24 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
     assert publish["jobs"]["pypi-publish"]["runs-on"] == "ubuntu-24.04"
     assert publish["jobs"]["release-build"]["if"] == "${{ !github.event.release.prerelease }}"
     assert publish["jobs"]["pypi-publish"]["if"] == "${{ !github.event.release.prerelease }}"
+
+    # Release eligibility is mechanically enforced (audit CI-04): the exact
+    # release commit must carry a successful, completed aggregate CI gate
+    # run; missing, failed, cancelled, stale, or in-progress work refuses to
+    # publish.
+    assert ci["jobs"]["gate"]["name"] == "CI gate"
+    eligibility = publish["jobs"]["release-eligibility"]
+    assert eligibility["permissions"] == {"contents": "read", "checks": "read"}
+    verify_step = next(
+        step
+        for step in eligibility["steps"]
+        if step.get("name", "").startswith("Verify the release commit")
+    )
+    assert verify_step["env"]["REQUIRED_CHECK"] == "CI gate"
+    verify_commands = verify_step["run"]
+    assert "commits/${RELEASE_SHA}/check-runs" in verify_commands
+    assert verify_commands.count("refusing to publish") == 3
+    assert publish["jobs"]["release-build"]["needs"] == ["test", "release-eligibility"]
     assert ci["jobs"]["test"]["timeout-minutes"] == 20
     assert publish["jobs"]["test"]["timeout-minutes"] == 20
     assert publish["jobs"]["release-build"]["timeout-minutes"] == 15
