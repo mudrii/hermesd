@@ -33,7 +33,7 @@ from hermesd.collect.common import (
     _read_text_capped,
     _safe_child_path,
 )
-from hermesd.collect.redaction import _redact_secret_url
+from hermesd.collect.redaction import _redact_secret_text, _redact_secret_url
 from hermesd.collect.sqlite_util import (
     _count_by,
     _query_rows,
@@ -872,7 +872,10 @@ def _read_exit_diag(path: Path, root: Path, now: float, tail_bytes: int) -> _Exi
                 unclean_24h += 1
     return _ExitDiag(
         recorded=True,
-        last_tag=last_tag,
+        # The ledger is a log file: upstream writes literal tags, but a foreign
+        # or tampered writer can put credential-shaped text in one, and every
+        # other log-derived string hermesd surfaces goes through the redactor.
+        last_tag=_redact_secret_text(last_tag[:_EXIT_DIAG_TAG_CHARS]),
         last_age_seconds=last_age,
         unclean_24h=unclean_24h,
         size_bytes=size,

@@ -3093,6 +3093,26 @@ def test_exit_diag_junk_lines_are_ignored(hermes_home: Path):
     assert "secret" not in json.dumps(gateway.model_dump(mode="json"))
 
 
+def test_exit_diag_tag_is_redacted(hermes_home: Path):
+    """The ledger is a log file, so its tag is redacted like every other one.
+
+    Upstream writes literal tags, but the file lives in a directory a tampered
+    or foreign writer can reach, and hermesd redacts log-derived text
+    everywhere else (``tests/test_collector_logs.py``).
+    """
+    _write_gateway_state(hermes_home)
+    logs = hermes_home / "logs"
+    logs.mkdir(exist_ok=True)
+    (logs / "gateway-exit-diag.log").write_text(
+        json.dumps({"ts": _iso(NOW - 45), "tag": "https://user:tok@example.com/pull/7"}) + "\n"
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.exit_diag_last_tag == "https://[REDACTED]@example.com/pull/7"
+    assert "tok" not in json.dumps(gateway.model_dump(mode="json"))
+
+
 def test_forensic_companion_files_reported_when_present(hermes_home: Path):
     _write_gateway_state(hermes_home)
     logs = hermes_home / "logs"

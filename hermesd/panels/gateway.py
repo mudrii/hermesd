@@ -315,7 +315,7 @@ def _witness_label(gw: GatewayState, theme: Theme) -> Text:
     predates the witness key entirely: the writer was on-loop, so staleness alone
     is proof the loop stopped.
     """
-    label = Text("  Witness: ", style=theme.ui_label)
+    label = Text("\n  Witness: ", style=theme.ui_label)
     if gw.loop_health is GatewayLoopHealth.ALIVE:
         label.append("loop-tick witness answered", style=theme.ui_ok)
     elif gw.loop_health is GatewayLoopHealth.WEDGED:
@@ -342,7 +342,7 @@ def _restart_storm_text(gw: GatewayState, theme: Theme) -> Text:
     file proves nothing either way and the line is omitted.
     """
     text = Text()
-    text.append("  Starts: ", style=theme.ui_label)
+    text.append("\n  Starts: ", style=theme.ui_label)
     window = _duration_label(gw.restart_storm_window_seconds)
     text.append(
         f"{window} {gw.gateway_starts_window}/{gw.restart_storm_cap}  1h {gw.gateway_starts_1h}",
@@ -361,7 +361,7 @@ def _restart_storm_text(gw: GatewayState, theme: Theme) -> Text:
 
 def _dashboard_client_text(gw: GatewayState, theme: Theme) -> Text:
     """Web dashboard attachment from the marker file's mtime; absent means never."""
-    text = Text("  Web client: ", style=theme.ui_label)
+    text = Text("\n  Web client: ", style=theme.ui_label)
     age = gw.dashboard_client_last_frame_age_seconds
     if gw.dashboard_client_attached:
         text.append("web dashboard client attached", style=theme.ui_ok)
@@ -494,10 +494,13 @@ def _exit_diag_text(gw: GatewayState, theme: Theme) -> Text:
     disables the writer, which is why an absent ledger reads as "no evidence"
     rather than "clean".
     """
-    text = Text("  Exit diagnostics: ", style=theme.ui_label)
+    text = Text("\n  Exit diagnostics: ", style=theme.ui_label)
     if not gw.exit_diag_recorded:
         text.append("no exit-diag ledger (writer may be disabled)", style=theme.banner_dim)
         return text
+    # The newest ledger record is whatever the gateway last wrote — a start
+    # record on a healthy boot — so it is labelled as a record, not an exit.
+    text.append("last record ", style=theme.ui_label)
     text.append(_or_dash(gw.exit_diag_last_tag), style=theme.banner_text)
     if gw.exit_diag_last_age_seconds is not None:
         text.append(
@@ -518,7 +521,7 @@ def _forensic_files_text(gw: GatewayState, theme: Theme) -> Text:
     """Event-only companion logs; growth — never absence — is the signal."""
     if not gw.forensic_files:
         return Text()
-    text = Text("  Event logs: ", style=theme.ui_label)
+    text = Text("\n  Event logs: ", style=theme.ui_label)
     parts = [
         f"{escape(file.name)} ({_size_label(file.size_bytes)}, "
         f"{_duration_label(file.age_seconds)} ago)"

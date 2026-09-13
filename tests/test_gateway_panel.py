@@ -897,3 +897,40 @@ def test_gateway_renders_shared_listener_mirrors() -> None:
     plain = _liveness_state(platforms=[PlatformStatus(name="telegram", state="connected")])
     detail = render_to_str(render_gateway(plain, Theme(), detail=True), width=200, no_color=True)
     assert "shared listener" not in detail
+
+
+def test_gateway_detail_puts_each_liveness_diagnostic_on_its_own_line() -> None:
+    """Witness, Starts, Web client, Exit diagnostics and Event logs get a line each.
+
+    Each helper returns a bare labelled ``Text`` and the renderer appends them
+    in sequence, so without a leading break the detail view ran them together:
+    ``… witness answered  Starts: … Web client: … Exit diagnostics: …`` on one
+    line, which reads as a single claim instead of five separate facts.
+    """
+    state = _liveness_state(
+        loop_health=GatewayLoopHealth.ALIVE,
+        gateway_starts_recorded=True,
+        gateway_starts_window=2,
+        restart_storm_cap=5,
+        seconds_since_last_gateway_start=120.0,
+        dashboard_client_attached=True,
+        dashboard_client_last_frame_age_seconds=5.0,
+        exit_diag_recorded=True,
+        exit_diag_last_tag="gateway.start",
+        exit_diag_last_age_seconds=14400.0,
+        forensic_files=[
+            ForensicFile(name="gateway_faulthandler.log", size_bytes=4096, age_seconds=3600.0),
+        ],
+    )
+    detail = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+
+    labels = ["Witness:", "Starts:", "Web client:", "Exit diagnostics:", "Event logs:"]
+    lines = detail.splitlines()
+    for label in labels:
+        matching = [line for line in lines if label in line]
+        assert matching, label
+        # Each of these facts owns its line: no other diagnostic shares it.
+        assert all(sum(other in line for other in labels) == 1 for line in matching), label
+    # The ledger's newest record is not necessarily an exit: say what it is.
+    exit_line = next(line for line in lines if "Exit diagnostics:" in line)
+    assert "last record" in exit_line
