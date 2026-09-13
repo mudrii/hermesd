@@ -84,8 +84,8 @@ jobs:
       - uses: ./.github/actions/locked-env
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Audit dependencies (pip-audit)
-        run: uv run pip-audit
+      - name: Audit dependencies (pip-audit, classified gate)
+        run: uv run python scripts/pip_audit_gate.py
 
   test:
     name: Tests (Python ${{ matrix.python-version }})
