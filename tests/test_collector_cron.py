@@ -6,7 +6,6 @@ import contextlib
 import json
 import os
 import shutil
-import socket
 import sqlite3
 import time
 from datetime import UTC, datetime
@@ -2941,7 +2940,7 @@ def test_collect_cron_fire_claim_dead_owner_releases_before_the_ttl(hermes_home:
     kernel proof shortens the window.
     """
     now = 1_800_000_000.0
-    host = socket.gethostname()
+    host = "test-host"
     _write_jobs_json(
         hermes_home,
         [
@@ -2963,7 +2962,7 @@ def test_collect_cron_fire_claim_dead_owner_releases_before_the_ttl(hermes_home:
         ],
     )
 
-    c = Collector(hermes_home, pid_exists=lambda pid: pid == 4242, clock=lambda: now)
+    c = Collector(hermes_home, pid_exists=lambda pid: pid == 4242, clock=lambda: now, hostname=host)
     try:
         state = c.collect()
     finally:

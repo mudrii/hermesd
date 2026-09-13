@@ -11,6 +11,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import socket
 import sqlite3
 import subprocess  # noqa: F401  # re-exported: tests patch hermesd.collector.subprocess.run
 import threading
@@ -664,6 +665,7 @@ class Collector:
         clock: Callable[[], float] = time.time,
         env: Mapping[str, str] | None = None,
         loop_tick_probe: Callable[[int, int | None], bool | None] | None = None,
+        hostname: str | None = None,
     ):
         self._root_home = hermes_home
         self._file_cache = file_cache if file_cache is not None else LastGoodFileCache()
@@ -689,6 +691,10 @@ class Collector:
         self._db = db_factory(self._paths.profile_path("state.db"))
         self._env = env if env is not None else os.environ
         self._clock = clock
+        # This host's name, as the cron fire-claim owner stamps it. Injected so
+        # the claim parser is testable off a fixed host instead of the machine
+        # running the suite.
+        self._hostname = hostname or socket.gethostname()
         self._available_tools_cache_key: (
             tuple[
                 tuple[str, int, int] | None,
@@ -2501,7 +2507,7 @@ class Collector:
                 repeat_times, repeat_completed = _cron_job_repeat(j)
                 paused, paused_reason = _cron_job_paused(j)
                 fire_claim_age, fire_claim_state = _cron_job_fire_claim(
-                    j, now=now, pid_exists=self._pid_exists
+                    j, now=now, pid_exists=self._pid_exists, hostname=self._hostname
                 )
                 pending_slot_at, pending_slot_age = _cron_job_pending_slot(j, now=now)
                 fire_error, fire_error_age = _cron_job_fire_error(j, now=now)
