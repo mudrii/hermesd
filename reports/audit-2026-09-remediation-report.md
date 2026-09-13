@@ -8,10 +8,11 @@ worktrees (`fix/kanban-findings`, `fix/operations-findings`, `fix/config-finding
 `fix/gateway-findings`, `fix/sessions-findings`), merged back with `--no-ff` so
 each original commit survives.
 
-**Result:** 48 commits (43 fix/test/docs + 5 area merges), 45 files, +11 605/−119.
-`2793 passed, 2 skipped`, **98.29 % coverage** (gate 96 %), ruff check/format,
-mypy and compileall all green; live read-only validation against the real
-`~/.hermes` reports `failed_sources: []`.
+**Result:** 54 non-merge commits (fix/test/docs) + 10 merges, 47 files, +12 272/−119.
+`2798 passed, 2 skipped` with the CI flags (`-W error::ResourceWarning`), **98.29 %
+coverage** (gate 96 %), ruff check/format, mypy and compileall all green; live
+read-only validation against the real `~/.hermes` reports `failed_sources: []`.
+Every fix was additionally proven pinned by backing it out again — see §8.
 
 ---
 
@@ -122,3 +123,74 @@ as unavailable rather than as a match. Panels 1, 2, 5, 7, 11, 12 and 13 all rend
   now have render coverage through the hygiene/total tests, but the exact strings
   are still asserted loosely (`"60 hygiene cooldown(s)"`); tightening every
   compact string was left as follow-up.
+
+---
+
+## 8. Deep-dive re-validation (after the fixes landed)
+
+### 8.1 Every fix is pinned — proven by backing it out again
+
+A scratch clone was walked commit by commit: each fix's **implementation** was reverted
+while its **tests were kept** (reverting the whole commit would remove the tests with the
+fix and prove nothing), then the tests it touched were run. Where a whole-commit revert
+conflicted with later work, a targeted mutation re-created the original bug instead.
+
+| Method | Commits | Result |
+| --- | --- | --- |
+| clean `git revert` of the fix, tests kept | `92cb8ff`, `01fc6ec`, `e88d83f`, `5c4d57c`, `001b66c`, `f722d2c`, `dfc0682`, `3ab2f77`, `e8399c7`, `3a9e9a9` | **RED-OK** — e.g. `5c4d57c` → `test_collect_kanban_notify_backlog_counts_only_this_tasks_unseen_events`; `3ab2f77` → 3 failures; `001b66c` → 4 failures |
+| pre-fix files restored (`git checkout <sha>^`) | `a6df530`, `d936145`, `1568ed7`, `1a3615d` | **RED-OK** — 3, 15, 6 and 3 failures respectively |
+| targeted mutation (revert conflicted) | `ae28cdb`, `b07b221`, `e5612dc`, `a912c8b`, `0a08eec`, `7840c34`, `86ebb6d` | **RED-OK** — 5, 1, 2, 1, 2, 3 and 4 failures |
+| docs-only (`e53f5a1`) | — | enforcement test verified separately: blanking a citation or naming a nonexistent pin fails it |
+| test-only commits | — | each new pin verified against the mutation it was written for (witness byte, mirror roster, caps, boundaries, symlinks) |
+
+No fix relies on a test that passes without it.
+
+### 8.2 Defects the re-validation itself found (and fixed)
+
+1. **`hygiene_total` was not in its last-good field list** (`d57b7f4`). Adding the field
+   without adding it to `_HYGIENE_FIELDS` meant a good pass followed by a failed
+   `gateway_hygiene` read restored the streak rows but reset the total to 0 — the panel
+   rendered "0 hygiene cooldown(s)" above the rows it was still showing, i.e. the exact
+   capped-list-as-total bug the field had just fixed, now on the failure path. New
+   resilience test fails the read after a successful pass (red before the fix). The same
+   audit confirmed the batch's other new fields (terminal `truncated`, catalog `usable`,
+   storm window, prune interval) are restored wholesale by their specs.
+2. **`_coerce_bool` rejected real numbers** (`90fe79a`): a JSON `1.0` or a REAL column —
+   truthy under the `bool()` it replaced — read as False. Floats are accepted now; only
+   the string forms stay restricted to upstream's spellings.
+3. **The hygiene effect label still re-derived the ladder threshold** (`ead785c`), and the
+   CHANGELOG bullet claimed otherwise. The label now follows
+   `GatewayHygieneState.suspended`, and the three places describing the base say
+   "default … (`hygiene_failure_cooldown_seconds`)" — upstream resolves it from config
+   (`config_defaults.py:584`, `gateway/run.py:101-149`).
+4. **The new config read's failure mode was unpinned** (`de41a8d`): a torn `config.yaml`
+   now has a test proving the storm source keeps upstream's defaults and stays healthy
+   instead of failing over an unrelated file.
+
+### 8.3 Independent end-to-end re-checks (real code paths, no fixtures)
+
+| Finding | Review's repro | Now |
+| --- | --- | --- |
+| 4.1 notify backlog | 21 for 1 unseen event | **1** |
+| 4.2 live log tails | 12 opens for 8 displayed | **8 opens** |
+| 4.3 nested-JSON payload | `failed_sources: [delegation_live, process_receipts]` | **`[]`** |
+| 4.4 backup cap | `good`/`corrupt` dropped | **kinds `[corrupt, good, other ×6]`, truncated** |
+| 4.5 corrupt catalog cache | "plugins match the catalog" | **`usable=False`, "catalog cache … is unreadable — update/removal checks unavailable"** |
+| 4.19 strict bool | `bool("false") is True` | **`"false"→False`, `1→True`, `1.0→True`** |
+
+Live run against the real `~/.hermes`: `failed_sources: []`; witness `alive`/armed;
+storm `0/5 in 120 s`; routes `13/13`; terminals 2 (not truncated); 9 live manifests;
+prune interval 24 h, not overdue; catalog cache absent → `usable=False` (no match claim);
+one `good` backup group. Panels 1, 2, 5, 7, 11, 12, 13 all render.
+
+### 8.4 Residual items (not part of this batch, left for a follow-up)
+
+- Pre-existing truthy flag reads outside the reviewed six remain, e.g.
+  `collect/gateway.py:285` (`needs_attention`), `:509` (`exists`), `collect/config.py:36,
+  38, 45, 46, 49` (config booleans), `collect/skills.py:209, 222` (usage `pinned`). They
+  have the same `"false"`-is-truthy hazard and the shared `_coerce_bool` now makes them a
+  mechanical change, but they predate the batch and are not among its findings.
+  (`config.py:145` and `gateway.py:642` are string-presence tests, not flag reads.)
+- The two skips are environmental: the opt-in live contract test and a TUI test that needs
+  a free pty.
+- Panel-2 compact strings are asserted by substring, not in full.
