@@ -152,7 +152,8 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         expired = sum(1 for lease in coord.leases if lease.expired)
         orphaned = sum(1 for lease in coord.leases if lease.orphaned)
         if expired:
-            lines.append(f" {expired} expired", style=theme.ui_warn)
+            # Qualified like the detail row: expiry alone is benign upstream.
+            lines.append(f" {expired} expired (holder may revive)", style=theme.ui_warn)
         if orphaned:
             lines.append(f" {orphaned} orphaned", style=f"bold {theme.ui_error}")
     if coord.hygiene:
@@ -916,7 +917,9 @@ def _coordination_sections(state: DashboardState, theme: Theme) -> list[Renderab
 
 
 _LEASE_NOTE = (
-    "Turn leases key a conversation lineage; compression locks key one session. "
+    "Turn leases key a conversation lineage; compression locks key one session "
+    "and only block other compressions, never turns "
+    "(hermes_state_compression.py:451-474). "
     "Upstream revives an expired lease whose holder still matches rather than "
     "stealing it, so expiry alone is benign — only expired rows with a dead "
     "holder (orphaned) are stuck. There is no background sweeper; rows clear "

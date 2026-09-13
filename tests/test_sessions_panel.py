@@ -671,6 +671,44 @@ def test_detail_lease_note_explains_revivable_expiry() -> None:
     assert "revive" in rendered
 
 
+def test_lease_note_says_a_compression_lock_only_blocks_compressions() -> None:
+    """The two lease kinds do different things; the note must not merge them.
+
+    A turn lease serializes turns across processes, while a compression lock is
+    keyed by session id and only blocks other compressions — a distinction the
+    model docstring carries (``SessionLeaseKind``) and the panel note did not.
+    """
+    rendered = render_to_str(
+        render_sessions(
+            _coordination_state(
+                session_coordination=SessionCoordinationState(
+                    leases=[_lease(expired=True, expires_in_seconds=-30)], lease_total=1
+                )
+            ),
+            Theme(),
+            detail=True,
+        )
+    )
+    assert "only block other compressions" in rendered
+
+
+def test_compact_expiry_line_names_the_revive_semantics() -> None:
+    """A bare "1 expired" in warn style reads as a fault, but upstream revives.
+
+    The detail row already says "expired — holder may revive"; the compact line
+    is the only place the count appears, so it carries the same qualifier.
+    """
+    coord = SessionCoordinationState(
+        leases=[_lease(expired=True, expires_in_seconds=-120)],
+        lease_total=1,
+    )
+    rendered = render_to_str(
+        render_sessions(_coordination_state(session_coordination=coord), Theme())
+    )
+    assert "1 expired" in rendered
+    assert "revive" in rendered
+
+
 def test_compact_counts_leases_and_flags() -> None:
     coord = SessionCoordinationState(
         leases=[
