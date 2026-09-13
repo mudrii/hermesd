@@ -208,3 +208,47 @@ def test_config_compact_shows_backup_stamp_and_corrupt_alert() -> None:
     assert "corrupt 2" in with_alert
     assert "corrupt 2" not in calm
     assert "—" in absent
+
+
+def _row_line(text: str, key: str) -> str:
+    for line in text.splitlines():
+        if key in line:
+            return line
+    raise AssertionError(f"{key!r} not rendered")
+
+
+def test_config_backup_rows_survive_the_group_cap() -> None:
+    """Under cap pressure the panel must still show the good stamp and the
+    corrupt count, not a false all-clear."""
+    from hermesd.collect.config import _CONFIG_BACKUP_GROUP_LIMIT, _config_backup_groups
+
+    names = [
+        f"config.yaml.aaa-{index:03d}.20260907-1430{index:02d}"
+        for index in range(_CONFIG_BACKUP_GROUP_LIMIT)
+    ]
+    names += [
+        "config.yaml.good.20260907-143000",
+        "config.yaml.corrupt.20260906-090000",
+    ]
+    groups, truncated = _config_backup_groups(names, now=1_783_000_000.0)
+    assert truncated is True
+
+    config = _backup_config(groups, config_backup_groups_truncated=True)
+    detail = _render(config, detail=True)
+    compact = _render(config, detail=False)
+
+    assert "20260907-143000" in _row_line(detail, "Last changed")
+    assert "no good copy" not in detail
+    assert "none" not in _row_line(detail, "Corrupt snapshots")
+    assert "1" in _row_line(detail, "Corrupt snapshots")
+    assert "20260907-143000" in compact
+    assert "corrupt 1" in compact
+
+
+def test_config_compact_flags_truncated_backup_groups() -> None:
+    good = ConfigBackupGroup(reason="good", kind="good", count=1, newest_stamp="20260907-143000")
+    truncated = _render(_backup_config([good], config_backup_groups_truncated=True), detail=False)
+    calm = _render(_backup_config([good]), detail=False)
+
+    assert "truncated" in truncated
+    assert "truncated" not in calm
