@@ -3,9 +3,10 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/c043004d1c6985732bcc1cbc5a9c9aecbbb4e0f0";
+    nixpkgsIntelDarwin.url = "github:NixOS/nixpkgs/8029b6c369415ee1ef02a86f352806348f104db9";
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, nixpkgsIntelDarwin }:
     let
       systems = [
         "aarch64-darwin"
@@ -13,7 +14,16 @@
         "x86_64-darwin"
         "x86_64-linux"
       ];
-      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      pkgsFor = system:
+        if system == "x86_64-darwin"
+        then import nixpkgsIntelDarwin {
+          inherit system;
+          # The supported 26.05 Darwin package set still marks Intel deprecated,
+          # so opt in explicitly for its remaining support window.
+          config.allowDeprecatedx86_64Darwin = true;
+        }
+        else nixpkgs.legacyPackages.${system};
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f (pkgsFor system));
 
       # Single source of truth for the package version: the flake always reads
       # it from pyproject.toml, so the two cannot drift apart.

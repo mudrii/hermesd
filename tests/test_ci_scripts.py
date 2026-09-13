@@ -24,8 +24,8 @@ def _run_audit_gate(
     executable_dir.mkdir()
     executable = executable_dir / "pip-audit"
     executable.write_text(
-        """#!/usr/bin/env python3
-import os
+        f"#!{sys.executable}\n"
+        """import os
 import sys
 from pathlib import Path
 
@@ -43,7 +43,7 @@ raise SystemExit(int(os.environ["FAKE_EXIT_CODE"]))
     environment = os.environ | {
         "FAKE_ATTEMPTS": str(attempts_path),
         "FAKE_EXIT_CODE": str(exit_code),
-        "PATH": f"{executable_dir}{os.pathsep}{os.environ['PATH']}",
+        "PATH": str(executable_dir),
     }
     if report_text is not None:
         environment["FAKE_REPORT"] = report_text

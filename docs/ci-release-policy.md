@@ -94,6 +94,10 @@ after creation. They do not prove protected-`main` ancestry; the
   environment. Docker installs that lock. Nix deliberately uses the versions
   in its commit-pinned nixpkgs package set and validates that set independently
   with the full tests and installed CLI/Git smoke checks.
+- Intel macOS uses the separately pinned `nixpkgs-26.05-darwin` package set;
+  the primary Nixpkgs revision no longer supports `x86_64-darwin`. All four
+  systems remain required in CI. Review this Intel package-set choice before
+  its upstream security-support window ends at the end of 2026.
 - Dependabot opens weekly PRs for GitHub Actions (minor/patch grouped,
   majors separate), uv, and Docker. Security alerts and security updates
   from repository settings are always active and unaffected by cadence.

@@ -87,7 +87,25 @@ def test_flake_version_matches_project_version() -> None:
     assert "inherit hermesd;" in flake_text
     assert "hermesd-cli-smoke" in flake_text
 
-    assert len(re.findall(r'github:[^/]+/[^/]+/[0-9a-f]{40}"', flake_text)) == 1
+    input_urls = dict(
+        re.findall(
+            r'^\s+([A-Za-z0-9_-]+)\.url = "github:([^\"]+)";',
+            flake_text,
+            re.MULTILINE,
+        )
+    )
+    assert {"nixpkgs", "nixpkgsIntelDarwin"} <= input_urls.keys()
+    assert all(re.fullmatch(r"NixOS/nixpkgs/[0-9a-f]{40}", url) for url in input_urls.values())
+
+    # Intel Darwin retains its supported package set without holding the other
+    # three systems back from the primary nixpkgs input.
+    assert re.search(
+        r'if system == "x86_64-darwin"\s*'
+        r"then import nixpkgsIntelDarwin .*?"
+        r"else nixpkgs\.legacyPackages\.\$\{system\}",
+        flake_text,
+        re.DOTALL,
+    )
 
 
 def test_readme_images_use_package_metadata_safe_urls() -> None:
