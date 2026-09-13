@@ -4,7 +4,27 @@ A real-time TUI monitoring dashboard for [Hermes Agent](https://github.com/NousR
 
 ![hermesd overview](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/overview.png)
 
-Screenshots are from `v2026.6.15`; panel content has grown since, but the layout and interactions are unchanged.
+Screenshots are from `v2026.6.15` and illustrate the earlier interface. The current release adds panel content, scrolling, and interaction improvements described below.
+
+## What’s New in 2026.9.13
+
+[**Release notes**](https://github.com/mudrii/hermesd/releases/tag/v2026.9.13) · [**Install from PyPI**](https://pypi.org/project/hermesd/2026.9.13/) · [**Installation and upgrades**](#installation)
+
+This release brings together the features and fixes since **v2026.7.11**, the previous published release. The `2026.9.8` development milestone was not published separately.
+
+- **Gateway health:** loop responsiveness alongside heartbeat age, crash/restart evidence, shared-listener routing, update receipts, and delivery problems. Process ownership checks distinguish current records from preserved or unverifiable evidence.
+- **Sessions and recovery:** names, pins, Git branches, profiles, activity ordering, capacity, turn leases, compression recovery, routing suspension, and reset churn. Hidden but resumable sessions no longer trigger false dangling-route warnings.
+- **Usage and costs:** per-model all-time, 24-hour, and seven-day breakdowns, including auxiliary work. Cache-write estimates, explicitly billed zero, mixed billed/estimated totals, and rolling-window refresh are corrected.
+- **Scheduled work and Kanban:** cron execution history, delivery outcomes, dispatch/ticker state, catch-up activity, and incidents; board notification backlogs, completion requirements, and failure breakers. Execution and delivery remain separate facts, and one corrupt board no longer hides healthy boards.
+- **Delegations and Operations:** recent task cards with model/provider, results, receipts, and redacted log tails, plus PR-monitoring, database recovery, hosted-room, and retained API-run evidence. Bounded display lists keep their totals and unreadable-record counts separate.
+- **Plugins, skills, and configuration:** installation provenance, activation evidence, cached catalog drift, MCP cache validity, prompted-skill snapshots, configuration backup history, and policy-aware Curator hygiene.
+- **Terminal usability:** whole-view Sessions/Config scrolling, fresh search results, plain-text clipboard export, atomic snapshot files, and improved Unicode, input, and shutdown handling.
+- **Privacy and resilience:** broader secret redaction, terminal-control sanitization, profile/path confinement, bounded reads, and safer malformed-data handling. Healthy sources keep updating while failed sources preserve last-good evidence.
+- **Release validation:** Python 3.11–3.14 checks, installed wheel/sdist runtime tests, Docker smoke checks, four Linux/macOS Nix targets, scheduled security audits, and protected exact-commit release gates.
+
+Optional views depend on the records your Hermes Agent version produces; older schemas retain supported fallbacks. Missing, stale, and unverifiable evidence is labelled explicitly. hermesd remains independently installed and read-only.
+
+**JSON snapshot consumers:** review the [compatibility notes](docs/releases/2026.9.13.md#compatibility-and-upgrade-notes) for added fields and the replacement of `gateway_starts_2m` with the configurable-window field `gateway_starts_window`.
 
 ## Why This Exists
 
@@ -20,7 +40,7 @@ When you run Hermes Agent seriously — gateway handling Telegram, Discord, Slac
 
 The only way to answer these was running `hermes status`, `hermes sessions list`, `hermes cron list`, tailing log files, and mentally stitching together a picture from 5+ different sources. That friction adds up.
 
-**The solution:** `hermesd` — a single terminal command that reads `~/.hermes/` and presents everything in one live-updating dashboard. Gateway health, sessions, tokens, costs, tools, cron, skills, logs — all refreshed automatically, no API keys, no network access, zero writes to your agent state.
+**The solution:** `hermesd` — a single terminal command that reads `~/.hermes/` and presents everything in one live-updating dashboard. Gateway health, sessions, tokens, costs, tools, cron, skills, logs — all refreshed automatically, no API keys or external API calls, and zero writes to your agent state. Gateway responsiveness checks may make a bounded local connection to the Agent’s loop-tick witness.
 
 It's not trying to replace the Hermes CLI or your Telegram interface. It's the at-a-glance overview layer that tells you whether everything is healthy and where your tokens are going — so you can make decisions without hunting for data.
 
@@ -30,7 +50,7 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 
 | # | Panel | What It Shows |
 |---|-------|---------------|
-| 1 | **Gateway & Platforms** | Live gateway PID, Hermes version, update status, drain/scale-to-zero state, served-profile record, per-platform profile routing and recorded shared-listener ingress URL, loop-tick witness verdict, crash forensics, respawn-storm counts, web-client attachment, synthesized per-profile mirror URLss, multiplex-migration verdict, channel aliases/staleness, platform families, per-platform connection dots, and channel-directory inventory |
+| 1 | **Gateway & Platforms** | Live gateway PID, Hermes version, update status, drain/scale-to-zero state, served-profile record, per-platform profile routing and recorded shared-listener ingress URL, loop-tick witness verdict, crash forensics, respawn-storm counts, web-client attachment, recorded per-profile mirror URLs, multiplex-migration verdict, channel aliases/staleness, platform families, per-platform connection dots, and channel-directory inventory |
 | 2 | **Sessions** | Active/total count, identity-verified live surfaces, display names, pinned sessions, branch/profile, last-activity age, compression-failure warnings, turn leases/compression locks, hygiene cooldowns, decoded chat routes, reset churn, CLI terminals, active compression-recovery state (live failure cooldown, armed anti-thrash probe deadline, fallback streak, ineffective-compaction strikes), message/tool/API call totals, cwd, archived state, handoff metadata, and parent-session lineage |
 | 3 | **Tokens / Cost** | Today's and all-time token usage, per-model usage from `session_model_usage` (all-time/24h/7d) with actual vs estimated cost, an auxiliary-work subtotal, cost-status reconciliation, recent-window rollups, and provider/endpoint breakdowns |
 | 4 | **Tools** | Available tools count, toolset availability (enabled/unavailable/lazy/disabled), per-session call stats, background processes with purpose/port/profile and a dead-pid marker, filesystem checkpoints, full tool name grid |
@@ -60,7 +80,7 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 - **Jump navigation** — press `g` / `G` in scrollable detail views to jump to the top or bottom
 - **Footer health indicator** — a green/yellow/red dot shows how many collector sources succeeded on the last refresh, with failed source names surfaced inline when degraded
 - **Header status** — the top-left header shows the installed `hermesd` version, while the header/footer surface an `AGENT OFFLINE` warning when Hermes Agent appears inactive
-- **Scrollable detail views** — `j`/`k` scroll Gateway, Sessions, Cron, Skills, Logs, and Operations; every listed panel except Logs scrolls its complete rendered detail, while Logs scrolls the selected stream
+- **Scrollable detail views** — `j`/`k` scroll Gateway, Sessions, Config, Cron, Skills, Logs, and Operations; every listed panel except Logs scrolls its complete rendered detail, while Logs scrolls the selected stream
 - **Profile inspection** — press `p` inside the Profiles panel to cycle the viewed profile without changing the selected data source
 - **Resilient** — keeps showing last known good data on transient SQLite and log-read failures
 - **Theme-aware** — inherits your Hermes Agent skin and updates live when `config.yaml` changes
@@ -88,7 +108,7 @@ Press `1` to expand. Shows whether the gateway process is alive (with the replac
 
 **Platform record ownership.** `gateway_state.json` re-stamps its top-level `pid`/`start_time` on every write, while each platform entry keeps the `writer_pid`/`writer_start_time` of the process that recorded it. hermesd compares the two by exact equality — the same rule upstream's `/api/status` uses to tell a live record from a preserved one — and renders `current`, `⚠ preserved` (the entry outlived the gateway life that wrote it, so its state may describe a process that is gone), or `—` when the record carries no usable writer identity (an older gateway, or a host that could not resolve a process start time). Ownership is evaluated separately from heartbeat freshness: a ticking event loop says nothing about who wrote a given platform row, and the compact view adds `⚠ N platform record(s) outlived their writer`. Because the comparison needs a start-time stamp on both sides, a matching PID alone is never treated as identity — the same PID reused by a later process reads as preserved, not current.
 
-**Liveness, lifecycle and updates.** The compact view adds a `loop:` indicator next to the running dot — `ticking` (heartbeat ≤ 90 s), `stale` (≤ 300 s), `wedged` (older while the gateway still claims to be running), or `unknown` — plus one-line warnings for "config changed, restart needed", "update unfinished", "code skew", "migration unverified", and any pending/failed deliveries. Platforms flagged `needs_attention` get a `!` marker.
+**Liveness, lifecycle and updates.** The compact view adds a `loop:` indicator next to the running dot, using the loop-tick witness and heartbeat evidence described below. Legacy and unverifiable records remain distinguishable, and a fresh heartbeat alone does not establish responsiveness. One-line warnings cover configuration changes, unfinished updates, code skew, unverified migration, and pending/failed deliveries. Platforms flagged `needs_attention` get a `!` marker.
 
 The detail view adds a **Liveness** section (heartbeat age, incarnation count, restarts in the last 24 h, current incarnation uptime, running code version/short sha, config generation, session-store status), the gateway lifecycle (phase, last exit code/reason, and a warning when the previous life ended without recording an exit), an **Updates** section (outcome, finish age, from → to version, first failed step, the recorded post-restart fleet matrix as state counts, and the runtime code-skew verdict with the evidence behind it), the **Shared-Listener Ingress** and **Multiplex Migration** sections described above, and a **Delivery Obligations** table with the five newest undelivered messages (platform, state, attempts, age, truncated last error — message content is never read). The platform table gains a **Retrying** age column and a `! needs attention` status marker.
 
@@ -200,13 +220,13 @@ Press `0` to expand. The Memory panel shows the configured memory provider, memo
 
 Use `]` from panel 10 or `--snapshot-panel 11` to expand. The Kanban panel reads `~/.hermes/kanban.db` and `~/.hermes/kanban/boards/*/kanban.db` in read-only mode and shows board counts, the current board, stale claim counts, typed blocker counts, configured dispatch mode, status breakdowns, active worker claims, blocked/failing tasks, recent run outcomes, a parent→child **Decomposition Tree** (`task_links`), and a **Task Metadata** table (branch, workspace, goal mode, current step) when those columns are populated.
 
-**Notify subscriptions and the breaker.** A `kanban_notify` source reads `kanban_notify_subs` from the same root-anchored board and reports, per subscription, the backlog of that task's own events newer than its cursor (`id > last_event_id`, as upstream's notifier claims them) — a backlog that only grows means the watcher that owns the subscription is wedged or gone. The panel shows subscriber counts rolled up per platform (case-insensitively, matching notifier routing), the total and worst backlog, a bounded worst-first table, and subscriptions whose `notifier_profile` names a profile that no longer exists; the default profile is excluded (upstream reports `"default"` for the root home) and orphan detection stays silent when `profiles/` itself cannot be read. The source fails independently of the board read. Review cards also carry their `completion_contract` (NULL = local-only, `OWNER/REPO` for PR publication, or an exact PR URL), and the Failures column doubles as a breaker read-out: `consecutive_failures` is upstream's trip counter (preserved across review reopens, not a retry budget) and the effective threshold follows upstream's order exactly — per-task `max_retries` (including an explicit `0`, which trips immediately) over the configured `kanban.failure_limit` over the default 2.
+**Notify subscriptions and the breaker.** A `kanban_notify` source reads `kanban_notify_subs` from the same root-anchored board and reports, per subscription, the backlog of that task's own events newer than its cursor (`id > last_event_id`, as upstream's notifier claims them) — a growing backlog helps identify subscriptions whose delivery progress needs investigation; it does not establish watcher liveness. The panel shows subscriber counts rolled up per platform (case-insensitively, matching notifier routing), the total and worst backlog, a bounded worst-first table, and subscriptions whose `notifier_profile` names a profile that no longer exists; the default profile is excluded (upstream reports `"default"` for the root home) and orphan detection stays silent when `profiles/` itself cannot be read. The source fails independently of the board read. Review cards also carry their `completion_contract` (NULL = local-only, `OWNER/REPO` for PR publication, or an exact PR URL), and the Failures column doubles as a breaker read-out: `consecutive_failures` is upstream's trip counter (preserved across review reopens, not a retry budget) and the effective threshold follows upstream's order exactly — per-task `max_retries` (including an explicit `0`; a task with no failures is not shown as tripped) over the configured `kanban.failure_limit` over the default 2.
 
 ![Kanban Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-11-kanban.png)
 
 ### [12] Operations — What Runtime Artifacts Exist?
 
-Use `]` from Kanban or `--snapshot-panel 12` to expand. The Operations panel summarizes dashboard background processes, Desktop build metadata, **Response Store** stats (conversation/response row counts + size from `response_store.db`), **Verification Evidence** from `verification_evidence.db`, active/waiting **Goals** from `state.db`, **MoA Traces** inventory and bounded latest-record metadata from `moa-traces/*.jsonl`, **Projects** from `projects.db` with missing primary paths, newest discovered repos, and verification/Kanban correlations, model-cache provider/model counts, cache ages, and PR monitor files across all of the agent's naming families (flat + subdirectory) with per-repo dedup. `cron/state/pr_monitor.json` is also read in its PR-keyed shape (a mapping of PR number to `{state, mergeable, title, updatedAt, …}`), which adds **Open** and **Conflict** columns to the PR table. A **Blocked scripts** row counts the shell scripts the agent refused to run under `cache/blocked-scripts/` with the newest age and the three newest file names — a bounded, symlink-safe, stat-only scan; the script contents are never read. It also reports **Delegations** from the `async_delegations` table in `state.db` — a compact `Delegations: N running · N failed · N undelivered` line whenever any counter is non-zero, and a detail table of the 10 newest delegations (id, state, delivery state and attempt count, whether the owner pid is still alive, duration, the goal parsed out of `task_json`, and the status/error excerpt parsed out of `result_json`), alongside a count of live subagent transcripts under `cache/delegation/live/<id>/task-*.log`. Both JSON columns are size-capped before parsing and every excerpt is clipped to 80 characters. A **State DB** section reports the `schema_version`, database and WAL size, last auto-prune and auto-archive ages, `db_file_generation` and `fts_storage_version` from `state_meta`; all of it comes from the same mtime-cached `state.db` open as the goals, so a refresh never snapshots the (multi-hundred-megabyte) WAL database twice. **Snapshots** summarizes `state-snapshots/` (count, total size, newest age) from a bounded, one-level, stat-only scan registered as its own `state_snapshots` health source, and **Web UI Build** shows the short content hash and build age from `web-ui-build-stamp.json`. Delegation tables and build stamps are simply omitted when the agent version does not produce them.
+Use `]` from Kanban or `--snapshot-panel 12` to expand. The Operations panel summarizes dashboard background processes, Desktop build metadata, **Response Store** stats (conversation/response row counts + size from `response_store.db`), **Verification Evidence** from `verification_evidence.db`, active/waiting **Goals** from `state.db`, **MoA Traces** inventory and bounded latest-record metadata from `moa-traces/*.jsonl`, **Projects** from `projects.db` with missing primary paths, newest discovered repos, and verification/Kanban correlations, model-cache provider/model counts, cache ages, and PR monitor files across all of the agent's naming families (flat + subdirectory) with per-repo dedup. `cron/state/pr_monitor.json` is also read in its PR-keyed shape (a mapping of PR number to `{state, mergeable, title, updatedAt, …}`), which adds **Open** and **Conflict** columns to the PR table. A **Blocked scripts** row counts the shell scripts the agent refused to run under `cache/blocked-scripts/` with the newest age and the three newest file names — a bounded, symlink-safe, stat-only scan; the script contents are never read. It also reports **Delegations** from the `async_delegations` table in `state.db` — a compact `Delegations: N running · N failed · N undelivered` line whenever any counter is non-zero, and a detail table of the 10 newest delegations (id, state, delivery state and attempt count, whether the owner pid is still alive, duration, the goal parsed out of `task_json`, and the status/error excerpt parsed out of `result_json`), alongside recent delegation manifests under `cache/delegation/live/<id>/`. Cards show task status, model/provider, exit reasons, and redacted tails from displayed task logs. Manifest counts do not establish that every recorded run is live; unreadable counted manifests are reported separately. Both JSON columns are size-capped before parsing and every excerpt is clipped to 80 characters. A **State DB** section reports the `schema_version`, database and WAL size, last auto-prune and auto-archive ages, `db_file_generation` and `fts_storage_version` from `state_meta`; all of it comes from the same mtime-cached `state.db` open as the goals, so a refresh never snapshots the (multi-hundred-megabyte) WAL database twice. **Snapshots** summarizes `state-snapshots/` (count, total size, newest age) from a bounded, one-level, stat-only scan registered as its own `state_snapshots` health source, and **Web UI Build** shows the short content hash and build age from `web-ui-build-stamp.json`. Delegation tables and build stamps are simply omitted when the agent version does not produce them.
 
 **Delegation forensics.** A **Delegations** row now also accounts for the async subagent handoff durably recorded in `result_json`: the `Procs` column sums handed-off, orphaned (with runtime) and unread-completion counts across every per-child entry, including `partial` mid-flight rows, while session ids, commands and output tails are never copied out of the payload. **Live Delegation Transcripts** parses `cache/delegation/live/<id>/manifest.json` into one card per newest delegation — model, provider, task count, per-task status and exit reason, and a redacted tail of `task-<index>.log` derived from the task index rather than the manifest's stored path — with the run directory's mtime rendered as *dispatch* age (it does not advance while a task runs) and an explicit note that the live roster (per-task tool counts, steer state, depth) exists only in gateway memory and over RPC. The scan is bounded at every level: at most 200 run directories, a 64 KiB manifest cap, five cards, and task logs tailed only for the tasks a card actually displays. **Process Receipts** lists the newest `logs/process-results/proc_*.json` receipts with exit code, completion reason, ages and a doubly-redacted output tail (upstream redacts at write time, hermesd again at its own boundary); an absent directory renders as "no receipts yet", which the 7-day / 64-file retention makes the normal quiet-machine case. Two markers close the section: `Checkpoint Prune` compares the profile's `checkpoints/.last_prune` against **twice the configured** `checkpoints.min_interval_hours` (24 h by default) with the caveat inline that a fresh marker proves the wrapper ran, not that pruning succeeded; and a ROOT `spawn-ledger.json.corrupt` raises a red flag with its age — upstream's parking bay for an unparseable ledger, whose contents are never parsed.
 
@@ -230,24 +250,44 @@ A **Skill Hygiene** section reads `skills/.usage.json`: how many skills were pat
 
 ## Installation
 
-Requires Python 3.11+ and a working [Hermes Agent](https://github.com/NousResearch/hermes-agent) installation (`~/.hermes/` must exist).
+Requires Python 3.11+ on **Linux or macOS**, and an existing Hermes home from [Hermes Agent](https://github.com/NousResearch/hermes-agent). The default is `~/.hermes/`; use `--hermes-home PATH` for another location. Install hermesd independently so its dependency pins do not change the Agent’s environment.
 
 ### Via pip
 
+Use a separate virtual environment with Python 3.11 or later:
+
 ```bash
-pip install hermesd
+python3.11 -m venv ~/.venvs/hermesd
+source ~/.venvs/hermesd/bin/activate
+python -m pip install hermesd
 hermesd
 hermesd --snapshot
 ```
 
 ### Via uv
 
+uv installs the CLI in its own isolated tool environment:
+
 ```bash
 uv tool install hermesd
 hermesd
 ```
 
+### Upgrading
+
+```bash
+# Existing uv tool installation
+uv tool upgrade hermesd
+
+# Existing pip installation: activate its virtual environment first
+python -m pip install --upgrade hermesd
+
+hermesd --version
+```
+
 ### From Source
+
+The checkout follows `main` and may include changes after the latest release. Use the `v2026.9.13` tag when you need that release’s source.
 
 ```bash
 git clone https://github.com/mudrii/hermesd.git
@@ -260,12 +300,16 @@ hermesd
 
 ### Docker
 
+Build locally from your checkout; hermesd does not currently publish maintained container images. The Hermes home is mounted read-only:
+
 ```bash
 docker build -t hermesd .
 docker run -it -v ~/.hermes:/home/hermesd/.hermes:ro hermesd
 ```
 
 ### Nix Flake
+
+CI builds and tests Linux/macOS packages on x86_64 and ARM64. The commands below follow `main`; the [release policy](docs/ci-release-policy.md#dependency-policy-ci-06070813) explains the independently validated Nix dependency set and Intel macOS support window.
 
 ```bash
 # Run directly
@@ -373,7 +417,7 @@ hermesd --log-tail-bytes 8192
 
 ## Architecture
 
-hermesd is a **read-only companion** — it reads files from `~/.hermes/` and never writes to Hermes Agent state. The only write path is the explicit `--snapshot-file PATH` export, which is rejected when the target is under the Hermes home.
+hermesd is a **read-only companion** — it reads files from `~/.hermes/` and never writes to Hermes Agent state. Explicit `--snapshot-file PATH` exports are rejected when the target is under the Hermes home. Private temporary SQLite copies and atomic-export staging files are created outside protected Agent state.
 
 ```
 ~/.hermes/                        hermesd
@@ -474,7 +518,9 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full TDD-first contributor work
 
 ### Releases
 
-User-facing release notes live in [`CHANGELOG.md`](CHANGELOG.md). Before tagging, bump the package version in `pyproject.toml`, keep `flake.nix` aligned, move user-facing `[Unreleased]` notes into a dated release section matching the package version, and update screenshot URLs if the release refreshes images. PyPI publishing is driven from GitHub Releases: tag the release as `vYYYY.M.D`, publish the release on GitHub, and the `python-publish` workflow reruns the test matrix, verifies that the tag, package version, changelog section, and distribution filenames match, smoke-tests the wheel and sdist, checks package metadata, then uploads to PyPI via OIDC. GitHub Actions dependencies are pinned to immutable SHAs with version comments and tracked by Dependabot.
+The [2026.9.13 release notes](docs/releases/2026.9.13.md) describe the current published release; [`CHANGELOG.md`](CHANGELOG.md) retains the development history. `main` can contain unreleased changes after a release tag.
+
+Follow the canonical [release policy](docs/ci-release-policy.md#release-eligibility-ci-04) before publishing. Update `pyproject.toml`, refresh `uv.lock`, and prepare the matching changelog/release notes; Nix derives the version from the package manifest. The exact release commit must pass the required CI gate on protected `main`. GitHub Release publication then checks eligibility, reruns the Python matrix and fresh security audits, builds and smoke-tests the distributions, and publishes to PyPI through the restricted environment using OIDC. Release tags are protected against updates and deletion.
 
 ### Project Structure
 
@@ -558,15 +604,15 @@ hermesd uses **TDD-first** contribution (see [`CONTRIBUTING.md`](CONTRIBUTING.md
 
 ### Dependencies
 
-Only 3 runtime dependencies:
+Three **direct** runtime dependencies are pinned for the published `2026.9.13` package:
 
-| Package | Version | Purpose | In hermes-agent? |
-|---------|---------|---------|------------------|
-| `rich` | >= 14.0 | TUI rendering (Live, Layout, Panel, Table, Text) | Yes |
-| `pyyaml` | >= 6.0 | Reading config.yaml | Yes |
-| `pydantic` | >= 2.0 | Data models and validation | Yes |
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `rich` | `==14.3.3` | TUI rendering (Live, Layout, Panel, Table, Text) |
+| `pyyaml` | `==6.0.3` | Reading config.yaml |
+| `pydantic` | `==2.13.4` | Data models and validation |
 
-If you install hermesd into the same environment as Hermes Agent, these dependencies are usually already present, so no additional downloads may be needed.
+These direct pins do not freeze every transitive dependency in a fresh PyPI installation. Development and Docker use `uv.lock`; Nix uses its separately validated pinned package set. See the [dependency and release policy](docs/ci-release-policy.md#dependency-policy-ci-06070813) for update and validation requirements. hermesd does not depend on or import the Hermes Agent package.
 
 ## License
 
