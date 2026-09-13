@@ -442,7 +442,7 @@ def _default_loop_tick_probe(
         if not 0 < tcp_port <= 65535:
             return None
         family: int = socket.AF_INET
-        address: object = ("127.0.0.1", tcp_port)
+        address: tuple[str, int] | str = ("127.0.0.1", tcp_port)
     else:
         node = home / "state" / f"gateway.loop-tick.{pid}.sock"
         try:
@@ -456,7 +456,7 @@ def _default_loop_tick_probe(
     try:
         sock = socket.socket(family, socket.SOCK_STREAM)
         sock.settimeout(max(float(timeout), 0.0))
-        sock.connect(address)  # type: ignore[arg-type]
+        sock.connect(address)
         return sock.recv(1) == b"1"
     except OSError:
         return False
