@@ -5,6 +5,7 @@ from __future__ import annotations
 from hermesd.models import (
     CronExecution,
     CronExecutionsState,
+    CronFireClaimState,
     CronIncident,
     CronJob,
     CronJobExecutionStats,
@@ -13,7 +14,7 @@ from hermesd.models import (
     DashboardState,
 )
 from hermesd.panels import render_panel
-from hermesd.panels.cron import render_cron
+from hermesd.panels.cron import _last_status_cell, render_cron
 from hermesd.theme import Theme
 from tests.conftest import render_to_str
 
@@ -975,3 +976,198 @@ def test_cron_delivery_line_sanitizes_instead_of_escaping() -> None:
     assert "\\[bold]" not in text
     assert "[bold]teleported 1" in text
     assert "\x1b[2J" not in text
+
+
+def test_cron_detail_labels_delivery_queued_as_unverified() -> None:
+    """``delivery_queued`` is its own vocabulary: the notice left but was never
+    verified, so resending would duplicate it (``cron/scheduler.py:2717-2723``)."""
+    job = CronJob(job_id="j1", name="nightly", last_status="delivery_queued")
+    state = DashboardState(cron=CronState(job_count=1, jobs=[job]))
+    text = render_to_str(render_cron(state, Theme(), detail=True), no_color=True)
+    assert "delivery_queued" in text
+    assert "do not resend" in text
+
+
+def test_cron_detail_labels_blocked_config_as_preflight_block() -> None:
+    """``blocked_config`` is a preflight block with an alert-once flag, not a
+    plain run error (``cron/scheduler.py:1438-1473``, ``:2726-2727``)."""
+    job = CronJob(
+        job_id="j1",
+        name="nightly",
+        last_status="blocked_config",
+        preflight_alerted=True,
+    )
+    state = DashboardState(cron=CronState(job_count=1, jobs=[job]))
+    text = render_to_str(render_cron(state, Theme(), detail=True), no_color=True)
+    assert "preflight block" in text
+    assert "alert sent" in text
+
+
+def test_cron_last_status_cell_keeps_delivery_and_config_out_of_error() -> None:
+    theme = Theme()
+    error_cell = _last_status_cell(CronJob(last_status="error"), theme)
+    queued_cell = _last_status_cell(CronJob(last_status="delivery_queued"), theme)
+    blocked_cell = _last_status_cell(CronJob(last_status="blocked_config"), theme)
+    failed_cell = _last_status_cell(CronJob(last_status="delivery_failed"), theme)
+    ok_cell = _last_status_cell(CronJob(last_status="ok"), theme)
+    empty_cell = _last_status_cell(CronJob(), theme)
+    assert error_cell.style == theme.ui_error
+    assert queued_cell.style == theme.ui_warn
+    assert blocked_cell.style == theme.ui_warn
+    assert failed_cell.style == theme.ui_warn
+    assert ok_cell.style == theme.banner_text
+    assert empty_cell.plain == "—"
+
+
+def test_cron_detail_shows_fire_claim_states() -> None:
+    running = CronJob(
+        job_id="j1",
+        name="running-job",
+        fire_claim_state=CronFireClaimState.RUNNING,
+        fire_claim_age_seconds=45.0,
+    )
+    abandoned = CronJob(
+        job_id="j2",
+        name="dead-job",
+        fire_claim_state=CronFireClaimState.ABANDONED_RUN,
+        fire_claim_age_seconds=900.0,
+    )
+    state = DashboardState(cron=CronState(job_count=2, jobs=[running, abandoned]))
+    text = render_to_str(render_cron(state, Theme(), detail=True), no_color=True)
+    assert "running now" in text
+    assert "abandoned run" in text
+
+
+def test_cron_detail_shows_pending_slot_and_last_fire_error() -> None:
+    job = CronJob(
+        job_id="j1",
+        name="webhook-job",
+        pending_slot_scheduled_at="2026-09-07T22:29:36+08:00",
+        pending_slot_age_seconds=90.0,
+        last_fire_error="loopback forward refused",
+        last_fire_error_age_seconds=120.0,
+    )
+    state = DashboardState(cron=CronState(job_count=1, jobs=[job]))
+    text = render_to_str(render_cron(state, Theme(), detail=True), no_color=True)
+    assert "pending slot" in text
+    assert "2026-09-07 22:29:36" in text
+    assert "loopback forward refused" in text
+
+
+def test_cron_detail_last_fire_error_omits_age_when_stamp_missing() -> None:
+    job = CronJob(job_id="j1", name="webhook-job", last_fire_error="loopback refused")
+    state = DashboardState(cron=CronState(job_count=1, jobs=[job]))
+    text = render_to_str(render_cron(state, Theme(), detail=True), no_color=True)
+    assert "loopback refused" in text
+    assert "unknown time" in text
+
+
+def test_cron_compact_marks_running_abandoned_and_pending_slot_jobs() -> None:
+    """The compact list shows only the first two jobs, so each marker gets a pass."""
+    running = CronJob(name="running-job", fire_claim_state=CronFireClaimState.RUNNING)
+    abandoned = CronJob(name="dead-job", fire_claim_state=CronFireClaimState.ABANDONED_RUN)
+    pending = CronJob(name="stuck-job", pending_slot_scheduled_at="2026-09-07T22:29:36+08:00")
+    first = render_to_str(
+        render_cron(
+            DashboardState(cron=CronState(job_count=3, jobs=[running, abandoned])), Theme()
+        ),
+        no_color=True,
+    )
+    second = render_to_str(
+        render_cron(DashboardState(cron=CronState(job_count=3, jobs=[pending, running])), Theme()),
+        no_color=True,
+    )
+    assert "▶" in first
+    assert "✗run" in first
+    assert "⧗" in second
+    assert "▶" in second
+
+
+def test_cron_compact_warns_when_a_fire_could_not_be_forwarded() -> None:
+    job = CronJob(name="webhook-job", last_fire_error="loopback refused")
+    state = DashboardState(cron=CronState(job_count=1, jobs=[job]))
+    text = render_to_str(render_cron(state, Theme()), no_color=True)
+    assert "Fire forward failed" in text
+
+
+def test_cron_compact_hides_fire_forward_line_when_none() -> None:
+    state = DashboardState(cron=CronState(job_count=1, jobs=[CronJob(name="ok-job")]))
+    text = render_to_str(render_cron(state, Theme()), no_color=True)
+    assert "Fire forward" not in text
+
+
+def test_cron_detail_shows_model_snapshot_only_when_unpinned() -> None:
+    """Operators must see which model an unpinned job will actually run: the
+    creation-time snapshot (``cron/jobs.py:1600-1630``)."""
+    unpinned = CronJob(
+        job_id="j1",
+        name="unpinned",
+        model="",
+        model_snapshot="hermes-default-large",
+        provider="",
+        provider_snapshot="openai",
+    )
+    pinned = CronJob(job_id="j2", name="pinned", model="gpt-9", provider="openai")
+    state = DashboardState(cron=CronState(job_count=2, jobs=[unpinned, pinned]))
+    text = render_to_str(render_cron(state, Theme(), detail=True), no_color=True)
+    assert "model hermes-default-large (unpinned snapshot)" in text
+    assert "provider openai (unpinned snapshot)" in text
+    # The pinned job's explicit pin is never described as a snapshot.
+    assert pinned.model not in text or "gpt-9 (unpinned" not in text
+
+
+def test_cron_detail_labels_detected_incident_as_never_alerted() -> None:
+    """An open incident still in ``detected`` was never alerted: upstream flips it
+    to ``alerted`` only when a failure ping actually leaves the process
+    (``cron/incidents.py:1-9``, ``cron/scheduler.py:2745-2746``), so a stale
+    ``detected`` row means the alert delivery path itself is broken. ``acked_at``
+    is only ever set together with ``closed_at`` (``cron/incidents.py:186-195``),
+    so an open incident can never be acknowledged."""
+    detected = CronIncident(
+        incident_id="i1",
+        job_id="j1",
+        job_name="nightly",
+        state="detected",
+        failure_type="timeout",
+        first_seen_age_seconds=7200.0,
+        last_seen_age_seconds=7200.0,
+        error_excerpt="boom",
+    )
+    state = DashboardState(
+        cron_executions=CronExecutionsState(
+            open_incident_count=1,
+            unacked_incident_count=1,
+            open_incidents=[detected],
+        )
+    )
+    text = render_to_str(render_cron(state, Theme(), detail=True), no_color=True)
+    assert "never alerted" in text
+
+
+def test_cron_detail_incident_note_explains_ack_semantics() -> None:
+    detected = CronIncident(incident_id="i1", job_id="j1", job_name="nightly", state="detected")
+    state = DashboardState(
+        cron_executions=CronExecutionsState(
+            open_incident_count=1, unacked_incident_count=1, open_incidents=[detected]
+        )
+    )
+    text = render_to_str(render_cron(state, Theme(), detail=True), no_color=True)
+    assert "acked_at" in text
+    assert "closed_at" in text
+
+
+def test_cron_detail_keeps_alerted_incident_label_and_unknown_states_verbatim() -> None:
+    alerted = CronIncident(incident_id="i1", job_id="j1", job_name="a", state="alerted")
+    exotic = CronIncident(incident_id="i2", job_id="j2", job_name="b", state="quarantined")
+    state = DashboardState(
+        cron_executions=CronExecutionsState(
+            open_incident_count=2,
+            unacked_incident_count=2,
+            open_incidents=[alerted, exotic],
+        )
+    )
+    text = render_to_str(render_cron(state, Theme(), detail=True), no_color=True)
+    # 'alerted' stays labelled; an unseen state is shown verbatim, never folded
+    # into 'never alerted'.
+    assert "alerted" in text
+    assert "quarantined" in text
