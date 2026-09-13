@@ -478,6 +478,17 @@ def _append_lifecycle(text: Text, gw: GatewayState, theme: Theme) -> None:
             "\n  ⚠ previous gateway life ended without recording an exit",
             style=theme.ui_warn,
         )
+    if gw.prior_unclean_exit or gw.prior_suspected_oom:
+        # The flags below are evidence, not a verdict: `gateway --replace`
+        # SIGTERMs the old process and SIGKILLs it ten seconds later
+        # (gateway/run.py:4924-4926), so a takeover that outran the grace window
+        # leaves the same record as a crash — upstream calls it a phantom
+        # unclean death (:4699).
+        text.append(
+            "\n    a deliberate restart (gateway --replace) that SIGKILLed the old "
+            "process looks the same",
+            style=theme.banner_dim,
+        )
     if gw.prior_unclean_exit:
         text.append("\n  ⚠ previous exit unclean", style=theme.ui_warn)
     if gw.prior_suspected_oom:

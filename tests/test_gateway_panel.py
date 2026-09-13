@@ -778,6 +778,23 @@ def test_gateway_renders_lifecycle_carry_flags() -> None:
     assert "suspected OOM" in detail
 
 
+def test_lifecycle_flags_note_the_replace_takeover_case() -> None:
+    """An unclean exit is not always a crash: ``gateway --replace`` looks the same.
+
+    Upstream's replacement path SIGTERMs the old gateway, waits ten seconds and
+    then SIGKILLs it (``gateway/run.py:4924-4926``); a kill past that grace
+    window never reaches ``mark_exited`` (``:5524-5529``), so the next boot's
+    ``detect_unclean_exit`` reports the "phantom unclean death" upstream names
+    (``:4699``) and hermesd renders it as an unclean exit / suspected OOM. The
+    flags are evidence, and the caveat belongs beside them.
+    """
+    state = _liveness_state(prior_unclean_exit=True, prior_suspected_oom=True)
+    detail = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "replace" in detail
+    assert "SIGKILL" in detail
+
+
 def test_gateway_renders_restart_storm_line_and_backoff() -> None:
     state = _liveness_state(
         gateway_starts_recorded=True,
