@@ -795,3 +795,267 @@ def test_kanban_pragma_failure_fails_source_and_keeps_last_good(hermes_home: Pat
         assert third.kanban.task_count == 1
     finally:
         c.close()
+
+
+# ---------------------------------------------------------------------------
+# Notify subscriptions: the kanban_notify source over kanban_notify_subs
+# ---------------------------------------------------------------------------
+
+
+def _insert_notify_sub(
+    conn: sqlite3.Connection,
+    task_id: str,
+    platform: str,
+    *,
+    last_event_id: int = 0,
+    notifier_profile: str | None = None,
+    delivery_mode: str = "notify",
+    chat_id: str = "chat-1",
+    thread_id: str = "",
+) -> None:
+    conn.execute(
+        "INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id, "
+        "notifier_profile, delivery_mode, created_at, last_event_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (task_id, platform, chat_id, thread_id, notifier_profile, delivery_mode, 1, last_event_id),
+    )
+
+
+def test_collect_kanban_notify_backlog_counts_and_platform_rollup(hermes_home: Path):
+    """Per-sub backlog is max(task_events.id) - last_event_id; platforms roll up
+    case-insensitively, matching notifier routing."""
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('t1', 'Watched', 'review', 1)"
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('t2', 'Quiet', 'done', 1)"
+    )
+    for _ in range(5):
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) VALUES ('t1', 'status', 1)"
+        )
+    for _ in range(2):
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) VALUES ('t2', 'status', 1)"
+        )
+    _insert_notify_sub(conn, "t1", "Discord", last_event_id=3)
+    _insert_notify_sub(conn, "t1", "discord", chat_id="chat-2", last_event_id=5)
+    _insert_notify_sub(conn, "t2", "Slack", last_event_id=7)
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "kanban_notify" not in state.health.failed_sources
+    assert state.kanban.notify_sub_count == 3
+    assert state.kanban.notify_platform_counts == {"discord": 2, "slack": 1}
+    assert state.kanban.notify_backlog_total == 2
+    assert state.kanban.notify_max_backlog == 2
+    backlog = state.kanban.notify_backlog_subs
+    # The row keeps the platform as stored; only the rollup lowercases.
+    assert [(sub.task_id, sub.platform) for sub in backlog] == [("t1", "Discord")]
+    assert backlog[0].last_event_id == 3
+    assert backlog[0].max_event_id == 5
+    assert backlog[0].backlog == 2
+
+
+def test_collect_kanban_notify_orphan_profiles(hermes_home: Path):
+    """A sub whose notifier_profile has no profiles/ directory is orphaned;
+    "default" names the root home upstream and "" names legacy unowned rows."""
+    (hermes_home / "profiles" / "ops").mkdir(parents=True)
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    create_kanban_db_tables(conn)
+    _insert_notify_sub(conn, "t1", "discord", notifier_profile="ghost")
+    _insert_notify_sub(conn, "t1", "slack", notifier_profile="ops")
+    _insert_notify_sub(conn, "t2", "api_server", notifier_profile="default")
+    _insert_notify_sub(conn, "t2", "telegram", notifier_profile=None)
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "kanban_notify" not in state.health.failed_sources
+    assert state.kanban.notify_orphan_profile_count == 1
+    assert state.kanban.notify_orphan_profiles == ["ghost"]
+
+
+def test_kanban_notify_missing_table_reads_healthy_empty(hermes_home: Path):
+    """A kanban.db without kanban_notify_subs is healthy with empty notify data."""
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    conn.execute(
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, "
+        "status TEXT NOT NULL, created_at INTEGER NOT NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "kanban_notify" not in state.health.failed_sources
+    assert state.kanban.notify_sub_count == 0
+    assert state.kanban.notify_platform_counts == {}
+    assert state.kanban.notify_backlog_subs == []
+    assert state.kanban.notify_orphan_profiles == []
+
+
+def test_kanban_notify_read_error_restores_only_notify_fields(hermes_home: Path, monkeypatch):
+    """A failing subscription read degrades only the notify fields; the board
+    itself keeps its fresh values and the notify fields keep their last good."""
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('t1', 'Task', 'todo', 1)"
+    )
+    _insert_notify_sub(conn, "t1", "discord", last_event_id=2)
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert first.kanban.task_count == 1
+        assert first.kanban.notify_sub_count == 1
+
+        conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at) VALUES ('t_new', 'New', 'todo', 1)"
+        )
+        conn.commit()
+        conn.close()
+
+        real_query_rows = kanban_module._query_rows
+
+        def flaky_query_rows(conn, sql, *args):
+            if "FROM kanban_notify_subs" in sql:
+                raise sqlite3.OperationalError("simulated notify-sub read failure")
+            return real_query_rows(conn, sql, *args)
+
+        monkeypatch.setattr(kanban_module, "_query_rows", flaky_query_rows)
+        second = c.collect()
+        assert "kanban_notify" in second.health.failed_sources
+        assert second.kanban.notify_sub_count == 1
+        assert second.kanban.task_count == 2
+    finally:
+        c.close()
+
+
+# ---------------------------------------------------------------------------
+# Completion contracts and the failure circuit breaker
+# ---------------------------------------------------------------------------
+
+
+def test_collect_kanban_completion_contract_and_breaker_state(hermes_home: Path):
+    """Review tasks expose their completion contract; breaker trips follow
+    upstream's threshold order: task max_retries > config > default."""
+    (hermes_home / "config.yaml").write_text(yaml.dump({"kanban": {"failure_limit": 3}}))
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, completion_contract) "
+        "VALUES ('t_rev', 'Review task', 'review', 1, 'owner/repo')"
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, completion_contract) "
+        "VALUES ('t_pr', 'PR task', 'review', 1, 'https://github.com/owner/repo/pull/7')"
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, consecutive_failures) "
+        "VALUES ('t_trip', 'Tripped', 'blocked', 1, 3)"
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, consecutive_failures, max_retries) "
+        "VALUES ('t_override', 'Override', 'in_progress', 1, 1, 1)"
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, consecutive_failures) "
+        "VALUES ('t_safe', 'Under limit', 'in_progress', 1, 2)"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "kanban" not in state.health.failed_sources
+    tasks = {
+        task.task_id: task
+        for task in [
+            *state.kanban.active_tasks,
+            *state.kanban.problem_tasks,
+            *state.kanban.recent_tasks,
+        ]
+    }
+    review = tasks["t_rev"]
+    assert review.completion_contract == "owner/repo"
+    assert review.breaker_limit == 3
+    assert review.breaker_tripped is False
+    assert tasks["t_pr"].completion_contract == "https://github.com/owner/repo/pull/7"
+    tripped = tasks["t_trip"]
+    assert tripped.breaker_limit == 3
+    assert tripped.breaker_tripped is True
+    override = tasks["t_override"]
+    assert override.breaker_limit == 1
+    assert override.breaker_tripped is True
+    assert tasks["t_safe"].breaker_tripped is False
+    # A review task with only a contract still surfaces through the
+    # enrichment read so its contract can be displayed.
+    assert "t_rev" in {task.task_id for task in state.kanban.recent_tasks}
+
+
+def test_collect_kanban_breaker_trips_at_default_limit_without_config(hermes_home: Path):
+    """With no kanban.failure_limit config the default trip count is 2
+    (upstream DEFAULT_FAILURE_LIMIT)."""
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, consecutive_failures) "
+        "VALUES ('t_trip', 'Tripped', 'blocked', 1, 2)"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    task = state.kanban.problem_tasks[0]
+    assert task.breaker_limit == 2
+    assert task.breaker_tripped is True
+
+
+def test_kanban_breaker_limit_prefers_task_override_then_config_then_default():
+    assert kanban_module._breaker_limit(0, 0) == 2
+    assert kanban_module._breaker_limit(0, 3) == 3
+    assert kanban_module._breaker_limit(1, 3) == 1
+
+
+def test_read_kanban_notify_fields_without_required_columns_returns_empty():
+    """A kanban_notify_subs table missing its cursor columns has nothing to read."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE kanban_notify_subs (task_id TEXT)")
+    try:
+        assert (
+            kanban_module._read_kanban_notify_fields(conn, known_profiles=frozenset({"ops"})) == {}
+        )
+    finally:
+        conn.close()

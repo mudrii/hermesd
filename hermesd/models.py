@@ -1329,6 +1329,19 @@ class KanbanTaskSummary(BaseModel):
     workspace_path: str = ""
     goal_mode: str = ""
     current_step_key: str = ""
+    # Completion contract: "" (local-only), "OWNER/REPO", or an exact PR URL.
+    # A PR-contract task gates completion on repository exact-head CI
+    # (tools/kanban_tools_schemas.py:461-464), so a done-looking review card
+    # may be waiting on CI rather than finished.
+    completion_contract: str = ""
+    # Per-task breaker trip count (NULL upstream -> 0 here). This is the
+    # failure count at which the breaker trips, not a retry budget
+    # (hermes_cli/kanban_db.py:908-914).
+    max_retries: int = 0
+    # Effective trip threshold and verdict for this task, computed against the
+    # configured kanban.failure_limit at collect time.
+    breaker_limit: int = 0
+    breaker_tripped: bool = False
 
 
 class KanbanRunSummary(BaseModel):
@@ -1347,6 +1360,24 @@ class KanbanRunSummary(BaseModel):
 class KanbanTaskLink(BaseModel):
     parent_id: str = ""
     child_id: str = ""
+
+
+class KanbanNotifySubSummary(BaseModel):
+    """One task notification subscription and its unseen-event backlog.
+
+    The gateway kanban-notifier claims task_events with ``id > last_event_id``
+    per subscription (``hermes_cli/kanban_db_notify.py:186-232``); ``backlog``
+    is ``max(task_events.id) - last_event_id``, so a backlog that only grows
+    means the watcher that owns the sub is wedged or gone.
+    """
+
+    task_id: str = ""
+    platform: str = ""
+    notifier_profile: str = ""
+    delivery_mode: str = ""
+    last_event_id: int = 0
+    max_event_id: int = 0
+    backlog: int = 0
 
 
 class KanbanBoardSummary(BaseModel):
@@ -1383,6 +1414,14 @@ class KanbanState(BaseModel):
     recent_tasks: list[KanbanTaskSummary] = Field(default_factory=list)
     task_links: list[KanbanTaskLink] = Field(default_factory=list)
     recent_runs: list[KanbanRunSummary] = Field(default_factory=list)
+    # Notify subscriptions (kanban_notify source over kanban_notify_subs).
+    notify_sub_count: int = 0
+    notify_platform_counts: dict[str, int] = Field(default_factory=dict)
+    notify_backlog_total: int = 0
+    notify_max_backlog: int = 0
+    notify_backlog_subs: list[KanbanNotifySubSummary] = Field(default_factory=list)
+    notify_orphan_profile_count: int = 0
+    notify_orphan_profiles: list[str] = Field(default_factory=list)
 
 
 class ModelCacheSummary(BaseModel):

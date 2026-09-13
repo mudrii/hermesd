@@ -635,6 +635,10 @@ def test_profiled_collector_reads_root_scoped_cron_kanban_and_gateway(
         "INSERT INTO tasks (id, title, status, created_at, started_at) VALUES (?, ?, ?, ?, ?)",
         ("t_root", "root task", "in_progress", int(time.time()), int(time.time())),
     )
+    root_kanban.execute(
+        "INSERT INTO kanban_notify_subs (task_id, platform, chat_id, created_at, last_event_id) "
+        "VALUES ('t_root', 'discord', 'chat-root', 1, 0)"
+    )
     root_kanban.commit()
     root_kanban.close()
     profile_kanban = sqlite3.connect(str(profile_home / "kanban.db"))
@@ -642,6 +646,10 @@ def test_profiled_collector_reads_root_scoped_cron_kanban_and_gateway(
     profile_kanban.execute(
         "INSERT INTO tasks (id, title, status, created_at, started_at) VALUES (?, ?, ?, ?, ?)",
         ("t_profile", "profile task", "in_progress", int(time.time()), int(time.time())),
+    )
+    profile_kanban.execute(
+        "INSERT INTO kanban_notify_subs (task_id, platform, chat_id, created_at, last_event_id) "
+        "VALUES ('t_profile', 'slack', 'chat-profile', 1, 0)"
     )
     profile_kanban.commit()
     profile_kanban.close()
@@ -667,6 +675,10 @@ def test_profiled_collector_reads_root_scoped_cron_kanban_and_gateway(
     assert state.kanban.db_present is True
     assert state.kanban.task_count == 1
     assert [task.task_id for task in state.kanban.active_tasks] == ["t_root"]
+    # kanban_notify_subs ride the same root store: the root sub is reported and
+    # the profile copy next to it is invisible, exactly like the board itself.
+    assert state.kanban.notify_sub_count == 1
+    assert state.kanban.notify_platform_counts == {"discord": 1}
     # gateway_state.json comes from the root copy written by the fixture.
     assert state.gateway.pid == 12345
     assert state.gateway.state == "running"

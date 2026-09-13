@@ -70,6 +70,7 @@ _KNOWN_TABLES = frozenset(
         "hosted_room_retired_ids",
         "hosted_room_revoked_grants",
         "hosted_rooms",
+        "kanban_notify_subs",
         "project_folders",
         "projects",
         "responses",
