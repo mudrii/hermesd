@@ -106,7 +106,7 @@ ruff check .                          All checks passed!
 ruff format --check .                 109 files already formatted
 mypy hermesd                          Success: no issues found in 45 source files
 python -m compileall -q hermesd       OK
-pytest tests/ -q -W error::ResourceWarning --cov=hermesd   2842 passed, 2 skipped — 98.37% (gate 96%)
+pytest tests/ -q -W error::ResourceWarning --cov=hermesd   2843 passed, 2 skipped — 98.37% (gate 96%)
 ```
 
 Live read-only run against the real `~/.hermes`:

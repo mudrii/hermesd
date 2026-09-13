@@ -117,7 +117,7 @@ to use, and all of them confirmed the citations landed there.
 | `4315063` | The exit-diag tag was clipped but never redacted, and five liveness facts ran together on one line | Tag redacted after the display clip; each fact gets its own line; the value is labelled `last record` |
 | `2cc2a9d` | A future-dated exit-diag record counted as an unclean exit in the last 24 h | `0 <= now - stamp <= day`, matching the starts reader |
 | `3cb9c0c` | The mirror roster was sliced to 16 profiles with no flag, so the slice read as the whole roster | `mirror_urls_truncated` on the platform, rendered as its own warning line |
-| `8e897d2` | `bool(row.get("archived"))` trusted INTEGER affinity, which leaves a text `'false'` as TEXT | `_coerce_bool` at all three reads; the affinity exception is retired |
+| `8e897d2`, `cf18101` | `bool(row.get("archived"))` and cron's `handoff_pending` trusted INTEGER affinity, which leaves a text `'false'` as TEXT | `_coerce_bool` at all four reads; the affinity exception is retired |
 
 **Standards and smells**
 
@@ -179,7 +179,7 @@ ruff check .                                                All checks passed!
 ruff format --check .                                       110 files already formatted
 mypy hermesd                                                Success: no issues found in 45 source files
 python -m compileall -q hermesd                             OK
-pytest tests/ -q -W error::ResourceWarning --cov=hermesd     2842 passed, 2 skipped — 98.37 % (gate 96 %)
+pytest tests/ -q -W error::ResourceWarning --cov=hermesd     2843 passed, 2 skipped — 98.37 % (gate 96 %)
 ```
 
 Two skips are environmental (a `pty.openpty` test and a TUI integration test), and
@@ -217,6 +217,7 @@ Live read-only validation against the real `~/.hermes` after the last fix:
 - **Reading gateway env overrides** (`HERMES_GATEWAY_MAX_STARTS`,
   `HERMES_GATEWAY_START_WINDOW_S`) is still not done: they belong to the gateway's own
   environment and the panel says the policy is "as recorded in config".
-- **`cron_executions.handoff_pending`** was left truthy in §9's original list; it is now
-  strict along with the other affinity columns, so that exception list is empty.
+- **`cron_executions.handoff_pending`** was the last truthy flag read from a row; it is
+  strict now (`cf18101`), so the affinity exception in §9's list is empty and the rule
+  is uniform: every flag read out of a payload or a database row is strict.
 - **README screenshots** (versioned URLs) were not regenerated.
