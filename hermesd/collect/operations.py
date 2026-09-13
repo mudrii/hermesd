@@ -512,7 +512,7 @@ def _live_task_from_entry(entry: dict[str, Any], run_dir: Path, home: Path) -> D
     tail = _live_log_tail(run_dir / log_name, home)
     return DelegationLiveTask(
         index=index,
-        goal=_clip_single_line(str(entry.get("goal") or "")),
+        goal=_redact_secret_text(_clip_single_line(str(entry.get("goal") or ""))),
         status=str(entry.get("status") or ""),
         exit_reason=str(entry.get("exit_reason") or ""),
         log_name=log_name if tail else "",

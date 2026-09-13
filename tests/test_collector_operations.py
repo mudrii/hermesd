@@ -2565,6 +2565,33 @@ def test_delegation_live_manifest_tails_only_the_displayed_tasks(
     assert card.running_task_count == total - cap
 
 
+def test_delegation_live_task_goal_is_redacted(hermes_home: Path, sample_db: Path):
+    """The goal sits beside an already-redacted tail but is free text of its
+    own, and it reaches --snapshot-format json."""
+    live = hermes_home / "cache" / "delegation" / "live"
+    _write_live_delegation(
+        live,
+        "deleg_goal_secret",
+        _sample_manifest(
+            delegation_id="deleg_goal_secret",
+            task_count=1,
+            tasks=[
+                {
+                    "index": 0,
+                    "goal": "deploy with token=sk-live-abc123",
+                    "status": "running",
+                }
+            ],
+        ),
+    )
+
+    state = _collect_ops(hermes_home)
+    assert "sk-live-abc123" not in json.dumps(state.model_dump(mode="json"))
+    goal = state.operations.delegation_live_manifests[0].tasks[0].goal
+    assert "[REDACTED]" in goal
+    assert goal.startswith("deploy with token=")
+
+
 # --- process completion receipts (item 13) -----------------------------------
 
 
