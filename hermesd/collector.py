@@ -3186,16 +3186,19 @@ class Collector:
             stale_after_days=stale_days,
             archive_after_days=archive_days,
         )
+        # One overlay for both shapes: the thresholds and the usage rollup come
+        # from files the run report does not contain, so a populated run must
+        # keep them exactly like the empty one does. Applied through a single
+        # dict so a new field cannot land on only one branch.
+        overlay = {
+            "stale_after_days": stale_days,
+            "archive_after_days": archive_days,
+            "thresholds_customized": thresholds_customized,
+            **hygiene,
+        }
         base_run = _curator_with_scheduler_state(
             CuratorRun(), scheduler_state, curator_cfg
-        ).model_copy(
-            update={
-                "stale_after_days": stale_days,
-                "archive_after_days": archive_days,
-                "thresholds_customized": thresholds_customized,
-                **hygiene,
-            }
-        )
+        ).model_copy(update=overlay)
         curator_dir = self._paths.shared_path("logs", "curator")
         if (
             curator_dir.is_symlink()
@@ -3258,7 +3261,7 @@ class Collector:
             ),
             scheduler_state,
             curator_cfg,
-        )
+        ).model_copy(update=overlay)
 
     def _collect_model_caches(self) -> list[ModelCacheSummary]:
         cache_names = [
