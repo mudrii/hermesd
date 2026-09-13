@@ -68,7 +68,10 @@ from hermesd.collect.cron import (
     _cron_catch_up_occurrences,
     _cron_catch_up_policy,
     _cron_job_dispatch,
+    _cron_job_fire_claim,
+    _cron_job_fire_error,
     _cron_job_paused,
+    _cron_job_pending_slot,
     _cron_job_repeat,
     _cron_suggestion_count,
     _cron_ticker_ages,
@@ -2045,6 +2048,7 @@ class Collector:
 
         jobs: list[CronJob] = []
         error_count = 0
+        now = self._clock()
         data = self._read_json_cached(self._paths.shared_path("cron", "jobs.json"))
         if data:
             directory = self._read_json_cached(self._paths.shared_path("channel_directory.json"))
@@ -2071,6 +2075,9 @@ class Collector:
                 dispatch_lateness, dispatch_kind = _cron_job_dispatch(j)
                 repeat_times, repeat_completed = _cron_job_repeat(j)
                 paused, paused_reason = _cron_job_paused(j)
+                fire_claim_age, fire_claim_state = _cron_job_fire_claim(j, now=now)
+                pending_slot_at, pending_slot_age = _cron_job_pending_slot(j, now=now)
+                fire_error, fire_error_age = _cron_job_fire_error(j, now=now)
                 jobs.append(
                     CronJob(
                         job_id=str(j.get("id") or ""),
@@ -2099,12 +2106,22 @@ class Collector:
                         repeat_times=repeat_times,
                         repeat_completed=repeat_completed,
                         no_agent=bool(j.get("no_agent")),
+                        model=str(j.get("model") or ""),
+                        provider=str(j.get("provider") or ""),
+                        fire_claim_age_seconds=fire_claim_age,
+                        fire_claim_state=fire_claim_state,
+                        pending_slot_scheduled_at=pending_slot_at,
+                        pending_slot_age_seconds=pending_slot_age,
+                        last_fire_error=fire_error,
+                        last_fire_error_age_seconds=fire_error_age,
+                        preflight_alerted=bool(j.get("preflight_alerted")),
+                        model_snapshot=str(j.get("model_snapshot") or ""),
+                        provider_snapshot=str(j.get("provider_snapshot") or ""),
                     )
                 )
 
         cron_dir = self._paths.shared_path("cron")
         root = self._paths.root_home
-        now = self._clock()
         heartbeat_age, last_success_age = _cron_ticker_ages(cron_dir, now=now, root=root)
         ticker_error, ticker_error_age = _cron_ticker_last_error(cron_dir, now=now, root=root)
         catch_up_count, catch_up_recorded = _cron_catch_up_occurrences(cron_dir, root)

@@ -18,6 +18,7 @@ import hermesd.collect.cron as cron_module
 from hermesd.collect.common import _EXCERPT_MAX_CHARS
 from hermesd.collect.cron import (
     _EXECUTIONS_RECENT_LIMIT,
+    _FIRE_CLAIM_TTL_SECONDS,
     _INCIDENTS_LIMIT,
 )
 from hermesd.collect.logs import _MAX_LOG_LINE_CHARS
@@ -26,7 +27,7 @@ from hermesd.collector import (
     _delivery_target_label,
     _latest_cron_output_excerpt,
 )
-from hermesd.models import CronState, CronTickerHealth
+from hermesd.models import CronFireClaimState, CronState, CronTickerHealth
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
 from tests.conftest import (
@@ -2613,3 +2614,315 @@ def test_cron_marker_readers_propagate_a_permission_error(tmp_path: Path):
             cron_module._cron_ticker_last_error(cron_dir, now=_FIXED_NOW, root=tmp_path)
     finally:
         os.chmod(cron_dir, 0o755)
+
+
+def test_collect_cron_fire_claim_running_and_abandoned(hermes_home: Path):
+    """A fire_claim under upstream's TTL is a live run; past it, an abandoned run.
+
+    Upstream takes the claim at dispatch (``cron/jobs.py:2588``) and heartbeats it
+    every 60 s against a 300 s ``FIRE_CLAIM_TTL_SECONDS`` (``cron/jobs.py:889-892``,
+    ``heartbeat_fire_claim`` ``:2600-2608``); a claim that is never cleared means
+    the runner died mid-run.
+    """
+    now = 1_800_000_000.0
+    _write_jobs_json(
+        hermes_home,
+        [
+            {
+                "id": "job-live",
+                "name": "Live Run",
+                "fire_claim": {"at": iso_ago(60, now=now), "by": "host:4242:abc"},
+            },
+            {
+                "id": "job-dead",
+                "name": "Dead Run",
+                "fire_claim": {"at": iso_ago(600, now=now), "by": "host:4242:def"},
+            },
+        ],
+    )
+
+    c = Collector(hermes_home, clock=lambda: now)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    by_id = {job.job_id: job for job in state.cron.jobs}
+    assert by_id["job-live"].fire_claim_state is CronFireClaimState.RUNNING
+    assert by_id["job-live"].fire_claim_age_seconds == pytest.approx(60, abs=5)
+    assert by_id["job-dead"].fire_claim_state is CronFireClaimState.ABANDONED_RUN
+    assert by_id["job-dead"].fire_claim_age_seconds == pytest.approx(600, abs=5)
+    assert "cron" not in state.health.failed_sources
+
+
+def test_collect_cron_fire_claim_ttl_boundary_and_unusable_claims(hermes_home: Path):
+    """Upstream liveness is ``0 <= age < FIRE_CLAIM_TTL_SECONDS``; unusable claims
+    carry no liveness claim at all rather than a guessed one
+    (``_claim_is_live``, ``cron/jobs.py:2087-2098``)."""
+    now = 1_800_000_000.0
+    _write_jobs_json(
+        hermes_home,
+        [
+            {"id": "job-edge", "fire_claim": {"at": iso_ago(_FIRE_CLAIM_TTL_SECONDS, now=now)}},
+            {"id": "job-none", "fire_claim": None},
+            {"id": "job-junk", "fire_claim": {"at": "not-a-timestamp"}},
+        ],
+    )
+
+    c = Collector(hermes_home, clock=lambda: now)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    by_id = {job.job_id: job for job in state.cron.jobs}
+    assert by_id["job-edge"].fire_claim_state is CronFireClaimState.ABANDONED_RUN
+    assert by_id["job-none"].fire_claim_state is None
+    assert by_id["job-none"].fire_claim_age_seconds is None
+    assert by_id["job-junk"].fire_claim_state is None
+    assert by_id["job-junk"].fire_claim_age_seconds is None
+
+
+def test_collect_cron_pending_slot_is_reported_for_recurring_jobs(hermes_home: Path):
+    """A pending slot is the occurrence a tick took off the schedule but never
+    claimed (``cron/occurrences.py:38-87``); upstream only honours the stamp for
+    recurring schedules, so a one-shot stamp is not reported."""
+    now = 1_800_000_000.0
+    scheduled = iso_ago(600, now=now)
+    _write_jobs_json(
+        hermes_home,
+        [
+            {
+                "id": "job-recurring",
+                "name": "Hourly",
+                "schedule": {"kind": "cron"},
+                "pending_slot": {
+                    "scheduled_at": scheduled,
+                    "at": iso_ago(90, now=now),
+                    "by": "host:4242",
+                },
+            },
+            {
+                "id": "job-oneshot",
+                "name": "Once",
+                "schedule": {"kind": "once"},
+                "pending_slot": {
+                    "scheduled_at": scheduled,
+                    "at": iso_ago(90, now=now),
+                    "by": "host:4242",
+                },
+            },
+        ],
+    )
+
+    c = Collector(hermes_home, clock=lambda: now)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    by_id = {job.job_id: job for job in state.cron.jobs}
+    assert by_id["job-recurring"].pending_slot_scheduled_at == scheduled
+    assert by_id["job-recurring"].pending_slot_age_seconds == pytest.approx(90, abs=5)
+    assert by_id["job-oneshot"].pending_slot_scheduled_at == ""
+    assert by_id["job-oneshot"].pending_slot_age_seconds is None
+
+
+def test_collect_cron_pending_slot_malformed_or_unstamped_reads_as_absent(
+    hermes_home: Path,
+):
+    """A stamp whose instant does not parse is never a fire upstream, so it is no
+    slot here either; a missing stamp time keeps the instant but no age."""
+    now = 1_800_000_000.0
+    scheduled = iso_ago(600, now=now)
+    _write_jobs_json(
+        hermes_home,
+        [
+            {
+                "id": "job-junk",
+                "schedule": {"kind": "interval"},
+                "pending_slot": {"scheduled_at": "junk", "at": iso_ago(90, now=now)},
+            },
+            {
+                "id": "job-unstamped",
+                "schedule": {"kind": "interval"},
+                "pending_slot": {"scheduled_at": scheduled},
+            },
+        ],
+    )
+
+    c = Collector(hermes_home, clock=lambda: now)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    by_id = {job.job_id: job for job in state.cron.jobs}
+    assert by_id["job-junk"].pending_slot_scheduled_at == ""
+    assert by_id["job-unstamped"].pending_slot_scheduled_at == scheduled
+    assert by_id["job-unstamped"].pending_slot_age_seconds is None
+
+
+def test_collect_cron_last_fire_error_is_redacted_and_aged(hermes_home: Path):
+    """``last_fire_error`` is the only record that a dashboard fire webhook could
+    not forward (``cron/jobs.py:2200-2212``). The detail is arbitrary webhook
+    text, so it is redacted and capped at the data boundary."""
+    now = 1_800_000_000.0
+    _write_jobs_json(
+        hermes_home,
+        [
+            {
+                "id": "job-fire",
+                "name": "Webhook Job",
+                "last_fire_error": {
+                    "at": iso_ago(120, now=now),
+                    "detail": "loopback forward failed: api_key=sk-live-secret",
+                },
+            },
+            {"id": "job-clean", "name": "Clean"},
+        ],
+    )
+
+    c = Collector(hermes_home, clock=lambda: now)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    by_id = {job.job_id: job for job in state.cron.jobs}
+    fired = by_id["job-fire"]
+    assert "sk-live-secret" not in fired.last_fire_error
+    assert "[REDACTED]" in fired.last_fire_error
+    assert fired.last_fire_error_age_seconds == pytest.approx(120, abs=5)
+    assert by_id["job-clean"].last_fire_error == ""
+    assert by_id["job-clean"].last_fire_error_age_seconds is None
+
+
+def test_collect_cron_preflight_alerted_flag(hermes_home: Path):
+    """``preflight_alerted`` is upstream's alert-once dedup marker
+    (``cron/jobs.py:2190-2198``)."""
+    _write_jobs_json(
+        hermes_home,
+        [
+            {"id": "job-alerted", "name": "Alerted", "preflight_alerted": True},
+            {"id": "job-quiet", "name": "Quiet"},
+        ],
+    )
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    by_id = {job.job_id: job for job in state.cron.jobs}
+    assert by_id["job-alerted"].preflight_alerted is True
+    assert by_id["job-quiet"].preflight_alerted is False
+
+
+def test_collect_cron_snapshots_record_unpinned_resolution(hermes_home: Path):
+    """Snapshots capture creation-time resolution for unpinned axes only
+    (``cron/jobs.py:1600-1630``, written at ``:1770-1771``); a pinned job records
+    neither, and an older agent writes no keys at all."""
+    _write_jobs_json(
+        hermes_home,
+        [
+            {
+                "id": "job-unpinned",
+                "name": "Unpinned",
+                "model": None,
+                "provider": None,
+                "model_snapshot": "hermes-default-large",
+                "provider_snapshot": "openai",
+            },
+            {
+                "id": "job-pinned",
+                "name": "Pinned",
+                "model": "gpt-9",
+                "provider": "openai",
+            },
+        ],
+    )
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    by_id = {job.job_id: job for job in state.cron.jobs}
+    unpinned = by_id["job-unpinned"]
+    assert unpinned.model == ""
+    assert unpinned.model_snapshot == "hermes-default-large"
+    assert unpinned.provider_snapshot == "openai"
+    pinned = by_id["job-pinned"]
+    assert pinned.model == "gpt-9"
+    assert pinned.model_snapshot == ""
+    assert pinned.provider_snapshot == ""
+
+
+def test_collect_cron_delivery_statuses_do_not_fold_into_error(hermes_home: Path):
+    """``last_error`` is null on delivery_failed (the failure lives in
+    ``last_delivery_error``), and delivery/blocked statuses stay their own
+    vocabulary instead of being read as agent errors."""
+    _write_jobs_json(
+        hermes_home,
+        [
+            {
+                "id": "job-dfailed",
+                "name": "Delivery Failed",
+                "last_status": "delivery_failed",
+                "last_error": None,
+                "last_delivery_error": "telegram 500",
+            },
+            {
+                "id": "job-queued",
+                "name": "Queued",
+                "last_status": "delivery_queued",
+                "last_error": None,
+            },
+            {
+                "id": "job-blocked",
+                "name": "Blocked",
+                "last_status": "blocked_config",
+                "last_error": "cron.prompt missing",
+            },
+            {"id": "job-error", "name": "Errored", "last_status": "error", "last_error": "boom"},
+        ],
+    )
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    by_id = {job.job_id: job for job in state.cron.jobs}
+    # Only the two jobs carrying a real agent error text count as errors; the
+    # blocked_config job carries one too and stays counted.
+    assert state.cron.error_count == 2
+    assert by_id["job-dfailed"].last_status == "delivery_failed"
+    assert by_id["job-dfailed"].last_delivery_error == "telegram 500"
+    assert by_id["job-queued"].last_status == "delivery_queued"
+    assert by_id["job-blocked"].last_status == "blocked_config"
+
+
+def test_collect_cron_future_dated_fire_claim_carries_no_state(hermes_home: Path):
+    """A future-dated claim is stale upstream (``_claim_is_live`` refuses it so it
+    can never wedge a job), but rendering that as "abandoned run" would claim
+    evidence hermesd does not have, so no state is derived."""
+    now = 1_800_000_000.0
+    _write_jobs_json(
+        hermes_home,
+        [{"id": "job-skew", "fire_claim": {"at": iso_ago(-600, now=now)}}],
+    )
+
+    c = Collector(hermes_home, clock=lambda: now)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    job = state.cron.jobs[0]
+    assert job.fire_claim_age_seconds == 0.0
+    assert job.fire_claim_state is None

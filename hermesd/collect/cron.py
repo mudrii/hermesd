@@ -37,6 +37,7 @@ from hermesd.collect.sqlite_util import (
 from hermesd.models import (
     CronExecution,
     CronExecutionsState,
+    CronFireClaimState,
     CronIncident,
     CronJobExecutionStats,
     CronTickerHealth,
@@ -564,6 +565,11 @@ def _read_cron_incidents(
     """
     if not _table_exists(conn, "cron_incidents"):
         return 0, 0, []
+    # Lifecycle is detected -> alerted -> closed, and ``acked_at`` is written only
+    # by the closing transition, together with ``closed_at``
+    # (``cron/incidents.py:172-203``): upstream has no acknowledge-without-close.
+    # So for data this schema produces, every open incident is unacked — the
+    # separate counter is kept because a foreign/newer schema may diverge.
     open_clause = "WHERE COALESCE(state, '') != 'closed' AND closed_at IS NULL"
     open_count = _count_rows(conn, f"SELECT COUNT(*) FROM cron_incidents {open_clause}")
     unacked_count = _count_rows(
@@ -772,6 +778,82 @@ def _cron_ticker_health(
     if ticker_error_recorded:
         return CronTickerHealth.FAILING
     return CronTickerHealth.OK
+
+
+# ``fire_claim`` lease: upstream sets FIRE_CLAIM_TTL_SECONDS = 300 with a 60 s
+# heartbeat (``cron/jobs.py:889-892``) and refreshes it from the run thread
+# (``heartbeat_fire_claim``, ``cron/jobs.py:2600-2608``).
+_FIRE_CLAIM_TTL_SECONDS = 300.0
+# ``pending_slot`` is honoured upstream only for recurring schedules
+# (``unclaimed_pending_slot``, ``cron/occurrences.py:53-70``).
+_PENDING_SLOT_SCHEDULE_KINDS = frozenset({"cron", "interval"})
+
+
+def _cron_job_fire_claim(
+    job: dict[str, Any], *, now: float
+) -> tuple[float | None, CronFireClaimState | None]:
+    """Fire-claim age and derived liveness, or (None, None) for no usable claim.
+
+    Upstream's own liveness window is ``0 <= age < FIRE_CLAIM_TTL_SECONDS``
+    (``_claim_is_live``, ``cron/jobs.py:2087-2098``), so a claim exactly at the
+    TTL is already stale: the run it leased died before its first 60 s heartbeat
+    could be replaced. A future-dated stamp (clock/TZ skew) is stale upstream
+    too, but rendering that as "abandoned run" would claim evidence hermesd does
+    not have, so it reports no state.
+    """
+    claim = _as_dict(job.get("fire_claim"))
+    claimed_at = _iso_to_epoch(str(claim.get("at") or ""))
+    if claimed_at is None:
+        return None, None
+    age = now - claimed_at
+    if age < 0:
+        return 0.0, None
+    state = (
+        CronFireClaimState.RUNNING
+        if age < _FIRE_CLAIM_TTL_SECONDS
+        else CronFireClaimState.ABANDONED_RUN
+    )
+    return age, state
+
+
+def _cron_job_pending_slot(job: dict[str, Any], *, now: float) -> tuple[str, float | None]:
+    """Pending-slot instant and stamp age, or ("", None) when it is no slot.
+
+    ``pending_slot`` is the durable record of the window between a tick advancing
+    a recurring job's ``next_run_at`` and the fire claim being taken
+    (``cron/occurrences.py:38-49``) — an occurrence that may never have run.
+    Upstream honours the stamp only for recurring schedules and only when its
+    instant parses (``:53-70``); its remaining guards need process-liveness and
+    machine-id knowledge hermesd does not have, so the badge says only that a
+    slot was recorded, never that a run is due.
+    """
+    kind = str(_as_dict(job.get("schedule")).get("kind") or "")
+    if kind not in _PENDING_SLOT_SCHEDULE_KINDS:
+        return "", None
+    slot = _as_dict(job.get("pending_slot"))
+    scheduled_at = str(slot.get("scheduled_at") or "")
+    if not scheduled_at or _iso_to_epoch(scheduled_at) is None:
+        return "", None
+    stamp_age = _age_seconds(_iso_to_epoch(str(slot.get("at") or "")), now)
+    return scheduled_at, stamp_age
+
+
+def _cron_job_fire_error(job: dict[str, Any], *, now: float) -> tuple[str, float | None]:
+    """Redacted ``last_fire_error`` detail and its age, or ("", None).
+
+    ``note_fire_forward_failure`` records that a scheduled fire could not be
+    handed to the runner — the only trace of a dashboard fire webhook miss, since
+    no execution row is written and ``last_error`` stays null
+    (``cron/jobs.py:2200-2212``). ``mark_job_run`` clears it on the next run
+    outcome (``cron/jobs.py:2231-2232``), so the text describes current auto-fire
+    health. The detail is arbitrary webhook text (URLs, tokens), so it goes
+    through the same redacting excerpt helper as every other free-text error.
+    """
+    err = _as_dict(job.get("last_fire_error"))
+    detail = _cron_error_excerpt(str(err.get("detail") or ""))
+    if not detail:
+        return "", None
+    return detail, _age_seconds(_iso_to_epoch(str(err.get("at") or "")), now)
 
 
 def _cron_job_dispatch(job: dict[str, Any]) -> tuple[float | None, str]:

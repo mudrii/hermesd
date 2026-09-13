@@ -9,6 +9,7 @@ from rich.text import Text
 from hermesd.models import (
     CronExecution,
     CronExecutionsState,
+    CronFireClaimState,
     CronJob,
     CronJobExecutionStats,
     CronState,
@@ -39,6 +40,45 @@ _TICKER_STYLES = {
 # "missed fires were accumulated and skipped, then ran once now".
 _DISPATCH_KIND_LABELS = {"catch_up": "catch-up after missed fire", "late": "late"}
 
+# jobs.json ``last_status`` is a five-value vocabulary (``cron/jobs.py:2214-2244``
+# plus the explicit statuses the scheduler records: ``delivery_queued``
+# ``cron/scheduler.py:2722-2723``, ``blocked_config`` ``:2726-2727``). Folding
+# either into "error" would tell an operator to retry a run that does not need
+# one — a queued notice left the process unverified (resending would duplicate
+# it) and a preflight block needs a config fix, not a rerun.
+_LAST_STATUS_LABELS = {
+    "delivery_queued": "delivery_queued (unverified — do not resend)",
+    "blocked_config": "blocked_config (preflight block)",
+}
+_LAST_STATUS_STYLES = {
+    "error": "ui_error",
+    "delivery_failed": "ui_warn",
+    "delivery_queued": "ui_warn",
+    "blocked_config": "ui_warn",
+}
+
+# Incident lifecycle is detected -> alerted -> closed (``cron/incidents.py:1-9``):
+# ``alerted`` is set only when a failure ping actually left the process
+# (``cron/scheduler.py:2745-2746``). An open row still in ``detected`` therefore
+# means no failure notice ever reached the operator — the alert delivery path
+# itself is broken — and because ``acked_at`` is only ever written together with
+# ``closed_at`` (``cron/incidents.py:186-195``), it can never be acknowledged
+# away. An unseen state is kept verbatim rather than folded in.
+_INCIDENT_STATE_LABELS = {
+    "detected": "never alerted",
+    "alerted": "alerted",
+}
+_INCIDENT_STATE_STYLES = {
+    "detected": "ui_error",
+    "alerted": "ui_warn",
+}
+_INCIDENT_ACK_NOTE = (
+    "  detected = no failure ping ever reached the operator; upstream marks a row\n"
+    "  alerted only when the ping actually leaves the process, so a row still\n"
+    "  detected is a broken alert path, and acked_at is only ever set together with\n"
+    "  closed_at — open incidents can never be acknowledged."
+)
+
 # Rendered on every detail pass: both catch-up markers are best effort and the
 # error marker is deleted on recovery, so a quiet panel is not a healthy cron.
 _CATCH_UP_ABSENCE_NOTE = (
@@ -60,8 +100,15 @@ def _fmt_error_age(age: float | None) -> str:
 
 
 def _job_markers(job: CronJob) -> str:
-    """Short compact-row glyphs for a failure streak and a paused job."""
+    """Short compact-row glyphs for a live/dead fire claim, a pending slot, a
+    failure streak, and a paused job."""
     markers = []
+    if job.fire_claim_state == CronFireClaimState.RUNNING:
+        markers.append("▶")
+    elif job.fire_claim_state == CronFireClaimState.ABANDONED_RUN:
+        markers.append("✗run")
+    if job.pending_slot_scheduled_at:
+        markers.append("⧗")
     if job.failure_streak > 0:
         markers.append(f"✗{job.failure_streak}")
     if job.paused:
@@ -98,6 +145,12 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     if c.ticker_error_recorded:
         lines.append(
             f"  ⚠ Tick error {_fmt_error_age(c.ticker_last_error_age_seconds)}\n",
+            style=theme.ui_error,
+        )
+    fire_failed = [j for j in c.jobs if j.last_fire_error]
+    if fire_failed:
+        lines.append(
+            f"  ⚠ Fire forward failed on {len(fire_failed)} job(s)\n",
             style=theme.ui_error,
         )
     if executions.open_incident_count:
@@ -327,8 +380,6 @@ def _jobs_table(
             else Text("○", style=theme.banner_dim)
         )
         state_color = theme.ui_ok if j.state == "scheduled" else theme.ui_warn
-        last = j.last_status or "—"
-        last_style = theme.ui_error if last == "error" else theme.banner_text
         window = [_window_counters(stats_by_job.get(j.job_id))] if show_window else []
         table.add_row(
             sym,
@@ -336,11 +387,25 @@ def _jobs_table(
             escape(j.schedule_display),
             escape(j.delivery_target_label or j.deliver or "—"),
             Text(sanitize_terminal_text(j.state), style=state_color),
-            Text(sanitize_terminal_text(last), style=last_style),
+            _last_status_cell(j, theme),
             *window,
             _job_error_label(j, stats_by_job.get(j.job_id)),
         )
     return table
+
+
+def _last_status_cell(job: CronJob, theme: Theme) -> Text:
+    """The ``last_status`` cell: delivery and config states keep their own words.
+
+    A status a newer agent adds is displayed verbatim (sanitized) rather than
+    bucketed into any known severity.
+    """
+    status = job.last_status or ""
+    if not status:
+        return Text("—", style=theme.banner_text)
+    label = _LAST_STATUS_LABELS.get(status, status)
+    style = getattr(theme, _LAST_STATUS_STYLES.get(status, "banner_text"))
+    return Text(sanitize_terminal_text(label), style=style)
 
 
 def _job_error_label(job: CronJob, stats: CronJobExecutionStats | None) -> str:
@@ -352,6 +417,25 @@ def _job_error_label(job: CronJob, stats: CronJobExecutionStats | None) -> str:
 def _job_flags_line(j: CronJob, theme: Theme) -> Text | None:
     """One line of the jobs.json fields too narrow to earn a table column."""
     parts = []
+    if j.fire_claim_state == CronFireClaimState.RUNNING:
+        parts.append(f"running now (claim {_fmt_age(j.fire_claim_age_seconds)} old)")
+    elif j.fire_claim_state == CronFireClaimState.ABANDONED_RUN:
+        # The claim outlived upstream's 300 s TTL without a run outcome: the
+        # runner died mid-run and never cleared or heartbeated it.
+        parts.append(f"abandoned run (claim {_fmt_age(j.fire_claim_age_seconds)} old)")
+    if j.pending_slot_scheduled_at:
+        stamp = ""
+        if j.pending_slot_age_seconds is not None:
+            stamp = f", stamped {_fmt_age(j.pending_slot_age_seconds)} ago"
+        parts.append(
+            f"pending slot {sanitize_terminal_text(fmt_iso_timestamp(j.pending_slot_scheduled_at))}"
+            f"{stamp} — may never have run"
+        )
+    if j.last_fire_error:
+        parts.append(
+            f"fire forward failed {_fmt_error_age(j.last_fire_error_age_seconds)}: "
+            f"{sanitize_terminal_text(j.last_fire_error)}"
+        )
     if j.failure_streak:
         parts.append(f"streak {j.failure_streak}")
     if j.paused:
@@ -359,6 +443,14 @@ def _job_flags_line(j: CronJob, theme: Theme) -> Text | None:
         parts.append(f"paused: {reason}" if reason else "paused")
     if j.last_delivery_error:
         parts.append(f"delivery: {sanitize_terminal_text(j.last_delivery_error[:80])}")
+    if j.preflight_alerted:
+        parts.append("config-block alert sent (alert-once)")
+    if not j.model and j.model_snapshot:
+        # An unpinned job runs whatever the snapshot resolved at creation; the
+        # panel would otherwise let an operator assume a pin that is not there.
+        parts.append(f"model {sanitize_terminal_text(j.model_snapshot)} (unpinned snapshot)")
+    if not j.provider and j.provider_snapshot:
+        parts.append(f"provider {sanitize_terminal_text(j.provider_snapshot)} (unpinned snapshot)")
     if j.dispatch_lateness_seconds is not None:
         parts.append(_dispatch_flag(j))
     if j.repeat_completed or j.repeat_times is not None:
@@ -396,6 +488,7 @@ def _executions_sections(executions: CronExecutionsState, theme: Theme) -> list[
             )
         )
         sections.append(_incidents_table(executions, theme))
+        sections.append(Text(f"{_INCIDENT_ACK_NOTE}\n", style=theme.banner_dim))
     return sections
 
 
@@ -514,9 +607,13 @@ def _incidents_table(executions: CronExecutionsState, theme: Theme) -> Table:
     table.add_column("Error", style=theme.ui_error)
 
     for incident in executions.open_incidents:
+        state = sanitize_terminal_text(incident.state)
         table.add_row(
             escape(incident.job_name or incident.job_id or "—"),
-            escape(incident.state) or "—",
+            Text(
+                _INCIDENT_STATE_LABELS.get(state, state) or "—",
+                style=getattr(theme, _INCIDENT_STATE_STYLES.get(state, "banner_text")),
+            ),
             escape(incident.failure_type) or "—",
             _fmt_age(incident.first_seen_age_seconds),
             _fmt_age(incident.last_seen_age_seconds),

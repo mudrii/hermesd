@@ -735,6 +735,33 @@ class CronJob(BaseModel):
     repeat_times: int | None = None
     repeat_completed: int = 0
     no_agent: bool = False
+    # Explicit inference pins from jobs.json. Empty means unpinned, which is the
+    # condition under which upstream records a resolution snapshot instead.
+    model: str = ""
+    provider: str = ""
+    # ``fire_claim`` (``cron/jobs.py:2588-2608``): the dispatch lease, refreshed
+    # every 60 s against a 300 s TTL. ``fire_claim_state`` is derived from the
+    # claim age in the collector; both are None/"" when no usable claim exists.
+    fire_claim_age_seconds: float | None = None
+    fire_claim_state: CronFireClaimState | None = None
+    # ``pending_slot`` (``cron/occurrences.py:38-87``): the occurrence a tick took
+    # off the schedule but never claimed. The scheduled instant is reported
+    # verbatim; the stamp age is None when the record carries no usable stamp.
+    pending_slot_scheduled_at: str = ""
+    pending_slot_age_seconds: float | None = None
+    # ``last_fire_error`` (``cron/jobs.py:2200-2212``): the only durable record
+    # that a dashboard fire webhook could not forward. ``last_error`` is NOT set
+    # for it. Redacted and capped in the collector; age is None without a stamp.
+    last_fire_error: str = ""
+    last_fire_error_age_seconds: float | None = None
+    # ``preflight_alerted`` (``cron/jobs.py:2190-2198``): upstream's alert-once
+    # dedup marker for a config-blocked job.
+    preflight_alerted: bool = False
+    # Creation-time resolution snapshots for unpinned axes
+    # (``cron/jobs.py:1600-1630``). Empty means pinned, no-agent, or unrecorded
+    # (older agent) — the snapshot is what the job will actually run.
+    model_snapshot: str = ""
+    provider_snapshot: str = ""
 
 
 class CronTickerHealth(StrEnum):
@@ -744,6 +771,19 @@ class CronTickerHealth(StrEnum):
     FAILING = "failing"
     STALE = "stale"
     UNKNOWN = "unknown"
+
+
+class CronFireClaimState(StrEnum):
+    """Derived liveness of a job's ``fire_claim`` lease.
+
+    Upstream takes the claim at dispatch and heartbeats it every 60 s against a
+    300 s ``FIRE_CLAIM_TTL_SECONDS`` (``cron/jobs.py:889-892``,
+    ``heartbeat_fire_claim`` ``:2600-2608``). A claim inside the window is a run
+    in progress; an older one was never cleared because the runner died mid-run.
+    """
+
+    RUNNING = "running"
+    ABANDONED_RUN = "abandoned run"
 
 
 class CronExecution(BaseModel):
