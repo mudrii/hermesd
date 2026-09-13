@@ -35,10 +35,13 @@ REQUIRED_DIST_FILES = (
 )
 
 
-def hermesd(*args: str) -> subprocess.CompletedProcess[str]:
+def hermesd(*args: str, home: Path | None = None) -> subprocess.CompletedProcess[str]:
     """Run the installed CLI from an isolated cwd, never the source tree."""
+    command = [sys.executable, "-I", "-m", "hermesd"]
+    if home is not None:
+        command += ["--hermes-home", str(home)]
     return subprocess.run(
-        [sys.executable, "-I", "-m", "hermesd", *args],
+        [*command, *args],
         capture_output=True,
         text=True,
         cwd=tempfile.mkdtemp(prefix="hermesd-smoke-cwd-"),
@@ -82,23 +85,23 @@ def snapshot_state(home: Path) -> dict[Path, str]:
 def check_snapshots(home: Path, label: str) -> None:
     before = snapshot_state(home)
 
-    overview = hermesd("--snapshot", "--no-color")
+    overview = hermesd("--snapshot", "--no-color", home=home)
     assert overview.returncode == 0, f"{label}: overview failed: {overview.stderr}"
     assert overview.stdout.strip(), f"{label}: empty overview output"
 
-    full_json = hermesd("--snapshot-format", "json")
+    full_json = hermesd("--snapshot-format", "json", home=home)
     assert full_json.returncode == 0, f"{label}: full JSON failed: {full_json.stderr}"
     payload = json.loads(full_json.stdout)
     assert payload["panel_num"] is None, f"{label}: unexpected panel annotation"
     assert "state" in payload, f"{label}: JSON payload missing state"
 
-    panel_json = hermesd("--snapshot-format", "json", "--snapshot-panel", "12")
+    panel_json = hermesd("--snapshot-format", "json", "--snapshot-panel", "12", home=home)
     assert panel_json.returncode == 0, f"{label}: panel JSON failed: {panel_json.stderr}"
     payload = json.loads(panel_json.stdout)
     assert payload["panel_num"] == 12, f"{label}: panel number not annotated"
     assert payload["panel_name"] == "Operations", f"{label}: wrong panel name"
 
-    panel_text = hermesd("--snapshot-panel", "8", "--no-color")
+    panel_text = hermesd("--snapshot-panel", "8", "--no-color", home=home)
     assert panel_text.returncode == 0, f"{label}: panel text failed: {panel_text.stderr}"
     assert panel_text.stdout.strip(), f"{label}: empty panel text output"
 
