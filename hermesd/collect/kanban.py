@@ -36,8 +36,12 @@ _DEFAULT_CLAIM_TTL_SECONDS = 300
 # Failure circuit breaker: the trip threshold order is per-task max_retries >
 # the dispatcher's kanban.failure_limit config > DEFAULT_FAILURE_LIMIT = 2
 # (hermes_cli/kanban_db_dispatch.py:33 and _record_task_failure :986-1013,
-# recompute_ready hermes_cli/kanban_db.py:2012-2050). max_retries <= 0 reads
-# as unset here: upstream stores NULL, and coercion cannot tell 0 from NULL.
+# recompute_ready hermes_cli/kanban_db.py:2012-2050). A task's max_retries is
+# an explicit override whenever the column is NOT NULL — upstream passes 0
+# through its int coercion (hermes_cli/kanban_db.py:1892-1894) and switches on
+# ``task_override is not None`` (kanban_db_dispatch.py:1027-1032), so
+# ``--max-retries 0`` means "trip on the first failure" and only NULL falls
+# through to the config value.
 _DEFAULT_FAILURE_LIMIT = 2
 
 
@@ -196,10 +200,19 @@ _ENRICHED_TASK_TEXT_COLUMNS = (
 )
 
 
-def _breaker_limit(max_retries: int, failure_limit: int) -> int:
-    """Upstream trip threshold: task override, then config, then the default."""
-    if max_retries > 0:
-        return max_retries
+def _optional_int(value: object) -> int | None:
+    """Coerce to int, preserving a genuine null (an unset max_retries column)."""
+    return None if value is None else _coerce_int(value)
+
+
+def _breaker_limit(max_retries: int | None, failure_limit: int) -> int:
+    """Upstream trip threshold: task override, then config, then the default.
+
+    ``max_retries`` is the raw column, so 0 survives as an immediate-trip
+    override instead of being mistaken for NULL.
+    """
+    if max_retries is not None:
+        return max(0, max_retries)
     if failure_limit > 0:
         return failure_limit
     return _DEFAULT_FAILURE_LIMIT
@@ -236,7 +249,7 @@ def _read_recent_enriched_tasks(conn: sqlite3.Connection) -> list[dict[str, Any]
 
 def _kanban_task_from_row(row: dict[str, Any], *, failure_limit: int = 0) -> KanbanTaskSummary:
     consecutive_failures = _coerce_int(row.get("consecutive_failures"))
-    max_retries = _coerce_int(row.get("max_retries"))
+    max_retries = _optional_int(row.get("max_retries"))
     breaker_limit = _breaker_limit(max_retries, failure_limit)
     return KanbanTaskSummary(
         task_id=str(row.get("id") or ""),
@@ -259,7 +272,7 @@ def _kanban_task_from_row(row: dict[str, Any], *, failure_limit: int = 0) -> Kan
         goal_mode=str(row.get("goal_mode") or ""),
         current_step_key=str(row.get("current_step_key") or ""),
         completion_contract=str(row.get("completion_contract") or ""),
-        max_retries=max_retries,
+        max_retries=max_retries or 0,
         breaker_limit=breaker_limit,
         breaker_tripped=consecutive_failures >= breaker_limit,
     )
@@ -294,11 +307,11 @@ def _kanban_board_present(paths: HermesPaths, board_slug: str) -> bool:
 
 # --- Notify subscriptions ---------------------------------------------------
 #
-# kanban_notify_subs is written by add_notify_sub and its unseen-event cursor
-# is claimed/advanced/rewound by claim/advance/rewind_notify_cursor
-# (hermes_cli/kanban_db_notify.py:78-130, :186-232); the gateway
-# kanban-notifier is the consumer (gateway/kanban_watchers_notifier.py). The
-# table lives in the same root-anchored kanban.db as the board itself —
+# kanban_notify_subs is written by add_notify_sub (:67-131) and its
+# unseen-event cursor is claimed/advanced/rewound by
+# claim/advance/rewind_notify_cursor (:340-371, :380-395, :409-429); the
+# gateway kanban-notifier is the consumer (gateway/kanban_watchers_notifier.py).
+# The table lives in the same root-anchored kanban.db as the board itself —
 # kanban_home() = get_default_hermes_root(), "Shared across profiles BY
 # DESIGN" (hermes_cli/kanban_db.py:382-401) — so this reader is ROOT-scoped
 # like the kanban source it complements.
@@ -323,7 +336,7 @@ def _kanban_notify_from_row(row: dict[str, Any]) -> KanbanNotifySubSummary:
         delivery_mode=str(row.get("delivery_mode") or ""),
         last_event_id=last_event_id,
         max_event_id=max_event_id,
-        backlog=max(0, max_event_id - last_event_id),
+        backlog=max(0, _coerce_int(row.get("unseen_event_count"))),
     )
 
 
@@ -347,16 +360,27 @@ def _read_kanban_notify_fields(
     # Column order is not stable across migrated databases, so the select list
     # is built from confirmed names only (see sqlite_util._table_columns).
     select_list = ", ".join(f"s.{name} AS {name}" for name in wanted)
-    newest = (
+    # max_event_id is the newest event id of THIS task (the panel's "Newest"
+    # column); unseen_event_count is the subscription's own backlog. task_events.id
+    # is a global autoincrement, so the gap between the two is not the backlog:
+    # upstream selects this task's rows with id > cursor
+    # (kanban_db_notify.py:310-337).
+    events_select = (
         ", COALESCE("
         "(SELECT MAX(e.id) FROM task_events e WHERE e.task_id = s.task_id), 0"
         ") AS max_event_id"
+        ", COALESCE("
+        "(SELECT COUNT(*) FROM task_events e WHERE e.task_id = s.task_id "
+        "AND e.id > s.last_event_id), 0"
+        ") AS unseen_event_count"
         if _table_exists(conn, "task_events")
-        else ", 0 AS max_event_id"
+        else ", 0 AS max_event_id, 0 AS unseen_event_count"
     )
     subs = [
         _kanban_notify_from_row(row)
-        for row in _query_rows(conn, f"SELECT {select_list}{newest} FROM kanban_notify_subs s")
+        for row in _query_rows(
+            conn, f"SELECT {select_list}{events_select} FROM kanban_notify_subs s"
+        )
     ]
     platform_counts: dict[str, int] = {}
     backlog_subs: list[KanbanNotifySubSummary] = []

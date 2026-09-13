@@ -58,7 +58,9 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             )
             suffix = f" (+{extra} more)" if extra > 0 else ""
             lines.append("  Orphan Profiles: ", style=theme.ui_label)
-            lines.append(f"{escape(orphans)}{suffix}\n", style=theme.ui_warn)
+            # Text.append never parses Rich markup, so only terminal controls
+            # are stripped here; escaping would show literal backslashes.
+            lines.append(f"{sanitize_terminal_text(orphans)}{suffix}\n", style=theme.ui_warn)
         tripped_ids = [
             task.task_id
             for task in (
@@ -73,7 +75,9 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             extra = len(tripped_ids) - len(shown)
             suffix = f" (+{extra} more)" if extra > 0 else ""
             lines.append("  Breaker Tripped: ", style=theme.ui_label)
-            lines.append(f"{escape(', '.join(shown))}{suffix}\n", style=theme.ui_error)
+            lines.append(
+                f"{sanitize_terminal_text(', '.join(shown))}{suffix}\n", style=theme.ui_error
+            )
         lines.append("  Dispatch: ", style=theme.ui_label)
         lines.append(
             "gateway" if kanban.dispatch_in_gateway else "disabled",
