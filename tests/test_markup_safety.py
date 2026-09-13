@@ -281,6 +281,10 @@ def _state_for(panel_num: int) -> DashboardState:
                         paused_reason=INJECT,
                         last_delivery_error=INJECT,
                         dispatch_kind=INJECT,
+                        pending_slot_scheduled_at=INJECT,
+                        last_fire_error=INJECT,
+                        model_snapshot=INJECT,
+                        provider_snapshot=INJECT,
                     )
                 ],
             ),
