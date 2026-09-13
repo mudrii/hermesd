@@ -74,7 +74,13 @@
           # The package build itself executes the pytest suite (checkPhase),
           # so `nix build .#hermesd` and `nix flake check` both prove that the
           # packaged code passes its tests — not merely that it evaluates.
-          nativeCheckInputs = [ python.pkgs.pytestCheckHook ];
+          # git is a hermesd runtime dependency (checkpoint summaries) and the
+          # test fixtures build bare checkpoint repos, so it must be on PATH
+          # in the sandbox.
+          nativeCheckInputs = [
+            python.pkgs.pytestCheckHook
+            pkgs.git
+          ];
 
           meta = with pkgs.lib; {
             description = "TUI monitoring dashboard for Hermes AI agent";
