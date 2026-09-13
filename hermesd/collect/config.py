@@ -249,13 +249,16 @@ def _config_backup_groups(
 
 
 def _provider_free_tier(entry: dict[str, Any]) -> bool:
-    """The Nous free-tier identity: ``auth_method`` and ``account_tier`` both
-    "anonymous" (``hermes_cli/anon_auth.py:39-41``, ``is_guest_state`` at
-    ``:88-89``, minted state at ``:271-272``). Key names only — the entry's
-    token values are never read, and a dead guest credential is removed rather
-    than marked, so the tier simply disappears when it lapses.
+    """The Nous free-tier identity: an anonymous credential.
+
+    Mirrors ``is_guest_state`` (``hermes_cli/anon_auth.py:88-89``), which keys
+    on ``auth_method == ANON_AUTH_METHOD`` alone — the tier is a consequence of
+    the credential, not a second condition, and an upgrade rewrites
+    ``auth_method`` in place (``:647,756``). Key names only — the entry's token
+    values are never read, and a dead guest credential is removed rather than
+    marked, so the tier simply disappears when it lapses.
     """
-    return entry.get("auth_method") == "anonymous" and entry.get("account_tier") == "anonymous"
+    return entry.get("auth_method") == "anonymous"
 
 
 def _provider_model_label(cfg: dict[str, Any]) -> str:

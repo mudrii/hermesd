@@ -363,11 +363,13 @@ def test_panel_notes_absent_catalog_cache(hermes_home: Path):
 
 
 def test_collect_free_tier_provider_marker(hermes_home: Path):
-    """providers.nous with auth_method/account_tier "anonymous" is the free tier.
+    """providers.nous with ``auth_method`` "anonymous" is the free tier.
 
-    Mirrors ``is_guest_state`` + ``ANON_ACCOUNT_TIER``
-    (``hermes_cli/anon_auth.py:39-41,88-89,271-272``). Key names only: the
-    state's token fields are never read.
+    Mirrors ``is_guest_state`` (``hermes_cli/anon_auth.py:88-89``), which keys
+    on the auth method alone; the tier is a *consequence* of an anonymous
+    credential (``ANON_AUTH_METHOD``, ``:39-41``), not a second condition, and
+    an upgrade rewrites ``auth_method`` in place. Key names only: the state's
+    token fields are never read.
     """
     (hermes_home / "auth.json").write_text(
         json.dumps(
@@ -380,7 +382,11 @@ def test_collect_free_tier_provider_marker(hermes_home: Path):
                         "access_token": "jwt-value-never-read",
                     },
                     "openai-codex": {"auth_method": "api_key", "account_tier": "paid"},
-                    "half-anon": {"auth_method": "anonymous"},
+                    # Upstream keys on the auth method alone, so an anonymous
+                    # credential with no stamped tier is still a guest — while
+                    # a stamped tier without the method is not.
+                    "anon-no-tier": {"auth_method": "anonymous"},
+                    "tier-only": {"account_tier": "anonymous"},
                 },
                 "active_provider": "nous",
             }
@@ -397,7 +403,8 @@ def test_collect_free_tier_provider_marker(hermes_home: Path):
     assert providers["nous"].free_tier is True
     assert providers["nous"].is_active is True
     assert providers["openai-codex"].free_tier is False
-    assert providers["half-anon"].free_tier is False
+    assert providers["anon-no-tier"].free_tier is True
+    assert providers["tier-only"].free_tier is False
     # Key names only: no token value may surface anywhere in the state.
     assert "anon-secret-value-never-read" not in state.model_dump_json()
     assert "jwt-value-never-read" not in state.model_dump_json()

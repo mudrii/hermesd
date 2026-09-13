@@ -1268,9 +1268,10 @@ class ProviderInfo(BaseModel):
     name: str
     is_active: bool = False
     # The Nous free-tier identity marker: providers.<name> with
-    # auth_method == "anonymous" and account_tier == "anonymous"
-    # (hermes_cli/anon_auth.py:39-41,88-89). Presence of the marker only — the
-    # state's token values are never read, and quota state never reaches disk.
+    # auth_method == "anonymous" (hermes_cli/anon_auth.py:39-41,88-89), which
+    # is the single condition upstream's is_guest_state tests. Presence of the
+    # marker only — the state's token values are never read, and quota state
+    # never reaches disk.
     free_tier: bool = False
 
 
