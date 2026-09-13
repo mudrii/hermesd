@@ -25,6 +25,38 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ### Added
 
+- The Kanban panel now reports task-notification subscriptions and their delivery backlog, which had no
+  reader anywhere in hermesd. A new `kanban_notify` health source reads `kanban_notify_subs` from the same
+  root-anchored `kanban.db` the board itself comes from — `kanban_home()` = `get_default_hermes_root()`,
+  "Shared across profiles BY DESIGN" (`hermes_cli/kanban_db.py:382-401`), so the source stays ROOT-scoped
+  under `--profile` — and reports, per subscription, the unseen-event backlog
+  `max(task_events.id) - last_event_id` (upstream's notifier claims events with `id > last_event_id`,
+  `hermes_cli/kanban_db_notify.py:186-232`): a backlog that only grows means the gateway watcher that owns
+  the subscription is wedged or gone. The panel shows subscriber counts rolled up per platform
+  (case-insensitively, matching notifier routing), the total and worst backlog, a bounded table of the
+  subscriptions that actually have unseen events (task, platform, delivery mode, owning profile, cursor,
+  newest event, backlog), and the subscriptions whose `notifier_profile` names a profile that no longer
+  exists under `profiles/` — orphaned routes no gateway can ever claim again. The default profile is
+  excluded from that verdict because upstream's `get_active_profile_name()` reports `"default"` for the
+  root home (`hermes_cli/profiles.py:1368-1382`) and the root owns no `profiles/` directory; when the
+  `profiles/` store itself cannot be read safely, orphan detection stays silent instead of accusing every
+  stamped subscription. The source fails independently of the board read, so a torn subscription table
+  degrades only the notify figures and `kanban_notify` appears alone in `health.failed_sources`.
+
+- The Kanban panel now explains done-looking review cards and tripped failure breakers. Tasks carry their
+  `completion_contract` (NULL = local-only, `OWNER/REPO` for PR publication, or an exact PR URL) as a new
+  **Contract** column in the Task Metadata table, and a review task whose only enrichment is a contract now
+  surfaces at all — a PR-contract task cannot complete until repository-required exact-head CI passes
+  (`tools/kanban_tools_schemas.py:461-464`), so a card sitting in review may be waiting on CI rather than
+  finished. The Failures column also becomes a breaker read-out: `consecutive_failures` is upstream's trip
+  counter (reset only by `complete_task`, deliberately preserved across review reopens —
+  `hermes_cli/kanban_db.py:3319-3320`), not a retry budget, and when it reaches the effective trip count the
+  panel renders `N/N breaker tripped` — the task will not be re-dispatched (`recompute_ready` skips blocked
+  tasks at the limit, `hermes_cli/kanban_db.py:2012-2050`). The threshold order mirrors
+  `_record_task_failure` exactly: per-task `max_retries` > the configured `kanban.failure_limit` >
+  upstream's `DEFAULT_FAILURE_LIMIT` of 2 (`hermes_cli/kanban_db_dispatch.py:33`), and the compact view
+  lists tripped task ids so a wedged board is visible without opening the detail view.
+
 - Added a separate, root-scoped Desktop plugin inventory. It reports the bounded presence of regular `desktop-plugins/*/plugin.js` entries without reading JavaScript or claiming that a plugin is loaded or enabled, and keeps truncation and source-health state distinct from the Agent Plugins inventory.
 
 - The Operations panel now reports the API server's durable run reservations, which had no reader anywhere in hermesd. A new `api_runs` health source opens `runs_idempotency.db` — PROFILE-scoped, exactly where upstream resolves it (`get_hermes_home()/"runs_idempotency.db"`, `gateway/platforms/api_server_run_idempotency.py:67`, permissions tightened to 0600 including the `-wal`/`-shm` sidecars at `:116-124`) — through the shared read-only connector, so a store with a WAL sidecar is copied to a private temp dir before it is opened and nothing is ever written back to `~/.hermes`. The section is labelled **Retained API Run Reservations** rather than "API Runs" because the table is a replay window and not an activity ledger, and the panel says why on every pass: `_prune_stale_terminal_locked` (`:168-186`) runs inside *every* `reserve` and `lookup` and deletes an aged row **only once its stored run status is terminal** (`TERMINAL_STATUSES = {completed, failed, cancelled, interrupted}`, `:17`), while long room runs push `retention_until` out (`extend_retention`, `:205-214`; `api_server_runs.py:56-61,222-232`) — so **an empty store is not evidence that the API was idle**. Nor is a present store proof the gateway is using it: when the file cannot be opened upstream logs "Run idempotency storage is unavailable; falling back to process memory, so replay will not survive a restart" and connects `":memory:"`, setting `_db_path = None` so `durable` is False (`:63-84`), and that capability is advertised only over HTTP (`api_server.py:2276`, `_idempotency_capabilities` `api_server_runs.py:108-113`) and never written to disk — hermesd therefore cannot detect the fallback and does not pretend to. An empty-but-present store renders `no reservations retained — not evidence that the API was idle` instead of a blank table. What is reported: store size, reservation count, a distinct-`scope` count, acknowledged and pid-recorded counts, how many rows are already past `retention_until`, the newest `updated_at` and oldest `created_at` as ages against the injected clock, and a bounded eight-row table of run id, status, created/updated ages, retention remaining or overdue, and ownership. Statuses are allowlisted against the vocabulary upstream actually sets — `queued` (`api_server_runs.py:475`), `running` (`:705`), `waiting_for_approval` (`:592`), `stopping` (`:871`) and the four terminal ones — and anything else renders as `unknown` rather than being dropped or guessed, because the store outlives the enumeration. `status_json` is parsed no further than that single word under a 16 KiB cap, and `fingerprint`, `idempotency_key` and `scope` are never selected: the tenant scope appears only as `COUNT(DISTINCT scope)`. `owner_started` is deliberately *not* carried as a timestamp — upstream fills it from `gateway/status.get_process_start_time` (`api_server_runs.py:81-87`), which returns `/proc` ticks on Linux and psutil centiseconds elsewhere, so it is same-host comparable only and this branch has already been bitten by exactly that unit split (`runtime/active_sessions.json` stores epoch seconds while `gateway_state.json` stores centiseconds); hermesd reduces it to `identity recorded` / `identity unverified` beside the pid and its liveness, so a pid that cannot be distinguished from a recycled one is labelled as such. Columns added by upstream's `_MIGRATIONS` (`:29-34`) are gated on a `PRAGMA table_info` set read once per connection, and every column is selected **by name** rather than positionally, because column order is not stable across databases. As with the other database sources, an absent or unreadable store reports `db_present=False` without failing the source, while one that disappears, corrupts or is replaced by an unsafe symlink after a good read raises so the panel keeps its last-good values and `api_runs` appears in `health.failed_sources`.

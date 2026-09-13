@@ -109,6 +109,7 @@ from hermesd.collect.hosted_rooms import _read_hosted_rooms
 from hermesd.collect.kanban import (
     _kanban_claim_ttl_seconds,
     _read_kanban_board_summary,
+    _read_kanban_notify,
     _read_kanban_state,
 )
 from hermesd.collect.logs import (
@@ -321,6 +322,17 @@ _DB_RECOVERY_FIELDS = ("db_recovery",)
 # field, so a corrupt shared-state.db or runs_idempotency.db degrades only itself.
 _HOSTED_ROOM_FIELDS = ("hosted_rooms",)
 _API_RUN_FIELDS = ("api_runs",)
+# Fields the kanban_notify source owns on KanbanState, used to restore just
+# that source's values from the last good state when it fails.
+_KANBAN_NOTIFY_FIELDS = (
+    "notify_sub_count",
+    "notify_platform_counts",
+    "notify_backlog_total",
+    "notify_max_backlog",
+    "notify_backlog_subs",
+    "notify_orphan_profile_count",
+    "notify_orphan_profiles",
+)
 _STATE_SNAPSHOT_FIELDS = ("snapshot_count", "snapshot_total_bytes", "newest_snapshot_age_seconds")
 _LIFECYCLE_FIELDS = (
     "lifecycle_phase",
@@ -897,6 +909,17 @@ class Collector:
                 ChannelDirectoryState,
             ),
             _SourceSpec("kanban", "kanban", self._collect_kanban, KanbanState),
+            # Notify subscriptions share kanban.db but fail independently, so a
+            # torn notifier-cursor read cannot blank the board already shown.
+            _SourceSpec(
+                "kanban",
+                "kanban_notify",
+                lambda: self._with_kanban_notify(results["kanban"]),
+                lambda: results["kanban"],
+                fallback=lambda: self._last_source_fields(
+                    "kanban_notify", results["kanban"], _KANBAN_NOTIFY_FIELDS
+                ),
+            ),
             _SourceSpec(
                 "operations",
                 "operations",
@@ -2327,6 +2350,47 @@ class Collector:
                 self._kanban_board_cache[board_dir.name] = summary
                 boards.append(summary)
         return state.model_copy(update={"board_count": len(boards), "boards": boards})
+
+    def _with_kanban_notify(self, state: KanbanState) -> KanbanState:
+        """Merge notify-subscription health into the board state.
+
+        Both the store and the profile names live at the root: kanban.db is
+        root-anchored upstream ("Shared across profiles BY DESIGN",
+        ``hermes_cli/kanban_db.py:382-401``) and ``profiles/`` is the root
+        profile store. An absent or unsafe kanban.db reads as no
+        subscriptions; the kanban source itself reports path problems.
+        """
+        db_path = self._paths.shared_path("kanban.db")
+        if (
+            not _exists_strict(db_path)
+            or db_path.is_symlink()
+            or not _path_resolves_under(db_path, self._paths.root_home)
+        ):
+            return state
+        return state.model_copy(
+            update=_read_kanban_notify(
+                db_path, known_profiles=self._kanban_notifier_profile_names()
+            )
+        )
+
+    def _kanban_notifier_profile_names(self) -> frozenset[str] | None:
+        """Profile names under the root ``profiles/`` store, or None when the
+        store cannot be read safely (orphan detection stays silent rather than
+        reporting every stamped subscription orphaned)."""
+        profiles_dir = self._paths.shared_path("profiles")
+        if (
+            profiles_dir.is_symlink()
+            or not _path_resolves_under(profiles_dir, self._paths.root_home)
+            or not profiles_dir.is_dir()
+        ):
+            return None
+        return frozenset(
+            entry.name
+            for entry in profiles_dir.iterdir()
+            if entry.is_dir()
+            and not entry.is_symlink()
+            and _path_resolves_under(entry, profiles_dir)
+        )
 
     def _collect_operations(
         self,

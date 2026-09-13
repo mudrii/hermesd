@@ -1314,7 +1314,25 @@ def create_kanban_db_tables(conn: sqlite3.Connection) -> None:
             skills TEXT,
             model_override TEXT,
             branch_name TEXT,
-            session_id TEXT
+            session_id TEXT,
+            max_retries INTEGER,
+            completion_contract TEXT
+        );
+        CREATE TABLE kanban_notify_subs (
+            task_id TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL DEFAULT '',
+            user_id TEXT,
+            user_id_alt TEXT,
+            chat_type TEXT,
+            notifier_profile TEXT,
+            delivery_mode TEXT NOT NULL DEFAULT 'notify',
+            delivery_metadata TEXT,
+            created_at INTEGER NOT NULL,
+            last_event_id INTEGER NOT NULL DEFAULT 0,
+            last_ping_event_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (task_id, platform, chat_id, thread_id)
         );
         CREATE TABLE task_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1354,7 +1372,10 @@ def sample_kanban_db(hermes_home: Path) -> Path:
     create_kanban_db_tables(conn)
     now = int(time.time())
     conn.execute(
-        "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO tasks (id, title, assignee, status, priority, created_at, started_at, "
+        "completed_at, claim_expires, consecutive_failures, worker_pid, last_failure_error, "
+        "last_heartbeat_at, current_run_id, skills, model_override, branch_name, session_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             "t_active",
             "Implement dashboard auth visibility",
@@ -1377,7 +1398,10 @@ def sample_kanban_db(hermes_home: Path) -> Path:
         ),
     )
     conn.execute(
-        "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO tasks (id, title, assignee, status, priority, created_at, started_at, "
+        "completed_at, claim_expires, consecutive_failures, worker_pid, last_failure_error, "
+        "last_heartbeat_at, current_run_id, skills, model_override, branch_name, session_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             "t_blocked",
             "Fix failed worker profile",
@@ -1400,7 +1424,10 @@ def sample_kanban_db(hermes_home: Path) -> Path:
         ),
     )
     conn.execute(
-        "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO tasks (id, title, assignee, status, priority, created_at, started_at, "
+        "completed_at, claim_expires, consecutive_failures, worker_pid, last_failure_error, "
+        "last_heartbeat_at, current_run_id, skills, model_override, branch_name, session_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             "t_null",
             "Task with NULL nullable columns",
