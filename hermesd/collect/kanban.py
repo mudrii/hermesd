@@ -294,11 +294,11 @@ def _kanban_board_present(paths: HermesPaths, board_slug: str) -> bool:
 
 # --- Notify subscriptions ---------------------------------------------------
 #
-# kanban_notify_subs is written by add_notify_sub and its unseen-event cursor
-# is claimed/advanced/rewound by claim/advance/rewind_notify_cursor
-# (hermes_cli/kanban_db_notify.py:78-130, :186-232); the gateway
-# kanban-notifier is the consumer (gateway/kanban_watchers_notifier.py). The
-# table lives in the same root-anchored kanban.db as the board itself —
+# kanban_notify_subs is written by add_notify_sub (:67-131) and its
+# unseen-event cursor is claimed/advanced/rewound by
+# claim/advance/rewind_notify_cursor (:340-371, :380-395, :409-429); the
+# gateway kanban-notifier is the consumer (gateway/kanban_watchers_notifier.py).
+# The table lives in the same root-anchored kanban.db as the board itself —
 # kanban_home() = get_default_hermes_root(), "Shared across profiles BY
 # DESIGN" (hermes_cli/kanban_db.py:382-401) — so this reader is ROOT-scoped
 # like the kanban source it complements.
@@ -323,7 +323,7 @@ def _kanban_notify_from_row(row: dict[str, Any]) -> KanbanNotifySubSummary:
         delivery_mode=str(row.get("delivery_mode") or ""),
         last_event_id=last_event_id,
         max_event_id=max_event_id,
-        backlog=max(0, max_event_id - last_event_id),
+        backlog=max(0, _coerce_int(row.get("unseen_event_count"))),
     )
 
 
@@ -347,16 +347,27 @@ def _read_kanban_notify_fields(
     # Column order is not stable across migrated databases, so the select list
     # is built from confirmed names only (see sqlite_util._table_columns).
     select_list = ", ".join(f"s.{name} AS {name}" for name in wanted)
-    newest = (
+    # max_event_id is the newest event id of THIS task (the panel's "Newest"
+    # column); unseen_event_count is the subscription's own backlog. task_events.id
+    # is a global autoincrement, so the gap between the two is not the backlog:
+    # upstream selects this task's rows with id > cursor
+    # (kanban_db_notify.py:310-337).
+    events_select = (
         ", COALESCE("
         "(SELECT MAX(e.id) FROM task_events e WHERE e.task_id = s.task_id), 0"
         ") AS max_event_id"
+        ", COALESCE("
+        "(SELECT COUNT(*) FROM task_events e WHERE e.task_id = s.task_id "
+        "AND e.id > s.last_event_id), 0"
+        ") AS unseen_event_count"
         if _table_exists(conn, "task_events")
-        else ", 0 AS max_event_id"
+        else ", 0 AS max_event_id, 0 AS unseen_event_count"
     )
     subs = [
         _kanban_notify_from_row(row)
-        for row in _query_rows(conn, f"SELECT {select_list}{newest} FROM kanban_notify_subs s")
+        for row in _query_rows(
+            conn, f"SELECT {select_list}{events_select} FROM kanban_notify_subs s"
+        )
     ]
     platform_counts: dict[str, int] = {}
     backlog_subs: list[KanbanNotifySubSummary] = []

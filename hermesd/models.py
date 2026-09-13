@@ -1720,10 +1720,11 @@ class KanbanTaskLink(BaseModel):
 class KanbanNotifySubSummary(BaseModel):
     """One task notification subscription and its unseen-event backlog.
 
-    The gateway kanban-notifier claims task_events with ``id > last_event_id``
-    per subscription (``hermes_cli/kanban_db_notify.py:186-232``); ``backlog``
-    is ``max(task_events.id) - last_event_id``, so a backlog that only grows
-    means the watcher that owns the sub is wedged or gone.
+    The gateway kanban-notifier claims *this task's* task_events with
+    ``task_id = ? AND id > last_event_id`` (``hermes_cli/kanban_db_notify.py:310-337``);
+    ``backlog`` counts those rows, so a backlog that only grows means the
+    watcher that owns the sub is wedged or gone. ``max_event_id`` is the task's
+    newest event id, not the backlog source.
     """
 
     task_id: str = ""
