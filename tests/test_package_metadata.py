@@ -68,14 +68,19 @@ def _assert_all_actions_are_sha_pinned(workflow: dict) -> None:
 
 
 def test_flake_version_matches_project_version() -> None:
-    project = tomllib.loads(Path("pyproject.toml").read_text())
-    expected_version = project["project"]["version"]
     flake_text = Path("flake.nix").read_text()
 
-    match = re.search(r'\bversion = "([^"]+)";', flake_text)
+    # Single source of truth: the flake derives its package version from
+    # pyproject.toml instead of duplicating a literal that can drift.
+    assert "importTOML ./pyproject.toml" in flake_text
+    assert "version = hermesdVersion pkgs;" in flake_text
 
-    assert match is not None
-    assert match.group(1) == expected_version
+    # The flake must realize the package and smoke the installed CLI, so
+    # `nix flake check` proves buildability rather than mere evaluation.
+    assert "checks = forAllSystems" in flake_text
+    assert "inherit hermesd;" in flake_text
+    assert "hermesd-cli-smoke" in flake_text
+
     assert len(re.findall(r'github:[^/]+/[^/]+/[0-9a-f]{40}"', flake_text)) == 1
 
 
