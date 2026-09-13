@@ -1578,6 +1578,140 @@ def sample_kanban_db(hermes_home: Path) -> Path:
 
 
 @pytest.fixture
+def sample_gateway_launch_forensics(hermes_home: Path) -> Path:
+    """The root gateway's launch ledger, exit-diag tail and web-client marker."""
+    now = time.time()
+    (hermes_home / "gateway-starts.log").write_text(f"{now - 60.0!r}\n{now - 300.0!r}\n")
+    state_dir = hermes_home / "state"
+    state_dir.mkdir(exist_ok=True)
+    (state_dir / "dashboard_clients.heartbeat").touch()
+    logs = hermes_home / "logs"
+    logs.mkdir(exist_ok=True)
+    (logs / "gateway-exit-diag.log").write_text(
+        json.dumps(
+            {
+                "ts": datetime.fromtimestamp(now - 120, tz=UTC).isoformat(),
+                "tag": "gateway.asyncio_main_return",
+                "pid": 4242,
+            }
+        )
+        + "\n"
+    )
+    (logs / "gateway-shutdown-diag.log").write_text("shutdown block\n")
+    return hermes_home / "gateway-starts.log"
+
+
+@pytest.fixture
+def sample_config_backups(hermes_home: Path, sample_config: Path) -> Path:
+    """One good and one corrupt point-in-time config snapshot."""
+    backups = hermes_home / "backups" / "config"
+    backups.mkdir(parents=True)
+    (backups / "config.yaml.good.20260101-120000").write_text("model:\n  default: gpt-5.4\n")
+    (backups / "config.yaml.corrupt.20260102-120000").write_text("{")
+    return backups
+
+
+@pytest.fixture
+def sample_plugin_catalog_cache(hermes_home: Path) -> Path:
+    """The published catalog cache the plugin sidecars are compared against."""
+    path = hermes_home / "cache" / "plugin-catalog.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "entries": [{"name": "weather", "sha": "a" * 40}],
+                "removed": [{"name": "evil", "reason": "malicious"}],
+            }
+        )
+    )
+    return path
+
+
+@pytest.fixture
+def sample_process_receipts(hermes_home: Path) -> Path:
+    """One finished background-process receipt."""
+    directory = hermes_home / "logs" / "process-results"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "proc_1.json").write_text(
+        json.dumps(
+            {
+                "id": "proc_1",
+                "command": "pytest -q",
+                "cwd": "/tmp",
+                "task_id": None,
+                "started_at": time.time() - 300,
+                "exit_code": 0,
+                "completion_reason": "completed",
+                "termination_source": "",
+                "notify_on_complete": False,
+                "output": "ok\n",
+            }
+        )
+    )
+    return directory
+
+
+@pytest.fixture
+def sample_terminal_breadcrumbs(hermes_home: Path) -> Path:
+    """One recent terminal breadcrumb (``{"session_id", "cwd", "ts"}``)."""
+    directory = hermes_home / "terminal-sessions"
+    directory.mkdir(exist_ok=True)
+    (directory / "tty-ttys001").write_text(
+        json.dumps({"session_id": "sess_001", "cwd": "/tmp/work", "ts": time.time() - 60})
+    )
+    return directory
+
+
+@pytest.fixture
+def sample_live_manifests(hermes_home: Path, sample_delegation_live_logs: Path) -> Path:
+    """A live delegation manifest beside the transcripts it describes."""
+    run_dir = sample_delegation_live_logs / "deleg_running"
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "model": "gpt-5.4",
+                "provider": "openai-codex",
+                "tasks": [{"index": 0, "status": "running"}],
+            }
+        )
+    )
+    return sample_delegation_live_logs
+
+
+@pytest.fixture
+def sample_session_coordination(sample_db: Path) -> Path:
+    """Turn leases, locks, hygiene streaks, routing entries and generations."""
+    conn = sqlite3.connect(str(sample_db))
+    create_session_coordination_tables(conn)
+    now = time.time()
+    insert_turn_lease(
+        conn, "conv-root", "pid=4242:tid=7:agent=ab:nonce=cd123456", now - 60, now + 240
+    )
+    insert_compression_lock(
+        conn, "sess_001", "pid=4242:tid=8:agent=ab:nonce=ef123456", now - 90, now + 210
+    )
+    conn.execute("INSERT INTO gateway_hygiene_state VALUES (?, ?)", ("telegram:123", 3))
+    insert_gateway_route(
+        conn,
+        "telegram:123",
+        {
+            "session_id": "sess_001",
+            "platform": "telegram",
+            "chat_type": "private",
+            "display_name": "Ops",
+            "suspended": True,
+        },
+        now - 30,
+    )
+    conn.execute(
+        "INSERT INTO conversation_generations VALUES (?, ?, ?)", ("telegram", "telegram:123", 5)
+    )
+    conn.commit()
+    conn.close()
+    return sample_db
+
+
+@pytest.fixture
 def populated_hermes_home(
     hermes_home,
     sample_db,
@@ -1612,6 +1746,28 @@ def populated_hermes_home(
 ) -> Path:
     """A fully populated mock ~/.hermes."""
     return hermes_home
+
+
+@pytest.fixture
+def forensic_hermes_home(
+    populated_hermes_home: Path,
+    sample_gateway_launch_forensics,
+    sample_config_backups,
+    sample_plugin_catalog_cache,
+    sample_process_receipts,
+    sample_terminal_breadcrumbs,
+    sample_live_manifests,
+    sample_session_coordination,
+) -> Path:
+    """``populated_hermes_home`` plus every artifact the forensics readers open.
+
+    Kept separate so the read-only manifest test exercises the new sources
+    (launch ledger, exit-diag, config backups, catalog cache, receipts,
+    breadcrumbs, live manifests, coordination tables) without changing the
+    panel-layout and whole-model-equality tests that share the plain populated
+    home.
+    """
+    return populated_hermes_home
 
 
 def _write_minimal_state_db(db_path: Path, session_id: str, source: str) -> None:

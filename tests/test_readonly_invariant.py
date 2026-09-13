@@ -60,20 +60,20 @@ def test_manifest_detects_same_size_content_change_with_restored_mtime(tmp_path:
     assert _manifest(tmp_path) != before
 
 
-def test_collector_does_not_write_to_hermes_home(populated_hermes_home: Path):
-    before = _manifest(populated_hermes_home)
+def test_collector_does_not_write_to_hermes_home(forensic_hermes_home: Path):
+    before = _manifest(forensic_hermes_home)
 
-    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    c = Collector(forensic_hermes_home, pid_exists=lambda pid: pid == 12345)
     c.collect()
     c.collect()  # a second poll must not mutate anything either
     c.close()
 
-    assert _manifest(populated_hermes_home) == before
+    assert _manifest(forensic_hermes_home) == before
 
 
-def test_collect_does_not_mutate_hermes_home(populated_hermes_home: Path):
-    before = _file_mtimes(populated_hermes_home)
-    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+def test_collect_does_not_mutate_hermes_home(forensic_hermes_home: Path):
+    before = _file_mtimes(forensic_hermes_home)
+    c = Collector(forensic_hermes_home, pid_exists=lambda pid: pid == 12345)
 
     try:
         for _ in range(3):
@@ -81,7 +81,7 @@ def test_collect_does_not_mutate_hermes_home(populated_hermes_home: Path):
     finally:
         c.close()
 
-    assert _file_mtimes(populated_hermes_home) == before
+    assert _file_mtimes(forensic_hermes_home) == before
 
 
 def _file_mtimes(root: Path) -> dict[Path, int]:
@@ -92,16 +92,16 @@ def _file_mtimes(root: Path) -> dict[Path, int]:
     }
 
 
-def test_snapshot_read_paths_do_not_write_to_hermes_home(populated_hermes_home: Path):
-    before = _manifest(populated_hermes_home)
+def test_snapshot_read_paths_do_not_write_to_hermes_home(forensic_hermes_home: Path):
+    before = _manifest(forensic_hermes_home)
 
-    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    app = DashboardApp(forensic_hermes_home, refresh_rate=5, no_color=True)
     app.render_snapshot()
     app.render_snapshot_text(10)
     app.render_snapshot_json()
     app.close()
 
-    assert _manifest(populated_hermes_home) == before
+    assert _manifest(forensic_hermes_home) == before
 
 
 def test_response_store_read_paths_do_not_write_to_hermes_home(hermes_home: Path):

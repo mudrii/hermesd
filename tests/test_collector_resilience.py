@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -161,7 +162,10 @@ def test_config_yaml_with_wrong_top_level_keeps_last_good_summary(
     corrupt_payload: str,
 ) -> None:
     config_path = populated_hermes_home / "config.yaml"
-    collector = Collector(populated_hermes_home)
+    # Two collects must be comparable: the summary carries age fields, so freeze
+    # the clock rather than comparing two different instants.
+    frozen_now = time.time()
+    collector = Collector(populated_hermes_home, clock=lambda: frozen_now)
     try:
         first = collector.collect()
         assert first.config.model == "gpt-5.4"
