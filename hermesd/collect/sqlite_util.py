@@ -220,8 +220,13 @@ def _select_columns(columns: frozenset[str], wanted: tuple[str, ...]) -> tuple[s
 
 
 def _count_rows(conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = ()) -> int:
-    """Count from a query over a table the caller has already confirmed to
-    exist; read errors propagate so the source fails to its last-good value."""
+    """One integer from a single-value query over a table the caller confirmed exists.
+
+    Named for its common case (``COUNT(*)``) but deliberately not restricted to
+    it: it reads any single-column, single-row scalar, which is why the session
+    coordination reader uses it for ``SUM(...)`` as well. Read errors propagate
+    so the source fails to its last-good value.
+    """
     cur = conn.execute(sql, params)
     row = cur.fetchone()
     return int(row[0] or 0) if row is not None else 0

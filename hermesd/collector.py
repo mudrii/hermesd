@@ -1656,7 +1656,7 @@ class Collector:
             cap=cap,
             window_seconds=window_seconds,
         )
-        return gateway.model_copy(update=storm.model_fields())
+        return gateway.model_copy(update=storm.as_update())
 
     def _with_exit_diag(self, gateway: GatewayState) -> GatewayState:
         """Crash forensics from the tail of the exit-diag ledger; metadata only.

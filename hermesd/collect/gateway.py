@@ -728,7 +728,13 @@ class _StartStorm:
     cap: int = _RESTART_STORM_CAP
     window_seconds: float = _RESTART_STORM_WINDOW_SECONDS
 
-    def model_fields(self) -> dict[str, Any]:
+    def as_update(self) -> dict[str, Any]:
+        """The model fields this readout owns, ready for ``model_copy(update=...)``.
+
+        Named ``as_update`` rather than ``model_fields``: the latter is a
+        Pydantic accessor, and a same-named method on a plain dataclass reads as
+        one even though this class has no Pydantic base.
+        """
         return {
             "gateway_starts_recorded": self.recorded,
             "gateway_starts_window": self.starts_window,
