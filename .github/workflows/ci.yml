@@ -14,6 +14,45 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: Classify changed files
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      docker: ${{ steps.filter.outputs.docker }}
+      nix: ${{ steps.filter.outputs.nix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: filter
+        with:
+          filters: |
+            # Docker inputs: build recipe, packaged application source, and
+            # every file the build copies or reads (pyproject, lockfile,
+            # README, LICENSE are package metadata and build inputs).
+            docker:
+              - '.github/workflows/ci.yml'
+              - '.dockerignore'
+              - 'Dockerfile'
+              - 'LICENSE'
+              - 'README.md'
+              - 'hermesd/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+            # Nix inputs: flake definition plus the same packaged source and
+            # metadata the flake build consumes.
+            nix:
+              - '.github/workflows/ci.yml'
+              - 'flake.nix'
+              - 'flake.lock'
+              - 'LICENSE'
+              - 'README.md'
+              - 'hermesd/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+
   static:
     name: Static analysis
     runs-on: ubuntu-24.04
@@ -106,6 +145,12 @@ jobs:
 
   docker:
     name: Docker
+    needs: changes
+    # Pull requests skip Docker only when no classified input changed; trusted
+    # events (push to main, manual dispatch) always run the full validation.
+    if: >-
+      needs.changes.outputs.docker == 'true' ||
+      github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -137,6 +182,10 @@ jobs:
 
   nix:
     name: Nix (${{ matrix.os }})
+    needs: changes
+    if: >-
+      needs.changes.outputs.nix == 'true' ||
+      github.event_name != 'pull_request'
     strategy:
       fail-fast: false
       matrix:
@@ -152,3 +201,45 @@ jobs:
         run: nix build .#hermesd
       - name: Smoke test installed executable
         run: ./result/bin/hermesd --version
+
+  # Single stable required check for branch protection. It always runs and
+  # treats every non-success outcome of expected work — including skipped-by-
+  # filter jobs that their classification says should have run, cancelled
+  # jobs, and a failed changes job — as a failed gate (audit CI-14).
+  gate:
+    name: CI gate
+    needs: [changes, static, security, test, macos, package, docker, nix]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Fail unless every expected job succeeded
+        env:
+          RESULTS: >-
+            changes=${{ needs.changes.result }}
+            static=${{ needs.static.result }}
+            security=${{ needs.security.result }}
+            test=${{ needs.test.result }}
+            macos=${{ needs.macos.result }}
+            package=${{ needs.package.result }}
+            docker=${{ needs.docker.result }}
+            nix=${{ needs.nix.result }}
+          DOCKER_EXPECTED: ${{ needs.changes.outputs.docker == 'true' || github.event_name != 'pull_request' }}
+          NIX_EXPECTED: ${{ needs.changes.outputs.nix == 'true' || github.event_name != 'pull_request' }}
+        run: |
+          status=0
+          for pair in $RESULTS; do
+            job="${pair%%=*}"
+            result="${pair#*=}"
+            case "$job" in
+              docker) expected="$DOCKER_EXPECTED" ;;
+              nix) expected="$NIX_EXPECTED" ;;
+              *) expected="true" ;;
+            esac
+            [ "$expected" = "true" ] || continue
+            if [ "$result" != "success" ]; then
+              echo "::error::required job '$job' finished with '$result'"
+              status=1
+            fi
+          done
+          exit $status

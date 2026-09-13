@@ -114,6 +114,65 @@ def _assert_ci_uses_locked_env(ci: dict, job_name: str, python_version: str) -> 
     assert step["with"]["python-version"] == python_version
 
 
+def test_ci_change_classification_and_gate() -> None:
+    ci = _workflow(".github/workflows/ci.yml")
+
+    # Classification: Docker/Nix rules must include application source and
+    # package metadata, so relevant changes cannot silently skip them.
+    changes_steps = ci["jobs"]["changes"]["steps"]
+    filter_step = next(
+        step for step in changes_steps if step.get("uses", "").startswith("dorny/paths-filter@")
+    )
+    assert re.fullmatch(r"dorny/paths-filter@[0-9a-f]{40}", filter_step["uses"])
+    filters = yaml.safe_load(filter_step["with"]["filters"])
+    packaged_inputs = {
+        ".github/workflows/ci.yml",
+        "LICENSE",
+        "README.md",
+        "hermesd/**",
+        "pyproject.toml",
+        "uv.lock",
+    }
+    assert packaged_inputs | {"Dockerfile", ".dockerignore"} == set(filters["docker"])
+    assert packaged_inputs | {"flake.nix", "flake.lock"} == set(filters["nix"])
+
+    # Only pull requests may skip Docker/Nix, and only on an empty diff;
+    # trusted events always run the full validation.
+    for job_name in ("docker", "nix"):
+        job = ci["jobs"][job_name]
+        assert job["needs"] == "changes"
+        assert f"needs.changes.outputs.{job_name} == 'true'" in job["if"]
+        assert "github.event_name != 'pull_request'" in job["if"]
+
+    # The aggregate gate always reports and treats every non-success outcome
+    # of expected work (including cancelled or misclassified skips) as a
+    # failed required check.
+    gate = ci["jobs"]["gate"]
+    assert gate["if"] == "always()"
+    assert set(gate["needs"]) == {
+        "changes",
+        "static",
+        "security",
+        "test",
+        "macos",
+        "package",
+        "docker",
+        "nix",
+    }
+    gate_step = gate["steps"][0]
+    results_env = gate_step["env"]["RESULTS"]
+    for job_name in gate["needs"]:
+        assert f"{job_name}=${{{{ needs.{job_name}.result }}}}" in results_env
+    assert gate_step["env"]["DOCKER_EXPECTED"] == (
+        "${{ needs.changes.outputs.docker == 'true' || github.event_name != 'pull_request' }}"
+    )
+    assert gate_step["env"]["NIX_EXPECTED"] == (
+        "${{ needs.changes.outputs.nix == 'true' || github.event_name != 'pull_request' }}"
+    )
+    gate_commands = "\n".join(_job_run_commands(ci, "gate"))
+    assert 'result" ] != "success"' in gate_commands or '!= "success"' in gate_commands
+
+
 def test_ci_splits_static_security_and_interpreter_gates() -> None:
     ci = _workflow(".github/workflows/ci.yml")
 
