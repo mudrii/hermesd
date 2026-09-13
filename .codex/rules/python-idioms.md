@@ -24,10 +24,13 @@ Project-wide conventions that apply on every version:
 ## Exception Groups — 3.11+
 
 ```python
-raise ExceptionGroup("validation errors", [
-    ValueError("name is required"),
-    ValueError("age must be positive"),
-])
+raise ExceptionGroup(
+    "validation errors",
+    [
+        ValueError("name is required"),
+        ValueError("age must be positive"),
+    ],
+)
 
 try:
     validate(data)
@@ -53,6 +56,7 @@ Prefer over bare `create_task` for structured concurrency with automatic cancell
 ```python
 from enum import StrEnum
 
+
 class Status(StrEnum):
     PENDING = "pending"
     ACTIVE = "active"
@@ -65,6 +69,7 @@ Prefer over plain string constants for fixed string sets. Values serialize natur
 
 ```python
 from typing import Self
+
 
 class Builder:
     def with_name(self, name: str) -> Self:
@@ -79,14 +84,19 @@ Use for fluent APIs and factory methods instead of forward references or class-b
 ```python
 from typing import Never, NoReturn
 
+
 def die(msg: str) -> NoReturn:
     raise RuntimeError(msg)
 
+
 def exhaustive(x: Status) -> str:
     match x:
-        case Status.PENDING: return "p"
-        case Status.ACTIVE:  return "a"
-        case Status.CLOSED:  return "c"
+        case Status.PENDING:
+            return "p"
+        case Status.ACTIVE:
+            return "a"
+        case Status.CLOSED:
+            return "c"
     _: Never = x  # mypy catches a missing case here
     raise AssertionError(_)
 ```
@@ -111,6 +121,7 @@ Use for multi-branch dispatch on structured data and command patterns. Prefer `i
 
 ```python
 from dataclasses import dataclass, field
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class OrderLine:
@@ -151,6 +162,7 @@ Pre-3.12 equivalent (safe everywhere):
 
 ```python
 from typing import TypeAlias
+
 Vector: TypeAlias = list[float]
 ```
 
@@ -160,6 +172,7 @@ Vector: TypeAlias = list[float]
 # 3.12+ only:
 def first[T](items: Sequence[T]) -> T: ...
 
+
 def decorator[**P, R](fn: Callable[P, R]) -> Callable[P, R]: ...
 ```
 
@@ -167,9 +180,11 @@ Pre-3.12 equivalent:
 
 ```python
 from typing import TypeVar, ParamSpec
+
 T = TypeVar("T")
 P = ParamSpec("P")
 R = TypeVar("R")
+
 
 def first(items: Sequence[T]) -> T: ...
 def decorator(fn: Callable[P, R]) -> Callable[P, R]: ...
@@ -179,6 +194,7 @@ def decorator(fn: Callable[P, R]) -> Callable[P, R]: ...
 
 ```python
 from typing import override
+
 
 class JsonParser(BaseParser):
     @override
@@ -204,6 +220,7 @@ UserId = NewType("UserId", int)
 ```python
 from typing import TypeIs
 
+
 def is_str_list(val: list[object]) -> TypeIs[list[str]]:
     return all(isinstance(x, str) for x in val)
 ```
@@ -214,6 +231,7 @@ On 3.11/3.12, import from `typing_extensions` (add dependency first). If the pro
 
 ```python
 from warnings import deprecated
+
 
 @deprecated("Use new_function instead")
 def old_function() -> None: ...

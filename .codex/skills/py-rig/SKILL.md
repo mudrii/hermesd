@@ -110,17 +110,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+
 class DatabaseReader(Protocol):
     def read_sessions(self) -> list[dict[str, object]]: ...
     def read_tool_stats(self) -> list[dict[str, object]]: ...
 
+
 class Clock(Protocol):
     def now(self) -> float: ...
 
+
 @dataclass(frozen=True, slots=True)
 class SessionSummarizer:
-    db: DatabaseReader     # injected, not constructed inside
-    clock: Clock           # no time.time() inside this class
+    db: DatabaseReader  # injected, not constructed inside
+    clock: Clock  # no time.time() inside this class
 
     def summarize(self) -> dict[str, object]:
         rows = self.db.read_sessions()
@@ -250,13 +253,16 @@ Add new tests to the matching prefix. Use `tests/conftest.py` fixtures (`hermes_
 def collector(hermes_home: Path) -> Collector:
     return Collector(hermes_home)
 
+
 def test_collector_returns_empty_state_when_home_is_bare(collector: Collector) -> None:
     state = collector.collect()
     assert state.gateway.running is False
     assert state.sessions == []
 
+
 def test_collector_preserves_cache_on_db_corruption(
-    collector: Collector, sample_db: Path,
+    collector: Collector,
+    sample_db: Path,
 ) -> None:
     first = collector.collect()
     sample_db.write_bytes(b"corrupt")
