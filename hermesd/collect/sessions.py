@@ -19,7 +19,11 @@ from hermesd.collect.common import (
     _iso_to_epoch,
 )
 from hermesd.collect.operations import _json_object_capped
-from hermesd.collect.redaction import _redact_secret_url, _redact_text_fields
+from hermesd.collect.redaction import (
+    _redact_bare_credentials,
+    _redact_secret_url,
+    _redact_text_fields,
+)
 from hermesd.collect.sqlite_util import (
     _count_rows,
     _query_rows,
@@ -517,6 +521,16 @@ def _hygiene_fields(
     return {"hygiene": hygiene}
 
 
+def _route_free_text(value: object) -> str:
+    """Redact one remote-controlled ``entry_json`` string.
+
+    Bare credential shapes are scrubbed first (a chat display name carries no
+    ``key = value`` label), then the field-oriented pass runs so multi-word
+    values under a secret key still collapse.
+    """
+    return _redact_text_fields(_redact_bare_credentials(str(value or "")))
+
+
 def _gateway_route(
     row: dict[str, Any],
     *,
@@ -545,13 +559,13 @@ def _gateway_route(
         session_id=session_id,
         platform=str(entry.get("platform") or ""),
         chat_type=str(entry.get("chat_type") or ""),
-        display_name=_redact_text_fields(str(entry.get("display_name") or ""))[:40],
+        display_name=_route_free_text(entry.get("display_name"))[:40],
         updated_at_age_seconds=_age_seconds(updated_at, now),
         suspended=bool(entry.get("suspended")),
         resume_pending=bool(entry.get("resume_pending")),
-        resume_reason=str(entry.get("resume_reason") or ""),
+        resume_reason=_route_free_text(entry.get("resume_reason")),
         was_auto_reset=bool(entry.get("was_auto_reset")),
-        auto_reset_reason=str(entry.get("auto_reset_reason") or ""),
+        auto_reset_reason=_route_free_text(entry.get("auto_reset_reason")),
         # The durable executing-turn marker: its start age is only meaningful
         # while a token exists (gateway/session.py:515-518).
         turn_age_seconds=_age_seconds(turn_started, now) if turn_token else None,

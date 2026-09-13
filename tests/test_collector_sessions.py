@@ -14,6 +14,7 @@ import pytest
 from rich.console import Console
 
 import hermesd.collect.sqlite_util as sqlite_util_module
+from hermesd.collect.redaction import _redact_bare_credentials
 from hermesd.collector import (
     _ACTIVE_SURFACE_LIMIT,
     Collector,
@@ -2353,6 +2354,89 @@ def test_gateway_route_display_name_is_redacted(hermes_home: Path) -> None:
     (route,) = state.session_coordination.routes
     assert "sk-live-abc123" not in route.display_name
     assert "[REDACTED]" in route.display_name
+
+
+def test_gateway_route_display_name_scrubs_bare_credential(hermes_home: Path) -> None:
+    """A chat display name is remote-controlled free text: a bare token carries
+    no ``key = value`` label for the field redactor to key on."""
+    secret = "sk-live-abcdefghijklmnop"
+    _insert_route_with_session(hermes_home, _route_entry(display_name=f"Ops bot {secret}"))
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    (route,) = state.session_coordination.routes
+    assert route.display_name == "Ops bot [REDACTED]"
+    assert secret not in json.dumps(state.model_dump(mode="json"))
+
+
+def test_gateway_route_display_name_scrubs_jwt_and_github_token(hermes_home: Path) -> None:
+    jwt = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        ".eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+        ".dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    )
+    pat = "ghp_abcdefghijklmnopqrst"
+    _insert_route_with_session(hermes_home, _route_entry(display_name=f"a {jwt} b {pat}"))
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    (route,) = state.session_coordination.routes
+    assert route.display_name == "a [REDACTED] b [REDACTED]"
+
+
+def test_gateway_route_display_name_without_credentials_is_unchanged(hermes_home: Path) -> None:
+    _insert_route_with_session(hermes_home, _route_entry(display_name="Bob (ops)"))
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    (route,) = state.session_coordination.routes
+    assert route.display_name == "Bob (ops)"
+
+
+def test_gateway_route_reasons_scrub_bare_credentials(hermes_home: Path) -> None:
+    """The resume/auto-reset reasons reach the panel and the JSON snapshot too."""
+    _insert_route_with_session(
+        hermes_home,
+        _route_entry(
+            resume_pending=True,
+            resume_reason="auth failed for sk-live-abcdefghijklmnop",
+            was_auto_reset=True,
+            auto_reset_reason="xoxb-abcdefghijklmnopqrst",
+        ),
+    )
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    (route,) = state.session_coordination.routes
+    assert route.resume_reason == "auth failed for [REDACTED]"
+    assert route.auto_reset_reason == "[REDACTED]"
+
+
+def test_redact_bare_credentials_scrubs_known_prefixes() -> None:
+    for value in (
+        "sk-abcdefghijklmnop",
+        "pk-abcdefghijklmnop",
+        "rk-abcdefghijklmnop",
+        "ghp_abcdefghijklmnop",
+        "gho_abcdefghijklmnop",
+        "ghs_abcdefghijklmnop",
+        "github_pat_abcdefghijklmnop",
+        "xoxb-abcdefghijklmnop",
+        "xoxp-abcdefghijklmnop",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r",
+    ):
+        assert _redact_bare_credentials(f"name {value} tail") == "name [REDACTED] tail"
+    # Too short to be a real credential, and ordinary words, stay visible.
+    for value in (
+        "sk-short",
+        "ghp_short",
+        "Bob (ops)",
+        "task-list",
+        "eyJhbGci",
+        "risk-reward",
+        "x" * 30_000,
+    ):
+        assert _redact_bare_credentials(value) == value
 
 
 def test_gateway_route_junk_entry_json_degrades_to_key_only(hermes_home: Path) -> None:

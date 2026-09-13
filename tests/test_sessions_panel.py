@@ -767,6 +767,49 @@ def test_detail_reset_churn_totals_and_shrink_warning() -> None:
     assert "never prunes" in rendered or "never pruned" in rendered
 
 
+def test_detail_reset_churn_shrink_warning_survives_emptied_table() -> None:
+    """An emptied table is the worst case of the never-prune invariant break:
+    the row count is 0, so gating the section on the total would hide the flag
+    exactly when it matters most."""
+    coord = SessionCoordinationState(
+        generations=[],
+        generation_chat_total=0,
+        generation_reset_total=0,
+        generation_count_shrank=True,
+    )
+    rendered = render_to_str(
+        render_sessions(_coordination_state(session_coordination=coord), Theme(), detail=True)
+    )
+    assert "Reset Churn" in rendered
+    assert "table shrank between refreshes — an invariant break" in rendered
+
+
+def test_compact_reset_churn_shrink_marker() -> None:
+    coord = SessionCoordinationState(
+        generations=[],
+        generation_chat_total=0,
+        generation_reset_total=0,
+        generation_count_shrank=True,
+    )
+    rendered = render_to_str(
+        render_sessions(_coordination_state(session_coordination=coord), Theme())
+    )
+    assert "⚠ reset churn: generations table shrank" in rendered
+
+
+def test_reset_churn_shrink_warning_absent_when_healthy() -> None:
+    coord = SessionCoordinationState(
+        generations=[ConversationGeneration(source="cli", session_key="k2", generation=9)],
+        generation_chat_total=3,
+        generation_reset_total=16,
+        generation_count_shrank=False,
+    )
+    state = _coordination_state(session_coordination=coord)
+    for detail in (True, False):
+        rendered = render_to_str(render_sessions(state, Theme(), detail=detail))
+        assert "shrank" not in rendered
+
+
 def test_detail_terminal_copy_says_upper_bound() -> None:
     readout = TerminalSessionReadout(
         sessions=[
