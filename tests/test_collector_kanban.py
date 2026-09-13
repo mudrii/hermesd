@@ -1216,6 +1216,48 @@ def test_collect_kanban_breaker_trips_immediately_when_max_retries_is_zero(herme
     assert task.breaker_tripped is True
 
 
+def test_collect_kanban_breaker_needs_a_failure_before_it_can_trip(hermes_home: Path):
+    """A healthy task with ``max_retries = 0`` is not a tripped breaker.
+
+    Upstream only compares against the limit after a failure increments the
+    counter (``kanban_db_dispatch.py:1025-1033``), so the effective floor is one
+    failure. Comparing the raw counter against a 0 limit reported a fresh,
+    never-failed task as ``0/0 breaker tripped`` in alert style.
+    """
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, consecutive_failures, max_retries) "
+        "VALUES ('t_fresh', 'Never failed', 'in_progress', 1, 0, 0)"
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, consecutive_failures, max_retries) "
+        "VALUES ('t_failed', 'Failed once', 'in_progress', 1, 1, 0)"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    tasks = {
+        task.task_id: task
+        for task in [
+            *state.kanban.active_tasks,
+            *state.kanban.problem_tasks,
+            *state.kanban.recent_tasks,
+        ]
+    }
+    # The zero limit still reaches the panel; only the trip verdict waits for
+    # the failure upstream requires.
+    assert tasks["t_fresh"].breaker_limit == 0
+    assert tasks["t_fresh"].breaker_tripped is False
+    assert tasks["t_failed"].breaker_tripped is True
+
+
 def test_collect_kanban_breaker_null_max_retries_uses_config_limit(hermes_home: Path):
     """A NULL max_retries is the only unset marker: it falls through to
     kanban.failure_limit (the default-2 path is covered without config)."""

@@ -39,9 +39,11 @@ _DEFAULT_CLAIM_TTL_SECONDS = 300
 # recompute_ready hermes_cli/kanban_db.py:2012-2050). A task's max_retries is
 # an explicit override whenever the column is NOT NULL — upstream passes 0
 # through its int coercion (hermes_cli/kanban_db.py:1892-1894) and switches on
-# ``task_override is not None`` (kanban_db_dispatch.py:1027-1032), so
-# ``--max-retries 0`` means "trip on the first failure" and only NULL falls
-# through to the config value.
+# ``task_override is not None`` (kanban_db_dispatch.py:1027-1032), so a stored
+# 0 is "trip on the first failure" rather than NULL's "fall through to the
+# config value". The CLI itself refuses ``--max-retries 0``
+# (hermes_cli/kanban.py:359-361), so such a row is a legacy or direct-DB
+# write; it is still read as the override it says it is.
 _DEFAULT_FAILURE_LIMIT = 2
 
 
@@ -209,7 +211,9 @@ def _breaker_limit(max_retries: int | None, failure_limit: int) -> int:
     """Upstream trip threshold: task override, then config, then the default.
 
     ``max_retries`` is the raw column, so 0 survives as an immediate-trip
-    override instead of being mistaken for NULL.
+    override instead of being mistaken for NULL. The threshold is only ever
+    reached *after* a failure, so the trip test below floors it at one
+    (``kanban_db_dispatch.py:1025-1033`` increments before comparing).
     """
     if max_retries is not None:
         return max(0, max_retries)
@@ -274,7 +278,9 @@ def _kanban_task_from_row(row: dict[str, Any], *, failure_limit: int = 0) -> Kan
         completion_contract=str(row.get("completion_contract") or ""),
         max_retries=max_retries or 0,
         breaker_limit=breaker_limit,
-        breaker_tripped=consecutive_failures >= breaker_limit,
+        # A breaker trips on failures: upstream increments the counter before it
+        # compares, so a fresh task under a 0 limit is not "0/0 tripped".
+        breaker_tripped=consecutive_failures >= max(breaker_limit, 1),
     )
 
 
