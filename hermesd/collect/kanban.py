@@ -354,6 +354,12 @@ def _read_kanban_notify_fields(
     ``known_profiles`` is the set of profile names under the root ``profiles/``
     store, or None when that store could not be read safely and orphan
     detection must stay silent rather than report every stamped sub orphaned.
+
+    The table is unbounded (one row per watcher), so the row list is capped
+    like every sibling query in this module and nothing that claims to be a
+    total is derived from it: the counts, the platform rollup, the backlog sum
+    and peak, and the distinct notifier profiles all come from their own
+    aggregates over the whole table.
     """
     if not _table_exists(conn, "kanban_notify_subs"):
         return {}
@@ -371,47 +377,64 @@ def _read_kanban_notify_fields(
     # is a global autoincrement, so the gap between the two is not the backlog:
     # upstream selects this task's rows with id > cursor
     # (kanban_db_notify.py:310-337).
-    events_select = (
-        ", COALESCE("
-        "(SELECT MAX(e.id) FROM task_events e WHERE e.task_id = s.task_id), 0"
-        ") AS max_event_id"
-        ", COALESCE("
-        "(SELECT COUNT(*) FROM task_events e WHERE e.task_id = s.task_id "
-        "AND e.id > s.last_event_id), 0"
-        ") AS unseen_event_count"
-        if _table_exists(conn, "task_events")
-        else ", 0 AS max_event_id, 0 AS unseen_event_count"
+    has_events = _table_exists(conn, "task_events")
+    max_event_expr = (
+        "COALESCE((SELECT MAX(e.id) FROM task_events e WHERE e.task_id = s.task_id), 0)"
+        if has_events
+        else "0"
     )
-    subs = [
+    unseen_expr = (
+        "COALESCE((SELECT COUNT(*) FROM task_events e WHERE e.task_id = s.task_id "
+        "AND e.id > s.last_event_id), 0)"
+        if has_events
+        else "0"
+    )
+    # Totals first, from aggregates over the whole table.
+    sub_count = _count_rows(conn, "SELECT COUNT(*) FROM kanban_notify_subs")
+    platform_counts: dict[str, int] = {}
+    for row in _query_rows(
+        conn, "SELECT platform, COUNT(*) AS subs FROM kanban_notify_subs GROUP BY platform"
+    ):
+        # Rolled up in Python so a non-ASCII platform lowercases the way
+        # Python does, not the way SQLite's ASCII-only LOWER does.
+        platform = str(row.get("platform") or "")
+        key = platform.lower() if platform else "unknown"
+        platform_counts[key] = platform_counts.get(key, 0) + _coerce_int(row.get("subs"))
+    backlog_totals = (
+        _query_rows(
+            conn,
+            "SELECT COALESCE(SUM(u), 0) AS total, COALESCE(MAX(u), 0) AS peak "
+            f"FROM (SELECT {unseen_expr} AS u FROM kanban_notify_subs s)",
+        )
+        or [{}]
+    )[0]
+    orphan_names: set[str] = set()
+    if known_profiles is not None:
+        # Distinct stamps only: profile names are a handful, not one per sub.
+        for row in _query_rows(conn, "SELECT DISTINCT notifier_profile FROM kanban_notify_subs"):
+            profile = str(row.get("notifier_profile") or "").strip()
+            if profile and profile != _DEFAULT_PROFILE_NAME and profile not in known_profiles:
+                orphan_names.add(profile)
+    # The displayed slice: the worst backlogs, capped. Only these rows carry the
+    # per-row correlated reads, so the cost is bounded by the cap, not the table.
+    backlog_subs = [
         _kanban_notify_from_row(row)
         for row in _query_rows(
-            conn, f"SELECT {select_list}{events_select} FROM kanban_notify_subs s"
+            conn,
+            f"SELECT {select_list}, {max_event_expr} AS max_event_id, "
+            f"{unseen_expr} AS unseen_event_count "
+            f"FROM kanban_notify_subs s WHERE {unseen_expr} > 0 "
+            f"ORDER BY unseen_event_count DESC, s.task_id, s.platform "
+            f"LIMIT {_NOTIFY_BACKLOG_SUB_LIMIT}",
         )
     ]
-    platform_counts: dict[str, int] = {}
-    backlog_subs: list[KanbanNotifySubSummary] = []
-    orphan_names: set[str] = set()
-    for sub in subs:
-        platform_key = sub.platform.lower() if sub.platform else "unknown"
-        platform_counts[platform_key] = platform_counts.get(platform_key, 0) + 1
-        if sub.backlog > 0:
-            backlog_subs.append(sub)
-        profile = sub.notifier_profile.strip()
-        if (
-            known_profiles is not None
-            and profile
-            and profile != _DEFAULT_PROFILE_NAME
-            and profile not in known_profiles
-        ):
-            orphan_names.add(profile)
-    backlog_subs.sort(key=lambda sub: (-sub.backlog, sub.task_id, sub.platform))
     orphans = sorted(orphan_names)
     return {
-        "notify_sub_count": len(subs),
+        "notify_sub_count": sub_count,
         "notify_platform_counts": platform_counts,
-        "notify_backlog_total": sum(sub.backlog for sub in subs),
-        "notify_max_backlog": max((sub.backlog for sub in subs), default=0),
-        "notify_backlog_subs": backlog_subs[:_NOTIFY_BACKLOG_SUB_LIMIT],
+        "notify_backlog_total": _coerce_int(backlog_totals.get("total")),
+        "notify_max_backlog": _coerce_int(backlog_totals.get("peak")),
+        "notify_backlog_subs": backlog_subs,
         "notify_orphan_profile_count": len(orphans),
         "notify_orphan_profiles": orphans[:_NOTIFY_ORPHAN_PROFILE_LIMIT],
     }

@@ -1345,3 +1345,60 @@ def test_kanban_notify_orphan_list_is_capped_while_the_count_is_exact(hermes_hom
     assert state.kanban.notify_orphan_profile_count == 8
     assert len(state.kanban.notify_orphan_profiles) == 5
     assert state.kanban.notify_orphan_profiles[0] == "ghost-0"
+
+
+def test_kanban_notify_read_is_capped_while_the_totals_stay_exact(hermes_home: Path):
+    """The subscription scan reads a bounded row list; every total stays exact.
+
+    ``kanban_notify_subs`` has no natural bound — the gateway garbage-collects
+    stale rows, but a long-lived board can hold one row per watcher — and each
+    row costs two correlated ``task_events`` subqueries. Every sibling query in
+    the module caps its read with ``LIMIT``; this one did not, so the panel
+    materialized the whole table to display ten rows. The counts are taken from
+    aggregates so the cap cannot make a total wrong.
+    """
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    conn.row_factory = sqlite3.Row
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('t1', 'Watched', 'review', 1)"
+    )
+    for event_id in range(1, 11):
+        conn.execute(
+            "INSERT INTO task_events (id, task_id, kind, created_at) VALUES (?, 't1', 'status', 1)",
+            (event_id,),
+        )
+    # Distinct backlogs: the cursor walks 0..10 across forty watchers.
+    for index in range(40):
+        _insert_notify_sub(
+            conn,
+            "t1",
+            "discord" if index % 2 == 0 else "slack",
+            chat_id=f"chat-{index}",
+            last_event_id=index % 11,
+        )
+    conn.commit()
+
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    fields = kanban_module._read_kanban_notify_fields(conn, known_profiles=frozenset())
+    conn.set_trace_callback(None)
+    conn.close()
+
+    expected_backlogs = [max(0, 10 - (index % 11)) for index in range(40)]
+    assert fields["notify_sub_count"] == 40
+    assert fields["notify_platform_counts"] == {"discord": 20, "slack": 20}
+    assert fields["notify_backlog_total"] == sum(expected_backlogs)
+    assert fields["notify_max_backlog"] == 10
+    backlog = fields["notify_backlog_subs"]
+    assert len(backlog) == 10  # literal: _NOTIFY_BACKLOG_SUB_LIMIT
+    assert [sub.backlog for sub in backlog] == sorted(expected_backlogs, reverse=True)[:10]
+    assert backlog[0].max_event_id == 10
+
+    # The unbounded row read is gone: every statement that selects subscription
+    # rows bounds itself, so the table can grow without growing the read.
+    listings = [
+        sql for sql in statements if "FROM kanban_notify_subs" in sql and "SELECT s." in sql
+    ]
+    assert listings
+    assert all("LIMIT" in sql.upper() for sql in listings)
