@@ -271,16 +271,21 @@ def _platform_status(
     profile, name = _split_platform_key(key)
     state = str(info.get("state") or "unknown")
     retrying_since = str(info.get("retrying_since") or "")
+    served = served_profiles or []
+    mirrors = _listener_mirror_urls(
+        name,
+        info,
+        state,
+        record_current=record_current,
+        served_profiles=served,
+    )
     return PlatformStatus(
         name=name,
         profile=profile,
-        mirror_urls=_listener_mirror_urls(
-            name,
-            info,
-            state,
-            record_current=record_current,
-            served_profiles=served_profiles or [],
-        ),
+        mirror_urls=mirrors,
+        # Only a built roster can be short: an empty one means nothing was
+        # mirrored, not that the profile list was cut.
+        mirror_urls_truncated=bool(mirrors) and len(served) > _MIRROR_PROFILE_LIMIT,
         ingress_url=_recorded_ingress_url(info, state=state, record_current=record_current),
         state=state,
         updated_at=str(info.get("updated_at") or ""),

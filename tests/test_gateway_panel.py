@@ -899,6 +899,33 @@ def test_gateway_renders_shared_listener_mirrors() -> None:
     assert "shared listener" not in detail
 
 
+def test_gateway_renders_truncated_mirror_roster_as_a_bound() -> None:
+    state = _liveness_state(
+        platforms=[
+            PlatformStatus(
+                name="api_server",
+                state="connected",
+                mirror_urls={"dev": "http://127.0.0.1:8088/p/dev/v1"},
+                mirror_urls_truncated=True,
+            )
+        ]
+    )
+    detail = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+    assert "more served profiles than this bound shows" in detail
+
+    bounded = _liveness_state(
+        platforms=[
+            PlatformStatus(
+                name="api_server",
+                state="connected",
+                mirror_urls={"dev": "http://127.0.0.1:8088/p/dev/v1"},
+            )
+        ]
+    )
+    detail = render_to_str(render_gateway(bounded, Theme(), detail=True), width=200, no_color=True)
+    assert "more served profiles" not in detail
+
+
 def test_gateway_detail_puts_each_liveness_diagnostic_on_its_own_line() -> None:
     """Witness, Starts, Web client, Exit diagnostics and Event logs get a line each.
 

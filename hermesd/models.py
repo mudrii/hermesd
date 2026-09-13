@@ -139,6 +139,9 @@ class PlatformStatus(BaseModel):
     # gateway/status.py:951-974), where a client reaches the profile on the
     # default listener. Empty unless the writer is live and the adapter serves.
     mirror_urls: dict[str, str] = Field(default_factory=dict)
+    # The synthesized roster is sliced to a display bound, so a short list must
+    # not read as the complete set of served profiles.
+    mirror_urls_truncated: bool = False
     # Per-entry writer provenance. Absent on a gateway that predates the stamps,
     # which is why ownership defaults to unverifiable rather than current.
     writer_pid: int | None = None

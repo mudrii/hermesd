@@ -3506,6 +3506,25 @@ def test_mirror_roster_is_bounded(hermes_home: Path):
     assert "p00" in platform.mirror_urls
     assert "p15" in platform.mirror_urls
     assert "p16" not in platform.mirror_urls
+    # A sliced roster must not read as the complete set of served profiles.
+    assert platform.mirror_urls_truncated is True
+
+
+def test_mirror_roster_below_the_bound_is_not_flagged(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    state_path = hermes_home / "gateway_state.json"
+    payload = json.loads(state_path.read_text())
+    payload["served_profiles"] = ["default", "dev", "coding"]
+    payload["platforms"] = {
+        "api_server": {"state": "connected", "listener_base": "http://127.0.0.1:8088"}
+    }
+    state_path.write_text(json.dumps(payload))
+
+    gateway = _collect(hermes_home).gateway
+
+    platform = next(p for p in gateway.platforms if p.name == "api_server")
+    assert sorted(platform.mirror_urls) == ["coding", "dev"]
+    assert platform.mirror_urls_truncated is False
 
 
 def test_restart_storm_keeps_defaults_when_config_is_unreadable(hermes_home: Path):

@@ -182,6 +182,13 @@ def _ingress_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
         for profile, url, platform_name in mirror_rows:
             mirrors.append(f"  {escape(platform_name)} / {escape(profile)}: ", style=theme.ui_label)
             mirrors.append(f"{escape(url)}\n", style=theme.banner_text)
+        if any(platform.mirror_urls_truncated for platform in gw.platforms):
+            # Say the roster is a slice: a bounded list must not read as the
+            # complete set of served profiles.
+            mirrors.append(
+                "  more served profiles than this bound shows (truncated)\n",
+                style=theme.ui_warn,
+            )
         sections.append(mirrors)
     if not entries:
         return sections
