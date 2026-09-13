@@ -1863,7 +1863,10 @@ class Collector:
                 estimated_cost_usd=_resolved_session_cost(r),
                 api_call_count=r.get("api_call_count") or 0,
                 cwd=r.get("cwd") or "",
-                archived=bool(r.get("archived") or 0),
+                # Strict, like every other flag read from a DB row: INTEGER
+                # affinity converts a numeric spelling, but a text 'false'
+                # survives as TEXT and bool() would call it archived.
+                archived=_coerce_bool(r.get("archived")),
                 rewind_count=r.get("rewind_count") or 0,
                 handoff_state=r.get("handoff_state") or "",
                 handoff_platform=r.get("handoff_platform") or "",
@@ -1873,7 +1876,7 @@ class Collector:
                 started_at=_coerce_float(r.get("started_at")),
                 ended_at=r.get("ended_at"),
                 title=r.get("title"),
-                is_active=r.get("ended_at") is None and not bool(r.get("archived") or 0),
+                is_active=r.get("ended_at") is None and not _coerce_bool(r.get("archived")),
                 git_branch=r.get("git_branch") or "",
                 chat_type=r.get("chat_type") or "",
                 display_name=r.get("display_name") or "",

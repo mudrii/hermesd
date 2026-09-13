@@ -837,7 +837,10 @@ def _read_project_summaries(
             name=str(row.get("name") or ""),
             board_slug=str(row.get("board_slug") or ""),
             primary_path=str(row.get("primary_path") or ""),
-            archived=bool(row.get("archived")),
+            # Strict, like every other flag read from a DB row: the column's
+            # INTEGER affinity converts a numeric spelling, but a text 'false'
+            # survives as TEXT and bool() would call the project archived.
+            archived=_coerce_bool(row.get("archived")),
             verification_root_count=_project_verification_root_count(
                 str(row.get("primary_path") or ""),
                 verification_roots,

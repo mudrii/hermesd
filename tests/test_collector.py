@@ -328,6 +328,37 @@ def test_collect_sessions_reads_newer_runtime_columns(hermes_home: Path):
     c.close()
 
 
+def test_sessions_archived_text_false_is_not_archived(hermes_home: Path):
+    """A text ``'false'`` in the archived column is not "archived".
+
+    The column has INTEGER affinity, which converts a well-formed integer
+    spelling but leaves anything else as TEXT — ``bool('false')`` is True, so a
+    hand-edited or foreign row would report the session as archived and drop it
+    from the active list. Reading it strictly costs nothing on real data, where
+    the value is already 0 or 1.
+    """
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn)
+    conn.execute("ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, archived) VALUES (?, ?, ?, ?)",
+        ("sess_text", "cli", time.time(), "false"),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    session = state.sessions[0]
+    assert session.archived is False
+    assert session.is_active is True
+
+
 def test_collect_kanban_state(populated_hermes_home: Path):
     c = Collector(populated_hermes_home)
     state = c.collect()
