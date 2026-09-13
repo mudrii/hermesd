@@ -139,17 +139,22 @@ from hermesd.collect.plugins import (
     MANIFEST_NAMES,
     MAX_PLUGIN_SCAN_DEPTH,
     PLUGIN_KIND_STANDALONE,
+    CatalogCacheEntry,
     CatalogProvenance,
     ManifestChoice,
+    RemovedCatalogEntry,
     catalog_provenance,
+    catalog_update_available,
     category_prefix,
     choose_manifest,
     declared_capabilities,
     gate_plugin,
     install_provenance,
+    parse_catalog_cache,
     parse_portable_manifest,
     plugin_key,
     plugin_name_set,
+    removed_catalog_match,
     requires_hermes_spec,
     resolve_plugin_kind,
 )
@@ -302,6 +307,15 @@ _CONFIG_BACKUP_FIELDS = (
     "config_backups_present",
     "config_backup_groups",
     "config_backup_groups_truncated",
+)
+# The catalog-cache enrichment owns these SkillsMemory fields plus the flags it
+# stamps onto the plugin rows, so its last-good fallback restores both.
+_PLUGIN_CATALOG_FIELDS = (
+    "plugins",
+    "plugin_catalog_cache_present",
+    "plugin_catalog_cache_age_seconds",
+    "plugin_catalog_update_count",
+    "plugin_catalog_removed_count",
 )
 # cache/blocked-scripts/ scan bounds and the fields the source owns.
 _BLOCKED_SCRIPT_SCAN_LIMIT = 200
@@ -912,6 +926,19 @@ class Collector:
                 lambda: results["skills_memory"],
                 fallback=lambda: self._last_source_fields(
                     "desktop_plugins", results["skills_memory"], _DESKTOP_PLUGIN_FIELDS
+                ),
+            ),
+            # Second writer of the `skills_memory` field: the live catalog cache
+            # adds drift/removal verdicts on top of the discovered plugins. An
+            # unreadable cache fails only this enrichment — the discovered
+            # plugin inventory beside it stays fresh.
+            _SourceSpec(
+                "skills_memory",
+                "plugin_catalog",
+                lambda: self._with_plugin_catalog(results["skills_memory"]),
+                lambda: results["skills_memory"],
+                fallback=lambda: self._last_source_fields(
+                    "plugin_catalog", results["skills_memory"], _PLUGIN_CATALOG_FIELDS
                 ),
             ),
             _SourceSpec("mcp_cache", "mcp_cache", self._collect_mcp_cache, MCPSchemaCache),
@@ -2849,6 +2876,73 @@ class Collector:
             update={
                 "desktop_plugins": plugins,
                 "desktop_plugin_scan_truncated": truncated,
+            }
+        )
+
+    def _with_plugin_catalog(self, current: SkillsMemory) -> SkillsMemory:
+        """Flag catalog drift, catalog removals and unmanaged installs.
+
+        Upstream compares an installed plugin's ``.hermes-catalog.json`` sha
+        with the live catalog's pin (``plugins_cmd_catalog.py:277-291``) and
+        blocks installs whose name/catalog name/repo is on the kill list
+        (``plugin_catalog.py:198-211``, ``plugins_cmd_catalog.py:96-103``). The
+        live catalog reaches disk through ``cache/plugin-catalog.json``
+        (``plugin_catalog.py:216-218``), refreshed on a 6h mtime TTL. hermesd
+        reads that cache from the ROOT home — the same divergence as the
+        ``plugins/`` directory it describes, kept so both sides of the
+        comparison describe one home (see .codex/rules/source-ownership.md).
+
+        No cache means no claims: update/removal flags stay False and the panel
+        says the checks are unavailable, never "everything is current".
+        """
+        cache_path = self._paths.shared_path("cache", "plugin-catalog.json")
+        if not _exists_strict(cache_path) or not cache_path.is_file():
+            return current.model_copy(
+                update={
+                    "plugin_catalog_cache_present": False,
+                    "plugin_catalog_cache_age_seconds": None,
+                    "plugin_catalog_update_count": 0,
+                    "plugin_catalog_removed_count": 0,
+                }
+            )
+        if cache_path.is_symlink() or not _path_resolves_under(cache_path, self._paths.root_home):
+            raise RuntimeError(f"unsafe plugin catalog cache: {cache_path.name}")
+        entries, removed = parse_catalog_cache(self._read_json_cached(cache_path))
+        plugins = [
+            self._flag_plugin_with_catalog(plugin, entries, removed) for plugin in current.plugins
+        ]
+        return current.model_copy(
+            update={
+                "plugins": plugins,
+                "plugin_catalog_cache_present": True,
+                "plugin_catalog_cache_age_seconds": self._file_age_seconds(cache_path),
+                "plugin_catalog_update_count": sum(
+                    1 for plugin in plugins if plugin.catalog_update_available
+                ),
+                "plugin_catalog_removed_count": sum(
+                    1 for plugin in plugins if plugin.catalog_removed
+                ),
+            }
+        )
+
+    def _flag_plugin_with_catalog(
+        self,
+        plugin: PluginInfo,
+        entries: dict[str, CatalogCacheEntry],
+        removed: list[RemovedCatalogEntry],
+    ) -> PluginInfo:
+        entry = entries.get(plugin.catalog_name) if plugin.catalog_name else None
+        update = catalog_update_available(plugin.catalog_sha, entry)
+        match = removed_catalog_match(
+            plugin.name, plugin.catalog_name, plugin.catalog_repo, removed=removed
+        )
+        if not update and match is None:
+            return plugin
+        return plugin.model_copy(
+            update={
+                "catalog_update_available": update,
+                "catalog_removed": match is not None,
+                "catalog_removed_reason": match.reason if match else "",
             }
         )
 

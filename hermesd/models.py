@@ -1055,6 +1055,13 @@ class PluginInfo(BaseModel):
     catalog_sha: str = ""
     catalog_tier: str = ""
     catalog_installed_at: str = ""
+    # cache/plugin-catalog.json comparisons (the live catalog's view of this
+    # plugin): an entry sha that differs from the sidecar's reviewed sha, and
+    # the kill-list verdict for name/catalog name/repo. Neither is set when the
+    # cache is absent — no cache, no claim.
+    catalog_update_available: bool = False
+    catalog_removed: bool = False
+    catalog_removed_reason: str = ""
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -1081,6 +1088,20 @@ class PluginInfo(BaseModel):
     def pinned(self) -> bool:
         """Derived: upstream records a pin only beside the revision it pins."""
         return bool(self.pinned_revision)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def unmanaged(self) -> bool:
+        """Derived: neither provenance sidecar recorded anything usable.
+
+        A catalog sidecar would fill ``catalog_*`` and an install record would
+        fill ``installed_revision``/``install_source``; neither existing means
+        the directory was never installed by the plugin tooling — a local or
+        hand-copied plugin, which is a fact about the files, not an error.
+        """
+        return not (
+            self.catalog_name or self.catalog_sha or self.installed_revision or self.install_source
+        )
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -1135,6 +1156,13 @@ class SkillsMemory(BaseModel):
     boot_md_present: bool = False
     boot_md_mtime: float | None = None
     skills: list[SkillInfo] = Field(default_factory=list)
+    # cache/plugin-catalog.json — the live catalog's view of the installed
+    # plugins above. Absent cache means the drift/removal checks made no
+    # claims this pass, which must not read as "everything is current".
+    plugin_catalog_cache_present: bool = False
+    plugin_catalog_cache_age_seconds: float | None = None
+    plugin_catalog_update_count: int = 0
+    plugin_catalog_removed_count: int = 0
 
 
 class ToolsetAvailability(BaseModel):

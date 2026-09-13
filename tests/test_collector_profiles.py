@@ -415,6 +415,49 @@ def test_profiled_collector_rejects_profile_root_swapped_to_outside(
     assert "tools_index" in second.health.failed_sources
 
 
+def test_plugin_catalog_cache_is_read_from_the_shared_root_under_a_profile(
+    profiled_hermes_home: Path,
+):
+    """The live-catalog cache is ROOT like the plugins/ directory it describes.
+
+    Comparing a root-installed plugin's sidecar sha against a profile-local
+    cache would manufacture drift, so both sides of the comparison must come
+    from one home.
+    """
+    root_cache = profiled_hermes_home / "cache"
+    root_cache.mkdir(exist_ok=True)
+    (root_cache / "plugin-catalog.json").write_text(
+        json.dumps(
+            {
+                "entries": [{"name": "root-weather", "sha": "a" * 40}],
+                "removed": [{"name": "root-evil", "reason": "malicious"}],
+            }
+        )
+    )
+    profile_cache = profiled_hermes_home / "profiles" / "coding" / "cache"
+    profile_cache.mkdir(parents=True)
+    (profile_cache / "plugin-catalog.json").write_text(json.dumps({"entries": [], "removed": []}))
+    plugin_dir = profiled_hermes_home / "plugins" / "root-weather"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text("name: root-weather\n")
+    (plugin_dir / ".hermes-catalog.json").write_text(
+        json.dumps({"catalog_name": "root-weather", "sha": "b" * 40})
+    )
+
+    c = Collector(profiled_hermes_home, profile_name="coding")
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    sm = state.skills_memory
+    assert sm.plugin_catalog_cache_present is True
+    assert sm.plugin_catalog_update_count == 1
+    assert sm.plugin_catalog_removed_count == 0
+    assert sm.plugins[0].catalog_update_available is True
+    c.close()
+
+
 def test_profiled_collector_keeps_config_backups_on_the_shared_root(profiled_hermes_home: Path):
     """backups/config/ inherits the config.yaml decision.
 

@@ -9,12 +9,17 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ### Added
 
+- Skills/Integrations panel: plugin catalog drift is now visible. Each installed
+  plugin is compared against the live catalog cache (`cache/plugin-catalog.json`):
+  "update available" when the catalog pins a different commit than the reviewed
+  sidecar, "removed" when name/catalog name/repo is on the kill list (reason
+  shown), and "unmanaged" when neither provenance sidecar recorded anything. An
+  absent cache renders honestly as "checks unavailable", never as "up to date".
 - Config panel: point-in-time `backups/config/` snapshots are now shown. The newest
   `good` copy is rendered as "config last changed" (a good copy is written only when
   config.yaml's bytes change, so an old stamp is an unchanged config, not a stale
   reader), `corrupt` snapshot counts are a hard alert, and `pre-setup`/migration
   stamps appear as an audit trail. Stamps are the writer's local time.
-
 - Curator panel: skill-library hygiene from `skills/.usage.json` — how many skills
   were patched but never re-used (the patch-reuse loop), state counts
   (active/stale/archived), pinned skills, and each skill's distance to the
