@@ -252,3 +252,58 @@ def test_kanban_detail_renders_notify_platform_counts() -> None:
     assert "Notify Platforms" in text
     assert "discord 2" in text
     assert "slack 1" in text
+    assert "truncated" not in text
+
+
+def test_kanban_detail_marks_a_truncated_platform_rollup() -> None:
+    """The rollup is capped at the busiest platforms; a cut rollup must not
+    read as every platform there is."""
+    state = DashboardState(
+        kanban=KanbanState(
+            db_present=True,
+            notify_sub_count=75,
+            notify_platform_counts={"discord": 30, "slack": 20},
+            notify_platforms_truncated=True,
+        )
+    )
+
+    text = render_to_str(render_kanban(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "discord 30" in text
+    assert "truncated" in text
+
+
+def test_kanban_detail_labels_a_capped_backlog_list() -> None:
+    """The backlog table shows the worst ten subscriptions; the section must
+    say so instead of reading as the whole backlog."""
+    subs = [KanbanNotifySubSummary(task_id=f"t{index}", backlog=1) for index in range(10)]
+    state = DashboardState(
+        kanban=KanbanState(
+            db_present=True,
+            notify_sub_count=40,
+            notify_backlog_sub_count=40,
+            notify_backlog_subs=subs,
+        )
+    )
+
+    text = render_to_str(render_kanban(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "showing 10 of 40" in text
+
+
+def test_kanban_detail_unlabeled_when_backlog_list_is_complete() -> None:
+    """When every backlogged sub is displayed there is nothing to disclose."""
+    sub = KanbanNotifySubSummary(task_id="t1", backlog=2)
+    state = DashboardState(
+        kanban=KanbanState(
+            db_present=True,
+            notify_sub_count=1,
+            notify_backlog_sub_count=1,
+            notify_backlog_subs=[sub],
+        )
+    )
+
+    text = render_to_str(render_kanban(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "Notify Backlog" in text
+    assert "showing" not in text

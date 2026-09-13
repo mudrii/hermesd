@@ -1806,8 +1806,13 @@ class KanbanState(BaseModel):
     # Notify subscriptions (kanban_notify source over kanban_notify_subs).
     notify_sub_count: int = 0
     notify_platform_counts: dict[str, int] = Field(default_factory=dict)
+    # True when notify_platform_counts was cut to its busiest entries.
+    notify_platforms_truncated: bool = False
     notify_backlog_total: int = 0
     notify_max_backlog: int = 0
+    # Subscriptions holding any unseen event: the exact count behind the
+    # capped worst-ten notify_backlog_subs list.
+    notify_backlog_sub_count: int = 0
     notify_backlog_subs: list[KanbanNotifySubSummary] = Field(default_factory=list)
     notify_orphan_profile_count: int = 0
     notify_orphan_profiles: list[str] = Field(default_factory=list)
