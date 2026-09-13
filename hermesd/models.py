@@ -1614,6 +1614,58 @@ class DelegationInfo(BaseModel):
     result_status: str = ""
     error_excerpt: str = ""
     owner_alive: bool = False
+    # Background-process handoff accounting, summed across the result payload's
+    # per-child entries (``tools/delegate_tool_child_run.py:744-762``, persisted
+    # by ``tools/async_delegation.py:198-225``). This is the only durable trace
+    # of the handoff feature — the live roster lives in gateway memory — so the
+    # counts are kept even though the session ids, commands and output tails
+    # they summarize never leave the payload.
+    handed_off_count: int = 0
+    orphaned_count: int = 0
+    unread_completion_count: int = 0
+
+
+class DelegationLiveTask(BaseModel):
+    """One per-child entry of a live delegation manifest.
+
+    ``status``/``exit_reason`` are the writer's best-effort updates after the
+    batch joins (``tools/delegation_live_log.py:270-286``); a crash before the
+    join leaves the task marked ``running`` forever. ``log_tail`` holds the last
+    few redacted lines of ``task-<index>.log`` for the detail view — the file
+    upstream pre-redacts per line, and hermesd redacts again before it leaves
+    the collector.
+    """
+
+    index: int = 0
+    goal: str = ""
+    status: str = ""
+    exit_reason: str = ""
+    log_name: str = ""
+    log_tail: list[str] = Field(default_factory=list)
+
+
+class DelegationLiveManifest(BaseModel):
+    """Per-delegation card from ``cache/delegation/live/<id>/manifest.json``.
+
+    Written at dispatch and amended after the join
+    (``tools/delegation_live_log.py:255-287``): model, provider, task count and
+    per-task status. This is the *manifest*, not the live roster — tool counts,
+    steer state and depth exist only in gateway memory and over RPC, so nothing
+    here claims to show them. ``dir_age_seconds`` comes from the directory
+    mtime, which is the only liveness signal hermesd has.
+    """
+
+    delegation_id: str = ""
+    model: str = ""
+    provider: str = ""
+    started: str = ""
+    completed: str = ""
+    manifest_present: bool = False
+    dir_age_seconds: float | None = None
+    task_count: int = 0
+    running_task_count: int = 0
+    tasks: list[DelegationLiveTask] = Field(default_factory=list)
+    tasks_truncated: bool = False
 
 
 class RetiredWalGeneration(BaseModel):
@@ -2002,6 +2054,55 @@ class ApiRunReservationsState(BaseModel):
     oldest_age_seconds: float | None = None
 
 
+# Upstream's receipt retention ceiling (``tools/process_registry_results.py:19-20``).
+PROCESS_RECEIPT_RETENTION_SECONDS: int = 7 * 24 * 60 * 60
+PROCESS_RECEIPT_MAX_FILES: int = 64
+
+# Upstream's checkpoint auto-prune wrapper defaults (``tools/checkpoint_manager.py:1094``):
+# it short-circuits within ``min_interval_hours`` of the marker, so hermesd flags
+# overdue at 2x the interval — a stale marker is a missed wrapper run, not proof
+# of anything about the store itself.
+CHECKPOINT_PRUNE_INTERVAL_SECONDS: int = 24 * 60 * 60
+CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS: int = 2 * CHECKPOINT_PRUNE_INTERVAL_SECONDS
+
+
+class ProcessReceipt(BaseModel):
+    """One finished background process, from ``logs/process-results/proc_*.json``.
+
+    Fields mirror upstream's ``_RESULT_FIELDS`` plus the redacted output tail
+    (``tools/process_registry_results.py:21-25,48-61``). Upstream redacts the
+    command and output before writing and marks the file 0600; hermesd redacts
+    both again at the collector boundary and never carries ``cwd``,
+    ``session_key`` or ``parent_session_id``.
+    """
+
+    process_id: str = ""
+    command: str = ""
+    exit_code: int | None = None
+    completion_reason: str = ""
+    termination_source: str = ""
+    started_age_seconds: float | None = None
+    finished_age_seconds: float | None = None
+    output_tail: str = ""
+
+
+class ProcessReceiptsState(BaseModel):
+    """Recently finished background processes, read from PROFILE
+    ``logs/process-results/``.
+
+    Upstream prunes receipts to 7 days / 64 files
+    (``tools/process_registry_results.py:28-45``), so an absent directory or an
+    empty store is normal on any machine that has not run detachable processes
+    lately — the panel says "no receipts yet" rather than implying a failure.
+    """
+
+    dir_present: bool = False
+    receipt_count: int = 0
+    newest_receipt_age_seconds: float | None = None
+    receipts: list[ProcessReceipt] = Field(default_factory=list)
+    receipts_truncated: bool = False
+
+
 class OperationsState(BaseModel):
     dashboard_process_count: int = 0
     desktop_build_stamp: str = ""
@@ -2041,6 +2142,10 @@ class OperationsState(BaseModel):
     delegation_failed_count: int = 0
     delegation_undelivered_count: int = 0
     delegation_live_log_count: int = 0
+    # Written by its own source (``delegation_live``) so a torn manifest keeps
+    # the last-good card list instead of blanking the panel.
+    delegation_live_manifests: list[DelegationLiveManifest] = Field(default_factory=list)
+    delegation_live_manifest_count: int = 0
     state_db_schema_version: int = 0
     state_db_size_bytes: int = 0
     state_db_wal_size_bytes: int = 0
@@ -2066,6 +2171,33 @@ class OperationsState(BaseModel):
     # are recorded as separate rows in .codex/rules/source-ownership.md.
     hosted_rooms: HostedRoomState = Field(default_factory=HostedRoomState)
     api_runs: ApiRunReservationsState = Field(default_factory=ApiRunReservationsState)
+    # Written by its own source (``process_receipts``): a receipt directory that
+    # disappears (7-day retention) must keep the last-good list, not blank it.
+    process_receipts: ProcessReceiptsState = Field(default_factory=ProcessReceiptsState)
+    # Checkpoint auto-prune wrapper marker, PROFILE ``checkpoints/.last_prune``
+    # (``tools/checkpoint_manager.py:1094-1130``).
+    checkpoint_prune_marker_present: bool = False
+    checkpoint_prune_marker_age_seconds: float | None = None
+    # ROOT parking bay for an unparseable spawn ledger
+    # (``hermes_cli/process_identity.py:160-171``).
+    spawn_ledger_corrupt_present: bool = False
+    spawn_ledger_corrupt_age_seconds: float | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def checkpoint_prune_overdue(self) -> bool:
+        """True when a marker exists and is older than the 48h overdue window.
+
+        Caveat kept with the render copy: a fresh marker proves the wrapper RAN,
+        not that pruning succeeded — per-repo failures land in the prune result,
+        not in the marker — so this flag is never a store-health verdict.
+        """
+        age = self.checkpoint_prune_marker_age_seconds
+        return (
+            self.checkpoint_prune_marker_present
+            and age is not None
+            and age > CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS
+        )
 
 
 class CuratorRun(BaseModel):

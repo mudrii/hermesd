@@ -7,12 +7,16 @@ from hermesd.models import (
     ApiRunReservationsState,
     DashboardState,
     DelegationInfo,
+    DelegationLiveManifest,
+    DelegationLiveTask,
     GoalSummary,
     HostedRoomState,
     HostedRoomSummary,
     ModelCacheSummary,
     OperationsState,
     PRMonitorSummary,
+    ProcessReceipt,
+    ProcessReceiptsState,
 )
 from hermesd.panels.operations import render_operations
 from hermesd.theme import Theme
@@ -95,6 +99,19 @@ def test_detail_renders_delegation_table():
     assert "pending x4" in text
     assert "boom in the worker" in text
     assert "alive" in text
+
+
+def test_detail_delegation_rows_show_process_accounting_counts():
+    state = _ops_state(
+        delegation_count=2,
+        delegations=[
+            _delegation(handed_off_count=2, orphaned_count=1, unread_completion_count=3),
+            _delegation(delegation_id="deleg_2c320307"),
+        ],
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=160)
+    assert "2 handed · 1 orphaned · 3 unread" in text
+    assert "—" in text  # a delegation with no accounting still gets a placeholder
 
 
 def test_detail_renders_state_db_section():
@@ -234,9 +251,10 @@ def test_operations_detail_escapes_blocked_script_names() -> None:
     assert "[bold red]evil.sh" in text
 
 
-def _placeholder_rows(text: str) -> list[list[str]]:
-    """Every rendered line that is nothing but seven em-dash cells."""
-    return [cells for line in text.splitlines() if (cells := line.split()) == ["—"] * 7]
+def _placeholder_rows(text: str, cells_count: int) -> list[list[str]]:
+    """Every rendered line that is nothing but em-dash cells."""
+    row = ["—"] * cells_count
+    return [cells for line in text.splitlines() if (cells := line.split()) == row]
 
 
 def test_operations_detail_delegations_table_placeholder_row_when_list_empty() -> None:
@@ -245,7 +263,7 @@ def test_operations_detail_delegations_table_placeholder_row_when_list_empty() -
     text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
 
     assert "Delegations (3 total · 0 live logs)" in text
-    assert _placeholder_rows(text) == [["—"] * 7]
+    assert _placeholder_rows(text, 8) == [["—"] * 8]
 
 
 def test_operations_detail_reports_no_verification_events_when_ledger_empty() -> None:
@@ -264,7 +282,7 @@ def test_operations_detail_projects_table_placeholder_row_when_list_empty() -> N
 
     assert "Projects" in text
     assert "Slug" in text
-    assert _placeholder_rows(text) == [["—"] * 7]
+    assert _placeholder_rows(text, 7) == [["—"] * 7]
 
 
 def test_operations_detail_goal_waiting_falls_back_to_session() -> None:
@@ -284,6 +302,262 @@ def test_operations_detail_goal_waiting_falls_back_to_session() -> None:
 
     assert "session sess_blocker" in text
     assert "pid " not in text
+
+
+# --- checkpoint prune marker (item 22) + corrupt ledger (item 24) -----------
+
+
+def test_compact_warns_when_checkpoint_prune_is_overdue():
+    from hermesd.models import (
+        CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS,
+    )
+
+    overdue = render_to_str(
+        render_operations(
+            _ops_state(
+                checkpoint_prune_marker_present=True,
+                checkpoint_prune_marker_age_seconds=float(
+                    CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS + 3600
+                ),
+            ),
+            Theme(),
+        ),
+        no_color=True,
+    )
+    fresh = render_to_str(
+        render_operations(
+            _ops_state(
+                checkpoint_prune_marker_present=True,
+                checkpoint_prune_marker_age_seconds=3600.0,
+            ),
+            Theme(),
+        ),
+        no_color=True,
+    )
+    assert "Checkpoint prune overdue" in overdue
+    assert "Checkpoint prune overdue" not in fresh
+
+
+def test_compact_warns_when_spawn_ledger_corrupt_marker_exists():
+    flagged = render_to_str(
+        render_operations(
+            _ops_state(spawn_ledger_corrupt_present=True, spawn_ledger_corrupt_age_seconds=7200.0),
+            Theme(),
+        ),
+        no_color=True,
+    )
+    absent = render_to_str(render_operations(_ops_state(), Theme()), no_color=True)
+    assert "spawn-ledger corrupt" in flagged
+    assert "2h" in flagged
+    assert "spawn-ledger corrupt" not in absent
+
+
+def test_detail_summary_rows_render_prune_and_ledger_markers():
+    from hermesd.models import CHECKPOINT_PRUNE_INTERVAL_SECONDS
+
+    state = _ops_state(
+        checkpoint_prune_marker_present=True,
+        checkpoint_prune_marker_age_seconds=float(CHECKPOINT_PRUNE_INTERVAL_SECONDS * 5),
+        spawn_ledger_corrupt_present=True,
+        spawn_ledger_corrupt_age_seconds=7200.0,
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+    assert "Checkpoint Prune" in text
+    assert "OVERDUE" in text
+    assert "Spawn Ledger" in text
+    assert "corrupt" in text
+
+
+# --- live delegation manifests (item 12) ------------------------------------
+
+
+def _live_manifest(**fields: object) -> DelegationLiveManifest:
+    base: dict[str, object] = {
+        "delegation_id": "deleg_live01",
+        "model": "Hermes-4.5",
+        "provider": "nous",
+        "started": "2026-07-10 10:00:00",
+        "manifest_present": True,
+        "dir_age_seconds": 45.0,
+        "task_count": 2,
+        "running_task_count": 1,
+        "tasks": [
+            DelegationLiveTask(
+                index=0,
+                goal="crawl the docs",
+                status="completed",
+                log_name="task-0.log",
+                log_tail=["12:00:01 tool | read docs/index.md"],
+            ),
+            DelegationLiveTask(
+                index=1,
+                goal="summarize",
+                status="running",
+                log_name="task-1.log",
+                log_tail=["12:00:02 assistant | working [hard]"],
+            ),
+        ],
+    }
+    base.update(fields)
+    return DelegationLiveManifest(**base)  # type: ignore[arg-type]
+
+
+def test_detail_renders_live_delegation_manifest_cards():
+    state = _ops_state(
+        delegation_live_manifest_count=1,
+        delegation_live_manifests=[_live_manifest()],
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+    assert "Live Delegation Transcripts" in text
+    assert "deleg_live01" in text
+    assert "Hermes-4.5" in text
+    assert "nous" in text
+    assert "2 total · 1 running" in text
+    assert "task 0" in text
+    assert "task 1" in text
+    assert "max_iterations" not in text  # exit_reason only when present
+    assert "12:00:02 assistant | working [hard]" in text
+
+
+def test_detail_live_manifests_render_truncation_and_roster_note():
+    state = _ops_state(
+        delegation_live_manifest_count=9,
+        delegation_live_manifests=[_live_manifest()],
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+    assert "showing 1 of 9" in text
+    # The live roster is memory/RPC-only: the panel must say so, not leave a blank.
+    assert "roster" in text
+    assert "memory" in text
+
+
+def test_detail_omits_live_manifest_section_when_absent():
+    text = render_to_str(render_operations(_ops_state(), Theme(), detail=True), no_color=True)
+    assert "Live Delegation Transcripts" not in text
+
+
+def test_detail_escapes_hostile_live_manifest_text():
+    state = _ops_state(
+        delegation_live_manifest_count=1,
+        delegation_live_manifests=[
+            _live_manifest(
+                model="[red]evil-model[/red]",
+                provider="[/] provider",
+                tasks=[
+                    DelegationLiveTask(
+                        index=0,
+                        goal="[link]x[/link]",
+                        status="[bold]running[/bold]",
+                        exit_reason="[italic]boom[/italic]",
+                        log_name="task-0.log",
+                        log_tail=["[underline]tail[/underline] \x1b[2J line"],
+                    )
+                ],
+            )
+        ],
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+    assert "[red]evil-model[/red]" in text
+    assert "[bold]running[/bold]" in text
+    assert "[underline]tail[/underline]" in text
+
+
+def test_compact_shows_live_delegation_line_when_present():
+    populated = render_to_str(
+        render_operations(
+            _ops_state(
+                delegation_live_manifest_count=2,
+                delegation_live_manifests=[_live_manifest()],
+            ),
+            Theme(),
+        ),
+        no_color=True,
+    )
+    absent = render_to_str(render_operations(_ops_state(), Theme()), no_color=True)
+    assert "Live delegations:" in populated
+    assert "2 live · 1 running" in populated
+    assert "Live delegations:" not in absent
+
+
+# --- process completion receipts (item 13) ----------------------------------
+
+
+def _receipts(**fields: object) -> ProcessReceiptsState:
+    base: dict[str, object] = {
+        "dir_present": True,
+        "receipt_count": 2,
+        "newest_receipt_age_seconds": 120.0,
+        "receipts": [
+            ProcessReceipt(
+                process_id="proc_abc123",
+                command="curl -H 'Authorization: Bearer [REDACTED]' https://api.example.dev",
+                exit_code=2,
+                completion_reason="exited",
+                started_age_seconds=600.0,
+                finished_age_seconds=120.0,
+                output_tail="AUTH Bearer [REDACTED]\ndone, exit 2",
+            ),
+            ProcessReceipt(
+                process_id="proc_def456",
+                command="npm run build",
+                exit_code=0,
+                completion_reason="completed",
+                started_age_seconds=3600.0,
+                finished_age_seconds=900.0,
+                output_tail="built in 42s",
+            ),
+        ],
+    }
+    base.update(fields)
+    return ProcessReceiptsState(**base)  # type: ignore[arg-type]
+
+
+def test_detail_renders_process_receipt_section():
+    state = _ops_state(process_receipts=_receipts())
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+    assert "Process Receipts" in text
+    assert "proc_abc123" in text
+    assert "proc_def456" in text
+    assert "Bearer [REDACTED]" in text
+    assert "done, exit 2" in text
+
+
+def test_detail_receipt_section_states_no_receipts_yet_when_dir_absent():
+    state = _ops_state(process_receipts=ProcessReceiptsState())
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=160, no_color=True)
+    assert "no receipts yet" in text
+
+
+def test_detail_receipts_escape_hostile_text():
+    state = _ops_state(
+        process_receipts=_receipts(
+            receipts=[
+                ProcessReceipt(
+                    process_id="proc_[link]evil[/link]",
+                    command="[bold]rm -rf[/bold] /tmp/x",
+                    exit_code=1,
+                    output_tail="\x1b[2J [italic]boom[/italic]",
+                )
+            ]
+        )
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+    assert "proc_[link]evil[/link]" in text
+    assert "[italic]boom[/italic]" in text
+    assert "\x1b[2J" not in text
+
+
+def test_compact_shows_finished_proc_count_when_present():
+    populated = render_to_str(
+        render_operations(_ops_state(process_receipts=_receipts()), Theme()), no_color=True
+    )
+    absent = render_to_str(
+        render_operations(_ops_state(process_receipts=ProcessReceiptsState()), Theme()),
+        no_color=True,
+    )
+    assert "Finished procs:" in populated
+    assert "2 receipts" in populated
+    assert "Finished procs:" not in absent
 
 
 # --- hosted rooms and retained API run reservations -------------------------

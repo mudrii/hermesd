@@ -13,17 +13,23 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from hermesd.collect.common import (
+    _MAX_TEXT_READ_BYTES,
     _age_seconds,
     _as_dict,
     _as_list,
     _coerce_float,
     _coerce_int,
+    _exists_strict,
     _iso_to_epoch,
     _path_resolves_under,
     _read_tail_text,
+    _read_text_capped,
+    _safe_capped_file,
     _safe_child_path,
+    _safe_mtime,
 )
 from hermesd.collect.kanban import _kanban_board_present
+from hermesd.collect.redaction import _redact_command_string, _redact_secret_text
 from hermesd.collect.sqlite_util import (
     _count_rows,
     _query_rows,
@@ -34,9 +40,13 @@ from hermesd.collect.sqlite_util import (
 from hermesd.models import (
     CuratorRun,
     DelegationInfo,
+    DelegationLiveManifest,
+    DelegationLiveTask,
     DiscoveredRepoSummary,
     GoalSummary,
     OperationsState,
+    ProcessReceipt,
+    ProcessReceiptsState,
     ProjectSummary,
     VerificationEventSummary,
     VerificationRootSummary,
@@ -236,7 +246,9 @@ def _delegation_from_row(
     dispatched_at = _coerce_float(row.get("dispatched_at"))
     completed_at = _coerce_float(row.get("completed_at")) or None
     task = _json_object_capped(row.get("task_json")) or {}
-    result = _first_delegation_result(row.get("result_json"))
+    result_object = _json_object_capped(row.get("result_json")) or {}
+    result = _first_delegation_result(result_object)
+    handed_off, orphaned, unread = _delegation_process_counts(result_object)
     owner_pid = _coerce_int(row.get("owner_pid"))
     return DelegationInfo(
         delegation_id=str(row.get("delegation_id") or ""),
@@ -253,7 +265,31 @@ def _delegation_from_row(
             str(result.get("error") or "") or str(result.get("summary") or "")
         ),
         owner_alive=bool(owner_pid) and pid_exists(owner_pid),
+        handed_off_count=handed_off,
+        orphaned_count=orphaned,
+        unread_completion_count=unread,
     )
+
+
+def _delegation_process_counts(result: dict[str, Any]) -> tuple[int, int, int]:
+    """Sum the per-child background-process accounting across one payload.
+
+    Upstream stamps each finished child entry with ``handed_off_processes``,
+    ``orphaned_processes`` (with ``runtime_seconds``) and
+    ``unread_completions`` (with ``exit_code`` and an output tail) before the
+    combined result is persisted (``tools/delegate_tool_child_run.py:744-762``,
+    ``tools/async_delegation.py:198-225``). A still-running unit carries the
+    same shape under ``partial: true`` (``record_unit_child``, ``:208-225``), so
+    partial rows count identically. hermesd keeps the counts only: session ids,
+    commands and output tails never leave the payload.
+    """
+    handed_off = orphaned = unread = 0
+    for entry in _as_list(result.get("results")):
+        data = _as_dict(entry)
+        handed_off += len(_as_list(data.get("handed_off_processes")))
+        orphaned += len(_as_list(data.get("orphaned_processes")))
+        unread += len(_as_list(data.get("unread_completions")))
+    return handed_off, orphaned, unread
 
 
 def _delegation_duration(
@@ -267,8 +303,8 @@ def _delegation_duration(
     return max(0.0, end - dispatched_at)
 
 
-def _first_delegation_result(raw: object) -> dict[str, Any]:
-    results = _as_list((_json_object_capped(raw) or {}).get("results"))
+def _first_delegation_result(result_object: dict[str, Any]) -> dict[str, Any]:
+    results = _as_list(result_object.get("results"))
     if results and isinstance(results[0], dict):
         return results[0]
     return {}
@@ -362,6 +398,277 @@ def _count_delegation_live_logs(live_root: Path, home: Path) -> int:
             if scanned >= _BOUNDED_SCAN_LIMIT:
                 break
     return count
+
+
+# Live-delegation manifest bounds. The manifest is a small dispatch-time
+# document (one entry per child task), 64 KiB refuses a runaway blob while
+# holding every realistic batch; the rendered card list is capped far below the
+# bounded directory scan, and only a few task logs are tailed per card.
+_LIVE_MANIFEST_MAX_BYTES = 64 * 1024
+_MAX_LIVE_MANIFESTS = 5
+_MAX_LIVE_TASKS = 8
+_MAX_LIVE_LOG_TAILS = 4
+_LIVE_TAIL_MAX_BYTES = 1024
+_LIVE_TAIL_MAX_LINES = 4
+_LIVE_TAIL_LINE_MAX_CHARS = 160
+
+
+def _read_delegation_live_manifests(live_root: Path, home: Path, *, now: float) -> dict[str, Any]:
+    """Parse ``cache/delegation/live/<id>/manifest.json`` into per-delegation cards.
+
+    Upstream writes the manifest at dispatch and amends per-task statuses after
+    the batch joins (``tools/delegation_live_log.py:255-287``); task logs sit in
+    the same directory. hermesd derives each task's log name from the task index
+    (``task-<index>.log``) instead of trusting the manifest's stored path. Tails
+    are redacted through hermesd's own layer even though upstream pre-redacts
+    the file, because this is free text reaching a panel.
+
+    The bounded scan mirrors ``_count_delegation_live_logs``: symlinked run dirs
+    and any path that resolves outside ``home`` are skipped. The count is
+    presence-based (every run dir holding a capped ``manifest.json``), while
+    only the newest ``_MAX_LIVE_MANIFESTS`` directories are parsed into cards —
+    so the panel can say "showing N of M" instead of silently truncating. A
+    torn manifest still counts its delegation but yields no card; it must never
+    fail the source.
+    """
+    empty = {"delegation_live_manifests": [], "delegation_live_manifest_count": 0}
+    if not _safe_child_path(live_root, home) or not live_root.is_dir():
+        return empty
+    candidates: list[tuple[float, Path]] = []
+    count = 0
+    with contextlib.suppress(OSError):
+        for run_dir in islice(live_root.iterdir(), _BOUNDED_SCAN_LIMIT):
+            if run_dir.is_symlink() or not run_dir.is_dir():
+                continue
+            if not _path_resolves_under(run_dir, home):
+                continue
+            manifest_file = run_dir / "manifest.json"
+            if (
+                manifest_file.is_symlink()
+                or not _safe_capped_file(manifest_file, home)
+                or not _exists_strict(manifest_file)
+            ):
+                continue
+            count += 1
+            candidates.append((_safe_mtime(run_dir), run_dir))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    manifests: list[DelegationLiveManifest] = []
+    for mtime, run_dir in candidates:
+        manifest = _live_manifest_from_dir(run_dir, home, mtime=mtime, now=now)
+        if manifest is not None:
+            manifests.append(manifest)
+            if len(manifests) >= _MAX_LIVE_MANIFESTS:
+                break
+    return {
+        "delegation_live_manifests": manifests,
+        "delegation_live_manifest_count": count,
+    }
+
+
+def _live_manifest_from_dir(
+    run_dir: Path, home: Path, *, mtime: float, now: float
+) -> DelegationLiveManifest | None:
+    """One delegation card, or None when the manifest is absent or unusable."""
+    data = _json_object_capped(
+        _read_text_capped(run_dir / "manifest.json", home),
+        max_bytes=_LIVE_MANIFEST_MAX_BYTES,
+    )
+    if data is None:
+        return None
+    task_entries = _as_list(data.get("tasks"))
+    tasks = [_live_task_from_entry(_as_dict(entry), run_dir, home) for entry in task_entries]
+    listed = tasks[:_MAX_LIVE_TASKS]
+    # The run dir IS the delegation id upstream (the writer names it so); the
+    # manifest's own field is ignored, so a doctored id cannot mislabel a card.
+    return DelegationLiveManifest(
+        delegation_id=run_dir.name,
+        model=str(data.get("model") or ""),
+        provider=str(data.get("provider") or ""),
+        started=str(data.get("started") or ""),
+        completed=str(data.get("completed") or ""),
+        manifest_present=True,
+        dir_age_seconds=_age_seconds(mtime, now),
+        task_count=_coerce_int(data.get("task_count")) or len(task_entries),
+        running_task_count=sum(1 for task in tasks if task.status == "running"),
+        tasks=listed,
+        tasks_truncated=len(tasks) > len(listed),
+    )
+
+
+def _live_task_from_entry(entry: dict[str, Any], run_dir: Path, home: Path) -> DelegationLiveTask:
+    index = _coerce_int(entry.get("index"))
+    log_name = f"task-{index}.log"
+    tail = _live_log_tail(run_dir / log_name, home)
+    return DelegationLiveTask(
+        index=index,
+        goal=_clip_single_line(str(entry.get("goal") or "")),
+        status=str(entry.get("status") or ""),
+        exit_reason=str(entry.get("exit_reason") or ""),
+        log_name=log_name if tail else "",
+        log_tail=tail,
+    )
+
+
+def _live_log_tail(log_path: Path, home: Path) -> list[str]:
+    """The last few redacted lines of one task log; [] when absent or unsafe.
+
+    The log is a regular file inside the run dir (checked, never taken from the
+    manifest), capped by bytes and lines before redaction so a hostile tail
+    cannot spend unbounded redaction work.
+    """
+    if log_path.is_symlink() or not _path_resolves_under(log_path, home):
+        return []
+    try:
+        if not log_path.is_file() or log_path.stat().st_size == 0:
+            return []
+        text = _read_tail_text(log_path, _LIVE_TAIL_MAX_BYTES)
+    except OSError:
+        return []
+    lines = [
+        _redact_secret_text(line.strip())[:_LIVE_TAIL_LINE_MAX_CHARS]
+        for line in text.splitlines()
+        if line.strip()
+    ]
+    return lines[-_LIVE_TAIL_MAX_LINES:]
+
+
+# Process receipt bounds. Upstream keeps 64 receipts of at most 200 KiB of
+# output each (``tools/process_registry_results.py:19-24``, ``:54``); hermesd
+# counts every receipt in the bounded scan but parses only the newest few, and
+# refuses files over the shared text cap instead of reading them whole.
+_MAX_PROCESS_RECEIPTS = 8
+_PROCESS_RECEIPT_TAIL_MAX_CHARS = 400
+
+
+def _read_process_receipts(receipts_dir: Path, home: Path, *, now: float) -> ProcessReceiptsState:
+    """Bounded read of PROFILE ``logs/process-results/proc_*.json`` receipts.
+
+    Upstream writes one 0600 JSON receipt per finished terminal process
+    (``tools/process_registry_results.py:48-61``) and prunes to 7 days / 64
+    files (``:28-45``). Everything here is presence-first: a missing directory,
+    junk JSON and oversized files are counted but never raise, and only the
+    newest ``_MAX_PROCESS_RECEIPTS`` parseable receipts are listed. Command and
+    output are redacted again through hermesd's own layer before they reach a
+    panel, though upstream already redacts both at write time (``:56-57``).
+    """
+    if (
+        receipts_dir.is_symlink()
+        or not _path_resolves_under(receipts_dir, home)
+        or not receipts_dir.is_dir()
+    ):
+        return ProcessReceiptsState()
+    candidates: list[tuple[float, Path]] = []
+    count = 0
+    newest: float | None = None
+    with contextlib.suppress(OSError):
+        for path in islice(receipts_dir.glob("proc_*.json"), _BOUNDED_SCAN_LIMIT):
+            if path.is_symlink() or not _path_resolves_under(path, home):
+                continue
+            mtime = _safe_mtime(path)
+            count += 1
+            candidates.append((mtime, path))
+            if newest is None or mtime > newest:
+                newest = mtime
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    receipts: list[ProcessReceipt] = []
+    for mtime, path in candidates:
+        if len(receipts) >= _MAX_PROCESS_RECEIPTS:
+            break
+        receipt = _process_receipt_from_file(path, home, mtime=mtime, now=now)
+        if receipt is not None:
+            receipts.append(receipt)
+    return ProcessReceiptsState(
+        dir_present=True,
+        receipt_count=count,
+        newest_receipt_age_seconds=_age_seconds(newest, now),
+        receipts=receipts,
+        receipts_truncated=count > len(receipts),
+    )
+
+
+def _process_receipt_from_file(
+    path: Path, home: Path, *, mtime: float, now: float
+) -> ProcessReceipt | None:
+    """One parsed receipt, or None when the file is unreadable or over the cap.
+
+    The text cap (256 KiB) doubles as the oversize refusal: upstream receipts
+    can legitimately approach 200 KiB of output, so refusing at the shared cap
+    keeps a worst-case file from being read whole while counting it above.
+    """
+    data = _json_object_capped(_read_text_capped(path, home), max_bytes=_MAX_TEXT_READ_BYTES)
+    if data is None:
+        return None
+    output = str(data.get("output") or "")
+    started_at = _coerce_float(data.get("started_at"))
+    exit_code = _coerce_int(data.get("exit_code"))
+    return ProcessReceipt(
+        process_id=str(data.get("id") or path.stem),
+        command=_redact_command_string(str(data.get("command") or "")),
+        exit_code=exit_code if data.get("exit_code") is not None else None,
+        completion_reason=str(data.get("completion_reason") or ""),
+        termination_source=str(data.get("termination_source") or ""),
+        started_age_seconds=_age_seconds(started_at if started_at > 0 else None, now),
+        finished_age_seconds=_age_seconds(mtime, now),
+        output_tail=_redact_secret_text(output[-_PROCESS_RECEIPT_TAIL_MAX_CHARS:]),
+    )
+
+
+def _read_checkpoint_prune_marker(marker_path: Path, home: Path, *, now: float) -> dict[str, Any]:
+    """The checkpoint auto-prune wrapper's ``.last_prune`` marker.
+
+    PROFILE scope: the marker lives in ``checkpoints/``, which upstream resolves
+    through ``get_hermes_home()`` (``tools/checkpoint_manager.py:33,37-42``), and
+    is written as a bare epoch after each wrapper pass (``:1106-1116``) with a
+    default interval of 24h (``:1094``). A fresh marker proves the wrapper ran,
+    not that pruning succeeded — per-repo failures are swallowed into the prune
+    result — so nothing downstream may read this as a store-health verdict.
+    Unreadable content falls back to the file mtime; an absent or unsafe marker
+    is a healthy default.
+    """
+    update: dict[str, Any] = {
+        "checkpoint_prune_marker_present": False,
+        "checkpoint_prune_marker_age_seconds": None,
+    }
+    if (
+        marker_path.is_symlink()
+        or not _path_resolves_under(marker_path, home)
+        or not _exists_strict(marker_path)
+        or not marker_path.is_file()
+    ):
+        return update
+    stamp = _coerce_float(_read_text_capped(marker_path, home).strip())
+    age = _age_seconds(stamp if stamp > 0 else None, now)
+    if age is None:
+        age = _age_seconds(_safe_mtime(marker_path), now)
+    update["checkpoint_prune_marker_present"] = True
+    update["checkpoint_prune_marker_age_seconds"] = age
+    return update
+
+
+def _read_corrupt_ledger_marker(path: Path, home: Path, *, now: float) -> dict[str, Any]:
+    """The ``spawn-ledger.json.corrupt`` parking bay, presence and mtime only.
+
+    ROOT scope, pinned to the ledger itself: upstream parks an unparseable
+    ``spawn-ledger.json`` beside it with ``os.replace``
+    (``hermes_cli/process_identity.py:160-171``), and the ledger resolves through
+    ``get_default_hermes_root()`` ("Machine-root ledger path",
+    ``:27,128-137``). The parked file's contents are the corrupt bytes and are
+    never read here — mtime is the only signal.
+    """
+    update: dict[str, Any] = {
+        "spawn_ledger_corrupt_present": False,
+        "spawn_ledger_corrupt_age_seconds": None,
+    }
+    if (
+        path.is_symlink()
+        or not _path_resolves_under(path, home)
+        or not _exists_strict(path)
+        or not path.is_file()
+    ):
+        return update
+    update["spawn_ledger_corrupt_present"] = True
+    update["spawn_ledger_corrupt_age_seconds"] = _age_seconds(_safe_mtime(path), now)
+    return update
 
 
 def _read_state_snapshots(root: Path, home: Path, *, now: float) -> dict[str, Any]:

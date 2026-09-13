@@ -8,6 +8,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import time
 from pathlib import Path
 from subprocess import CompletedProcess
 
@@ -1367,6 +1368,105 @@ def test_delegation_detail_rows_capped_at_ten_newest(hermes_home: Path):
     assert ops.delegations[0].delegation_id == "deleg_14"
 
 
+def test_delegation_process_accounting_counts_across_result_entries(hermes_home: Path):
+    """Per-child background-process accounting is summed across the payload.
+
+    Upstream stamps each child entry with ``handed_off_processes``,
+    ``orphaned_processes`` and ``unread_completions`` before the result is
+    persisted (``tools/delegate_tool_child_run.py:744-762``), and the combined
+    result lands in ``result_json`` (``tools/async_delegation.py:198-205``).
+    """
+    conn = _open_state_db(hermes_home)
+    create_async_delegations_table(conn)
+    result = {
+        "results": [
+            {
+                "status": "ok",
+                "handed_off_processes": [{"session_id": "proc_a", "command": "sleep 100"}],
+                "orphaned_processes": [
+                    {"session_id": "proc_b", "command": "watch", "runtime_seconds": 12}
+                ],
+                "unread_completions": [
+                    {
+                        "session_id": "proc_c",
+                        "command": "build",
+                        "exit_code": 3,
+                        "output_tail": "error: boom",
+                    }
+                ],
+            },
+            {
+                "status": "error",
+                "orphaned_processes": [
+                    {"session_id": "proc_d", "command": "tail -f", "runtime_seconds": 1},
+                    {"session_id": "proc_e", "command": "top", "runtime_seconds": 2},
+                ],
+            },
+        ],
+        "process_notes": ["Handed off to you: proc_a (sleep 100) — you own it now."],
+    }
+    insert_delegation(conn, "deleg_procs", result_json=json.dumps(result))
+    conn.commit()
+    conn.close()
+
+    entry = _collect_ops(hermes_home).operations.delegations[0]
+    assert entry.handed_off_count == 1
+    assert entry.orphaned_count == 3
+    assert entry.unread_completion_count == 1
+
+
+def test_delegation_process_accounting_counts_partial_rows(hermes_home: Path):
+    """A still-running unit's mid-flight row counts the same shape.
+
+    ``record_unit_child`` persists ``{"results": [...], "partial": true}``
+    (``tools/async_delegation.py:208-225``); the counts must survive the join.
+    """
+    conn = _open_state_db(hermes_home)
+    create_async_delegations_table(conn)
+    insert_delegation(
+        conn,
+        "deleg_partial",
+        state="running",
+        result_json=json.dumps(
+            {
+                "results": [
+                    {
+                        "status": "ok",
+                        "unread_completions": [
+                            {"session_id": "proc_x", "exit_code": 0, "output_tail": "done"}
+                        ],
+                    }
+                ],
+                "partial": True,
+            }
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    entry = _collect_ops(hermes_home).operations.delegations[0]
+    assert entry.handed_off_count == 0
+    assert entry.orphaned_count == 0
+    assert entry.unread_completion_count == 1
+
+
+def test_delegation_process_accounting_defaults_to_zero(hermes_home: Path):
+    """Payloads without the accounting keys — and unparseable ones — read as 0."""
+    conn = _open_state_db(hermes_home)
+    create_async_delegations_table(conn)
+    insert_delegation(conn, "deleg_plain")
+    insert_delegation(conn, "deleg_junk", result_json="[[[")
+    conn.commit()
+    conn.close()
+
+    by_id = {d.delegation_id: d for d in _collect_ops(hermes_home).operations.delegations}
+    for delegation_id in ("deleg_plain", "deleg_junk"):
+        entry = by_id[delegation_id]
+        assert entry.handed_off_count == 0
+        assert entry.orphaned_count == 0
+        assert entry.unread_completion_count == 0
+
+
 def test_delegation_undelivered_counts_only_completed_rows(hermes_home: Path):
     conn = _open_state_db(hermes_home)
     create_async_delegations_table(conn)
@@ -2231,3 +2331,382 @@ def test_discovered_repos_read_error_fails_source_and_keeps_last_good(
         assert [r.root for r in third.operations.discovered_repos] == ["/repo/hermesd"]
     finally:
         c.close()
+
+
+# --- live delegation manifests (item 12) ------------------------------------
+
+
+def _write_live_delegation(
+    live: Path,
+    delegation_id: str,
+    manifest: dict[str, object],
+    *,
+    logs: dict[str, str] | None = None,
+) -> Path:
+    run_dir = live / delegation_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "manifest.json").write_text(json.dumps(manifest))
+    for name, content in (logs or {}).items():
+        (run_dir / name).write_text(content)
+    return run_dir
+
+
+def _sample_manifest(**overrides: object) -> dict[str, object]:
+    manifest: dict[str, object] = {
+        "delegation_id": "deleg_live01",
+        "started": "2026-07-10 10:00:00",
+        "task_count": 2,
+        "model": "Hermes-4.5",
+        "provider": "nous",
+        "tasks": [
+            {"index": 0, "goal": "crawl the docs", "status": "completed", "log": "x"},
+            {
+                "index": 1,
+                "goal": "summarize",
+                "status": "max_iterations",
+                "exit_reason": "max_iterations",
+                "log": "y",
+            },
+        ],
+    }
+    manifest.update(overrides)
+    return manifest
+
+
+def test_delegation_live_manifests_are_parsed(hermes_home: Path, sample_db: Path):
+    live = hermes_home / "cache" / "delegation" / "live"
+    _write_live_delegation(
+        live,
+        "deleg_live01",
+        _sample_manifest(),
+        logs={"task-0.log": "line one\n", "task-1.log": "12:00:00 assistant | working\n"},
+    )
+    c = Collector(hermes_home, clock=_fixed_clock)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+    ops = state.operations
+
+    assert "delegation_live" not in state.health.failed_sources
+    assert ops.delegation_live_manifest_count == 1
+    assert len(ops.delegation_live_manifests) == 1
+    manifest = ops.delegation_live_manifests[0]
+    assert manifest.delegation_id == "deleg_live01"
+    assert manifest.model == "Hermes-4.5"
+    assert manifest.provider == "nous"
+    assert manifest.task_count == 2
+    assert manifest.manifest_present is True
+    assert manifest.started == "2026-07-10 10:00:00"
+    assert manifest.dir_age_seconds is not None
+    assert [task.status for task in manifest.tasks] == ["completed", "max_iterations"]
+    assert manifest.tasks[1].exit_reason == "max_iterations"
+    assert manifest.running_task_count == 0
+    # The task-0 tail was read; the manifest's opaque "log" path is not carried.
+    assert manifest.tasks[0].log_name == "task-0.log"
+    assert manifest.tasks[0].log_tail == ["line one"]
+    assert manifest.tasks[1].log_name == "task-1.log"
+    assert manifest.tasks[1].log_tail == ["12:00:00 assistant | working"]
+
+
+def test_delegation_live_manifest_absent_dirs_and_files_are_healthy(
+    hermes_home: Path, sample_db: Path
+):
+    live = hermes_home / "cache" / "delegation" / "live"
+    live.mkdir(parents=True)
+    (live / "deleg_nomanifest").mkdir()  # dir without a manifest: not counted
+
+    ops = _collect_ops(hermes_home).operations
+    assert ops.delegation_live_manifest_count == 0
+    assert ops.delegation_live_manifests == []
+
+
+def test_delegation_live_manifest_junk_json_is_healthy(hermes_home: Path, sample_db: Path):
+    """A torn manifest still marks a live delegation dir (presence count) but
+    yields no card; it must never fail the source."""
+    live = hermes_home / "cache" / "delegation" / "live"
+    run_dir = live / "deleg_junk"
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text("{not json")
+
+    ops = _collect_ops(hermes_home).operations
+    assert ops.delegation_live_manifest_count == 1
+    assert ops.delegation_live_manifests == []
+
+
+def test_delegation_live_manifest_dir_absent_is_healthy(hermes_home: Path, sample_db: Path):
+    ops = _collect_ops(hermes_home).operations
+    assert ops.delegation_live_manifest_count == 0
+    assert ops.delegation_live_manifests == []
+
+
+def test_delegation_live_log_tail_is_redacted_and_clipped(hermes_home: Path, sample_db: Path):
+    live = hermes_home / "cache" / "delegation" / "live"
+    tail = "\n".join(f"12:00:0{i} assistant | line {i}" for i in range(6))
+    _write_live_delegation(
+        live,
+        "deleg_secret",
+        _sample_manifest(delegation_id="deleg_secret"),
+        logs={
+            "task-0.log": (
+                tail + "\n"
+                "12:00:06 assistant | export API_TOKEN=sk-super-secret-123\n"
+                "12:09:99 assistant | [bold]styled[/bold] output\n"
+            )
+        },
+    )
+    ops = _collect_ops(hermes_home).operations
+    manifest = ops.delegation_live_manifests[0]
+    task = manifest.tasks[0]
+    joined = "\n".join(task.log_tail)
+    assert "sk-super-secret-123" not in joined
+    assert "REDACTED" in joined
+    # Only the newest lines survive the cap.
+    assert len(task.log_tail) <= 4
+    assert "line 5" in joined
+    assert "line 0" not in joined
+
+
+def test_delegation_live_manifest_symlinked_run_dir_is_ignored(
+    hermes_home: Path, sample_db: Path, tmp_path: Path
+):
+    outside = tmp_path / "outside-live"
+    outside.mkdir()
+    manifest_path = outside / "manifest.json"
+    manifest_path.write_text(json.dumps(_sample_manifest()))
+    live = hermes_home / "cache" / "delegation" / "live"
+    live.mkdir(parents=True)
+    (live / "deleg_evil").symlink_to(outside, target_is_directory=True)
+
+    ops = _collect_ops(hermes_home).operations
+    assert ops.delegation_live_manifest_count == 0
+    assert ops.delegation_live_manifests == []
+
+
+def test_delegation_live_manifest_scan_is_bounded(hermes_home: Path, sample_db: Path):
+    live = hermes_home / "cache" / "delegation" / "live"
+    live.mkdir(parents=True)
+    for index in range(30):
+        _write_live_delegation(live, f"deleg_{index:02d}", _sample_manifest())
+    ops = _collect_ops(hermes_home).operations
+    # Newest manifests first, and the rendered list is capped below the count.
+    assert ops.delegation_live_manifest_count == 30
+    assert len(ops.delegation_live_manifests) == 5
+    assert {m.delegation_id for m in ops.delegation_live_manifests} <= {
+        f"deleg_{index:02d}" for index in range(30)
+    }
+
+
+def test_delegation_live_manifest_task_list_is_capped(hermes_home: Path, sample_db: Path):
+    live = hermes_home / "cache" / "delegation" / "live"
+    tasks = [{"index": index, "goal": f"g{index}", "status": "running"} for index in range(12)]
+    _write_live_delegation(live, "deleg_many", _sample_manifest(task_count=12, tasks=tasks))
+    ops = _collect_ops(hermes_home).operations
+    manifest = ops.delegation_live_manifests[0]
+    assert manifest.task_count == 12
+    assert len(manifest.tasks) < 12
+    assert manifest.running_task_count == 12  # counted over every entry, not the cap
+
+
+# --- process completion receipts (item 13) -----------------------------------
+
+
+def _write_receipt(home: Path, name: str, record: dict[str, object]) -> Path:
+    receipts_dir = home / "logs" / "process-results"
+    receipts_dir.mkdir(parents=True, exist_ok=True)
+    path = receipts_dir / name
+    path.write_text(json.dumps(record))
+    return path
+
+
+def _receipt_record(**overrides: object) -> dict[str, object]:
+    record: dict[str, object] = {
+        "id": "proc_abc123",
+        "command": "curl -H 'Authorization: Bearer sk-live-token-9' https://api.example.dev",
+        "exit_code": 2,
+        "completion_reason": "exited",
+        "termination_source": "",
+        "started_at": time.time() - 300,
+        "output": "building...\nAUTH Bearer sk-super-secret-77\ndone, exit 2\n",
+    }
+    record.update(overrides)
+    return record
+
+
+def test_process_receipts_are_parsed_and_redacted(hermes_home: Path, sample_db: Path):
+    _write_receipt(hermes_home, "proc_abc123.json", _receipt_record())
+    _write_receipt(
+        hermes_home,
+        "proc_def456.json",
+        _receipt_record(id="proc_def456", exit_code=0, completion_reason="completed"),
+    )
+
+    c = Collector(hermes_home, clock=_fixed_clock)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "process_receipts" not in state.health.failed_sources
+    receipts = state.operations.process_receipts
+    assert receipts.dir_present is True
+    assert receipts.receipt_count == 2
+    assert receipts.newest_receipt_age_seconds is not None
+    assert receipts.receipts_truncated is False
+    by_id = {r.process_id: r for r in receipts.receipts}
+    abc = by_id["proc_abc123"]
+    assert abc.exit_code == 2
+    assert abc.completion_reason == "exited"
+    assert abc.started_age_seconds is not None and abc.started_age_seconds > 0
+    tail = abc.output_tail
+    assert "sk-super-secret-77" not in tail
+    assert "REDACTED" in tail
+    assert "sk-live-token-9" not in abc.command
+    assert "REDACTED" in abc.command
+
+
+def test_process_receipts_newest_first_and_truncation_flag(hermes_home: Path, sample_db: Path):
+    for index in range(11):
+        path = _write_receipt(
+            hermes_home,
+            f"proc_{index:02d}.json",
+            _receipt_record(id=f"proc_{index:02d}"),
+        )
+        stamp = time.time() - (20 - index) * 60
+        os.utime(path, (stamp, stamp))
+
+    ops = _collect_ops(hermes_home).operations
+    receipts = ops.process_receipts
+    assert receipts.receipt_count == 11
+    assert len(receipts.receipts) == 8
+    assert receipts.receipts_truncated is True
+    # Newest mtime first.
+    assert receipts.receipts[0].process_id == "proc_10"
+    assert receipts.receipts[-1].process_id == "proc_03"
+
+
+def test_process_receipts_absent_dir_is_healthy(hermes_home: Path, sample_db: Path):
+    ops = _collect_ops(hermes_home).operations
+    receipts = ops.process_receipts
+    assert receipts.dir_present is False
+    assert receipts.receipt_count == 0
+    assert receipts.receipts == []
+
+
+def test_process_receipts_junk_and_oversized_are_counted_not_listed(
+    hermes_home: Path, sample_db: Path
+):
+    receipts_dir = hermes_home / "logs" / "process-results"
+    receipts_dir.mkdir(parents=True, exist_ok=True)
+    (receipts_dir / "proc_junk.json").write_text("{not json")
+    oversized = receipts_dir / "proc_big.json"
+    oversized.write_text(json.dumps({"id": "proc_big", "output": "x" * 300_000}))
+
+    # A legitimately large receipt (upstream allows ~200 KiB of output) still parses.
+    _write_receipt(
+        hermes_home,
+        "proc_mid.json",
+        _receipt_record(id="proc_mid", output="y" * 100_000),
+    )
+
+    ops = _collect_ops(hermes_home).operations
+    receipts = ops.process_receipts
+    # Presence count includes unreadable/oversized files; only parseable ones list.
+    assert receipts.receipt_count == 3
+    assert [r.process_id for r in receipts.receipts] == ["proc_mid"]
+    assert len(receipts.receipts[0].output_tail) <= 400
+
+
+def test_process_receipts_symlinked_dir_reads_as_absent(
+    hermes_home: Path, sample_db: Path, tmp_path: Path
+):
+    outside = tmp_path / "outside-receipts"
+    outside.mkdir()
+    _write_receipt(outside, "proc_out.json", _receipt_record(id="proc_out"))
+    receipts_dir = hermes_home / "logs" / "process-results"
+    receipts_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        (receipts_dir / "linked").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are not supported here")
+
+    ops = _collect_ops(hermes_home).operations
+    assert ops.process_receipts.dir_present is True  # the real dir exists
+    assert ops.process_receipts.receipt_count == 0  # symlinked children are skipped
+    assert ops.process_receipts.receipts == []
+
+
+# --- checkpoint prune marker (item 22) + corrupt ledger marker (item 24) -----
+
+
+def test_checkpoint_prune_marker_age_and_overdue_threshold(hermes_home: Path, sample_db: Path):
+    """A marker older than 48h (2x the 24h interval) flags overdue.
+
+    Marker content is a bare epoch written by ``maybe_auto_prune_checkpoints``
+    (``tools/checkpoint_manager.py:1106-1116``).
+    """
+    checkpoints = hermes_home / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    marker = checkpoints / ".last_prune"
+
+    ops = _collect_ops(hermes_home).operations
+    assert ops.checkpoint_prune_marker_present is False
+    assert ops.checkpoint_prune_marker_age_seconds is None
+    assert ops.checkpoint_prune_overdue is False
+
+    marker.write_text(str(_FIXED_NOW - 3600))
+    ops = _collect_ops(hermes_home).operations
+    assert ops.checkpoint_prune_marker_present is True
+    assert ops.checkpoint_prune_marker_age_seconds == pytest.approx(3600)
+    assert ops.checkpoint_prune_overdue is False
+
+    marker.write_text(str(_FIXED_NOW - 50 * 3600))
+    ops = _collect_ops(hermes_home).operations
+    assert ops.checkpoint_prune_marker_age_seconds == pytest.approx(50 * 3600)
+    assert ops.checkpoint_prune_overdue is True
+
+
+def test_checkpoint_prune_marker_junk_content_falls_back_to_mtime(
+    hermes_home: Path, sample_db: Path
+):
+    """Upstream treats a corrupt marker as "no prior run"; hermesd falls back to
+    the file mtime so an unreadable stamp still shows staleness."""
+    marker = hermes_home / "checkpoints" / ".last_prune"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("not-a-number")
+    stamp = _FIXED_NOW - 60 * 3600
+    os.utime(marker, (stamp, stamp))
+
+    ops = _collect_ops(hermes_home).operations
+    assert ops.checkpoint_prune_marker_present is True
+    assert ops.checkpoint_prune_marker_age_seconds == pytest.approx(60 * 3600)
+    assert ops.checkpoint_prune_overdue is True
+
+
+def test_spawn_ledger_corrupt_marker_presence_and_age(hermes_home: Path, sample_db: Path):
+    """The parking bay is created by ``_read_ledger_or_quarantine``
+    (``hermes_cli/process_identity.py:160-171``) next to the ROOT ledger."""
+    ops = _collect_ops(hermes_home).operations
+    assert ops.spawn_ledger_corrupt_present is False
+    assert ops.spawn_ledger_corrupt_age_seconds is None
+
+    marker = hermes_home / "spawn-ledger.json.corrupt"
+    marker.write_text("[{corrupt ledger contents")
+    stamp = _FIXED_NOW - 7200
+    os.utime(marker, (stamp, stamp))
+
+    ops = _collect_ops(hermes_home).operations
+    assert ops.spawn_ledger_corrupt_present is True
+    assert ops.spawn_ledger_corrupt_age_seconds == pytest.approx(7200)
+
+
+def test_spawn_ledger_corrupt_symlink_is_ignored(
+    hermes_home: Path, sample_db: Path, tmp_path: Path
+):
+    outside = tmp_path / "outside-corrupt.json"
+    outside.write_text("nope")
+    marker = hermes_home / "spawn-ledger.json.corrupt"
+    marker.symlink_to(outside)
+
+    ops = _collect_ops(hermes_home).operations
+    assert ops.spawn_ledger_corrupt_present is False

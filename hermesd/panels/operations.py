@@ -8,21 +8,28 @@ from rich.text import Text
 
 from hermesd.models import (
     API_RUN_RETENTION_SECONDS,
+    CHECKPOINT_PRUNE_INTERVAL_SECONDS,
+    CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS,
     HOSTED_ROOM_DISBANDED_RETENTION_SECONDS,
     MAX_ACTIVE_HOSTED_ROOMS,
     MAX_DISBANDED_HOSTED_ROOM_TOMBSTONES,
     MAX_EVENTS_PER_HOSTED_ROOM,
     MAX_PERSISTENT_REPAIR_ATTEMPTS,
+    PROCESS_RECEIPT_MAX_FILES,
+    PROCESS_RECEIPT_RETENTION_SECONDS,
     ApiRunReservation,
     ApiRunReservationsState,
     DashboardState,
     DbRecoveryState,
+    DelegationInfo,
+    DelegationLiveManifest,
     HostedRoomState,
     HostedRoomSummary,
     OperationsState,
+    ProcessReceiptsState,
 )
 from hermesd.panels.formatting import escape_terminal_text as escape
-from hermesd.panels.formatting import fmt_age_seconds
+from hermesd.panels.formatting import fmt_age_seconds, sanitize_terminal_text
 from hermesd.theme import Theme
 
 # Rendered under the Database Recovery section. Every line is a limit on what the
@@ -69,6 +76,28 @@ _API_RUN_NOTE_LINES = (
     "elsewhere), so it is reduced to 'identity recorded' and never compared to a timestamp.",
 )
 
+# Rendered under Process Receipts: the two lines an operator needs to not
+# over-read an empty list — retention empties it legitimately, and the scope
+# differs from every other registry in this panel.
+_RECEIPT_NOTE_LINES = (
+    f"Receipts are retained upstream for {PROCESS_RECEIPT_RETENTION_SECONDS // 86400} days / "
+    f'{PROCESS_RECEIPT_MAX_FILES} files, so "no receipts yet" is normal on a quiet machine.',
+    "PROFILE-scoped: <home>/logs/process-results/ — the ROOT spawn-ledger.json is a different",
+    "registry. Command and output are redacted again before rendering; cwd and session keys",
+    "are never read.",
+)
+
+# Rendered under Live Delegation Transcripts. The first block is the thing an
+# operator will most expect and hermesd cannot have: the live roster (per-task
+# tool counts, steer state, depth) exists only in gateway memory and over RPC.
+# The second covers the writer's own best-effort status updates.
+_LIVE_MANIFEST_NOTE_LINES = (
+    "Manifests and task-log tails only: the live roster — per-task tool counts, steer",
+    "state, depth — exists in gateway memory and over RPC, and hermesd cannot see it.",
+    "Task statuses are the writer's best-effort post-join updates; a crashed join",
+    "leaves tasks marked running. Tails are redacted again before rendering.",
+)
+
 # Rendered whenever a bounded list was cut short, so a display cap can never be
 # mistaken for the size of the table it came from.
 _TRUNCATION_LABEL = "showing {shown} of {total} — the counts above cover the whole table"
@@ -99,6 +128,13 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     if delegation_line:
         lines.append("  Delegations: ", style=theme.ui_label)
         lines.append(f"{delegation_line}\n", style=theme.banner_text)
+    if ops.delegation_live_manifests:
+        running = sum(m.running_task_count for m in ops.delegation_live_manifests)
+        lines.append("  Live delegations: ", style=theme.ui_label)
+        lines.append(
+            f"{ops.delegation_live_manifest_count} live · {running} running\n",
+            style=theme.banner_text,
+        )
     # Counts only, like every other compact row here: room names and run ids are
     # untrusted free text and belong to the detail view.
     if ops.hosted_rooms.db_present:
@@ -112,9 +148,25 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     if ops.api_runs.db_present:
         lines.append("  API Runs: ", style=theme.ui_label)
         lines.append(f"{ops.api_runs.reservation_count} retained\n", style=theme.banner_text)
+    if ops.process_receipts.receipt_count:
+        lines.append("  Finished procs: ", style=theme.ui_label)
+        lines.append(f"{ops.process_receipts.receipt_count} receipts\n", style=theme.banner_text)
     if ops.blocked_script_count:
         lines.append("  Blocked scripts: ", style=theme.ui_label)
         lines.append(f"{ops.blocked_script_count}\n", style=theme.ui_warn)
+    if ops.checkpoint_prune_overdue:
+        age = ops.checkpoint_prune_marker_age_seconds
+        lines.append("  ⚠ Checkpoint prune overdue ", style=theme.ui_warn)
+        lines.append(
+            f"({_age_span_label(age)} since last pass)\n",
+            style=theme.ui_warn,
+        )
+    if ops.spawn_ledger_corrupt_present:
+        lines.append("  ⚠ spawn-ledger corrupt ", style=theme.ui_warn)
+        lines.append(
+            f"(parked {_age_span_label(ops.spawn_ledger_corrupt_age_seconds)} ago)\n",
+            style=theme.ui_warn,
+        )
     lines.append("  Verify: ", style=theme.ui_label)
     if ops.verification_db_present:
         lines.append(
@@ -161,6 +213,15 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
             )
         )
         sections.append(_delegations_table(ops, theme))
+
+    if ops.delegation_live_manifests:
+        sections.append(_heading("Live Delegation Transcripts", theme))
+        sections.extend(_live_manifest_sections(ops, theme))
+        sections.append(_note(_LIVE_MANIFEST_NOTE_LINES, theme))
+
+    # Always stated, even when the directory has never existed: an absent
+    # receipt store is the normal case on a quiet machine, not a failure.
+    sections.extend(_receipt_sections(ops.process_receipts, theme))
 
     if ops.state_db_size_bytes or ops.state_db_schema_version:
         sections.append(_heading("State DB", theme))
@@ -216,6 +277,8 @@ def _has_no_artifacts(ops: OperationsState) -> bool:
         and not ops.projects_db_present
         and not ops.goal_count
         and not ops.delegation_count
+        and not ops.delegation_live_manifests
+        and not ops.process_receipts.receipt_count
         and not ops.snapshot_count
         and not ops.state_db_size_bytes
         and not ops.web_ui_build_hash
@@ -480,7 +543,34 @@ def _summary_table(ops: OperationsState, theme: Theme) -> Table:
         )
     if ops.blocked_script_count:
         summary.add_row("Blocked scripts", _blocked_scripts_label(ops))
+    if ops.checkpoint_prune_marker_present:
+        summary.add_row("Checkpoint Prune", _checkpoint_prune_label(ops))
+    if ops.spawn_ledger_corrupt_present:
+        summary.add_row("Spawn Ledger", _spawn_ledger_corrupt_label(ops))
     return summary
+
+
+def _checkpoint_prune_label(ops: OperationsState) -> str:
+    """Marker age against upstream's 24h interval, with the overdue verdict.
+
+    The caveat is part of the row: a fresh marker proves the wrapper ran, not
+    that pruning succeeded.
+    """
+    age = _age_span_label(ops.checkpoint_prune_marker_age_seconds)
+    verdict = (
+        f"OVERDUE (> {_age_span_label(float(CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS))})"
+        if ops.checkpoint_prune_overdue
+        else f"interval {_age_span_label(float(CHECKPOINT_PRUNE_INTERVAL_SECONDS))}"
+    )
+    return f"last pass {age} ago · {verdict} · a fresh marker proves the wrapper ran, not that pruning succeeded"
+
+
+def _spawn_ledger_corrupt_label(ops: OperationsState) -> str:
+    """The parked corrupt ledger: presence and age, contents never read."""
+    return (
+        f"⚠ corrupt ledger parked {_age_span_label(ops.spawn_ledger_corrupt_age_seconds)} ago "
+        "(read-only viewer; contents never parsed)"
+    )
 
 
 def _blocked_scripts_label(ops: OperationsState) -> str:
@@ -592,6 +682,7 @@ def _delegations_table(ops: OperationsState, theme: Theme) -> Table:
     table.add_column("Took", justify="right", style=theme.banner_dim)
     table.add_column("Goal", style=theme.banner_text)
     table.add_column("Result", style=theme.banner_dim)
+    table.add_column("Procs", style=theme.banner_dim)
     for delegation in ops.delegations:
         delivery = escape(delegation.delivery_state) or "—"
         if delegation.delivery_attempts:
@@ -604,10 +695,132 @@ def _delegations_table(ops: OperationsState, theme: Theme) -> Table:
             _duration_label(delegation.duration_seconds),
             escape(delegation.goal) or "—",
             escape(delegation.error_excerpt) or escape(delegation.result_status) or "—",
+            _delegation_procs_label(delegation),
         )
     if not ops.delegations:
-        table.add_row("—", "—", "—", "—", "—", "—", "—")
+        table.add_row("—", "—", "—", "—", "—", "—", "—", "—")
     return table
+
+
+def _live_manifest_sections(ops: OperationsState, theme: Theme) -> list[RenderableType]:
+    """One card per parsed manifest, newest first, capped by the collector."""
+    parts: list[RenderableType] = []
+    for manifest in ops.delegation_live_manifests:
+        table = Table(box=None, show_header=False, padding=(0, 2))
+        table.add_column("Key", style=theme.ui_label)
+        table.add_column("Value", style=theme.banner_text)
+        table.add_row("Delegation", escape(manifest.delegation_id) or "—")
+        label = " / ".join(part for part in (manifest.provider, manifest.model) if part)
+        table.add_row("Model", escape(label) or "—")
+        table.add_row(
+            "Tasks", f"{manifest.task_count} total · {manifest.running_task_count} running"
+        )
+        if manifest.started:
+            table.add_row("Started", escape(manifest.started))
+        if manifest.completed:
+            table.add_row("Completed", escape(manifest.completed))
+        table.add_row("Dir Age", _age_span_label(manifest.dir_age_seconds))
+        if manifest.tasks_truncated:
+            table.add_row("Tasks", _truncation_label(len(manifest.tasks), manifest.task_count))
+        parts.append(table)
+        parts.append(_live_tasks_text(manifest, theme))
+    shown = len(ops.delegation_live_manifests)
+    if shown < ops.delegation_live_manifest_count:
+        parts.append(
+            Text(
+                "  "
+                + _truncation_label(shown, ops.delegation_live_manifest_count)
+                + " — newest first\n",
+                style=theme.banner_dim,
+            )
+        )
+    return parts
+
+
+def _live_tasks_text(manifest: DelegationLiveManifest, theme: Theme) -> Text:
+    """Per-task status lines with the optional redacted log tail.
+
+    Rich Text is literal (never markup-parsed), but the strings are escaped
+    anyway so the model layer stays untrusted end to end.
+    """
+    lines = Text()
+    if not manifest.tasks:
+        lines.append("  no task entries parsed\n", style=theme.banner_dim)
+        return lines
+    for task in manifest.tasks:
+        # Text() never parses markup, so sanitize (strip ANSI/control codes)
+        # rather than escape(): escaping here would show literal backslashes.
+        status = sanitize_terminal_text(task.status) or "unknown"
+        label = f"  task {task.index} · {status}"
+        if task.exit_reason:
+            label += f" · exit {sanitize_terminal_text(task.exit_reason)}"
+        lines.append(label + "\n", style=theme.banner_text)
+        for tail_line in task.log_tail:
+            lines.append(f"    {sanitize_terminal_text(tail_line)}\n", style=theme.banner_dim)
+    return lines
+
+
+def _receipt_sections(receipts: ProcessReceiptsState, theme: Theme) -> list[RenderableType]:
+    parts: list[RenderableType] = [_heading("Process Receipts", theme)]
+    if receipts.receipts:
+        parts.append(_receipts_table(receipts, theme))
+        if receipts.receipts_truncated:
+            parts.append(
+                Text(
+                    "  "
+                    + _truncation_label(len(receipts.receipts), receipts.receipt_count)
+                    + " — newest first\n",
+                    style=theme.banner_dim,
+                )
+            )
+    else:
+        parts.append(
+            Text(
+                "  no receipts yet — background processes that finish while unwatched land here\n",
+                style=theme.banner_dim,
+            )
+        )
+    parts.append(_note(_RECEIPT_NOTE_LINES, theme))
+    return parts
+
+
+def _receipts_table(receipts: ProcessReceiptsState, theme: Theme) -> Table:
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("Process", style=theme.ui_accent)
+    table.add_column("Exit", justify="right", style=theme.banner_text)
+    table.add_column("Reason", style=theme.banner_dim)
+    table.add_column("Finished", style=theme.banner_dim)
+    table.add_column("Command", style=theme.banner_text)
+    table.add_column("Output Tail", style=theme.banner_dim)
+    for receipt in receipts.receipts:
+        table.add_row(
+            escape(receipt.process_id) or "—",
+            "—" if receipt.exit_code is None else str(receipt.exit_code),
+            escape(receipt.completion_reason) or escape(receipt.termination_source) or "—",
+            _age_span_label(receipt.finished_age_seconds),
+            escape(receipt.command) or "—",
+            escape(_single_line(receipt.output_tail)) or "—",
+        )
+    return table
+
+
+def _single_line(value: str) -> str:
+    """Collapse a multi-line tail to one table cell, keeping the newest text."""
+    collapsed = " ⏎ ".join(part for part in value.splitlines() if part.strip())
+    return collapsed[-120:] if len(collapsed) > 120 else collapsed
+
+
+def _delegation_procs_label(delegation: DelegationInfo) -> str:
+    """Background-process accounting for one delegation; only non-zero buckets
+    render, so an old payload without the keys stays visually quiet."""
+    parts = []
+    if delegation.handed_off_count:
+        parts.append(f"{delegation.handed_off_count} handed")
+    if delegation.orphaned_count:
+        parts.append(f"{delegation.orphaned_count} orphaned")
+    if delegation.unread_completion_count:
+        parts.append(f"{delegation.unread_completion_count} unread")
+    return " · ".join(parts) if parts else "—"
 
 
 def _state_db_table(ops: OperationsState, theme: Theme) -> Table:
