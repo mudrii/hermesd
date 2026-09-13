@@ -120,10 +120,18 @@ jobs:
           PY
 
   nix:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
-      - name: Check commit-pinned Nix flake
+      - name: Check commit-pinned Nix flake (builds package, tests, and smoke checks)
         run: nix flake check --no-write-lock-file
+      - name: Build hermesd package (runs the pytest suite)
+        run: nix build .#hermesd
+      - name: Smoke test installed executable
+        run: ./result/bin/hermesd --version
