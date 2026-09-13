@@ -278,7 +278,10 @@ def _backup_section(c: ConfigSummary, theme: Theme) -> list[RenderableType]:
     else:
         table.add_row("Last changed", "no good copy")
     corrupt_count = _corrupt_backup_count(c)
-    table.add_row("Corrupt snapshots", str(corrupt_count) if corrupt_count else "none")
+    if corrupt_count:
+        table.add_row("Corrupt snapshots", Text(str(corrupt_count), style=theme.ui_error))
+    else:
+        table.add_row("Corrupt snapshots", "none")
     audit = [group for group in c.config_backup_groups if group.kind not in ("good", "corrupt")]
     if audit:
         table.add_row(
