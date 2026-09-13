@@ -8,14 +8,17 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from hermesd.collect.common import _optional_epoch
+from hermesd.collect.common import _exists_strict, _optional_epoch
 from hermesd.db import _SQLITE_TIMEOUT_SECONDS, snapshot_wal_database
 
 
 @contextlib.contextmanager
 def _connect_readonly_sqlite(db_path: Path) -> Iterator[sqlite3.Connection]:
     conn: sqlite3.Connection | None = None
-    if db_path.with_name(f"{db_path.name}-wal").exists():
+    # Strict, not Path.exists(): from Python 3.14 exists() also swallows EACCES, so
+    # an unreadable sidecar would read as absent and this would silently fall
+    # through to immutable=1 — serving checkpoint-lagging data as current.
+    if _exists_strict(db_path.with_name(f"{db_path.name}-wal")):
         snapshot_dir, snapshot_db = snapshot_wal_database(db_path, prefix="hermesd-kanban-")
         try:
             conn = sqlite3.connect(
