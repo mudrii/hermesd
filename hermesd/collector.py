@@ -1692,11 +1692,11 @@ class Collector:
     def _with_dashboard_client(self, gateway: GatewayState) -> GatewayState:
         """Web dashboard attachment from the marker file's mtime; the socket is never touched."""
         path = self._paths.shared_path("state", "dashboard_clients.heartbeat")
-        attached, age = _dashboard_client_status(path, self._paths.root_home, self._clock())
+        status = _dashboard_client_status(path, self._paths.root_home, self._clock())
         return gateway.model_copy(
             update={
-                "dashboard_client_attached": attached,
-                "dashboard_client_last_frame_age_seconds": age,
+                "dashboard_client_attached": status.attached,
+                "dashboard_client_last_frame_age_seconds": status.age_seconds,
             }
         )
 

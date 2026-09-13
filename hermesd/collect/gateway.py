@@ -821,15 +821,25 @@ def _read_start_storm(
 # ---------------------------------------------------------------------------
 
 
-def _dashboard_client_status(path: Path, root: Path, now: float) -> tuple[bool, float | None]:
-    attached = False
-    age: float | None = None
+@dataclass(frozen=True, slots=True)
+class _DashboardClientStatus:
+    """Two related answers about the marker file, named rather than positional."""
+
+    attached: bool = False
+    age_seconds: float | None = None
+
+
+def _dashboard_client_status(path: Path, root: Path, now: float) -> _DashboardClientStatus:
+    status = _DashboardClientStatus()
     if _safe_child_path(path, root):
         stamp = _mtime(path)
         if stamp is not None:
             age = max(0.0, now - stamp)
-            attached = age <= _DASHBOARD_CLIENT_ATTACHED_SECONDS
-    return attached, age
+            status = _DashboardClientStatus(
+                attached=age <= _DASHBOARD_CLIENT_ATTACHED_SECONDS,
+                age_seconds=age,
+            )
+    return status
 
 
 # ---------------------------------------------------------------------------
