@@ -318,12 +318,14 @@ def _json_object_capped(
 
     None means "no usable object" — absent, over the cap, malformed, or not a
     JSON object — which lets callers distinguish that from a genuine ``{}``.
+    ``RecursionError`` joins the suppressed set because nesting deep enough to
+    exhaust the decoder is just more junk: it must not fail the source.
     """
     if not isinstance(raw, str) or not raw:
         return None
     if len(raw.encode("utf-8", errors="replace")) > max_bytes:
         return None
-    with contextlib.suppress(json.JSONDecodeError, ValueError):
+    with contextlib.suppress(json.JSONDecodeError, ValueError, RecursionError):
         decoded = json.loads(raw)
         if isinstance(decoded, dict):
             return decoded
@@ -849,9 +851,11 @@ def _same_path_or_descendant(candidate: str, parent: str) -> bool:
 
 
 def _json_list_count(value: object) -> int:
+    """Length of a JSON array column; 0 for absent, malformed or absurdly nested
+    text, which the decoder refuses with RecursionError rather than a parse error."""
     if not isinstance(value, str) or not value:
         return 0
-    with contextlib.suppress(json.JSONDecodeError):
+    with contextlib.suppress(json.JSONDecodeError, RecursionError):
         decoded = json.loads(value)
         if isinstance(decoded, list):
             return len(decoded)
@@ -1024,12 +1028,17 @@ def _state_transition_label(entry: dict[str, Any]) -> str:
 
 
 def _moa_latest_record_summary(path: Path, max_bytes: int) -> tuple[str, list[str]]:
+    """Newest parseable JSON record's labels and keys; junk lines are skipped.
+
+    A line nested deeply enough to exhaust the decoder raises RecursionError,
+    which counts as junk here for the same reason a torn line does.
+    """
     with contextlib.suppress(OSError):
         for line in reversed(_read_tail_text(path, max_bytes).splitlines()):
             stripped = line.strip()
             if not stripped:
                 continue
-            with contextlib.suppress(json.JSONDecodeError):
+            with contextlib.suppress(json.JSONDecodeError, RecursionError):
                 data = json.loads(stripped)
                 if isinstance(data, dict):
                     keys = sorted(str(key) for key in data)[:8]
