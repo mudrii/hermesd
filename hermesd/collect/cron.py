@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import json
 import math
-import socket
 import sqlite3
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -812,9 +811,15 @@ def _cron_job_fire_claim(
     *,
     now: float,
     pid_exists: Callable[[int], bool] | None = None,
-    hostname: str | None = None,
+    hostname: str,
 ) -> tuple[float | None, CronFireClaimState | None]:
     """Fire-claim age and derived liveness, or (None, None) for no usable claim.
+
+    ``hostname`` is required: the claim's ``by`` prefix has to be matched
+    against the name the claim writer actually stamped, and only the Collector
+    (which receives it injected) knows that name. Guessing it here with
+    ``socket.gethostname()`` would silently reclassify same-host owners as
+    foreign on any host whose name the guess misses.
 
     Upstream's own liveness window is ``0 <= age < FIRE_CLAIM_TTL_SECONDS``
     (``_claim_is_live``, ``cron/jobs.py:2087-2098``), so a claim exactly at the
@@ -835,8 +840,7 @@ def _cron_job_fire_claim(
         return 0.0, None
     owner_dead = False
     if pid_exists is not None:
-        host = socket.gethostname() if hostname is None else hostname
-        owner_pid = _claim_owner_pid(claim, host)
+        owner_pid = _claim_owner_pid(claim, hostname)
         if owner_pid is not None:
             owner_dead = not pid_exists(owner_pid)
     state = (

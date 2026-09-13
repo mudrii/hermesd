@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import time
 from datetime import UTC, datetime
@@ -2971,9 +2972,17 @@ def test_collect_cron_fire_claim_dead_owner_releases_before_the_ttl(hermes_home:
     manual run instead of holding the lease for the full 300 s TTL. A foreign
     host, a machine-id override or any unparseable owner stays live — only
     kernel proof shortens the window.
+
+    The host is a sentinel that cannot be this machine's name, so the
+    ``ABANDONED_RUN`` verdict for ``job-dead`` is only reachable when the reader
+    classifies the claim through the injected ``hostname``: a reader-side
+    ``socket.gethostname()`` fallback would read both ``injected-host`` claims
+    as foreign and leave ``job-dead`` RUNNING — this assert fails on the wrong
+    verdict, not merely on a missing constructor keyword.
     """
     now = 1_800_000_000.0
-    host = "test-host"
+    host = "injected-host"
+    assert host != socket.gethostname()
     _write_jobs_json(
         hermes_home,
         [
@@ -3006,6 +3015,19 @@ def test_collect_cron_fire_claim_dead_owner_releases_before_the_ttl(hermes_home:
     assert by_id["job-dead"].fire_claim_state is CronFireClaimState.ABANDONED_RUN
     assert by_id["job-dead"].fire_claim_age_seconds == pytest.approx(5, abs=5)
     assert by_id["job-foreign"].fire_claim_state is CronFireClaimState.RUNNING
+
+
+def test_cron_fire_claim_reader_takes_no_hostname_of_its_own() -> None:
+    """The fire-claim reader has no hostname of its own to fall back on.
+
+    Only the Collector knows the name a claim writer stamps (injected there),
+    so ``_cron_job_fire_claim`` requires ``hostname``: a reader-side
+    ``socket.gethostname()`` default would silently reclassify same-host owners
+    as foreign on any host whose name the guess misses.
+    """
+    job = {"fire_claim": {"at": iso_ago(5, now=1_800_000_000.0), "by": "h:4242:tok"}}
+    with pytest.raises(TypeError, match="hostname"):
+        cron_module._cron_job_fire_claim(job, now=1_800_000_000.0, pid_exists=lambda pid: False)
 
 
 @pytest.mark.parametrize("owner", ["", "hostonly", "localhost:notdigits", None])
