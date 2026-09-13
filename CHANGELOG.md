@@ -9,7 +9,7 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ## [2026.9.13] - 2026-09-13
 
-Release preparation. This release includes all changes since the published
+This release includes all changes since the published
 `v2026.7.11`, including the unpublished `2026.9.8` development milestone below.
 See the [consolidated release notes](docs/releases/2026.9.13.md) for the complete
 release scope grouped by dashboard area.
@@ -86,7 +86,7 @@ release scope grouped by dashboard area.
 
 ### CI/CD
 
-- Follow-up validation binds release eligibility to protected-main ancestry and the latest attempt of the exact-SHA main-push CI workflow, makes dependency review part of the required aggregate gate, and rejects cancelled, missing, or unexpected gate outcomes. Both release test and build caches are disabled. Scanner reports are validated for shape, completeness and exit-code agreement; wheel pins reject duplicate requirements; sdists include their helper scripts, lockfile and policy documents. Nix restores the required Hatchling build tool and installed Git support, with package, CLI and checkpoint checks configured for all four Linux/macOS architecture targets. GitHub publication-environment and tag-policy configuration remain separate pre-publication requirements; these notes do not claim they are already enforced.
+- Follow-up validation binds release eligibility to protected-main ancestry and the latest attempt of the exact-SHA main-push CI workflow, makes dependency review part of the required aggregate gate, and rejects cancelled, missing, or unexpected gate outcomes. Both release test and build caches are disabled. Scanner reports are validated for shape, completeness and exit-code agreement; wheel pins reject duplicate requirements; sdists include their helper scripts, lockfile and policy documents. Nix restores the required Hatchling build tool and installed Git support, with package, CLI and checkpoint checks configured for all four Linux/macOS architecture targets. The publication environment now admits only `v*` tags without administrator bypass; version-tag creation is administrator-only and tag updates/deletion are blocked. Protected-main ancestry is enforced separately by the release workflow.
 - Validated development-tool updates include pytest 9.1.1, Ruff 0.16.6 and types-PyYAML 6.0.12.20260906. Cross-version JSON-error and platform timestamp tests now exercise failures deterministically.
 - Hardened the whole pipeline per the consolidated CI/CD audit. Nix now proves buildability: the flake derives its version from `pyproject.toml` (single source of truth), declares `checks` outputs that build the package, run its pytest suite, and smoke the installed CLI, and CI builds `.#hermesd` on Linux and macOS instead of merely evaluating. Published runtime requirements are exact pins matching `uv.lock` (`rich==14.3.3`, `pyyaml==6.0.3`, `pydantic==2.13.4`), enforced against wheel metadata by `scripts/check_wheel_pins.py`; the pydantic upgrade itself was validated on hermesd's own full Python 3.11–3.14 matrix, mypy, and snapshot/threading surfaces before landing (decision and evidence in `docs/dependency-decisions.md`).
 - CI now separates lint/format/types into a `static` job, dependency auditing into a `security` job (per-interpreter, marker-aware), and keeps the test matrix to behavior; a composite `locked-env` action defines toolchain setup once so CI and the publication workflow cannot drift, with release builds keeping uv caching disabled to preserve the publication trust boundary.
@@ -290,7 +290,7 @@ release scope grouped by dashboard area.
 ## [2026.9.8] - 2026-09-08
 
 Unpublished development milestone; all changes in this section are included in
-the `2026.9.13` release preparation.
+the `2026.9.13` release.
 
 ### Added
 

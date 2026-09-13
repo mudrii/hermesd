@@ -35,17 +35,18 @@ Rules that keep the gate honest:
 
 ## Branch protection (CI-03)
 
-`main` is protected by a classic branch protection rule, not a ruleset.
-Policy:
+`main` is protected by a classic branch protection rule. The live settings were
+verified on 13 September 2026:
 
 1. Integration into `main` is pull-request-only; direct pushes are rejected.
-2. Required check: the **`CI gate`** context (plus the job contexts, if
-   required explicitly). Red or missing checks block merge.
+2. Required check: the **`CI gate`** context, bound to the GitHub Actions app
+   (app ID 15368). Red or missing checks block merge.
 3. Strict-freshness ("require branches to be up to date") is enabled so every
    merge carries current validation evidence.
 4. Force pushes and branch deletion are denied.
-5. Administrator/bot bypass: **disabled** — no role merges without the gate.
-   Emergency exceptions happen by reverting through a PR, not by bypass.
+5. Administrator enforcement is enabled (`enforce_admins: true`), so no role
+   merges without the gate. Emergency exceptions happen by reverting through a
+   PR, not by bypass.
 
 ## Release eligibility (CI-04)
 
@@ -59,21 +60,27 @@ A tag is publish-eligible only when all of the following hold:
    conclusion. Missing, failed, cancelled, stale, or still-running evidence
    refuses publication.
 3. Tag/package-version/changelog agreement (checked in `release-build`).
-4. The `pypi` GitHub environment must restrict deployment to approved release
-   tag refs under the selected reviewer policy; the eligibility check above
-   separately proves protected `main` history. Publication uses OIDC trusted
-   publishing.
+4. The `pypi` GitHub environment accepts only `v*` tag refs. Publication uses
+   OIDC trusted publishing after the eligibility and release-test jobs succeed.
 
-**Observed repository state (13 September 2026):** the `pypi` environment uses
-a custom deployment policy that allows only the `main` branch. A release job
-runs from a tag ref, so this branch-only rule blocks the intended `v*` tag
-deployment. The environment has no required reviewers and permits administrator
-bypass. CI-04 remains open until the allowed release-tag pattern and reviewer/
-bypass policy are chosen, configured, and verified.
+**Verified repository controls (13 September 2026):** the `pypi` environment
+has one deployment policy: pattern `v*`, type `tag`. The former `main`-branch
+policy was deleted. Publishing is automated with no required reviewers; its
+administrator bypass is disabled. The workflow still requires protected-`main`
+ancestry, exact-SHA CI evidence, and fresh dependency audits before the publish
+job can reach the environment.
 
-Tag protection target (CI-04): `v*` tags are created only from protected
-`main` history, and tag creation/update rights follow the same restriction as
-pushes. No active tag ruleset currently enforces this target.
+Two active rulesets target `refs/tags/v*`:
+
+- **Release tag creation** (ID 23175145) applies a `creation` rule. Its only
+  bypass actor is the administrator repository role (role ID 5), and that
+  bypass applies only to creation.
+- **Immutable release tags** (ID 23175146) applies `update`, `deletion`, and
+  `non_fast_forward` rules, with no bypass actor.
+
+These tag rulesets control who can create a release tag and make it immutable
+after creation. They do not prove protected-`main` ancestry; the
+`release-eligibility` job enforces that separately before publication.
 
 ## Dependency policy (CI-06/07/08/13)
 

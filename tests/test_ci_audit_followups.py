@@ -260,17 +260,21 @@ def test_nix_ci_exercises_every_advertised_flake_system() -> None:
     assert ci["jobs"]["nix"]["runs-on"] == "${{ matrix.runner }}"
 
 
-def test_policy_distinguishes_enforced_controls_from_pending_repository_settings() -> None:
-    policy = Path("docs/ci-release-policy.md").read_text()
+def test_policy_documents_verified_repository_controls() -> None:
+    policy = " ".join(Path("docs/ci-release-policy.md").read_text().split())
 
     assert "classic branch protection rule" in policy
-    assert "not a ruleset" in policy
+    assert "bound to the GitHub Actions app" in policy
+    assert "Administrator enforcement is enabled" in policy
     assert "direct runtime requirements" in policy
     assert "transitive dependencies" in policy
     assert "dependency-review" in policy and "CI gate" in policy
-    assert "Observed repository state" in policy
-    assert "restrict deployment to approved release" in policy
-    assert "separately proves protected `main` history" in policy
-    assert "allows only the `main` branch" in policy
-    assert "branch-only rule blocks" in policy
-    assert "No active tag ruleset" in policy
+    assert "accepts only `v*` tag refs" in policy
+    assert "pattern `v*`, type `tag`" in policy
+    assert "no required reviewers" in policy
+    assert "administrator bypass is disabled" in policy
+    assert "Release tag creation" in policy
+    assert "Immutable release tags" in policy
+    assert "`update`, `deletion`, and `non_fast_forward` rules" in policy
+    assert "do not prove protected-`main` ancestry" in policy
+    assert "`release-eligibility` job enforces that separately" in policy
