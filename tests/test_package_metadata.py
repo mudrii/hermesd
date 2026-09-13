@@ -340,6 +340,9 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
     assert 'uv run python -m venv "$RUNNER_TEMP/sdist-smoke"' in ci_package_commands
     assert '"$RUNNER_TEMP/sdist-smoke/bin/hermesd" --version' in ci_package_commands
     assert '"$RUNNER_TEMP/sdist-smoke/bin/python" -I -m hermesd --version' in ci_package_commands
+    # Installed-artifact behavior smoke must run for wheel and sdist (audit
+    # CI-19): snapshots, missing data, read-only, distribution metadata.
+    assert ci_package_commands.count("scripts/installed_smoke.py") == 2
     # No checkout-relative smoke paths may remain.
     assert ".wheel-smoke" not in ci_package_commands.replace("$RUNNER_TEMP/wheel-smoke", "")
     assert ".sdist-smoke" not in ci_package_commands.replace("$RUNNER_TEMP/sdist-smoke", "")
@@ -372,6 +375,7 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
     assert '"$RUNNER_TEMP/sdist-smoke/bin/python" -m pip install dist/*.tar.gz' in release_commands
     assert '"$RUNNER_TEMP/sdist-smoke/bin/hermesd" --version' in release_commands
     assert '"$RUNNER_TEMP/sdist-smoke/bin/python" -I -m hermesd --version' in release_commands
+    assert release_commands.count("scripts/installed_smoke.py") == 2
     assert "uv run twine check dist/*" in release_commands
     upload_step = _action_step(publish, "release-build", UPLOAD_ARTIFACT_ACTION)
     assert upload_step["with"] == {

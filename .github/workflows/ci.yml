@@ -138,10 +138,12 @@ jobs:
           "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip install dist/*.whl
           "$RUNNER_TEMP/wheel-smoke/bin/hermesd" --version
           "$RUNNER_TEMP/wheel-smoke/bin/python" -I -m hermesd --version
+          "$RUNNER_TEMP/wheel-smoke/bin/python" scripts/installed_smoke.py
           uv run python -m venv "$RUNNER_TEMP/sdist-smoke"
           "$RUNNER_TEMP/sdist-smoke/bin/python" -m pip install dist/*.tar.gz
           "$RUNNER_TEMP/sdist-smoke/bin/hermesd" --version
           "$RUNNER_TEMP/sdist-smoke/bin/python" -I -m hermesd --version
+          "$RUNNER_TEMP/sdist-smoke/bin/python" scripts/installed_smoke.py
       - name: Check package metadata
         run: uv run twine check dist/*
 
