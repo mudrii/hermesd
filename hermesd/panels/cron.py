@@ -60,12 +60,14 @@ _LAST_STATUS_STYLES = {
 # Incident lifecycle is detected -> alerted -> closed (``cron/incidents.py:1-9``):
 # ``alerted`` is set only when a failure ping actually left the process
 # (``cron/scheduler.py:2745-2746``). An open row still in ``detected`` therefore
-# means no failure notice ever reached the operator — the alert delivery path
-# itself is broken — and because ``acked_at`` is only ever written together with
-# ``closed_at`` (``cron/incidents.py:186-195``), it can never be acknowledged
-# away. An unseen state is kept verbatim rather than folded in.
+# records no *delivered* failure ping — but that alone does not prove the alert
+# delivery path is broken, because upstream also leaves the row in ``detected``
+# when the failure notice was only queued (``cron/scheduler.py:2516-2528``).
+# And because ``acked_at`` is only ever written together with ``closed_at``
+# (``cron/incidents.py:186-195``), it can never be acknowledged away. An unseen
+# state is kept verbatim rather than folded in.
 _INCIDENT_STATE_LABELS = {
-    "detected": "never alerted",
+    "detected": "no delivered failure ping",
     "alerted": "alerted",
 }
 _INCIDENT_STATE_STYLES = {
@@ -73,10 +75,12 @@ _INCIDENT_STATE_STYLES = {
     "alerted": "ui_warn",
 }
 _INCIDENT_ACK_NOTE = (
-    "  detected = no failure ping ever reached the operator; upstream marks a row\n"
-    "  alerted only when the ping actually leaves the process, so a row still\n"
-    "  detected is a broken alert path, and acked_at is only ever set together with\n"
-    "  closed_at — open incidents can never be acknowledged."
+    "  detected = no delivered failure ping recorded; upstream marks a row\n"
+    "  alerted only when the ping actually leaves the process, and a notice can\n"
+    "  also sit queued (cron/scheduler.py:2516-2528) without the row moving — a\n"
+    "  detected row is an alert to chase, not proof the delivery path is broken.\n"
+    "  acked_at is only ever set together with closed_at — open incidents can\n"
+    "  never be acknowledged."
 )
 
 # Rendered on every detail pass: both catch-up markers are best effort and the
