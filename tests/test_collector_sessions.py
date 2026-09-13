@@ -35,6 +35,7 @@ from tests.conftest import (
     create_session_coordination_tables,
     create_state_db_tables,
     insert_compression_lock,
+    insert_gateway_route,
     insert_model_usage,
     insert_turn_lease,
 )
@@ -2603,3 +2604,50 @@ def test_active_surface_joinable_chip_from_shared_runtime_url(hermes_home: Path)
     # The advertised URL must never be stored, let alone rendered.
     assert "127.0.0.1" not in str(state.active_surfaces)
     assert "8123" not in str(state.active_surfaces)
+
+
+def test_hygiene_rows_report_an_exact_total_beyond_the_capped_list(hermes_home: Path) -> None:
+    """A capped row list must never be presented as the count.
+
+    ``SessionCoordinationState``'s own rule is that totals are exact while the
+    lists are capped, and the compact marker used ``len()`` of the capped list.
+    """
+    conn = _make_coordination_db(hermes_home)
+    for index in range(55):
+        conn.execute(
+            "INSERT INTO gateway_hygiene_state (session_key, failure_streak) VALUES (?, ?)",
+            (f"telegram:{index}", index % 6 + 1),
+        )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW)
+    try:
+        coord = c.collect().session_coordination
+    finally:
+        c.close()
+
+    assert len(coord.hygiene) == 50
+    assert coord.hygiene_total == 55
+
+
+def test_route_total_is_reported_beside_capped_route_rows(hermes_home: Path) -> None:
+    conn = _make_coordination_db(hermes_home)
+    for index in range(55):
+        insert_gateway_route(
+            conn,
+            f"telegram:{index}",
+            {"session_id": "missing", "platform": "telegram", "suspended": True},
+            _COORD_NOW - 30,
+        )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: False)
+    try:
+        coord = c.collect().session_coordination
+    finally:
+        c.close()
+
+    assert len(coord.routes) == 50
+    assert coord.route_total == 55

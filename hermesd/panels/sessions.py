@@ -156,8 +156,11 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         if orphaned:
             lines.append(f" {orphaned} orphaned", style=f"bold {theme.ui_error}")
     if coord.hygiene:
-        # Per-chat session-hygiene failure streaks: compaction backing off.
-        lines.append(f"  ⚠ {len(coord.hygiene)} hygiene cooldown(s)", style=f"bold {theme.ui_warn}")
+        # Per-chat session-hygiene failure streaks: compaction backing off. The
+        # model's own rule: report the exact total, never the capped row count.
+        lines.append(
+            f"  ⚠ {coord.hygiene_total} hygiene cooldown(s)", style=f"bold {theme.ui_warn}"
+        )
         suspended = sum(1 for row in coord.hygiene if row.suspended)
         if suspended:
             lines.append(f" · {suspended} compaction off", style=f"bold {theme.ui_error}")
@@ -880,6 +883,10 @@ def _coordination_sections(state: DashboardState, theme: Theme) -> list[Renderab
         sections.append(Text(f"  {_LEASE_NOTE}", style=theme.banner_dim))
     if coord.hygiene:
         sections.append(section_heading("Hygiene Cooldowns", theme))
+        caption = f"  {coord.hygiene_total} chat(s) with a failure streak"
+        if coord.hygiene_total > len(coord.hygiene):
+            caption += f" — showing the worst {len(coord.hygiene)}"
+        sections.append(Text(caption, style=theme.banner_text))
         sections.append(_hygiene_table(coord.hygiene, theme))
         sections.append(Text(f"  {_HYGIENE_NOTE}", style=theme.banner_dim))
     if coord.routes:
@@ -888,8 +895,12 @@ def _coordination_sections(state: DashboardState, theme: Theme) -> list[Renderab
         waiting = sum(1 for route in coord.routes if route.needs_user_message)
         dangling = sum(1 for route in coord.routes if route.dangling)
         if waiting or dangling:
+            # Only a capped list needs the routing table's exact size beside it.
+            total = coord.route_total if coord.route_total > len(coord.routes) else None
             sections.append(
-                Text(f"  {_route_counts_label(waiting, dangling)}\n", style=theme.banner_text)
+                Text(
+                    f"  {_route_counts_label(waiting, dangling, total)}\n", style=theme.banner_text
+                )
             )
     # An emptied table is the worst case of the never-prune invariant break:
     # the chat total is 0 exactly when the shrink flag is set, so gating on the
@@ -1032,14 +1043,18 @@ def _routes_table(routes: list[GatewayRouteState], theme: Theme) -> Table:
     return table
 
 
-def _route_counts_label(waiting: int, dangling: int) -> str:
+def _route_counts_label(waiting: int, dangling: int, total: int | None = None) -> str:
+    """Counts from the retained rows, with the table's exact size when capped.
+
+    ``total`` is only passed when the row list was truncated, so an uncapped
+    panel keeps the plain wording rather than stating the obvious.
+    """
+    scope = f" of {total} routed chats" if total is not None else " chat(s)"
     parts: list[str] = []
     if waiting:
-        parts.append(f"{waiting} chat(s) need a user message to recover")
+        parts.append(f"{waiting}{scope} need a user message to recover")
     if dangling:
-        parts.append(
-            f"{dangling} dangling route(s) — the gateway would resume a nonexistent session"
-        )
+        parts.append(f"{dangling}{scope} dangling — the gateway would resume a nonexistent session")
     return " · ".join(parts)
 
 

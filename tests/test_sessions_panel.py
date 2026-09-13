@@ -967,3 +967,54 @@ def test_terminal_section_labels_a_truncated_scan_as_a_floor() -> None:
     )
     assert "1 open CLI terminals in the last 24 hours" in text
     assert "at least" not in text
+
+
+def test_hygiene_counts_use_the_exact_total_not_the_capped_list() -> None:
+    """60 chats with streaks must not render as the 3 retained rows."""
+    coord = SessionCoordinationState(
+        hygiene=[
+            GatewayHygieneState(session_key=f"chat-{index}", failure_streak=4, suspended=True)
+            for index in range(3)
+        ],
+        hygiene_total=60,
+    )
+    compact = render_to_str(
+        render_sessions(DashboardState(session_coordination=coord), Theme()),
+        width=110,
+        no_color=True,
+    )
+    assert "60 hygiene cooldown(s)" in compact
+
+    detail = render_to_str(
+        render_sessions(DashboardState(session_coordination=coord), Theme(), detail=True),
+        width=140,
+        no_color=True,
+    )
+    assert "60 chat(s) with a failure streak" in detail
+    assert "showing the worst 3" in detail
+
+
+def test_route_counts_carry_the_exact_denominator_when_the_list_is_capped() -> None:
+    """A capped route list must not imply it is the whole routing table."""
+    routes = [
+        GatewayRouteState(session_key=f"chat-{index}", platform="telegram", suspended=True)
+        for index in range(50)
+    ]
+    coord = SessionCoordinationState(routes=routes, route_total=500)
+    detail = render_to_str(
+        render_sessions(DashboardState(session_coordination=coord), Theme(), detail=True),
+        width=140,
+        no_color=True,
+    )
+    assert "50 of 500 routed chats need a user message to recover" in detail
+
+    uncapped = SessionCoordinationState(
+        routes=[GatewayRouteState(session_key="chat-1", suspended=True)], route_total=1
+    )
+    detail = render_to_str(
+        render_sessions(DashboardState(session_coordination=uncapped), Theme(), detail=True),
+        width=140,
+        no_color=True,
+    )
+    assert "1 chat(s) need a user message to recover" in detail
+    assert "of 1 routed chats" not in detail

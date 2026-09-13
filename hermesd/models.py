@@ -707,6 +707,8 @@ class SessionCoordinationState(BaseModel):
     leases: list[SessionLease] = Field(default_factory=list)
     lease_total: int = 0
     hygiene: list[GatewayHygieneState] = Field(default_factory=list)
+    # Exact count of chats with a non-zero failure streak; ``hygiene`` is capped.
+    hygiene_total: int = 0
     routes: list[GatewayRouteState] = Field(default_factory=list)
     route_total: int = 0
     generations: list[ConversationGeneration] = Field(default_factory=list)

@@ -351,6 +351,7 @@ class _SessionCoordinationRows:
     lock_rows: tuple[dict[str, Any], ...] = ()
     lease_total: int = 0
     hygiene_rows: tuple[dict[str, Any], ...] = ()
+    hygiene_total: int = 0
     routing_rows: tuple[dict[str, Any], ...] = ()
     routing_total: int = 0
     generation_rows: tuple[dict[str, Any], ...] = ()
@@ -389,9 +390,12 @@ def _read_session_coordination_rows(conn: Any) -> _SessionCoordinationRows:
         )
         lease_total += _table_count_or_zero(conn, "compression_locks")
     hygiene_rows: tuple[dict[str, Any], ...] = ()
+    hygiene_total = 0
     if _table_exists(conn, "gateway_hygiene_state"):
         # A 0-streak row is cleared state upstream keeps only transiently; it is
-        # not a warning and never reaches the panel.
+        # not a warning and never reaches the panel. The total counts exactly the
+        # rows the list is filtered to, so a capped list can never be mistaken
+        # for the count.
         hygiene_rows = tuple(
             _query_rows(
                 conn,
@@ -399,6 +403,10 @@ def _read_session_coordination_rows(conn: Any) -> _SessionCoordinationRows:
                 "WHERE COALESCE(failure_streak, 0) > 0 "
                 f"ORDER BY COALESCE(failure_streak, 0) DESC LIMIT {_HYGIENE_ROW_LIMIT}",
             )
+        )
+        hygiene_total = _count_rows(
+            conn,
+            "SELECT COUNT(*) FROM gateway_hygiene_state WHERE COALESCE(failure_streak, 0) > 0",
         )
     routing_rows: tuple[dict[str, Any], ...] = ()
     routing_total = 0
@@ -431,6 +439,7 @@ def _read_session_coordination_rows(conn: Any) -> _SessionCoordinationRows:
         lock_rows=lock_rows,
         lease_total=lease_total,
         hygiene_rows=hygiene_rows,
+        hygiene_total=hygiene_total,
         routing_rows=routing_rows,
         routing_total=routing_total,
         generation_rows=generation_rows,
@@ -497,6 +506,7 @@ _HYGIENE_SUSPENSION_STREAK = 3
 def _hygiene_fields(
     rows: tuple[dict[str, Any], ...],
     session_rows: list[dict[str, Any]],
+    total: int = 0,
 ) -> dict[str, Any]:
     """Pair each streak with the chat's recorded compression failure, if any.
 
@@ -519,7 +529,7 @@ def _hygiene_fields(
         )
         for row in rows
     ]
-    return {"hygiene": hygiene}
+    return {"hygiene": hygiene, "hygiene_total": total}
 
 
 def _route_free_text(value: object) -> str:

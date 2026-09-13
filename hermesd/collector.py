@@ -2002,7 +2002,11 @@ class Collector:
                 raise RuntimeError("state.db gateway hygiene disappeared or became unsafe")
             return coord
         return coord.model_copy(
-            update=_hygiene_fields(readout.coordination.hygiene_rows, session_rows)
+            update=_hygiene_fields(
+                readout.coordination.hygiene_rows,
+                session_rows,
+                readout.coordination.hygiene_total,
+            )
         )
 
     def _with_gateway_routes(
