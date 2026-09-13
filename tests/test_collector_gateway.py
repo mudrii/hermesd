@@ -20,13 +20,14 @@ import yaml
 from hermesd.collect.gateway import (
     _INCARNATION_SCAN_LIMIT,
     _OPEN_DELIVERY_LIMIT,
+    _listener_mirror_urls,
 )
 from hermesd.collector import (
     Collector,
     _is_dashboard_process,
     _pid_exists,
 )
-from hermesd.models import GatewayLoopHealth, PlatformOwnership, PlatformStatus
+from hermesd.models import DashboardState, GatewayLoopHealth, PlatformOwnership, PlatformStatus
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
 from tests.conftest import create_state_db_tables, render_to_str
@@ -823,6 +824,10 @@ def _collect(home: Path, *, live_pid: int = 4242):
         return collector.collect()
     finally:
         collector.close()
+
+
+def _gateway_detail(state: DashboardState) -> str:
+    return render_to_str(render_panel(1, state, Theme(), detail=True), width=200, no_color=True)
 
 
 # --------------------------------------------------------------------------
@@ -2831,14 +2836,43 @@ def test_restart_storm_garbage_and_future_lines_are_ignored(hermes_home: Path):
 
 
 def test_restart_storm_empty_file_records_nothing(hermes_home: Path):
+    """Upstream appends ``now`` before its atomic replace, so an empty ledger is not a ledger."""
     _write_gateway_state(hermes_home)
     (hermes_home / "gateway-starts.log").write_text("")
 
-    gateway = _collect(hermes_home).gateway
+    state = _collect(hermes_home)
 
-    assert gateway.gateway_starts_recorded is True
-    assert gateway.gateway_starts_2m == 0
-    assert gateway.seconds_since_last_gateway_start is None
+    assert state.gateway.gateway_starts_recorded is False
+    assert state.gateway.gateway_starts_2m == 0
+    assert state.gateway.seconds_since_last_gateway_start is None
+    assert "Starts:" not in _gateway_detail(state)
+
+
+@pytest.mark.parametrize("content", ["   \n\n", "not-a-float\n# junk\n\n"])
+def test_restart_storm_unparseable_file_records_nothing(hermes_home: Path, content: str):
+    _write_gateway_state(hermes_home)
+    (hermes_home / "gateway-starts.log").write_text(content)
+
+    state = _collect(hermes_home)
+
+    assert state.gateway.gateway_starts_recorded is False
+    assert state.gateway.gateway_starts_2m == 0
+    assert state.gateway.in_respawn_backoff is False
+    assert "Starts:" not in _gateway_detail(state)
+
+
+def test_restart_storm_one_valid_epoch_beside_junk_still_records(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    (hermes_home / "gateway-starts.log").write_text(f"not-a-float\n{NOW - 30!r}\n\n")
+
+    state = _collect(hermes_home)
+
+    assert state.gateway.gateway_starts_recorded is True
+    assert state.gateway.gateway_starts_2m == 1
+    assert state.gateway.gateway_starts_1h == 1
+    assert state.gateway.seconds_since_last_gateway_start == pytest.approx(30.0)
+    assert state.gateway.restart_storm_cap == 5
+    assert "Starts:" in _gateway_detail(state)
 
 
 # --------------------------------------------------------------------------
@@ -3090,3 +3124,70 @@ def test_listener_base_mirrors_are_redacted(hermes_home: Path):
 
     assert "hunter2" not in json.dumps(platform.model_dump(mode="json"))
     assert platform.mirror_urls["dev"].startswith("http://[REDACTED]@127.0.0.1:8088/p/dev/v1")
+
+
+@pytest.mark.parametrize("state", ["starting", "paused", "unknown"])
+def test_listener_base_mirrors_require_a_serving_state(hermes_home: Path, state: str):
+    """Upstream mirrors only a serving default entry (gateway/status.py:962-966)."""
+    _write_gateway_state(
+        hermes_home,
+        served_profiles=["dev"],
+        platforms={
+            "api_server": {"state": state, "listener_base": "http://127.0.0.1:8088"},
+        },
+    )
+
+    assert _collect(hermes_home).gateway.platforms[0].mirror_urls == {}
+
+
+def test_listener_base_mirrors_absent_when_state_is_missing(hermes_home: Path):
+    _write_gateway_state(
+        hermes_home,
+        served_profiles=["dev"],
+        platforms={"api_server": {"listener_base": "http://127.0.0.1:8088"}},
+    )
+
+    platform = _collect(hermes_home).gateway.platforms[0]
+
+    assert platform.state == "unknown"
+    assert platform.mirror_urls == {}
+
+
+@pytest.mark.parametrize("state", ["connected", "connecting", "retrying"])
+def test_listener_base_mirrors_are_synthesized_for_every_serving_state(
+    hermes_home: Path, state: str
+):
+    _write_gateway_state(
+        hermes_home,
+        served_profiles=["dev"],
+        platforms={
+            "api_server": {"state": state, "listener_base": "http://127.0.0.1:8088"},
+        },
+    )
+
+    assert _collect(hermes_home).gateway.platforms[0].mirror_urls == {
+        "dev": "http://127.0.0.1:8088/p/dev/v1"
+    }
+
+
+def test_listener_mirror_urls_need_a_live_writer():
+    assert (
+        _listener_mirror_urls(
+            "api_server",
+            {"listener_base": "https://x.test"},
+            "connected",
+            record_current=False,
+            served_profiles=["coding"],
+        )
+        == {}
+    )
+
+
+def test_listener_mirror_urls_skip_the_default_profile():
+    assert _listener_mirror_urls(
+        "api_server",
+        {"listener_base": "https://x.test"},
+        "connected",
+        record_current=True,
+        served_profiles=["default", "coding"],
+    ) == {"coding": "https://x.test/p/coding/v1"}

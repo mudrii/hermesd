@@ -121,6 +121,12 @@ _PROFILE_PLATFORM_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}:[a-z0-9][a-z0-
 # (hermes_cli/gateway_multiplex_served.py:66-68): the route belonged to an
 # adapter that is not serving, so the URL is history rather than an endpoint.
 _INGRESS_SUPPRESSED_STATES = frozenset({"fatal", "disconnected", "stopped"})
+# Adapter states the multiplexer will mirror a shared listener for
+# (gateway/status.py:962-966). Upstream asks whether the default's entry is
+# *serving*, not whether it escaped a failure vocabulary: ``paused`` and any
+# unrecognised or missing state are refused, so neither may publish a callback
+# URL hermesd synthesized for a secondary profile.
+_MIRROR_SERVING_STATES = frozenset({"connected", "connecting", "retrying"})
 
 
 def _optional_int(value: object) -> int | None:
@@ -224,12 +230,15 @@ def _listener_mirror_urls(
     Mirrors ``shared_listener_mirror_platforms`` (``gateway/status.py:951-974``):
     the multiplexer never builds api_server/webhook adapters for a secondary, so
     every reader must synthesize ``<listener_base>/p/<profile><mirror_path>``
-    from the default profile's own entry. The same suppression rules as recorded
-    ingress URLs apply — a dead writer, a suppressed state, or a missing base
-    mean the URL is history rather than an endpoint — and the value is redacted
-    at the data boundary. Only a bounded roster of served profiles is synthesized.
+    from the default profile's own entry. Only an entry upstream calls *serving*
+    is mirrored — ``_MIRROR_SERVING_STATES``, the allow-list at
+    ``gateway/status.py:962-966`` — not the ingress deny-list, which answers a
+    different question (a paused or unlabelled adapter is not serving, and
+    upstream refuses to publish its URL). A dead writer or a missing base also
+    mean the URL is history rather than an endpoint, and the value is redacted at
+    the data boundary. Only a bounded roster of served profiles is synthesized.
     """
-    if not record_current or state in _INGRESS_SUPPRESSED_STATES:
+    if not record_current or state not in _MIRROR_SERVING_STATES:
         return {}
     if name not in _SHARED_LISTENER_MIRROR_PLATFORMS:
         return {}
@@ -714,7 +723,13 @@ class _StartStorm:
 
 
 def _read_start_storm(path: Path, root: Path, now: float) -> _StartStorm:
-    """Count recorded gateway starts in the storm-detection windows."""
+    """Count recorded gateway starts in the storm-detection windows.
+
+    ``recorded`` means "a ledger we can read", not "a file exists": upstream
+    appends ``now`` before its atomic ``os.replace`` (``gateway/status.py:64-79``),
+    so a file whose every line fails to parse — empty, whitespace or junk — was
+    not written by the ledger and proves as little as an absent one.
+    """
     if not path.is_file():
         return _StartStorm()
     text = _read_text_capped(path, root)
@@ -730,7 +745,7 @@ def _read_start_storm(path: Path, root: Path, now: float) -> _StartStorm:
         if 0.0 < epoch <= now:
             starts.append(epoch)
     if not starts:
-        return _StartStorm(recorded=True)
+        return _StartStorm()
     return _StartStorm(
         recorded=True,
         starts_2m=sum(1 for start in starts if now - start <= _RESTART_STORM_WINDOW_SECONDS),
