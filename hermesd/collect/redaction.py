@@ -286,6 +286,41 @@ def _redact_text_fields(text: str) -> str:
     return "".join((*pieces, text[consumed:]))
 
 
+# Well-known credential prefixes (GitHub's ghp_/gho_/ghs_/ghu_, Slack's
+# xox[baprs]-) and the base64url header every JWT opens with. Free text decoded
+# from an untrusted source — a chat display name, a resume reason — can carry
+# such a value with no `key = value` shape for _redact_text_fields to key on,
+# so the value shape itself is matched.
+#
+# Linearity: every alternative is a literal prefix plus one length-floored run
+# that ends its branch, so the run is consumed greedily and never backtracked —
+# a long line costs one linear pass. (A run followed by a required literal, as
+# in a dotted-JWT-only shape, would backtrack per `eyJ` occurrence instead.)
+# The `eyJ` branch therefore covers a JWT's dotted base64url runs in one class
+# rather than pinned segment by segment.
+_BARE_CREDENTIAL_RE = re.compile(
+    r"sk-[A-Za-z0-9_-]{12,}"
+    r"|pk-[A-Za-z0-9_-]{12,}"
+    r"|rk-[A-Za-z0-9_-]{12,}"
+    r"|gh[pous]_[A-Za-z0-9]{12,}"
+    r"|github_pat_[A-Za-z0-9_]{12,}"
+    r"|xox[baprs]-[A-Za-z0-9-]{12,}"
+    r"|eyJ[A-Za-z0-9_.-]{12,}"
+)
+
+
+def _redact_bare_credentials(value: str) -> str:
+    """Scrub bare well-known credential shapes anywhere in ``value``.
+
+    The field-oriented redactor above only rewrites ``key = value`` shapes, so
+    an unlabelled token in remote-controlled free text would pass through it.
+    Text without a credential shape is returned unchanged.
+    """
+    if not value:
+        return ""
+    return _BARE_CREDENTIAL_RE.sub("[REDACTED]", value)
+
+
 def _redact_secret_text(value: str) -> str:
     if value.lstrip().startswith(("{", "[")):
         try:
