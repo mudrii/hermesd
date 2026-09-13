@@ -5,8 +5,9 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import socket
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -789,17 +790,38 @@ _FIRE_CLAIM_TTL_SECONDS = 300.0
 _PENDING_SLOT_SCHEDULE_KINDS = frozenset({"cron", "interval"})
 
 
+def _claim_owner_pid(claim: dict[str, Any], hostname: str) -> int | None:
+    """The claim owner's pid when ``by`` names THIS host, else None (fail safe).
+
+    Upstream stamps ``by`` as ``f"{_machine_id()}:{uuid4().hex}"``
+    (``cron/jobs.py:2588``) and only proves death for a same-host pid
+    (``_claim_owner_is_dead``, ``:2070-2086``): a foreign host, an explicit
+    ``HERMES_MACHINE_ID`` or an unparseable owner never shortens the TTL.
+    """
+    parts = str(claim.get("by") or "").split(":")
+    if len(parts) < 2 or not parts[1].isdigit() or parts[0] != hostname:
+        return None
+    return int(parts[1])
+
+
 def _cron_job_fire_claim(
-    job: dict[str, Any], *, now: float
+    job: dict[str, Any],
+    *,
+    now: float,
+    pid_exists: Callable[[int], bool] | None = None,
+    hostname: str | None = None,
 ) -> tuple[float | None, CronFireClaimState | None]:
     """Fire-claim age and derived liveness, or (None, None) for no usable claim.
 
     Upstream's own liveness window is ``0 <= age < FIRE_CLAIM_TTL_SECONDS``
     (``_claim_is_live``, ``cron/jobs.py:2087-2098``), so a claim exactly at the
     TTL is already stale: the run it leased died before its first 60 s heartbeat
-    could be replaced. A future-dated stamp (clock/TZ skew) is stale upstream
-    too, but rendering that as "abandoned run" would claim evidence hermesd does
-    not have, so it reports no state.
+    could be replaced. A same-host owner pid that has exited releases the claim
+    even earlier (``_claim_owner_is_dead``, ``:2070-2086``), which is what stops
+    a killed ``hermes cron run`` from blocking the next manual run for the whole
+    window. A future-dated stamp (clock/TZ skew) is stale upstream too, but
+    rendering that as "abandoned run" would claim evidence hermesd does not
+    have, so it reports no state.
     """
     claim = _as_dict(job.get("fire_claim"))
     claimed_at = _iso_to_epoch(str(claim.get("at") or ""))
@@ -808,9 +830,15 @@ def _cron_job_fire_claim(
     age = now - claimed_at
     if age < 0:
         return 0.0, None
+    owner_dead = False
+    if pid_exists is not None:
+        host = socket.gethostname() if hostname is None else hostname
+        owner_pid = _claim_owner_pid(claim, host)
+        if owner_pid is not None:
+            owner_dead = not pid_exists(owner_pid)
     state = (
         CronFireClaimState.RUNNING
-        if age < _FIRE_CLAIM_TTL_SECONDS
+        if age < _FIRE_CLAIM_TTL_SECONDS and not owner_dead
         else CronFireClaimState.ABANDONED_RUN
     )
     return age, state
@@ -844,9 +872,9 @@ def _cron_job_fire_error(job: dict[str, Any], *, now: float) -> tuple[str, float
     ``note_fire_forward_failure`` records that a scheduled fire could not be
     handed to the runner — the only trace of a dashboard fire webhook miss, since
     no execution row is written and ``last_error`` stays null
-    (``cron/jobs.py:2200-2212``). ``mark_job_run`` clears it on the next run
-    outcome (``cron/jobs.py:2231-2232``), so the text describes current auto-fire
-    health. The detail is arbitrary webhook text (URLs, tokens), so it goes
+    (``cron/jobs.py:2200-2212``). It is popped only when a run *succeeds*
+    (``cron/jobs.py:2228-2232``), so a repeatedly failing job keeps the original
+    text: the recorded age beside it is part of the message, not decoration. The detail is arbitrary webhook text (URLs, tokens), so it goes
     through the same redacting excerpt helper as every other free-text error.
     """
     err = _as_dict(job.get("last_fire_error"))

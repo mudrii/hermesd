@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import time
 from datetime import UTC, datetime
@@ -2926,3 +2927,67 @@ def test_collect_cron_future_dated_fire_claim_carries_no_state(hermes_home: Path
     job = state.cron.jobs[0]
     assert job.fire_claim_age_seconds == 0.0
     assert job.fire_claim_state is None
+
+
+def test_collect_cron_fire_claim_dead_owner_releases_before_the_ttl(hermes_home: Path):
+    """A same-host owner pid that has exited releases the claim immediately.
+
+    ``_claim_is_live`` (``cron/jobs.py:2087-2098``) returns False when
+    ``_claim_owner_is_dead`` (``:2070-2086``) proves the claim's ``by`` pid is
+    gone on THIS host, so a killed ``hermes cron run`` stops blocking the next
+    manual run instead of holding the lease for the full 300 s TTL. A foreign
+    host, a machine-id override or any unparseable owner stays live — only
+    kernel proof shortens the window.
+    """
+    now = 1_800_000_000.0
+    host = socket.gethostname()
+    _write_jobs_json(
+        hermes_home,
+        [
+            {
+                "id": "job-alive",
+                "name": "Owner alive",
+                "fire_claim": {"at": iso_ago(5, now=now), "by": f"{host}:4242:abc"},
+            },
+            {
+                "id": "job-dead",
+                "name": "Owner gone",
+                "fire_claim": {"at": iso_ago(5, now=now), "by": f"{host}:4243:def"},
+            },
+            {
+                "id": "job-foreign",
+                "name": "Foreign host",
+                "fire_claim": {"at": iso_ago(5, now=now), "by": "elsewhere:4243:ghi"},
+            },
+        ],
+    )
+
+    c = Collector(hermes_home, pid_exists=lambda pid: pid == 4242, clock=lambda: now)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    by_id = {job.job_id: job for job in state.cron.jobs}
+    assert by_id["job-alive"].fire_claim_state is CronFireClaimState.RUNNING
+    assert by_id["job-dead"].fire_claim_state is CronFireClaimState.ABANDONED_RUN
+    assert by_id["job-dead"].fire_claim_age_seconds == pytest.approx(5, abs=5)
+    assert by_id["job-foreign"].fire_claim_state is CronFireClaimState.RUNNING
+
+
+@pytest.mark.parametrize("owner", ["", "hostonly", "localhost:notdigits", None])
+def test_collect_cron_fire_claim_unverifiable_owner_stays_live(hermes_home: Path, owner: object):
+    """An owner hermesd cannot parse or place is unverifiable, never dead."""
+    now = 1_800_000_000.0
+    _write_jobs_json(
+        hermes_home,
+        [{"id": "job-x", "fire_claim": {"at": iso_ago(5, now=now), "by": owner}}],
+    )
+
+    c = Collector(hermes_home, pid_exists=lambda pid: False, clock=lambda: now)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.cron.jobs[0].fire_claim_state is CronFireClaimState.RUNNING

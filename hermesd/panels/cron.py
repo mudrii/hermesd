@@ -149,17 +149,32 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         )
     fire_failed = [j for j in c.jobs if j.last_fire_error]
     if fire_failed:
+        newest_fire_error_age = min(
+            (
+                job.last_fire_error_age_seconds
+                for job in fire_failed
+                if job.last_fire_error_age_seconds is not None
+            ),
+            default=None,
+        )
         lines.append(
-            f"  ⚠ Fire forward failed on {len(fire_failed)} job(s)\n",
+            f"  ⚠ Fire forward failed on {len(fire_failed)} job(s)  "
+            f"newest {_fmt_error_age(newest_fire_error_age)}\n",
             style=theme.ui_error,
         )
     if executions.open_incident_count:
         lines.append("  Incidents: ", style=theme.ui_label)
-        lines.append(
-            f"{executions.open_incident_count} open "
-            f"({executions.unacked_incident_count} unacked)\n",
-            style=theme.ui_error,
-        )
+        # ``acked_at`` is written only together with ``closed_at`` upstream, so an
+        # open incident is always unacked in this schema; the qualifier is only
+        # rendered when it distinguishes something.
+        if executions.unacked_incident_count != executions.open_incident_count:
+            lines.append(
+                f"{executions.open_incident_count} open "
+                f"({executions.unacked_incident_count} unacked)\n",
+                style=theme.ui_error,
+            )
+        else:
+            lines.append(f"{executions.open_incident_count} open\n", style=theme.ui_error)
     lines.append("  Jobs: ", style=theme.ui_label)
     lines.append(f"{c.job_count}", style=theme.banner_text)
     lines.append("  Errors: ", style=theme.ui_label)

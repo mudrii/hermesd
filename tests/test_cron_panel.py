@@ -1171,3 +1171,40 @@ def test_cron_detail_keeps_alerted_incident_label_and_unknown_states_verbatim() 
     # into 'never alerted'.
     assert "alerted" in text
     assert "quarantined" in text
+
+
+def test_cron_compact_fire_forward_line_carries_the_newest_age() -> None:
+    """An ageless warning reads as current; the newest miss age bounds it."""
+    state = DashboardState(
+        cron=CronState(
+            jobs=[
+                CronJob(
+                    job_id="j1",
+                    name="old",
+                    last_fire_error="loopback refused",
+                    last_fire_error_age_seconds=86400.0,
+                ),
+                CronJob(
+                    job_id="j2",
+                    name="recent",
+                    last_fire_error="loopback refused",
+                    last_fire_error_age_seconds=120.0,
+                ),
+            ]
+        )
+    )
+    text = render_to_str(render_cron(state, Theme()), width=100, no_color=True)
+    assert "Fire forward failed on 2 job(s)" in text
+    assert "newest 2m ago" in text
+
+
+def test_cron_compact_hides_unacked_when_it_cannot_differ() -> None:
+    """``acked_at`` is written only with ``closed_at``, so open == unacked in this
+    schema (``cron/incidents.py:172-203``); the qualifier is only worth a line
+    when a foreign schema diverges from that."""
+    state = DashboardState(
+        cron_executions=_executions_state(open_incident_count=2, unacked_incident_count=2)
+    )
+    text = render_to_str(render_cron(state, Theme()), width=100, no_color=True)
+    assert "Incidents: 2 open" in text
+    assert "unacked" not in text

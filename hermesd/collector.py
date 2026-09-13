@@ -2468,7 +2468,9 @@ class Collector:
                 dispatch_lateness, dispatch_kind = _cron_job_dispatch(j)
                 repeat_times, repeat_completed = _cron_job_repeat(j)
                 paused, paused_reason = _cron_job_paused(j)
-                fire_claim_age, fire_claim_state = _cron_job_fire_claim(j, now=now)
+                fire_claim_age, fire_claim_state = _cron_job_fire_claim(
+                    j, now=now, pid_exists=self._pid_exists
+                )
                 pending_slot_at, pending_slot_age = _cron_job_pending_slot(j, now=now)
                 fire_error, fire_error_age = _cron_job_fire_error(j, now=now)
                 jobs.append(
