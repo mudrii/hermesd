@@ -56,7 +56,11 @@ class LastGoodFileCache:
             values=self._json_values,
             bad_mtimes=self._json_bad_mtimes,
             load=lambda: _load_json(path),
-            load_errors=(OSError, UnicodeError, json.JSONDecodeError),
+            # RecursionError is how the decoder refuses a nesting bomb. It is a
+            # deterministic content failure like a parse error, so it must be
+            # caught here: uncaught, it escapes the mtime bookkeeping and the
+            # file is re-parsed on every single refresh.
+            load_errors=(OSError, UnicodeError, json.JSONDecodeError, RecursionError),
             is_valid=_is_json_mapping,
             default_factory=dict,
         )
@@ -68,7 +72,7 @@ class LastGoodFileCache:
             values=self._json_lists,
             bad_mtimes=self._json_list_bad_mtimes,
             load=lambda: _load_json(path),
-            load_errors=(OSError, UnicodeError, json.JSONDecodeError),
+            load_errors=(OSError, UnicodeError, json.JSONDecodeError, RecursionError),
             is_valid=_is_json_object_list,
             default_factory=list,
         )
@@ -80,7 +84,8 @@ class LastGoodFileCache:
             values=self._yaml_values,
             bad_mtimes=self._yaml_bad_mtimes,
             load=lambda: _load_yaml(path),
-            load_errors=(OSError, UnicodeError, yaml.YAMLError),
+            # Deeply nested YAML exhausts the recursive composer the same way.
+            load_errors=(OSError, UnicodeError, yaml.YAMLError, RecursionError),
             is_valid=_is_json_mapping,
             default_factory=dict,
         )

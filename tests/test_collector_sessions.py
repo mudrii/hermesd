@@ -2609,6 +2609,33 @@ def test_terminal_breadcrumbs_absent_directory_is_empty(hermes_home: Path) -> No
     assert state.terminal_sessions.sessions == []
 
 
+def test_terminal_breadcrumbs_deeply_nested_json_reads_as_junk(hermes_home: Path) -> None:
+    """A nesting bomb is junk, not a failed source.
+
+    ``json.loads`` refuses nesting deep enough to exhaust the decoder with
+    ``RecursionError`` rather than a ``JSONDecodeError``, so the guard has to
+    name it: otherwise the terminal-sessions source lands in failed_sources
+    over one hostile breadcrumb.
+    """
+    directory = hermes_home / "terminal-sessions"
+    directory.mkdir()
+    (directory / "tty-bomb").write_text('{"ts": ' + "[" * 3000 + "]" * 3000 + "}")
+    _write_breadcrumb(
+        directory,
+        "tty-dev-pts-3",
+        {"session_id": "sess_t", "cwd": "/repo", "ts": _COORD_NOW - 60},
+    )
+
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "terminal_sessions" not in state.health.failed_sources
+    assert state.terminal_sessions.count == 1
+
+
 def test_terminal_breadcrumb_rows_are_bounded(hermes_home: Path) -> None:
     directory = hermes_home / "terminal-sessions"
     for i in range(15):

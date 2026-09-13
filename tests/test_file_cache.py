@@ -485,3 +485,31 @@ def test_invalid_utf8_keeps_bad_mtime_caching(tmp_path, monkeypatch):
     assert cache.read_json_mapping(path) == {"ok": 1}
     assert cache.read_json_mapping(path) == {"ok": 1}
     assert open_calls == 1
+
+
+def test_deeply_nested_json_is_refused_and_not_reparsed(tmp_path, monkeypatch):
+    """A nesting bomb is a content failure, not a transient one.
+
+    ``json.loads`` refuses nesting deep enough to exhaust the decoder with
+    ``RecursionError``, which was not in ``load_errors``: the exception escaped
+    the mtime bookkeeping, so the file was re-parsed on every refresh instead of
+    being remembered as bad for its mtime.
+    """
+    cache = LastGoodFileCache()
+    path = tmp_path / "bomb.json"
+    path.write_text("[" * 3000 + "]" * 3000)
+
+    open_calls = 0
+    real_open = Path.open
+
+    def counting_open(self: Path, *args, **kwargs):
+        nonlocal open_calls
+        if self == path:
+            open_calls += 1
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+
+    assert cache.read_json_mapping(path) == {}
+    assert cache.read_json_mapping(path) == {}
+    assert open_calls == 1

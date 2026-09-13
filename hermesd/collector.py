@@ -2093,7 +2093,9 @@ class Collector:
                 continue
             try:
                 data = json.loads(_read_text_capped(entry, home))
-            except (json.JSONDecodeError, UnicodeError):
+            except (json.JSONDecodeError, UnicodeError, RecursionError):
+                # RecursionError is the deep-nesting refusal, not a parse error:
+                # a nesting bomb is junk like any other unreadable breadcrumb.
                 continue
             if not isinstance(data, dict):
                 continue
