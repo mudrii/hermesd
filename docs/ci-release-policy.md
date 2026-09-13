@@ -68,8 +68,10 @@ history; tag creation/update rights follow the same restriction as pushes.
   release builds). A fresh install resolves to the same versions exercised by
   CI. Bump the pin and the lock together.
 - Dev toolchain extras keep floor pins; `uv.lock` is the real development
-  environment. The Docker and Nix environments resolve their own locked
-  baselines and are validated independently.
+  environment. The Docker environment installs the same locked pins; the Nix
+  environment satisfies runtime requirements from nixpkgs, whose in-tree
+  versions may run ahead of the lock, and validates them with the build-time
+  pytest suite plus the installed-CLI smoke rather than wheel metadata.
 - Dependabot opens weekly PRs for GitHub Actions (minor/patch grouped,
   majors separate), uv, and Docker. Security alerts and security updates
   from repository settings are always active and unaffected by cadence.
