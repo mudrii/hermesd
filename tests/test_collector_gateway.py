@@ -20,6 +20,7 @@ import yaml
 from hermesd.collect.gateway import (
     _INCARNATION_SCAN_LIMIT,
     _OPEN_DELIVERY_LIMIT,
+    _listener_mirror_urls,
 )
 from hermesd.collector import (
     Collector,
@@ -3090,3 +3091,70 @@ def test_listener_base_mirrors_are_redacted(hermes_home: Path):
 
     assert "hunter2" not in json.dumps(platform.model_dump(mode="json"))
     assert platform.mirror_urls["dev"].startswith("http://[REDACTED]@127.0.0.1:8088/p/dev/v1")
+
+
+@pytest.mark.parametrize("state", ["starting", "paused", "unknown"])
+def test_listener_base_mirrors_require_a_serving_state(hermes_home: Path, state: str):
+    """Upstream mirrors only a serving default entry (gateway/status.py:962-966)."""
+    _write_gateway_state(
+        hermes_home,
+        served_profiles=["dev"],
+        platforms={
+            "api_server": {"state": state, "listener_base": "http://127.0.0.1:8088"},
+        },
+    )
+
+    assert _collect(hermes_home).gateway.platforms[0].mirror_urls == {}
+
+
+def test_listener_base_mirrors_absent_when_state_is_missing(hermes_home: Path):
+    _write_gateway_state(
+        hermes_home,
+        served_profiles=["dev"],
+        platforms={"api_server": {"listener_base": "http://127.0.0.1:8088"}},
+    )
+
+    platform = _collect(hermes_home).gateway.platforms[0]
+
+    assert platform.state == "unknown"
+    assert platform.mirror_urls == {}
+
+
+@pytest.mark.parametrize("state", ["connected", "connecting", "retrying"])
+def test_listener_base_mirrors_are_synthesized_for_every_serving_state(
+    hermes_home: Path, state: str
+):
+    _write_gateway_state(
+        hermes_home,
+        served_profiles=["dev"],
+        platforms={
+            "api_server": {"state": state, "listener_base": "http://127.0.0.1:8088"},
+        },
+    )
+
+    assert _collect(hermes_home).gateway.platforms[0].mirror_urls == {
+        "dev": "http://127.0.0.1:8088/p/dev/v1"
+    }
+
+
+def test_listener_mirror_urls_need_a_live_writer():
+    assert (
+        _listener_mirror_urls(
+            "api_server",
+            {"listener_base": "https://x.test"},
+            "connected",
+            record_current=False,
+            served_profiles=["coding"],
+        )
+        == {}
+    )
+
+
+def test_listener_mirror_urls_skip_the_default_profile():
+    assert _listener_mirror_urls(
+        "api_server",
+        {"listener_base": "https://x.test"},
+        "connected",
+        record_current=True,
+        served_profiles=["default", "coding"],
+    ) == {"coding": "https://x.test/p/coding/v1"}
