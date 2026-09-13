@@ -220,6 +220,7 @@ from hermesd.collect.skills import (
 )
 from hermesd.collect.sqlite_util import (
     _connect_readonly_sqlite,
+    _snapshot_wal_if_present,
     _table_count_or_zero,
 )
 from hermesd.collect.system import (
@@ -734,6 +735,10 @@ class Collector:
         # state and the gateway ledgers so a pass snapshots the (large, WAL)
         # db only once.
         self._state_db_cache: tuple[int, _StateDbReadout] | None = None
+        # kanban.db's shared WAL snapshots, keyed by source path: each entry is
+        # (source mtime, path to read, temp-dir owner). One per database, so the
+        # boards' own stores do not evict the root one.
+        self._kanban_snapshots: dict[Path, tuple[int | None, Path, Any]] = {}
         self._checkpoint_summary_cache: dict[
             str, tuple[tuple[int, ...], tuple[int, float | None, str]]
         ] = {}
@@ -2661,6 +2666,33 @@ class Collector:
             platforms=platform_infos,
         )
 
+    def _kanban_read_path(self, db_path: Path) -> Path:
+        """A path to read kanban.db from, copying its WAL at most once per change.
+
+        Three readers touch this database in a refresh — the board state, one
+        summary per board, and the notify subscriptions — and each used to
+        snapshot the WAL on its own, copying a multi-megabyte file per reader.
+        The snapshot is keyed by the source's mtime (db plus sidecar) and shared
+        by all of them; without a WAL there is nothing to copy and the real path
+        is returned.
+        """
+        key = _db_source_mtime_ns(db_path)
+        cached = self._kanban_snapshots.get(db_path)
+        if cached is not None and key is not None and cached[0] == key:
+            return cached[1]
+        if cached is not None:
+            owner = cached[2]
+            if owner is not None:
+                owner.cleanup()
+            del self._kanban_snapshots[db_path]
+        snapshot = _snapshot_wal_if_present(db_path)
+        if snapshot is None:
+            self._kanban_snapshots[db_path] = (key, db_path, None)
+            return db_path
+        snapshot_dir, snapshot_db = snapshot
+        self._kanban_snapshots[db_path] = (key, snapshot_db, snapshot_dir)
+        return snapshot_db
+
     def _collect_kanban(self) -> KanbanState:
         cfg = self._read_yaml_reporting_stale()
         kanban_cfg = _as_dict(cfg.get("kanban"))
@@ -2683,7 +2715,14 @@ class Collector:
             if last_kanban is not None and last_kanban.db_present:
                 raise RuntimeError("kanban.db replaced by unsafe path")
             return self._with_kanban_boards(base_state)
-        return self._with_kanban_boards(_read_kanban_state(db_path, base_state, now=self._clock()))
+        return self._with_kanban_boards(
+            _read_kanban_state(
+                self._kanban_read_path(db_path),
+                base_state,
+                now=self._clock(),
+                resolved=True,
+            )
+        )
 
     def _read_current_kanban_board(self) -> str:
         path = self._paths.shared_path("kanban", "current")
@@ -2742,11 +2781,12 @@ class Collector:
                     continue
                 try:
                     summary = _read_kanban_board_summary(
-                        db_path,
+                        self._kanban_read_path(db_path),
                         slug=board_dir.name,
                         current=board_dir.name == state.current_board,
                         claim_ttl_seconds=state.claim_ttl_seconds,
                         now=self._clock(),
+                        resolved=True,
                     )
                 except (sqlite3.Error, OSError) as exc:
                     self._kanban_board_errors.append(
@@ -2782,7 +2822,9 @@ class Collector:
             return state
         return state.model_copy(
             update=_read_kanban_notify(
-                db_path, known_profiles=self._kanban_notifier_profile_names()
+                self._kanban_read_path(db_path),
+                known_profiles=self._kanban_notifier_profile_names(),
+                resolved=True,
             )
         )
 
@@ -4221,4 +4263,8 @@ class Collector:
         self._closing.set()
         with self._lock:
             self._closed = True
+            for _source, snapshot in self._kanban_snapshots.items():
+                if snapshot[2] is not None:
+                    snapshot[2].cleanup()
+            self._kanban_snapshots.clear()
             self._db.close()

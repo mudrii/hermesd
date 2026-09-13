@@ -11,6 +11,7 @@ import pytest
 import yaml
 
 import hermesd.collect.kanban as kanban_module
+import hermesd.collect.sqlite_util as sqlite_util_module
 from hermesd.collect.kanban import _read_recent_enriched_tasks
 from hermesd.collector import (
     Collector,
@@ -1474,3 +1475,50 @@ def test_kanban_notify_read_is_capped_while_the_totals_stay_exact(hermes_home: P
     ]
     assert listings
     assert all("LIMIT" in sql.upper() for sql in listings)
+
+
+def test_kanban_db_wal_is_copied_once_per_refresh(
+    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Every kanban reader shares one WAL snapshot per refresh.
+
+    The board state, the per-board summaries and the notify subscriptions all
+    read kanban.db, and each reader used to snapshot the WAL database on its
+    own — up to three full copies of a possibly large file per refresh, which is
+    the cost commit 040769e removed for state.db.
+    """
+    db_path = hermes_home / "kanban.db"
+    writer = sqlite3.connect(str(db_path))
+    create_kanban_db_tables(writer)
+    assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    writer.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('t1', 'Watched', 'review', 1)"
+    )
+    writer.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES ('t1', 'status', 1)")
+    _insert_notify_sub(writer, "t1", "discord", last_event_id=0)
+    writer.commit()
+    # The connection stays open so the -wal sidecar exists for the whole collect.
+
+    copies: list[Path] = []
+    original = sqlite_util_module.snapshot_wal_database
+
+    def counting(source: Path, *, prefix: str):
+        copies.append(source)
+        return original(source, prefix=prefix)
+
+    monkeypatch.setattr(sqlite_util_module, "snapshot_wal_database", counting)
+    try:
+        c = Collector(hermes_home)
+        try:
+            state = c.collect()
+        finally:
+            c.close()
+    finally:
+        writer.close()
+
+    assert [path.name for path in copies] == ["kanban.db"]
+    # Both readers saw the snapshot's contents, not an empty or stale store.
+    assert state.kanban.task_count == 1
+    assert state.kanban.notify_sub_count == 1
+    assert "kanban" not in state.health.failed_sources
+    assert "kanban_notify" not in state.health.failed_sources

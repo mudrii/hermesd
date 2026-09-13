@@ -56,8 +56,16 @@ def _kanban_claim_ttl_seconds(cfg: dict[str, Any]) -> int:
     return _DEFAULT_CLAIM_TTL_SECONDS
 
 
-def _read_kanban_state(db_path: Path, base_state: KanbanState, *, now: float) -> KanbanState:
-    with _connect_readonly_sqlite(db_path) as conn:
+def _read_kanban_state(
+    db_path: Path, base_state: KanbanState, *, now: float, resolved: bool = False
+) -> KanbanState:
+    """Board state from kanban.db.
+
+    ``resolved`` means the path is already a shared snapshot of the WAL
+    database (the collector copies it once per refresh and points every reader
+    at the same file), so the sidecar check must not run again.
+    """
+    with _connect_readonly_sqlite(db_path, resolved=resolved) as conn:
         conn.row_factory = sqlite3.Row
         status_counts = _count_by(conn, "SELECT status, COUNT(*) FROM tasks GROUP BY status")
         assignee_counts = _count_by(
@@ -125,8 +133,9 @@ def _read_kanban_board_summary(
     current: bool,
     claim_ttl_seconds: int,
     now: float,
+    resolved: bool = False,
 ) -> KanbanBoardSummary:
-    with _connect_readonly_sqlite(db_path) as conn:
+    with _connect_readonly_sqlite(db_path, resolved=resolved) as conn:
         conn.row_factory = sqlite3.Row
         return KanbanBoardSummary(
             slug=slug,
@@ -444,9 +453,11 @@ def _read_kanban_notify_fields(
     }
 
 
-def _read_kanban_notify(db_path: Path, *, known_profiles: frozenset[str] | None) -> dict[str, Any]:
+def _read_kanban_notify(
+    db_path: Path, *, known_profiles: frozenset[str] | None, resolved: bool = False
+) -> dict[str, Any]:
     """kanban_notify_subs reads; {} on a pre-subs schema, errors propagate so
     the kanban_notify source fails to its last-good value."""
-    with _connect_readonly_sqlite(db_path) as conn:
+    with _connect_readonly_sqlite(db_path, resolved=resolved) as conn:
         conn.row_factory = sqlite3.Row
         return _read_kanban_notify_fields(conn, known_profiles=known_profiles)
