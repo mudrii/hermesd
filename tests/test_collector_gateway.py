@@ -3425,3 +3425,44 @@ def test_restart_storm_keeps_defaults_when_config_is_unreadable(hermes_home: Pat
     assert gateway.restart_storm_window_seconds == pytest.approx(120.0)
     assert gateway.gateway_starts_window == 6
     assert gateway.in_respawn_backoff is True
+
+
+def test_gateway_reads_stringified_state_flags_strictly(hermes_home: Path):
+    """A stringified ``"false"`` in gateway_state.json is not truth.
+
+    The record is written by the live gateway, so a string where a boolean
+    belongs is corruption; reading it truthily would raise a "needs attention"
+    flag on a healthy platform and claim a config file exists that does not.
+    """
+    (hermes_home / "gateway_state.json").write_text(
+        json.dumps(
+            {
+                "pid": 4242,
+                "start_time": NOW - 5000,
+                "kind": "hermes-gateway",
+                "gateway_state": "running",
+                "platforms": {
+                    "telegram": {"state": "connected", "needs_attention": "false"},
+                },
+                "config_generation": {
+                    "fingerprint": "fp",
+                    "short": "abc123",
+                    "sources": [
+                        {
+                            "name": "config.yaml",
+                            "path": "/tmp/config.yaml",
+                            "exists": "false",
+                            "mtime_ns": 1,
+                            "size": 2,
+                        }
+                    ],
+                },
+            }
+        )
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    platform = next(p for p in gateway.platforms if p.name == "telegram")
+    assert platform.needs_attention is False
+    assert gateway.config_sources[0].exists is False

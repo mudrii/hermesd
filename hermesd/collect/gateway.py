@@ -23,6 +23,7 @@ from hermesd.collect.common import (
     _age_seconds,
     _as_dict,
     _as_list,
+    _coerce_bool,
     _coerce_float,
     _coerce_int,
     _file_size,
@@ -282,7 +283,7 @@ def _platform_status(
         updated_at=str(info.get("updated_at") or ""),
         error_code=str(info.get("error_code") or ""),
         error_message=str(info.get("error_message") or ""),
-        needs_attention=bool(info.get("needs_attention")),
+        needs_attention=_coerce_bool(info.get("needs_attention")),
         retrying_since=retrying_since,
         retrying_since_age_seconds=_age_seconds(_iso_to_epoch(retrying_since), now),
         writer_pid=_identity_stamp(info.get("writer_pid")),
@@ -506,7 +507,7 @@ def _config_generation(data: JsonMapping) -> _ConfigGeneration:
         ConfigSourceStamp(
             name=str(info.get("name") or ""),
             path=str(info.get("path") or ""),
-            exists=bool(info.get("exists")),
+            exists=_coerce_bool(info.get("exists")),
             mtime_ns=_coerce_int(info.get("mtime_ns")),
             size=_coerce_int(info.get("size")),
         )
