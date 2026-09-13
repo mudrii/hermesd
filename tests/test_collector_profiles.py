@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import sqlite3
 import time
 from datetime import UTC, datetime
@@ -1543,3 +1544,43 @@ def test_probed_loop_tick_resolves_the_node_under_the_root_home(
 
     assert seen == [home]
     assert seen[0] != home / "profiles" / "coding"
+
+
+def _defined_test_names() -> set[str]:
+    root = Path(__file__).resolve().parent
+    names: set[str] = set()
+    for path in root.glob("test_*.py"):
+        names.update(
+            re.findall(r"^def (test_[A-Za-z0-9_]+)", path.read_text(encoding="utf-8"), re.M)
+        )
+    return names
+
+
+def test_source_ownership_rows_cite_upstream_and_resolve_their_pins():
+    """Rule 3 and the pin column are enforced, not just documented.
+
+    ``_documented_scopes`` only reads the scope cell, so a row could cite no
+    upstream file at all, and a "pinned by" cell could name a test that does not
+    exist — which is exactly how the `gateway_loop_tick` row came to credit a
+    test that never armed a witness. Divergence rows are exempt only from having
+    a pin at all (many pre-existing rows are explicitly `UNPINNED`); any name
+    they *do* cite has to exist.
+    """
+    defined = _defined_test_names()
+    problems: list[str] = []
+    for cells in _table_rows(_RULE_FILE.read_text()):
+        if len(cells) < 8:
+            continue
+        name = cells[0].strip("`")
+        if not name or not name.replace("_", "").isalnum() or not name.islower():
+            continue
+        scope_cell = cells[1]
+        scope = scope_cell.split()[0].strip("`") if scope_cell.split() else ""
+        if scope not in _SCOPES:
+            continue
+        if not cells[5].strip():
+            problems.append(f"{name}: no upstream citation")
+        for cited in re.findall(r"`(test_[A-Za-z0-9_]+)`", cells[7]):
+            if cited not in defined:
+                problems.append(f"{name}: pin {cited} is not defined in tests/")
+    assert problems == [], "source-ownership.md rows are incomplete:\n" + "\n".join(problems)

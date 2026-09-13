@@ -362,6 +362,16 @@ class _SessionCoordinationRows:
 def _read_session_coordination_rows(conn: Any) -> _SessionCoordinationRows:
     """Every coordination table hermesd reads from state.db, absent-tolerant.
 
+    The shapes mirror upstream ``hermes_state_common.py``: ``session_turn_leases``
+    / ``compression_locks`` (``:506-518``, writers
+    ``hermes_state_compression.py:433-605``), ``gateway_routing`` (``:447-457``,
+    payload written by ``gateway/session.py:535-545``), ``gateway_hygiene_state``
+    (``:459-465``, writer ``hermes_state_gateway.py:513-535``) and
+    ``conversation_generations`` (``:482-487``, bumped by
+    ``hermes_state_messages.py:30-34``) — all through
+    ``get_hermes_home()/"state.db"`` (``hermes_state.py:160,178``), i.e. the
+    selected profile's store.
+
     Tables predate nothing: agents older than the lease/hygiene/routing
     features simply have no table, which reads as empty — the same contract as
     the operations and gateway-ledger readers. Once a table exists, read errors
