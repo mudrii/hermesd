@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 from hermesd.collect.common import (
     _age_seconds,
     _as_list,
+    _coerce_bool,
     _coerce_float,
     _coerce_int,
     _iso_to_epoch,
@@ -561,10 +562,10 @@ def _gateway_route(
         chat_type=str(entry.get("chat_type") or ""),
         display_name=_route_free_text(entry.get("display_name"))[:40],
         updated_at_age_seconds=_age_seconds(updated_at, now),
-        suspended=bool(entry.get("suspended")),
-        resume_pending=bool(entry.get("resume_pending")),
+        suspended=_coerce_bool(entry.get("suspended")),
+        resume_pending=_coerce_bool(entry.get("resume_pending")),
         resume_reason=_route_free_text(entry.get("resume_reason")),
-        was_auto_reset=bool(entry.get("was_auto_reset")),
+        was_auto_reset=_coerce_bool(entry.get("was_auto_reset")),
         auto_reset_reason=_route_free_text(entry.get("auto_reset_reason")),
         # The durable executing-turn marker: its start age is only meaningful
         # while a token exists (gateway/session.py:515-518).

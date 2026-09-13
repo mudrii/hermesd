@@ -215,6 +215,28 @@ def _coerce_int(value: object) -> int:
     return 0
 
 
+_TRUTHY_STATE_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def _coerce_bool(value: object) -> bool:
+    """Boolean read for untrusted state, where ``bool()`` is wrong.
+
+    ``bool("false")`` is True, so a corrupted or foreign payload could flip a
+    warning on with a stringified flag. Only the shapes the writers actually
+    produce count as truth: JSON ``true``, SQLite ``1``, and the ``"1"`` /
+    ``"true"`` / ``"yes"`` / ``"on"`` spellings upstream itself accepts
+    (``gateway/scale_to_zero.py:38``). Everything else — including ``"false"``,
+    ``"0"``, ``None`` and junk — is False.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in _TRUTHY_STATE_VALUES
+    return False
+
+
 def _coerce_float(value: object) -> float:
     if isinstance(value, bool):
         return float(value)

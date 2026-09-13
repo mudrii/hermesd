@@ -17,6 +17,7 @@ import pytest
 import hermesd.collector as collector_module
 from hermesd.collector import (
     Collector,
+    _coerce_bool,
     _coerce_float,
     _coerce_int,
     _CollectionHealth,
@@ -2181,3 +2182,42 @@ def test_terminal_breadcrumb_scan_is_bounded_and_flags_truncation(hermes_home: P
     assert len(term.sessions) == 12
     assert term.count == 200
     assert term.truncated is True
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (True, True),
+        (1, True),
+        ("1", True),
+        ("true", True),
+        ("on", True),
+        (False, False),
+        (0, False),
+        ("false", False),
+        ("0", False),
+        ("off", False),
+        (None, False),
+        ("junk", False),
+        ([], False),
+        ({}, False),
+    ],
+)
+def test_coerce_bool_never_reads_a_stringified_false_as_truth(value: object, expected: bool):
+    """`bool("false")` is True; an untrusted flag must never flip a warning on."""
+    assert _coerce_bool(value) is expected
+
+
+def test_collect_cron_stringified_preflight_flag_is_not_truthy(hermes_home: Path):
+    """A corrupted ``"preflight_alerted": "false"`` must not claim an alert was sent."""
+    cron_dir = hermes_home / "cron"
+    cron_dir.mkdir(exist_ok=True)
+    (cron_dir / "jobs.json").write_text(
+        json.dumps({"jobs": [{"id": "job-x", "name": "Job X", "preflight_alerted": "false"}]})
+    )
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+    assert state.cron.jobs[0].preflight_alerted is False
