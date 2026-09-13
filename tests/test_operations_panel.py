@@ -308,16 +308,14 @@ def test_operations_detail_goal_waiting_falls_back_to_session() -> None:
 
 
 def test_compact_warns_when_checkpoint_prune_is_overdue():
-    from hermesd.models import (
-        CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS,
-    )
+    from hermesd.models import CHECKPOINT_PRUNE_INTERVAL_SECONDS
 
     overdue = render_to_str(
         render_operations(
             _ops_state(
                 checkpoint_prune_marker_present=True,
                 checkpoint_prune_marker_age_seconds=float(
-                    CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS + 3600
+                    2 * CHECKPOINT_PRUNE_INTERVAL_SECONDS + 3600
                 ),
             ),
             Theme(),

@@ -695,7 +695,7 @@ def test_cron_excerpt_serves_last_good_when_output_file_cannot_be_stat_ed(
         def failing_is_file(self: Path, *args: object, **kwargs: object) -> bool:
             if self == output_file:
                 raise OSError("stat denied")
-            return real_is_file(self, *args, **kwargs)  # type: ignore[arg-type]
+            return real_is_file(self, *args, **kwargs)
 
         monkeypatch.setattr(Path, "stat", failing_stat)
         monkeypatch.setattr(Path, "is_file", failing_is_file)

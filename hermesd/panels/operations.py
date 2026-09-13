@@ -25,6 +25,7 @@ from hermesd.models import (
     HostedRoomSummary,
     OperationsState,
     ProcessReceiptsState,
+    checkpoint_prune_overdue_after,
 )
 from hermesd.panels.formatting import escape_terminal_text as escape
 from hermesd.panels.formatting import fmt_age_seconds, sanitize_terminal_text
@@ -569,15 +570,17 @@ def _summary_table(ops: OperationsState, theme: Theme) -> Table:
 
 
 def _checkpoint_prune_label(ops: OperationsState) -> str:
-    """Marker age against upstream's 24h interval, with the overdue verdict.
+    """Marker age against the effective prune cadence, with the overdue verdict.
 
-    The caveat is part of the row: a fresh marker proves the wrapper ran, not
-    that pruning succeeded.
+    The cadence is upstream's default 24h or ``checkpoints.min_interval_hours``
+    when set, so the bound follows config rather than a fixed number. The caveat
+    is part of the row: a fresh marker proves the wrapper ran, not that pruning
+    succeeded.
     """
     age = _age_span_label(ops.checkpoint_prune_marker_age_seconds)
     interval = ops.checkpoint_prune_interval_seconds
     verdict = (
-        f"OVERDUE (> {_age_span_label(2 * interval)})"
+        f"OVERDUE (> {_age_span_label(checkpoint_prune_overdue_after(interval))})"
         if ops.checkpoint_prune_overdue
         else f"interval {_age_span_label(interval)}"
     )

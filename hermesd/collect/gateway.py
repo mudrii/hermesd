@@ -850,7 +850,6 @@ class _ExitDiag:
     unclean_24h: int = 0
     size_bytes: int = 0
     oversized: bool = False
-    forensic_files: list[ForensicFile] = field(default_factory=list)
 
 
 def _read_exit_diag(path: Path, root: Path, now: float, tail_bytes: int) -> _ExitDiag:

@@ -380,7 +380,7 @@ def _traced_statements(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]
     real_connect = sqlite3.connect
 
     def tracing_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
-        conn = real_connect(*args, **kwargs)  # type: ignore[arg-type]
+        conn = real_connect(*args, **kwargs)
         target = str(args[0]) if args else str(kwargs.get("database") or "")
         conn.set_trace_callback(lambda sql: statements.append((target, sql)))
         return conn

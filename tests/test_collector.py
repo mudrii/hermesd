@@ -1987,7 +1987,7 @@ def test_last_good_fallback_does_not_regress_across_alternating_failures(
         assert [job.name for job in second.cron.jobs] == ["Nightly digest"]
         assert second.config.model == "gpt-6"
 
-        del c._collect_cron  # type: ignore[attr-defined]
+        del c._collect_cron
         c._collect_config = config_boom  # type: ignore[method-assign]
         jobs_path.write_text(json.dumps({"jobs": [{"id": "weekly", "name": "Weekly digest"}]}))
         third = c.collect()

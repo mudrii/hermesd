@@ -689,7 +689,7 @@ def test_api_runs_issues_no_query_that_selects_an_excluded_column(
     real_connect = sqlite3.connect
 
     def tracing_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
-        conn = real_connect(*args, **kwargs)  # type: ignore[arg-type]
+        conn = real_connect(*args, **kwargs)
         conn.set_trace_callback(statements.append)
         return conn
 

@@ -264,7 +264,7 @@ def _recovery_state(**overrides: object) -> DashboardState:
     """A state whose single session carries the given compression-recovery row."""
     return DashboardState(
         collected_at=_NOW,
-        sessions=[_session(**overrides)],  # type: ignore[arg-type]
+        sessions=[_session(**overrides)],
     )
 
 

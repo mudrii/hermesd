@@ -204,22 +204,15 @@ def _config_backup_groups(
     Names are what the backups directory listed (any order); each group keeps
     its full count and its newest stamp. Junk and hand-named copies
     (``config.yaml.bak-my-note``) are skipped — only the writer's own naming
-    scheme carries a reason. Both caps are display hygiene for a hostile
-    directory: the entry cap bounds the scan, the group cap bounds the model,
-    and either firing marks the result truncated. Groups come back ranked by
-    kind (``_KIND_RANK``) so the cap always keeps the load-bearing ``good`` and
-    ``corrupt`` rows and drops audit-trail bulk instead.
+    scheme carries a reason. The entry cap bounds the *caller's* directory scan
+    (the collector slices before calling), so this function only applies the
+    display cap on the number of groups and marks the result truncated when it
+    fires. Groups come back ranked by kind (``_KIND_RANK``) so that cap always
+    keeps the load-bearing ``good`` and ``corrupt`` rows and drops audit-trail
+    bulk instead.
     """
-    kept: list[str] = []
-    scan_truncated = False
-    for name in names:
-        if len(kept) >= _CONFIG_BACKUP_ENTRY_LIMIT:
-            scan_truncated = True
-            break
-        kept.append(name)
-
     stamps_by_reason: dict[str, list[tuple[str, float]]] = {}
-    for name in kept:
+    for name in names:
         if not name.startswith(_BACKUP_CONFIG_PREFIX):
             continue
         reason, separator, stamp = name[len(_BACKUP_CONFIG_PREFIX) :].rpartition(".")
@@ -244,7 +237,7 @@ def _config_backup_groups(
             )
         )
     groups.sort(key=lambda group: (_KIND_RANK.get(group.kind, 99), group.reason))
-    truncated = scan_truncated or len(groups) > _CONFIG_BACKUP_GROUP_LIMIT
+    truncated = len(groups) > _CONFIG_BACKUP_GROUP_LIMIT
     return groups[:_CONFIG_BACKUP_GROUP_LIMIT], truncated
 
 

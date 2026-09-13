@@ -2505,7 +2505,7 @@ def test_loop_tick_sustained_silence_escalates_to_wedged(hermes_home: Path):
         hermes_home,
         pid_exists=lambda pid: pid == 4242,
         clock=_clock,
-        loop_tick_probe=lambda pid, tcp_port: False,  # type: ignore[arg-type,return-value]
+        loop_tick_probe=lambda pid, tcp_port: False,
     )
     try:
         first = collector.collect().gateway
@@ -2537,7 +2537,7 @@ def test_loop_tick_escalation_band_starts_at_the_stale_budget(hermes_home: Path)
         hermes_home,
         pid_exists=lambda pid: pid == 4242,
         clock=_clock,
-        loop_tick_probe=lambda pid, tcp_port: False,  # type: ignore[arg-type,return-value]
+        loop_tick_probe=lambda pid, tcp_port: False,
     )
     try:
         first = collector.collect().gateway
@@ -2597,7 +2597,7 @@ def test_loop_tick_witness_absent_node_is_ambiguity_never_a_wedge(hermes_home: P
         hermes_home,
         pid_exists=lambda pid: pid == 4242,
         clock=_clock,
-        loop_tick_probe=lambda pid, tcp_port: None,  # type: ignore[arg-type,return-value]
+        loop_tick_probe=lambda pid, tcp_port: None,
     )
     try:
         for _ in range(5):
@@ -2617,7 +2617,7 @@ def test_loop_tick_disarmed_witness_never_escalates(hermes_home: Path):
         hermes_home,
         pid_exists=lambda pid: pid == 4242,
         clock=_clock,
-        loop_tick_probe=lambda pid, tcp_port: False,  # type: ignore[arg-type,return-value]
+        loop_tick_probe=lambda pid, tcp_port: False,
     )
     try:
         for _ in range(5):
@@ -2685,7 +2685,7 @@ def test_loop_tick_strikes_reset_after_a_witness_answer(hermes_home: Path):
         hermes_home,
         pid_exists=lambda pid: pid == 4242,
         clock=_clock,
-        loop_tick_probe=probe,  # type: ignore[arg-type]
+        loop_tick_probe=probe,
     )
     try:
         first = collector.collect().gateway

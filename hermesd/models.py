@@ -2332,9 +2332,17 @@ PROCESS_RECEIPT_MAX_FILES: int = 64
 # overdue at 2x the interval — a stale marker is a missed wrapper run, not proof
 # of anything about the store itself.
 CHECKPOINT_PRUNE_INTERVAL_SECONDS: int = 24 * 60 * 60
-# The overdue window is twice the *configured* cadence
-# (``checkpoints.min_interval_hours``); this is the default-policy value.
-CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS: int = 2 * CHECKPOINT_PRUNE_INTERVAL_SECONDS
+
+
+def checkpoint_prune_overdue_after(interval_seconds: float) -> float:
+    """When a prune marker counts as missed: twice the *effective* cadence.
+
+    The wrapper short-circuits within ``min_interval_hours`` of the marker, so
+    the overdue window follows ``checkpoints.min_interval_hours`` when it is set
+    (``tools/checkpoint_manager.py:1094``) instead of a hardcoded default. One
+    helper so the verdict and the bound the panel prints cannot disagree.
+    """
+    return 2 * interval_seconds
 
 
 class ProcessReceipt(BaseModel):
@@ -2472,7 +2480,7 @@ class OperationsState(BaseModel):
         not in the marker — so this flag is never a store-health verdict.
         """
         age = self.checkpoint_prune_marker_age_seconds
-        overdue_after = 2 * self.checkpoint_prune_interval_seconds
+        overdue_after = checkpoint_prune_overdue_after(self.checkpoint_prune_interval_seconds)
         return self.checkpoint_prune_marker_present and age is not None and age > overdue_after
 
 

@@ -1969,7 +1969,7 @@ def _count_opens(monkeypatch: pytest.MonkeyPatch, target: Path) -> list[Path]:
     def counting_open(self: Path, *args: object, **kwargs: object) -> object:
         if self == target:
             opens.append(self)
-        return real_open(self, *args, **kwargs)  # type: ignore[arg-type]
+        return real_open(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "open", counting_open)
     return opens
