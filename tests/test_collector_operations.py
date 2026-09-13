@@ -2666,6 +2666,26 @@ def test_process_receipts_are_parsed_and_redacted(hermes_home: Path, sample_db: 
     assert "REDACTED" in abc.command
 
 
+def test_process_receipt_redacts_before_slicing_the_tail(hermes_home: Path, sample_db: Path):
+    """Slicing first can cut a credential's prefix off and leave the token raw.
+
+    ``output`` is remote-controlled log text: with the tail taken before
+    redaction, a token whose ``Bearer ``/``key=`` marker falls outside the cap
+    keeps 400 raw characters, because the redactor has nothing left to key on.
+    """
+    _write_receipt(
+        hermes_home,
+        "proc_tail.json",
+        _receipt_record(output="build log line\nBearer " + "T" * 900),
+    )
+
+    receipt = _collect_ops(hermes_home).operations.process_receipts.receipts[0]
+
+    assert "TTTT" not in receipt.output_tail
+    assert "[REDACTED]" in receipt.output_tail
+    assert len(receipt.output_tail) <= 400
+
+
 def test_process_receipts_newest_first_and_truncation_flag(hermes_home: Path, sample_db: Path):
     for index in range(11):
         path = _write_receipt(

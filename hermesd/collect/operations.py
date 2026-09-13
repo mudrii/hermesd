@@ -626,7 +626,9 @@ def _process_receipt_from_file(
         termination_source=str(data.get("termination_source") or ""),
         started_age_seconds=_age_seconds(started_at if started_at > 0 else None, now),
         finished_age_seconds=_age_seconds(mtime, now),
-        output_tail=_redact_secret_text(output[-_PROCESS_RECEIPT_TAIL_MAX_CHARS:]),
+        # Redact first, then bound: slicing ahead of the redactor can cut the
+        # "Bearer "/"key=" marker off a credential and keep the token itself.
+        output_tail=_redact_secret_text(output)[-_PROCESS_RECEIPT_TAIL_MAX_CHARS:],
     )
 
 
