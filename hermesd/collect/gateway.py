@@ -723,7 +723,13 @@ class _StartStorm:
 
 
 def _read_start_storm(path: Path, root: Path, now: float) -> _StartStorm:
-    """Count recorded gateway starts in the storm-detection windows."""
+    """Count recorded gateway starts in the storm-detection windows.
+
+    ``recorded`` means "a ledger we can read", not "a file exists": upstream
+    appends ``now`` before its atomic ``os.replace`` (``gateway/status.py:64-79``),
+    so a file whose every line fails to parse — empty, whitespace or junk — was
+    not written by the ledger and proves as little as an absent one.
+    """
     if not path.is_file():
         return _StartStorm()
     text = _read_text_capped(path, root)
@@ -739,7 +745,7 @@ def _read_start_storm(path: Path, root: Path, now: float) -> _StartStorm:
         if 0.0 < epoch <= now:
             starts.append(epoch)
     if not starts:
-        return _StartStorm(recorded=True)
+        return _StartStorm()
     return _StartStorm(
         recorded=True,
         starts_2m=sum(1 for start in starts if now - start <= _RESTART_STORM_WINDOW_SECONDS),
