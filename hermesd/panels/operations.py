@@ -132,7 +132,9 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         running = sum(m.running_task_count for m in ops.delegation_live_manifests)
         lines.append("  Live delegations: ", style=theme.ui_label)
         lines.append(
-            f"{ops.delegation_live_manifest_count} live · {running} running\n",
+            # "live" counts every run dir; "running" only the cards parsed into
+            # this list, so the copy marks which side is the displayed slice.
+            f"{ops.delegation_live_manifest_count} live · {running} running (shown)\n",
             style=theme.banner_text,
         )
     # Counts only, like every other compact row here: room names and run ids are
@@ -187,6 +189,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
 
 def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     ops = state.operations
+    no_artifacts = _has_no_artifacts(ops)
     sections: list[RenderableType] = [_summary_table(ops, theme)]
 
     if ops.model_caches:
@@ -219,9 +222,12 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         sections.extend(_live_manifest_sections(ops, theme))
         sections.append(_note(_LIVE_MANIFEST_NOTE_LINES, theme))
 
-    # Always stated, even when the directory has never existed: an absent
-    # receipt store is the normal case on a quiet machine, not a failure.
-    sections.extend(_receipt_sections(ops.process_receipts, theme))
+    # Stated whenever the panel has anything else to show: an absent receipt
+    # store is the normal case on a quiet machine, not a failure. On a machine
+    # with no artifacts at all this section is replaced by the single
+    # "No operations artifacts found" line below instead of saying both.
+    if not no_artifacts:
+        sections.extend(_receipt_sections(ops.process_receipts, theme))
 
     if ops.state_db_size_bytes or ops.state_db_schema_version:
         sections.append(_heading("State DB", theme))
@@ -249,7 +255,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     if ops.api_runs.db_present:
         sections.extend(_api_run_sections(ops.api_runs, theme))
 
-    if _has_no_artifacts(ops):
+    if no_artifacts:
         sections.append(Text("\n  No operations artifacts found\n", style=theme.banner_dim))
 
     return Panel(
@@ -267,6 +273,12 @@ def _heading(label: str, theme: Theme) -> Text:
 
 
 def _has_no_artifacts(ops: OperationsState) -> bool:
+    """True when the detail view has nothing to read out but its own empty text.
+
+    Mirrors the section gates in ``_render_detail``: every marker and summary
+    readout that would render a row counts as an artifact, so the panel never
+    claims to be empty while showing one.
+    """
     return (
         not ops.model_caches
         and not ops.pr_monitors
@@ -281,8 +293,12 @@ def _has_no_artifacts(ops: OperationsState) -> bool:
         and not ops.process_receipts.receipt_count
         and not ops.snapshot_count
         and not ops.state_db_size_bytes
+        and not ops.state_db_schema_version
         and not ops.web_ui_build_hash
+        and not ops.desktop_build_stamp
         and not ops.blocked_script_count
+        and not ops.checkpoint_prune_marker_present
+        and not ops.spawn_ledger_corrupt_present
         and not ops.db_recovery.artifacts_present
         and not ops.hosted_rooms.db_present
         and not ops.api_runs.db_present
@@ -719,9 +735,9 @@ def _live_manifest_sections(ops: OperationsState, theme: Theme) -> list[Renderab
             table.add_row("Started", escape(manifest.started))
         if manifest.completed:
             table.add_row("Completed", escape(manifest.completed))
-        table.add_row("Dir Age", _age_span_label(manifest.dir_age_seconds))
+        table.add_row("Dispatched", _age_span_label(manifest.dir_age_seconds))
         if manifest.tasks_truncated:
-            table.add_row("Tasks", _truncation_label(len(manifest.tasks), manifest.task_count))
+            table.add_row("Task List", _truncation_label(len(manifest.tasks), manifest.task_count))
         parts.append(table)
         parts.append(_live_tasks_text(manifest, theme))
     shown = len(ops.delegation_live_manifests)

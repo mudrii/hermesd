@@ -1907,7 +1907,9 @@ class DelegationLiveManifest(BaseModel):
     per-task status. This is the *manifest*, not the live roster — tool counts,
     steer state and depth exist only in gateway memory and over RPC, so nothing
     here claims to show them. ``dir_age_seconds`` comes from the directory
-    mtime, which is the only liveness signal hermesd has.
+    mtime, which is the dispatch write time; appending a ``task-<index>.log`` or
+    rewriting the manifest does not advance it, so this is a *dispatched* age,
+    not a liveness signal.
     """
 
     delegation_id: str = ""

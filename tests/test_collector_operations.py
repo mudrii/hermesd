@@ -2440,6 +2440,20 @@ def test_delegation_live_manifest_dir_absent_is_healthy(hermes_home: Path, sampl
     assert ops.delegation_live_manifests == []
 
 
+def test_delegation_live_manifest_deeply_nested_json_is_healthy(hermes_home: Path, sample_db: Path):
+    """Nesting deep enough to trip json.loads' RecursionError is junk, not a
+    broken source: it must be refused like any other unparseable manifest."""
+    live = hermes_home / "cache" / "delegation" / "live"
+    run_dir = live / "deleg_nested"
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text('{"tasks": ' + "[" * 3000 + "]" * 3000 + "}")
+
+    state = _collect_ops(hermes_home)
+    assert "delegation_live" not in state.health.failed_sources
+    assert state.operations.delegation_live_manifest_count == 1
+    assert state.operations.delegation_live_manifests == []
+
+
 def test_delegation_live_log_tail_is_redacted_and_clipped(hermes_home: Path, sample_db: Path):
     live = hermes_home / "cache" / "delegation" / "live"
     tail = "\n".join(f"12:00:0{i} assistant | line {i}" for i in range(6))
@@ -2506,6 +2520,76 @@ def test_delegation_live_manifest_task_list_is_capped(hermes_home: Path, sample_
     assert manifest.task_count == 12
     assert len(manifest.tasks) < 12
     assert manifest.running_task_count == 12  # counted over every entry, not the cap
+
+
+def test_delegation_live_manifest_tails_only_the_displayed_tasks(
+    hermes_home: Path, sample_db: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Log tails are read for the displayed slice only; counts still cover all."""
+    live = hermes_home / "cache" / "delegation" / "live"
+    cap = operations_module._MAX_LIVE_TASKS
+    total = cap + 4
+    tasks = [
+        {
+            "index": index,
+            "goal": f"g{index}",
+            # Every task past the display cut is running, so a running count
+            # taken from the slice alone would read 0.
+            "status": "completed" if index < cap else "running",
+        }
+        for index in range(total)
+    ]
+    _write_live_delegation(
+        live,
+        "deleg_many_tasks",
+        _sample_manifest(task_count=total, tasks=tasks),
+        logs={f"task-{index}.log": f"log line {index}\n" for index in range(total)},
+    )
+
+    calls: list[Path] = []
+    real_tail = operations_module._live_log_tail
+
+    def counting_tail(path: Path, home: Path) -> list[str]:
+        calls.append(path)
+        return real_tail(path, home)
+
+    monkeypatch.setattr(operations_module, "_live_log_tail", counting_tail)
+    ops = _collect_ops(hermes_home).operations
+    card = ops.delegation_live_manifests[0]
+
+    assert len(calls) == cap
+    assert len(card.tasks) == cap
+    assert [task.status for task in card.tasks] == ["completed"] * cap
+    assert card.tasks_truncated is True
+    assert card.task_count == total
+    assert card.running_task_count == total - cap
+
+
+def test_delegation_live_task_goal_is_redacted(hermes_home: Path, sample_db: Path):
+    """The goal sits beside an already-redacted tail but is free text of its
+    own, and it reaches --snapshot-format json."""
+    live = hermes_home / "cache" / "delegation" / "live"
+    _write_live_delegation(
+        live,
+        "deleg_goal_secret",
+        _sample_manifest(
+            delegation_id="deleg_goal_secret",
+            task_count=1,
+            tasks=[
+                {
+                    "index": 0,
+                    "goal": "deploy with token=sk-live-abc123",
+                    "status": "running",
+                }
+            ],
+        ),
+    )
+
+    state = _collect_ops(hermes_home)
+    assert "sk-live-abc123" not in json.dumps(state.model_dump(mode="json"))
+    goal = state.operations.delegation_live_manifests[0].tasks[0].goal
+    assert "[REDACTED]" in goal
+    assert goal.startswith("deploy with token=")
 
 
 # --- process completion receipts (item 13) -----------------------------------
@@ -2615,6 +2699,29 @@ def test_process_receipts_junk_and_oversized_are_counted_not_listed(
     assert receipts.receipt_count == 3
     assert [r.process_id for r in receipts.receipts] == ["proc_mid"]
     assert len(receipts.receipts[0].output_tail) <= 400
+
+
+def test_process_receipts_deeply_nested_json_is_healthy(hermes_home: Path, sample_db: Path):
+    """Same recursion guard as the manifest reader: junk nesting is counted,
+    listed nowhere, and never fails the source."""
+    receipts_dir = hermes_home / "logs" / "process-results"
+    receipts_dir.mkdir(parents=True, exist_ok=True)
+    (receipts_dir / "proc_nested.json").write_text('{"output": ' + "[" * 3000 + "]" * 3000 + "}")
+
+    state = _collect_ops(hermes_home)
+    assert "process_receipts" not in state.health.failed_sources
+    assert state.operations.process_receipts.receipt_count == 1
+    assert state.operations.process_receipts.receipts == []
+
+
+def test_json_decode_helpers_treat_deep_nesting_as_junk(tmp_path: Path):
+    """The recursion guard covers the other untrusted decode sites too: a DB
+    JSON column and an MoA trace line."""
+    nested = "[" * 3000 + "]" * 3000
+    assert operations_module._json_list_count(nested) == 0
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text('{"event": "x", "payload": ' + nested + "}\n")
+    assert operations_module._moa_latest_record_summary(trace, 64_000) == ("", [])
 
 
 def test_process_receipts_symlinked_dir_reads_as_absent(
