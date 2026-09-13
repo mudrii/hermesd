@@ -3264,3 +3264,143 @@ def test_respawn_storm_policy_reads_only_upstream_shapes():
         5,
         300.5,
     )
+
+
+# --------------------------------------------------------------------------
+# O. regression pins for review-reported mutation survivors
+# --------------------------------------------------------------------------
+
+
+def test_loop_tick_probe_uses_only_the_first_byte(hermes_home: Path):
+    """The protocol is one byte: a witness that appends anything still answers.
+
+    Pins ``recv(1)`` (``hermes_cli/gateway.py:363-376``): a probe that drained
+    the socket would misread a well-behaved handler that writes ``b"1\\n"``.
+    """
+    import socket
+    import threading
+
+    from hermesd.collect.gateway import _default_loop_tick_probe
+
+    home = _short_socket_dir()
+    (home / "state").mkdir()
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(home / "state" / "gateway.loop-tick.4242.sock"))
+    listener.listen(1)
+
+    def serve() -> None:
+        conn, _ = listener.accept()
+        with conn:
+            conn.sendall(b"1\n")
+
+    watcher = threading.Thread(target=serve, daemon=True)
+    watcher.start()
+    try:
+        assert _default_loop_tick_probe(4242, None, home) is True
+        watcher.join(timeout=5)
+    finally:
+        listener.close()
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_exit_diag_size_warning_boundary(hermes_home: Path):
+    """Oversized is False below the 2 MiB cap and True above it."""
+    from hermesd.collect.gateway import _EXIT_DIAG_SIZE_WARN_BYTES
+
+    _write_gateway_state(hermes_home)
+    logs = hermes_home / "logs"
+    logs.mkdir(exist_ok=True)
+    ledger = logs / "gateway-exit-diag.log"
+
+    padding = '{"tag": "padding"}\n'
+    one_mib = padding * (1024 * 1024 // len(padding))
+    ledger.write_text(one_mib)
+    gateway = _collect(hermes_home).gateway
+    assert gateway.exit_diag_size_bytes == len(one_mib)
+    assert gateway.exit_diag_oversized is False
+
+    over = one_mib + "x" * (_EXIT_DIAG_SIZE_WARN_BYTES - len(one_mib) + 1)
+    ledger.write_text(over)
+    gateway = _collect(hermes_home).gateway
+    assert gateway.exit_diag_oversized is True
+
+
+def test_exit_diag_unclean_count_window_is_24h(hermes_home: Path):
+    """An unclean exit older than a day is history, not a current signal."""
+    _write_gateway_state(hermes_home)
+    _write_exit_diag(
+        hermes_home,
+        [
+            {"ts": _iso(NOW - 30 * 3600), "tag": "gateway.previous_unclean_exit", "pid": 9},
+            {"ts": _iso(NOW - 2 * 3600), "tag": "gateway.previous_unclean_exit", "pid": 10},
+            {"ts": _iso(NOW - 3600), "tag": "gateway.previous_unclean_exit", "pid": 11},
+        ],
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.exit_diag_unclean_24h == 2
+
+
+def test_forensic_companions_are_stat_only(hermes_home: Path, monkeypatch: pytest.MonkeyPatch):
+    """Companion logs are reported by size alone; their contents are never read."""
+    _write_gateway_state(hermes_home)
+    logs = hermes_home / "logs"
+    logs.mkdir(exist_ok=True)
+    companions = ("gateway-shutdown-diag.log", "gateway_faulthandler.log", "launchd-reload.log")
+    for name in companions:
+        (logs / name).write_text("SECRET-COMPANION-BODY")
+
+    import hermesd.collect.gateway as gateway_module
+
+    read_paths: list[str] = []
+    for helper in ("_read_text_capped", "_read_tail_text"):
+        real = getattr(gateway_module, helper)
+
+        def spy(path: Path, *args: object, _real: object = real, **kwargs: object) -> object:
+            read_paths.append(Path(path).name)
+            return _real(path, *args, **kwargs)  # type: ignore[operator]
+
+        monkeypatch.setattr(gateway_module, helper, spy)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert {f.name for f in gateway.forensic_files} == set(companions)
+    assert all(size > 0 for size in (f.size_bytes for f in gateway.forensic_files))
+    assert read_paths == [] or not set(read_paths) & set(companions)
+
+
+def test_restart_storm_exactly_at_the_cap_is_not_backoff(hermes_home: Path):
+    """Upstream backs off only *past* the cap (``len(recent) <= max_starts``)."""
+    _write_gateway_state(hermes_home)
+    _write_starts_log(hermes_home, [NOW - 10 * index for index in range(1, 6)])
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.gateway_starts_window == 5
+    assert gateway.in_respawn_backoff is False
+
+
+def test_mirror_roster_is_bounded(hermes_home: Path):
+    """The synthesized mirror list honors its profile bound.
+
+    The bound is asserted as a literal: importing the constant under test into
+    the expectation would make the assertion move with the mutation.
+    """
+    _write_gateway_state(hermes_home)
+    profiles = [f"p{index:02d}" for index in range(20)]
+    state_path = hermes_home / "gateway_state.json"
+    payload = json.loads(state_path.read_text())
+    payload["served_profiles"] = profiles
+    payload["platforms"] = {
+        "api_server": {"state": "connected", "listener_base": "http://127.0.0.1:8088"}
+    }
+    state_path.write_text(json.dumps(payload))
+
+    gateway = _collect(hermes_home).gateway
+
+    platform = next(p for p in gateway.platforms if p.name == "api_server")
+    assert len(platform.mirror_urls) == 16
+    assert "p00" in platform.mirror_urls
+    assert "p15" in platform.mirror_urls
+    assert "p16" not in platform.mirror_urls
