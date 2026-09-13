@@ -2210,6 +2210,17 @@ def test_coerce_bool_never_reads_a_stringified_false_as_truth(value: object, exp
     assert _coerce_bool(value) is expected
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_coerce_bool_rejects_non_finite_numbers(value: float):
+    """A non-finite float is not a boolean the writers can produce.
+
+    ``nan != 0`` and ``inf != 0`` are both True, so a JSON ``NaN`` (which
+    ``json.loads`` accepts by default) or a YAML ``.inf`` read as a set flag.
+    Only finite numbers count, mirroring ``_coerce_float``'s isfinite guard.
+    """
+    assert _coerce_bool(value) is False
+
+
 def test_collect_cron_stringified_preflight_flag_is_not_truthy(hermes_home: Path):
     """A corrupted ``"preflight_alerted": "false"`` must not claim an alert was sent."""
     cron_dir = hermes_home / "cron"

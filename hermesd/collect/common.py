@@ -237,7 +237,9 @@ def _coerce_bool(value: object) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, int | float):
-        return value != 0
+        # NaN and the infinities are not booleans any writer produces, and both
+        # compare unequal to zero: a JSON ``NaN`` would otherwise read as set.
+        return math.isfinite(value) and value != 0
     if isinstance(value, str):
         return value.strip().lower() in _TRUTHY_STATE_VALUES
     return False
