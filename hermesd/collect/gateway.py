@@ -704,37 +704,77 @@ def _fleet_state_counts(fleet: list[object]) -> dict[str, int]:
 
 @dataclass(frozen=True, slots=True)
 class _StartStorm:
-    """Start ledger facts for the dashboard window."""
+    """Start ledger facts for the configured respawn-storm window."""
 
     recorded: bool = False
-    starts_2m: int = 0
+    starts_window: int = 0
     starts_1h: int = 0
     last_start_age_seconds: float | None = None
+    cap: int = _RESTART_STORM_CAP
+    window_seconds: float = _RESTART_STORM_WINDOW_SECONDS
 
-    def model_fields(self, now: float) -> dict[str, Any]:
+    def model_fields(self) -> dict[str, Any]:
         return {
             "gateway_starts_recorded": self.recorded,
-            "gateway_starts_2m": self.starts_2m,
+            "gateway_starts_window": self.starts_window,
             "gateway_starts_1h": self.starts_1h,
             "seconds_since_last_gateway_start": self.last_start_age_seconds,
-            "restart_storm_cap": _RESTART_STORM_CAP if self.recorded else 0,
-            "in_respawn_backoff": self.recorded and self.starts_2m > _RESTART_STORM_CAP,
+            "restart_storm_cap": self.cap if self.recorded else 0,
+            "restart_storm_window_seconds": self.window_seconds,
+            "in_respawn_backoff": self.recorded and self.starts_window > self.cap,
         }
 
 
-def _read_start_storm(path: Path, root: Path, now: float) -> _StartStorm:
+def _respawn_storm_policy(cfg: JsonMapping) -> tuple[int, float]:
+    """``(max_starts, window_seconds)`` as upstream resolves them from config.
+
+    Mirrors ``_respawn_storm_backoff`` (``hermes_cli/gateway.py:4673-4685``):
+    only a real ``int`` counts for ``max_starts`` (a JSON ``true`` is an int in
+    Python but not upstream) and only ``int``/``float`` for ``window_seconds``;
+    anything else keeps ``DEFAULT_CONFIG``'s 5 / 120 s
+    (``hermes_cli/config_defaults.py:1978``). The environment overrides upstream
+    also honours (``HERMES_GATEWAY_MAX_STARTS``, ``HERMES_GATEWAY_START_WINDOW_S``)
+    belong to the gateway's environment and are deliberately not read here — the
+    panel therefore reports the policy *as recorded in config*.
+    """
+    respawn = _as_dict(_as_dict(cfg.get("gateway")).get("respawn_storm"))
+    raw_cap = respawn.get("max_starts")
+    cap = (
+        raw_cap
+        if isinstance(raw_cap, int) and not isinstance(raw_cap, bool)
+        else _RESTART_STORM_CAP
+    )
+    raw_window = respawn.get("window_seconds")
+    window = (
+        float(raw_window)
+        if isinstance(raw_window, int | float) and not isinstance(raw_window, bool)
+        else _RESTART_STORM_WINDOW_SECONDS
+    )
+    return cap, window
+
+
+def _read_start_storm(
+    path: Path,
+    root: Path,
+    now: float,
+    *,
+    cap: int = _RESTART_STORM_CAP,
+    window_seconds: float = _RESTART_STORM_WINDOW_SECONDS,
+) -> _StartStorm:
     """Count recorded gateway starts in the storm-detection windows.
 
     ``recorded`` means "a ledger we can read", not "a file exists": upstream
     appends ``now`` before its atomic ``os.replace`` (``gateway/status.py:64-79``),
     so a file whose every line fails to parse — empty, whitespace or junk — was
-    not written by the ledger and proves as little as an absent one.
+    not written by the ledger and proves as little as an absent one. A
+    non-positive ``cap`` disables the writer upstream (``max_starts <= 0``), so a
+    leftover file is stale by construction and no verdict is derived from it.
     """
-    if not path.is_file():
-        return _StartStorm()
+    if cap <= 0 or not path.is_file():
+        return _StartStorm(cap=cap, window_seconds=window_seconds)
     text = _read_text_capped(path, root)
     if not text and _file_size(path) > 0:
-        return _StartStorm()
+        return _StartStorm(cap=cap, window_seconds=window_seconds)
     starts: list[float] = []
     for line in text.splitlines():
         try:
@@ -745,12 +785,14 @@ def _read_start_storm(path: Path, root: Path, now: float) -> _StartStorm:
         if 0.0 < epoch <= now:
             starts.append(epoch)
     if not starts:
-        return _StartStorm()
+        return _StartStorm(cap=cap, window_seconds=window_seconds)
     return _StartStorm(
         recorded=True,
-        starts_2m=sum(1 for start in starts if now - start <= _RESTART_STORM_WINDOW_SECONDS),
+        starts_window=sum(1 for start in starts if now - start <= window_seconds),
         starts_1h=sum(1 for start in starts if now - start <= _DAY_SECONDS / 24.0),
         last_start_age_seconds=now - max(starts),
+        cap=cap,
+        window_seconds=window_seconds,
     )
 
 

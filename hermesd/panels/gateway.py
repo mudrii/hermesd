@@ -343,8 +343,9 @@ def _restart_storm_text(gw: GatewayState, theme: Theme) -> Text:
     """
     text = Text()
     text.append("  Starts: ", style=theme.ui_label)
+    window = _duration_label(gw.restart_storm_window_seconds)
     text.append(
-        f"2m {gw.gateway_starts_2m}/{gw.restart_storm_cap}  1h {gw.gateway_starts_1h}",
+        f"{window} {gw.gateway_starts_window}/{gw.restart_storm_cap}  1h {gw.gateway_starts_1h}",
         style=theme.banner_text,
     )
     last = gw.seconds_since_last_gateway_start

@@ -781,9 +781,10 @@ def test_gateway_renders_lifecycle_carry_flags() -> None:
 def test_gateway_renders_restart_storm_line_and_backoff() -> None:
     state = _liveness_state(
         gateway_starts_recorded=True,
-        gateway_starts_2m=2,
+        gateway_starts_window=2,
         gateway_starts_1h=9,
         restart_storm_cap=5,
+        restart_storm_window_seconds=120.0,
         seconds_since_last_gateway_start=45.0,
     )
     detail = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
@@ -793,9 +794,10 @@ def test_gateway_renders_restart_storm_line_and_backoff() -> None:
 
     storm = _liveness_state(
         gateway_starts_recorded=True,
-        gateway_starts_2m=6,
+        gateway_starts_window=6,
         gateway_starts_1h=11,
         restart_storm_cap=5,
+        restart_storm_window_seconds=120.0,
         seconds_since_last_gateway_start=12.0,
         in_respawn_backoff=True,
     )

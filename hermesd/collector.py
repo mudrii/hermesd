@@ -107,6 +107,7 @@ from hermesd.collect.gateway import (
     _read_gateway_ledger_rows,
     _read_start_storm,
     _record_writer,
+    _respawn_storm_policy,
     _update_receipt_status,
 )
 from hermesd.collect.hosted_rooms import _read_hosted_rooms
@@ -394,9 +395,10 @@ _LIFECYCLE_FIELDS = (
 # gateway-starts.log: the respawn-storm ledger's fields.
 _RESTART_STORM_FIELDS = (
     "gateway_starts_recorded",
-    "gateway_starts_2m",
+    "gateway_starts_window",
     "gateway_starts_1h",
     "restart_storm_cap",
+    "restart_storm_window_seconds",
     "seconds_since_last_gateway_start",
     "in_respawn_backoff",
 )
@@ -1626,10 +1628,24 @@ class Collector:
         return gateway.model_copy(update={"loop_health": health, "loop_tick_armed": plan.armed})
 
     def _with_restart_storm(self, gateway: GatewayState) -> GatewayState:
-        """Respawn-storm ledger facts from gateway-starts.log (read-only ring file)."""
+        """Respawn-storm ledger facts from gateway-starts.log (read-only ring file).
+
+        The cap and window are upstream's configurable policy
+        (``gateway.respawn_storm``), read from the same root ``config.yaml`` the
+        config source uses — mtime-cached, so this costs one stat on a steady
+        install. config.yaml here is the ROOT file, like every other gateway
+        launch input.
+        """
+        cap, window_seconds = _respawn_storm_policy(self._read_yaml_cached())
         path = self._paths.shared_path("gateway-starts.log")
-        storm = _read_start_storm(path, self._paths.root_home, self._clock())
-        return gateway.model_copy(update=storm.model_fields(self._clock()))
+        storm = _read_start_storm(
+            path,
+            self._paths.root_home,
+            self._clock(),
+            cap=cap,
+            window_seconds=window_seconds,
+        )
+        return gateway.model_copy(update=storm.model_fields())
 
     def _with_exit_diag(self, gateway: GatewayState) -> GatewayState:
         """Crash forensics from the tail of the exit-diag ledger; metadata only.

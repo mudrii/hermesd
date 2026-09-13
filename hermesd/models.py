@@ -225,11 +225,14 @@ class GatewayState(BaseModel):
     prior_suspected_oom: bool = False
     # Respawn-storm ledger (gateway-starts.log). The file records one epoch per
     # start; an absent file is NOT evidence of zero restarts, because
-    # HERMES_GATEWAY_MAX_STARTS<=0 disables the writer.
+    # HERMES_GATEWAY_MAX_STARTS<=0 disables the writer. ``window`` counts starts
+    # inside the configured ``gateway.respawn_storm.window_seconds`` (120 s by
+    # default), which is also what ``in_respawn_backoff`` compares against the cap.
     gateway_starts_recorded: bool = False
-    gateway_starts_2m: int = 0
+    gateway_starts_window: int = 0
     gateway_starts_1h: int = 0
     restart_storm_cap: int = 0
+    restart_storm_window_seconds: float = 0.0
     seconds_since_last_gateway_start: float | None = None
     in_respawn_backoff: bool = False
     # Exit diagnostics ledger (logs/gateway-exit-diag.log): one JSON object per

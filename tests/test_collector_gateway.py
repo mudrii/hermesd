@@ -2796,7 +2796,7 @@ def test_restart_storm_counts_window_and_cap(hermes_home: Path):
     gateway = _collect(hermes_home).gateway
 
     assert gateway.gateway_starts_recorded is True
-    assert gateway.gateway_starts_2m == 2
+    assert gateway.gateway_starts_window == 2
     assert gateway.gateway_starts_1h == 4
     assert gateway.seconds_since_last_gateway_start == pytest.approx(30.0)
     assert gateway.in_respawn_backoff is False
@@ -2809,7 +2809,7 @@ def test_restart_storm_backoff_when_cap_is_exceeded(hermes_home: Path):
 
     gateway = _collect(hermes_home).gateway
 
-    assert gateway.gateway_starts_2m == 6
+    assert gateway.gateway_starts_window == 6
     assert gateway.in_respawn_backoff is True
 
 
@@ -2819,7 +2819,7 @@ def test_restart_storm_absent_file_is_not_evidence_of_zero_restarts(hermes_home:
     gateway = _collect(hermes_home).gateway
 
     assert gateway.gateway_starts_recorded is False
-    assert gateway.gateway_starts_2m == 0
+    assert gateway.gateway_starts_window == 0
     assert gateway.in_respawn_backoff is False
 
 
@@ -2831,7 +2831,7 @@ def test_restart_storm_garbage_and_future_lines_are_ignored(hermes_home: Path):
     gateway = _collect(hermes_home).gateway
 
     assert gateway.gateway_starts_recorded is True
-    assert gateway.gateway_starts_2m == 2
+    assert gateway.gateway_starts_window == 2
     assert gateway.seconds_since_last_gateway_start == pytest.approx(30.0)
 
 
@@ -2843,7 +2843,7 @@ def test_restart_storm_empty_file_records_nothing(hermes_home: Path):
     state = _collect(hermes_home)
 
     assert state.gateway.gateway_starts_recorded is False
-    assert state.gateway.gateway_starts_2m == 0
+    assert state.gateway.gateway_starts_window == 0
     assert state.gateway.seconds_since_last_gateway_start is None
     assert "Starts:" not in _gateway_detail(state)
 
@@ -2856,7 +2856,7 @@ def test_restart_storm_unparseable_file_records_nothing(hermes_home: Path, conte
     state = _collect(hermes_home)
 
     assert state.gateway.gateway_starts_recorded is False
-    assert state.gateway.gateway_starts_2m == 0
+    assert state.gateway.gateway_starts_window == 0
     assert state.gateway.in_respawn_backoff is False
     assert "Starts:" not in _gateway_detail(state)
 
@@ -2868,7 +2868,7 @@ def test_restart_storm_one_valid_epoch_beside_junk_still_records(hermes_home: Pa
     state = _collect(hermes_home)
 
     assert state.gateway.gateway_starts_recorded is True
-    assert state.gateway.gateway_starts_2m == 1
+    assert state.gateway.gateway_starts_window == 1
     assert state.gateway.gateway_starts_1h == 1
     assert state.gateway.seconds_since_last_gateway_start == pytest.approx(30.0)
     assert state.gateway.restart_storm_cap == 5
@@ -3191,3 +3191,76 @@ def test_listener_mirror_urls_skip_the_default_profile():
         record_current=True,
         served_profiles=["default", "coding"],
     ) == {"coding": "https://x.test/p/coding/v1"}
+
+
+def _write_respawn_config(home: Path, **respawn: object) -> None:
+    body = ["gateway:", "  respawn_storm:"]
+    for key, value in respawn.items():
+        body.append(f"    {key}: {value!r}" if isinstance(value, str) else f"    {key}: {value}")
+    (home / "config.yaml").write_text("\n".join(body) + "\n")
+
+
+def test_restart_storm_uses_the_configured_cap(hermes_home: Path):
+    """Upstream's effective cap is ``gateway.respawn_storm.max_starts``, not 5.
+
+    ``_respawn_storm_backoff`` reads the value from ``load_config()``
+    (``hermes_cli/gateway.py:4673-4685``), so a raised cap means no backoff
+    where the hardcoded default would have cried storm — and a lowered one means
+    a real storm the default would have missed.
+    """
+    _write_gateway_state(hermes_home)
+    _write_respawn_config(hermes_home, max_starts=10)
+    _write_starts_log(hermes_home, [NOW - 10 * i for i in range(1, 7)])
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.gateway_starts_window == 6
+    assert gateway.restart_storm_cap == 10
+    assert gateway.in_respawn_backoff is False
+
+    _write_respawn_config(hermes_home, max_starts=2)
+    gateway = _collect(hermes_home).gateway
+    assert gateway.restart_storm_cap == 2
+    assert gateway.in_respawn_backoff is True
+
+
+def test_restart_storm_uses_the_configured_window(hermes_home: Path):
+    """A 300 s window counts starts the hardcoded 120 s window would drop."""
+    _write_gateway_state(hermes_home)
+    _write_respawn_config(hermes_home, window_seconds=300)
+    _write_starts_log(hermes_home, [NOW - 60, NOW - 150, NOW - 290, NOW - 400])
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.restart_storm_window_seconds == pytest.approx(300.0)
+    assert gateway.gateway_starts_window == 3
+    assert gateway.gateway_starts_1h == 4
+    assert gateway.in_respawn_backoff is False
+
+
+def test_restart_storm_disabled_writer_makes_no_claims(hermes_home: Path):
+    """``max_starts <= 0`` disables the writer upstream, so the ledger is stale
+    by construction and hermesd must not report a storm verdict from it."""
+    _write_gateway_state(hermes_home)
+    _write_respawn_config(hermes_home, max_starts=0)
+    _write_starts_log(hermes_home, [NOW - 10 for _ in range(9)])
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.gateway_starts_recorded is False
+    assert gateway.in_respawn_backoff is False
+
+
+def test_respawn_storm_policy_reads_only_upstream_shapes():
+    """booleans and junk are not ints upstream: mirror the isinstance guards."""
+    from hermesd.collect.gateway import _respawn_storm_policy
+
+    assert _respawn_storm_policy({}) == (5, 120.0)
+    assert _respawn_storm_policy({"gateway": {"respawn_storm": {"max_starts": 8}}}) == (8, 120.0)
+    assert _respawn_storm_policy(
+        {"gateway": {"respawn_storm": {"max_starts": True, "window_seconds": "300"}}}
+    ) == (5, 120.0)
+    assert _respawn_storm_policy({"gateway": {"respawn_storm": {"window_seconds": 300.5}}}) == (
+        5,
+        300.5,
+    )

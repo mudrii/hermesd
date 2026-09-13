@@ -1369,7 +1369,7 @@ def test_gateway_launch_files_are_root_scoped_under_a_profile(
     # The root copy: one start, marker mtime at 2027-01-15. The nine profile
     # entries (which would trip the storm cap) and the profile marker are ignored.
     assert gateway.gateway_starts_recorded is True
-    assert gateway.gateway_starts_2m == 0
+    assert gateway.gateway_starts_window == 0
     assert gateway.gateway_starts_1h == 1
     assert gateway.dashboard_client_last_frame_age_seconds is not None
     assert gateway.exit_diag_recorded is True
