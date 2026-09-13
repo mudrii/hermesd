@@ -2491,9 +2491,12 @@ class Collector:
                     self._log_tail_bytes,
                 )
                 last_status = j.get("last_status")
-                # A raw null must fall back to the model default, not fail the job.
+                # A raw null must fall back to the model default, not fail the
+                # job; anything else is read strictly, like the sibling
+                # no_agent/preflight_alerted flags in the same machine-written
+                # record (`cron/jobs.py` stores `not paused` as a real bool).
                 raw_enabled = j.get("enabled", True)
-                enabled = True if raw_enabled is None else bool(raw_enabled)
+                enabled = True if raw_enabled is None else _coerce_bool(raw_enabled)
                 dispatch_lateness, dispatch_kind = _cron_job_dispatch(j)
                 repeat_times, repeat_completed = _cron_job_repeat(j)
                 paused, paused_reason = _cron_job_paused(j)

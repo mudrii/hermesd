@@ -3033,3 +3033,37 @@ def test_cron_no_agent_flag_is_read_strictly(hermes_home: Path):
 
     assert by_id["job-script"].no_agent is False
     assert by_id["job-agentless"].no_agent is True
+
+
+def test_cron_enabled_flag_is_read_strictly(hermes_home: Path):
+    """The job's own ``enabled`` flag is a machine-written boolean.
+
+    ``cron/jobs.py`` stores ``not paused`` and reads it back truthily, so a
+    stringified ``"false"`` beside the real booleans is corruption, not a
+    disabled job: ``bool("false")`` would report every stringified job as
+    enabled, the opposite of what the record says. An omitted or null flag
+    still falls back to the job default (enabled), which is a separate,
+    deliberate reading pinned by ``test_cron_source_survives_null_enabled``.
+    """
+    _write_jobs_json(
+        hermes_home,
+        [
+            {"id": "job-quoted-false", "name": "Quoted false", "enabled": "false"},
+            {"id": "job-quoted-zero", "name": "Quoted zero", "enabled": "0"},
+            {"id": "job-real-false", "name": "Really paused", "enabled": False},
+            {"id": "job-real-true", "name": "Enabled", "enabled": True},
+            {"id": "job-absent", "name": "No flag"},
+        ],
+    )
+
+    c = Collector(hermes_home, clock=lambda: 1_800_000_000.0)
+    try:
+        by_id = {job.job_id: job for job in c.collect().cron.jobs}
+    finally:
+        c.close()
+
+    assert by_id["job-quoted-false"].enabled is False
+    assert by_id["job-quoted-zero"].enabled is False
+    assert by_id["job-real-false"].enabled is False
+    assert by_id["job-real-true"].enabled is True
+    assert by_id["job-absent"].enabled is True
