@@ -36,6 +36,10 @@ _FULL_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 # (``hermes_cli/active_sessions.py:426-433``), so an exactly-equal pair can still
 # differ by a fraction of a second once rounded against the injected clock.
 _LEASE_TRANSFER_TOLERANCE_SECONDS = 1.0
+# A routing entry's durable turn token is CAS-cleared on normal unwind and left
+# behind by SIGKILL/OOM (gateway/session.py:515-518), so a token older than this
+# grace reads as "turn never unwound" — a crash marker, not a slow turn.
+_TURN_UNWIND_GRACE_SECONDS = 300
 
 # Cross-restart schema-repair budget hermes-agent refuses to exceed on one
 # damaged file: ``_MAX_PERSISTENT_REPAIR_ATTEMPTS`` (``hermes_state_repair.py:48``).
@@ -530,6 +534,184 @@ class ProcessLiveness(StrEnum):
     UNVERIFIABLE = "unverifiable"
 
 
+class SessionLeaseKind(StrEnum):
+    """Which state.db coordination row a :class:`SessionLease` summarizes.
+
+    A *turn lease* is keyed by the conversation lineage root and serializes
+    turns across processes (``hermes_state_compression.py:519-536``); a
+    *compression lock* is keyed by the exact session id and only blocks other
+    compressions (``:451-474``).
+    """
+
+    TURN_LEASE = "turn_lease"
+    COMPRESSION_LOCK = "compression_lock"
+
+
+class SessionLease(BaseModel):
+    """One ``session_turn_leases`` / ``compression_locks`` row.
+
+    Both tables share the shape ``(key, holder, acquired_at, expires_at)``
+    (``hermes_state_common.py:506-518``) and the same default 300s TTL; there
+    is no background sweeper upstream, so a row disappears only when its holder
+    releases it or another acquirer reclaims it.
+
+    Liveness mirrors upstream's reclaim rule
+    (``hermes_state.py:119-143``): a holder is *dead* only on kernel proof its
+    ``pid=`` is gone; an unparseable holder (no ``pid=``) is unverifiable and
+    keeps its lease until TTL, and a recycled pid reads as alive — the same
+    conservatism as the active-surface checks.
+    """
+
+    kind: SessionLeaseKind = SessionLeaseKind.TURN_LEASE
+    # conversation lineage root (turn lease) or exact session id (lock)
+    key: str = ""
+    holder: str = ""
+    pid: int = 0
+    # Ages against the injected clock, like every other cached-readout value.
+    held_seconds: float | None = None
+    # expires_at - now; negative means the TTL has already elapsed.
+    expires_in_seconds: float | None = None
+    expired: bool = False
+    liveness: ProcessLiveness = ProcessLiveness.UNVERIFIABLE
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def orphaned(self) -> bool:
+        """Derived: the holder's pid is provably gone (upstream would reclaim)."""
+        return self.liveness is ProcessLiveness.DEAD
+
+
+class GatewayHygieneState(BaseModel):
+    """One ``gateway_hygiene_state`` row: per-chat session-hygiene failures.
+
+    Writers increment the streak per failed hygiene run
+    (``hermes_state_gateway.py:513-529``); the consumer escalates a cooldown
+    ladder x1/x3/x9 over the 300s base, clamped at 3600s
+    (``gateway/run.py:101-149``), so a streak of 3+ effectively disables
+    pre-turn compaction for up to an hour. Rows are deleted only when a
+    compression actually recovers the chat (``gateway/run.py:152-167``).
+    """
+
+    session_key: str = ""
+    failure_streak: int = 0
+    # streak >= 3: compaction effectively suspended
+    suspended: bool = False
+    # Joined from the session row's compression_failure_error ("" when no
+    # matching session row or no recorded error): the why behind the streak.
+    compression_failure_error: str = ""
+
+
+class GatewayRouteState(BaseModel):
+    """Decoded ``gateway_routing.entry_json`` (one ``SessionEntry.to_dict()``,
+    ``gateway/session.py:535-545``) for one routed chat.
+
+    ``entry_json`` also carries token counters and Slack watermarks; only the
+    state flags below are extracted, and ``display_name`` is redacted before it
+    reaches this model. ``turn_never_unwound`` is the crash marker: a durable
+    turn token is CAS-cleared on normal unwind and left behind by SIGKILL/OOM
+    (``gateway/session.py:515-518``), so a token older than a few minutes means
+    the turn died mid-flight.
+    """
+
+    session_key: str = ""
+    session_id: str = ""
+    platform: str = ""
+    chat_type: str = ""
+    display_name: str = ""
+    updated_at_age_seconds: float | None = None
+    suspended: bool = False
+    resume_pending: bool = False
+    resume_reason: str = ""
+    was_auto_reset: bool = False
+    auto_reset_reason: str = ""
+    # Age of active_turn_started_at; None when the entry carries no token.
+    turn_age_seconds: float | None = None
+    # The routed session id has no row in sessions: the gateway would try to
+    # resume a nonexistent id.
+    dangling: bool = False
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def turn_never_unwound(self) -> bool:
+        """Derived: a turn token older than the unwind grace — a crash marker."""
+        return (
+            self.turn_age_seconds is not None and self.turn_age_seconds > _TURN_UNWIND_GRACE_SECONDS
+        )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def needs_user_message(self) -> bool:
+        """Derived: suspended or resume-pending chats recover only on the next
+        inbound user message (a resume-pending chat auto-continues the *same*
+        transcript, but both sit idle until the chat speaks again)."""
+        return self.suspended or self.resume_pending
+
+
+class ConversationGeneration(BaseModel):
+    """One ``conversation_generations`` row: the monotonic reset counter for a
+    routing peer (``hermes_state_common.py:460-487``).
+
+    The table is deliberately never garbage-collected, so hermesd treats a
+    shrinking row count between refreshes as an invariant break and raises a
+    panel warning (``SessionCoordinationState.generation_count_shrank``).
+    """
+
+    source: str = ""
+    session_key: str = ""
+    generation: int = 0
+
+
+class TerminalBreadcrumb(BaseModel):
+    """One terminal breadcrumb under ``terminal-sessions/``.
+
+    Upstream records ``{"session_id", "cwd", "ts"}`` per terminal identity so
+    ``hermes -c`` can find that terminal's session
+    (``hermes_cli/terminal_breadcrumbs.py:76-94``). One file per terminal, best
+    effort: the file count is only an *upper bound* on live terminals.
+    """
+
+    terminal: str = ""
+    session_id: str = ""
+    cwd: str = ""
+    age_seconds: float | None = None
+
+
+class TerminalSessionReadout(BaseModel):
+    """Bounded recent terminal breadcrumbs plus the 24h file count.
+
+    ``count`` covers every breadcrumb within the 24-hour window even when
+    ``sessions`` is truncated to the newest rows.
+    """
+
+    sessions: list[TerminalBreadcrumb] = Field(default_factory=list)
+    count: int = 0
+
+
+class SessionCoordinationState(BaseModel):
+    """Gateway/lease coordination state beside the session table.
+
+    Four independently-failing sources write nested groups here:
+    ``session_leases`` (turn leases + compression locks), ``gateway_hygiene``
+    (per-chat hygiene failure streaks), ``gateway_routes`` (decoded routing
+    entries) and ``generation_churn`` (conversation generations). All read the
+    selected profile's ``state.db``; totals are exact row counts while the row
+    lists are capped, so a panel must never present a capped list as the count.
+    """
+
+    leases: list[SessionLease] = Field(default_factory=list)
+    lease_total: int = 0
+    hygiene: list[GatewayHygieneState] = Field(default_factory=list)
+    routes: list[GatewayRouteState] = Field(default_factory=list)
+    route_total: int = 0
+    generations: list[ConversationGeneration] = Field(default_factory=list)
+    # One row per (source, session_key) peer.
+    generation_chat_total: int = 0
+    # Sum of generations: lifetime reset boundaries ever written upstream.
+    generation_reset_total: int = 0
+    # The never-prune invariant broke: the row count shrank between refreshes.
+    generation_count_shrank: bool = False
+
+
 class ActiveSurface(BaseModel):
     """One lease in ``runtime/active_sessions.json``.
 
@@ -573,6 +755,15 @@ class ActiveSurface(BaseModel):
     # (``tui_gateway/session_lifecycle.py:33-38``); it asks the registry to raise
     # rather than warn when it cannot prove liveness.
     track_liveness: bool = False
+    # The lease advertises cooperative attach: metadata.shared_runtime_url is
+    # present (``hermes_cli/shared_session_attach.py:32-47`` — presence is the
+    # whole signal; the handshake is HTTP and hermesd never probes it). The URL
+    # itself is deliberately not stored: only gateway surfaces that advertise it
+    # show the joinable chip. Gateway leases record surface "gateway:<platform>"
+    # (``gateway/run_busy.py:187``) and bot delivery consumers carry
+    # metadata.bot_live_delivery_consumer
+    # (``tui_gateway/session_lifecycle.py:36``).
+    joinable: bool = False
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -2346,6 +2537,8 @@ class DashboardState(BaseModel):
     gateway: GatewayState = Field(default_factory=GatewayState)
     migration: MigrationState = Field(default_factory=MigrationState)
     sessions: list[SessionInfo] = Field(default_factory=list)
+    session_coordination: SessionCoordinationState = Field(default_factory=SessionCoordinationState)
+    terminal_sessions: TerminalSessionReadout = Field(default_factory=TerminalSessionReadout)
     active_surfaces: list[ActiveSurface] = Field(default_factory=list)
     active_surface_count: int = 0
     active_surfaces_truncated: bool = False

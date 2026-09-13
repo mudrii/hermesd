@@ -54,12 +54,16 @@ def _connect_readonly_sqlite(db_path: Path) -> Iterator[sqlite3.Connection]:
 _KNOWN_TABLES = frozenset(
     {
         "async_delegations",
+        "compression_locks",
+        "conversation_generations",
         "conversations",
         "cron_incidents",
         "delivery_obligations",
         "discovered_repos",
         "executions",
         "gateway_heartbeats",
+        "gateway_hygiene_state",
+        "gateway_routing",
         # shared-state.db (gateway/hosted_rooms.py:87-148). The
         # hosted_room_policy_* tables beside these are deliberately absent: they
         # hold conversation transcripts, which hermesd never reads.
@@ -76,6 +80,7 @@ _KNOWN_TABLES = frozenset(
         "responses",
         # runs_idempotency.db (api_server_run_idempotency.py:86-99).
         "run_idempotency",
+        "session_turn_leases",
         "task_attachments",
         "task_comments",
         "task_events",

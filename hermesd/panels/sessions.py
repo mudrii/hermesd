@@ -8,7 +8,18 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from hermesd.models import ActiveSurface, DashboardState, ProcessLiveness, SessionInfo
+from hermesd.models import (
+    ActiveSurface,
+    DashboardState,
+    GatewayHygieneState,
+    GatewayRouteState,
+    ProcessLiveness,
+    SessionCoordinationState,
+    SessionInfo,
+    SessionLease,
+    SessionLeaseKind,
+    TerminalSessionReadout,
+)
 from hermesd.panels.formatting import (
     escape_terminal_text as escape,
 )
@@ -52,6 +63,14 @@ _MAX_ERROR_CHARS = 60
 # Bound on the sessions examined for compression warnings, matching the other
 # per-section row caps in this panel.
 _COMPRESSION_WARNING_ROWS = 10
+# Coordination-section bounds. Coordination keys are rotation-stable chat keys
+# (e.g. "telegram:<chat>:<thread>") — shortened like session ids, never shown
+# whole for a stranger's chat.
+_COORDINATION_KEY_CHARS = 14
+_MAX_COORDINATION_ERROR_CHARS = 44
+_MAX_ROUTE_FLAGS = 4
+_RESET_CHURN_ROWS = 5
+_TERMINAL_ROWS = 8
 
 # Rendered under the Live Surfaces section: the numbers beside it are a lease
 # count, a verified-activity count and a pid count, and reading any one of them
@@ -104,6 +123,9 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             lines.append(f" {live} live", style=f"bold {theme.ui_ok}")
         if unverified:
             lines.append(f" {unverified} unverified", style=theme.ui_warn)
+        joinable = sum(1 for s in state.active_surfaces if s.joinable)
+        if joinable:
+            lines.append(f" {joinable} joinable", style=f"bold {theme.ui_ok}")
         if state.active_surfaces_truncated:
             lines.append(f"  first {len(state.active_surfaces)} retained", style=theme.banner_dim)
         # Capacity is a third number, not a restatement of either above: the
@@ -121,6 +143,26 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         # A live cooldown or an armed anti-thrash deadline: the compressor is
         # backing off on these sessions right now.
         lines.append(f"  ⚠ {recovering} compression recovery", style=f"bold {theme.ui_warn}")
+    coord = state.session_coordination
+    if coord.lease_total:
+        # Exact totals; the expired/orphaned flags come from the retained rows
+        # (capped upstream of the panel) and under-report only on a database
+        # already large enough to scroll.
+        lines.append(f"  {coord.lease_total} lease(s)", style=f"bold {theme.ui_accent}")
+        expired = sum(1 for lease in coord.leases if lease.expired)
+        orphaned = sum(1 for lease in coord.leases if lease.orphaned)
+        if expired:
+            lines.append(f" {expired} expired", style=theme.ui_warn)
+        if orphaned:
+            lines.append(f" {orphaned} orphaned", style=f"bold {theme.ui_error}")
+    if coord.hygiene:
+        # Per-chat session-hygiene failure streaks: compaction backing off.
+        lines.append(f"  ⚠ {len(coord.hygiene)} hygiene cooldown(s)", style=f"bold {theme.ui_warn}")
+        suspended = sum(1 for row in coord.hygiene if row.suspended)
+        if suspended:
+            lines.append(f" · {suspended} compaction off", style=f"bold {theme.ui_error}")
+    if state.terminal_sessions.count:
+        lines.append(f"  {state.terminal_sessions.count} cli tty", style=theme.banner_dim)
     lines.append(f"   {total_msgs} msgs  {total_tc} tools\n", style=theme.banner_text)
     for s in state.sessions[:4]:
         sid_short = s.session_id[-6:] if len(s.session_id) > 6 else s.session_id
@@ -180,6 +222,7 @@ def _render_detail(
     if warnings is not None:
         sections.append(section_heading("Warnings", theme))
         sections.append(warnings)
+    sections.extend(_coordination_sections(state, theme))
     runtime_table = _runtime_table(sessions, theme)
     if runtime_table is not None:
         sections.append(section_heading("Runtime", theme, leading_blank=len(sections) > 1))
@@ -642,6 +685,10 @@ def _surface_state_label(surface: ActiveSurface, theme: Theme) -> Text:
         label.append(_lease_age_label(surface.updated_at_age_seconds), style=theme.ui_accent)
     if surface.track_liveness:
         label.append(" tracked", style=theme.banner_dim)
+    if surface.joinable:
+        # The lease advertises metadata.shared_runtime_url; the URL itself is
+        # never shown — the chip is the whole message.
+        label.append(" joinable", style=f"bold {theme.ui_ok}")
     return label
 
 
@@ -807,3 +854,242 @@ def _lifetime_context_label(session: SessionInfo) -> str:
         + session.reasoning_tokens
     )
     return f"{fmt_tokens(lifetime_tokens)} / {fmt_tokens(session.context_limit)}"
+
+
+# ── Session coordination sections (leases, hygiene, routes, churn, ttys) ────
+
+
+def _coordination_sections(state: DashboardState, theme: Theme) -> list[RenderableType]:
+    """The state.db coordination sections under panel 2's detail view.
+
+    Everything here is counters, timestamps and flags from the selected
+    profile's ``state.db`` plus the terminal breadcrumb files — conversation
+    content is never read. Each section renders only when its source has
+    anything to say; an empty table reads as "nothing is stuck", which is the
+    healthy state.
+    """
+    coord = state.session_coordination
+    sections: list[RenderableType] = []
+    if coord.leases:
+        sections.append(section_heading("Turn Leases & Locks", theme))
+        sections.append(_leases_table(coord.leases, theme))
+        sections.append(Text(f"  {_LEASE_NOTE}", style=theme.banner_dim))
+    if coord.hygiene:
+        sections.append(section_heading("Hygiene Cooldowns", theme))
+        sections.append(_hygiene_table(coord.hygiene, theme))
+        sections.append(Text(f"  {_HYGIENE_NOTE}", style=theme.banner_dim))
+    if coord.routes:
+        sections.append(section_heading("Chat Routes", theme))
+        sections.append(_routes_table(coord.routes, theme))
+        waiting = sum(1 for route in coord.routes if route.needs_user_message)
+        dangling = sum(1 for route in coord.routes if route.dangling)
+        if waiting or dangling:
+            sections.append(
+                Text(f"  {_route_counts_label(waiting, dangling)}\n", style=theme.banner_text)
+            )
+    if coord.generation_chat_total:
+        sections.append(section_heading("Reset Churn", theme))
+        sections.append(_reset_churn_section(coord, theme))
+    term = state.terminal_sessions
+    if term.count:
+        sections.append(section_heading("CLI Terminals", theme))
+        sections.append(_terminal_section(term, theme))
+    return sections
+
+
+_LEASE_NOTE = (
+    "Turn leases key a conversation lineage; compression locks key one session. "
+    "Upstream revives an expired lease whose holder still matches rather than "
+    "stealing it, so expiry alone is benign — only expired rows with a dead "
+    "holder (orphaned) are stuck. There is no background sweeper; rows clear "
+    "when their holder releases them."
+)
+
+_HYGIENE_NOTE = (
+    "Failure streaks are per rotation-stable chat key; cooldowns climb x1/x3/x9 "
+    "over the 300s base, clamped at 1h, so streak 3 suspends pre-turn "
+    "compaction. A row clears only when compaction recovers."
+)
+
+
+def _duration_or_dash(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    return fmt_age_seconds(max(0, int(seconds)))
+
+
+def _ttl_label(lease: SessionLease) -> str:
+    expires_in = lease.expires_in_seconds
+    if expires_in is None:
+        return "—"
+    if expires_in >= 0:
+        return f"{fmt_age_seconds(int(expires_in))} left"
+    return f"expired {fmt_age_seconds(int(-expires_in))} ago"
+
+
+def _lease_state_label(lease: SessionLease, theme: Theme) -> Text:
+    """Orphaned first (the action-worthy case), then plain expiry — an expired
+    lease whose holder still matches is revived upstream, not stolen."""
+    if lease.orphaned:
+        return Text("orphaned", style=f"bold {theme.ui_error}")
+    if lease.expired:
+        return Text("expired — holder may revive", style=theme.ui_warn)
+    if lease.liveness is ProcessLiveness.LIVE:
+        return Text("live", style=f"bold {theme.ui_ok}")
+    return Text("unverified", style=theme.ui_warn)
+
+
+def _leases_table(leases: list[SessionLease], theme: Theme) -> Table:
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("Kind", style=theme.ui_label)
+    table.add_column("Key", style=theme.session_label)
+    table.add_column("PID", justify="right", style=theme.banner_dim)
+    table.add_column("Held", justify="right", style=theme.banner_dim)
+    table.add_column("TTL", justify="right", style=theme.banner_dim)
+    table.add_column("State", style=theme.banner_dim)
+    for lease in leases:
+        table.add_row(
+            "turn lease" if lease.kind is SessionLeaseKind.TURN_LEASE else "compress lock",
+            escape(lease.key[-_COORDINATION_KEY_CHARS:]),
+            str(lease.pid) if lease.pid else "—",
+            _duration_or_dash(lease.held_seconds),
+            _ttl_label(lease),
+            _lease_state_label(lease, theme),
+        )
+    return table
+
+
+def _hygiene_effect_label(streak: int) -> str:
+    if streak >= 3:
+        return "compaction suspended, cooldown up to 1h"
+    return "compaction cooldown backoff"
+
+
+def _hygiene_table(rows: list[GatewayHygieneState], theme: Theme) -> Table:
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("Chat", style=theme.session_label)
+    table.add_column("Streak", justify="right", style=theme.ui_accent)
+    table.add_column("Effect", style=theme.ui_warn)
+    table.add_column("Last error", style=theme.banner_dim)
+    for row in rows:
+        table.add_row(
+            escape(row.session_key[-_COORDINATION_KEY_CHARS:]),
+            str(row.failure_streak),
+            escape(_hygiene_effect_label(row.failure_streak)),
+            escape(_truncate(row.compression_failure_error, _MAX_COORDINATION_ERROR_CHARS))
+            if row.compression_failure_error
+            else "—",
+        )
+    return table
+
+
+def _route_flags(route: GatewayRouteState) -> str:
+    """Severity-ordered: the cap keeps the most actionable flags, so a broken
+    resume target or a stuck turn can never be truncated away by a longer
+    list of historical markers."""
+    flags: list[str] = []
+    if route.dangling:
+        flags.append("dangling")
+    if route.turn_never_unwound:
+        flags.append("turn never unwound")
+    if route.suspended:
+        flags.append("suspended")
+    if route.resume_pending:
+        flags.append(
+            f"resume-pending ({route.resume_reason})" if route.resume_reason else "resume-pending"
+        )
+    if route.was_auto_reset:
+        flags.append(
+            f"auto-reset ({route.auto_reset_reason})" if route.auto_reset_reason else "auto-reset"
+        )
+    return ", ".join(flags[:_MAX_ROUTE_FLAGS]) if flags else "—"
+
+
+def _routes_table(routes: list[GatewayRouteState], theme: Theme) -> Table:
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("Chat", style=theme.session_label)
+    table.add_column("Platform", style=theme.banner_text)
+    table.add_column("Type", style=theme.banner_dim)
+    table.add_column("Turn", justify="right", style=theme.banner_dim)
+    table.add_column("Name", style=theme.banner_text)
+    table.add_column("Flags", style=theme.ui_warn)
+    for route in routes:
+        table.add_row(
+            escape(route.session_key[-_COORDINATION_KEY_CHARS:]),
+            escape(route.platform) if route.platform else "—",
+            escape(route.chat_type) if route.chat_type else "—",
+            _lease_age_label(route.turn_age_seconds),
+            escape(route.display_name) if route.display_name else "—",
+            escape(_route_flags(route)),
+        )
+    return table
+
+
+def _route_counts_label(waiting: int, dangling: int) -> str:
+    parts: list[str] = []
+    if waiting:
+        parts.append(f"{waiting} chat(s) need a user message to recover")
+    if dangling:
+        parts.append(
+            f"{dangling} dangling route(s) — the gateway would resume a nonexistent session"
+        )
+    return " · ".join(parts)
+
+
+def _reset_churn_section(coord: SessionCoordinationState, theme: Theme) -> RenderableType:
+    """Top chats by generation plus the lifetime reset total.
+
+    ``conversation_generations`` is never pruned upstream, so the row count is
+    a lifetime figure — a shrink between refreshes is an invariant break, not
+    quiet tidying, and is called out as such.
+    """
+    lines = Text()
+    lines.append(f"  lifetime resets {coord.generation_reset_total}", style=theme.ui_accent)
+    lines.append(f" across {coord.generation_chat_total} chat(s)", style=theme.banner_text)
+    if coord.generation_count_shrank:
+        lines.append(
+            " · table shrank between refreshes — upstream never prunes it",
+            style=f"bold {theme.ui_error}",
+        )
+    lines.append("\n")
+    if not coord.generations:
+        return lines
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("Chat", style=theme.session_label)
+    table.add_column("Source", style=theme.banner_dim)
+    table.add_column("Resets", justify="right", style=theme.ui_accent)
+    for generation in coord.generations[:_RESET_CHURN_ROWS]:
+        table.add_row(
+            escape(generation.session_key[-_COORDINATION_KEY_CHARS:]),
+            escape(generation.source) if generation.source else "—",
+            str(generation.generation),
+        )
+    return Group(lines, table)
+
+
+_TERMINAL_NOTE = (
+    "file count is an upper bound — a breadcrumb proves a terminal recorded a "
+    "session recently, not that the terminal is still alive, and stale files "
+    "linger up to 30 days"
+)
+
+
+def _terminal_section(term: TerminalSessionReadout, theme: Theme) -> RenderableType:
+    lines = Text()
+    lines.append(f"  {term.count} open CLI terminals in the last 24 hours", style=theme.ui_accent)
+    lines.append(f" — {_TERMINAL_NOTE}\n", style=theme.banner_dim)
+    if not term.sessions:
+        return lines
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("Terminal", style=theme.session_label)
+    table.add_column("Session", style=theme.banner_dim)
+    table.add_column("CWD", style=theme.banner_text)
+    table.add_column("Age", justify="right", style=theme.banner_dim)
+    for row in term.sessions[:_TERMINAL_ROWS]:
+        table.add_row(
+            escape(row.terminal),
+            escape(row.session_id[-8:]) if row.session_id else "—",
+            escape(_cwd_label(row.cwd)) if row.cwd else "—",
+            _duration_or_dash(row.age_seconds),
+        )
+    return Group(lines, table)

@@ -190,6 +190,7 @@ def create_state_db_tables(
     source_required: bool = True,
     include_v021_columns: bool = False,
     include_compression_columns: bool = True,
+    include_session_key: bool = False,
 ) -> None:
     """Create the session/message tables used by collector and DB tests.
 
@@ -211,6 +212,11 @@ def create_state_db_tables(
     extra_session_columns = SESSION_V021_COLUMNS_SQL if include_v021_columns else ""
     if include_v021_columns and include_compression_columns:
         extra_session_columns += SESSION_COMPRESSION_COLUMNS_SQL
+    if include_session_key:
+        # Gateway chats carry a rotation-stable session_key (written by the
+        # repair/recovery paths in hermes_state_gateway.py); the hygiene and
+        # routing tests join on it.
+        extra_session_columns += ",\n            session_key TEXT"
     model_usage_table = SESSION_MODEL_USAGE_SQL if include_v021_columns else ""
     conn.executescript(
         f"""
@@ -260,6 +266,85 @@ def create_state_db_tables(
             codex_reasoning_items TEXT
         );
         """
+    )
+
+
+def create_session_coordination_tables(conn: sqlite3.Connection) -> None:
+    """Create the state.db coordination tables hermesd's session-side sources read.
+
+    Column shapes mirror upstream ``hermes_state_common.py:447-518,482-487``
+    (gateway_routing, gateway_hygiene_state, conversation_generations,
+    compression_locks, session_turn_leases).
+    """
+    conn.executescript(
+        """
+        CREATE TABLE gateway_routing (
+            scope TEXT NOT NULL DEFAULT '',
+            session_key TEXT NOT NULL,
+            entry_json TEXT NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (scope, session_key)
+        );
+        CREATE TABLE gateway_hygiene_state (
+            session_key TEXT PRIMARY KEY,
+            failure_streak INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE conversation_generations (
+            source TEXT NOT NULL,
+            session_key TEXT NOT NULL,
+            generation INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (source, session_key)
+        );
+        CREATE TABLE compression_locks (
+            session_id TEXT PRIMARY KEY,
+            holder TEXT NOT NULL,
+            acquired_at REAL NOT NULL,
+            expires_at REAL NOT NULL
+        );
+        CREATE TABLE session_turn_leases (
+            conversation_id TEXT PRIMARY KEY,
+            holder TEXT NOT NULL,
+            acquired_at REAL NOT NULL,
+            expires_at REAL NOT NULL
+        );
+        """
+    )
+
+
+def insert_turn_lease(
+    conn: sqlite3.Connection,
+    conversation_id: str,
+    holder: str,
+    acquired_at: float,
+    expires_at: float,
+) -> None:
+    conn.execute(
+        "INSERT INTO session_turn_leases (conversation_id, holder, acquired_at, expires_at) "
+        "VALUES (?,?,?,?)",
+        (conversation_id, holder, acquired_at, expires_at),
+    )
+
+
+def insert_compression_lock(
+    conn: sqlite3.Connection,
+    session_id: str,
+    holder: str,
+    acquired_at: float,
+    expires_at: float,
+) -> None:
+    conn.execute(
+        "INSERT INTO compression_locks (session_id, holder, acquired_at, expires_at) "
+        "VALUES (?,?,?,?)",
+        (session_id, holder, acquired_at, expires_at),
+    )
+
+
+def insert_gateway_route(
+    conn: sqlite3.Connection, session_key: str, entry: dict, updated_at: float
+) -> None:
+    conn.execute(
+        "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) VALUES (?,?,?,?)",
+        ("/sessions/dir", session_key, json.dumps(entry), updated_at),
     )
 
 

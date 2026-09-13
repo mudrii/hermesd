@@ -87,6 +87,53 @@ and this project uses date-based versions in `YYYY.M.D` form.
 - The [12] panel flags "Checkpoint prune overdue" when the PROFILE `checkpoints/.last_prune` marker is older than 48h (2x upstream's 24h auto-prune interval), with the caveat kept inline: a fresh marker proves the wrapper ran, not that pruning succeeded.
 
 - The [12] panel raises a red flag with its age when ROOT `spawn-ledger.json.corrupt` exists — the parking bay where upstream moves an unparseable spawn ledger rather than silently treating it as empty.
+- The Sessions panel now surfaces the gateway's cross-process coordination state, read from four
+  profile-scoped `state.db` tables that had no reader anywhere in hermesd. **Turn leases and
+  compression locks** (`session_turn_leases`, `compression_locks`; upstream writers
+  `hermes_state_compression.py:433-605`) render per-row in the detail view with holder pid, hold
+  duration, remaining TTL and a verdict: `expired` rows are labelled as benign-with-recovery
+  (upstream revives an expired lease whose holder still matches rather than stealing it), while a
+  provably dead holder pid marks the row `orphaned`; the compact view shows the counts. Liveness
+  mirrors upstream's own reclaim rule (`hermes_state.py:119-143`) — kernel proof only, pid reuse
+  reads as alive, and pid-less legacy holders stay unverifiable instead of being declared dead.
+
+- Session-hygiene failure streaks per chat (`gateway_hygiene_state`) appear as a hygiene-cooldowns
+  section with the chat key, the streak, the recorded `compression_failure_error` for the reason,
+  and the effect: the cooldown ladder runs x1/x3/x9 over the 300s base clamped at 1h
+  (`gateway/run.py:101-149`), so a streak of 3+ is rendered as "compaction suspended, cooldown up to
+  1h" and badged on the compact panel. Rows clear upstream only when compaction recovers, which the
+  panel states.
+
+- Per-chat routing state, decoded from `gateway_routing.entry_json` (`SessionEntry.to_dict()`,
+  `gateway/session.py:535-545`) through the bounded JSON reader: platform, chat type, redacted
+  display name, and the state flags — `suspended`, `resume-pending` (with reason), `was-auto-reset`
+  (with reason), and the crash marker `turn never unwound` when a durable turn token is older than a
+  five-minute unwind grace. A route whose session id has no row in `sessions` is flagged `dangling`
+  — the gateway would resume a nonexistent session — and suspended plus resume-pending chats are
+  counted as needing a user message to recover. Entry payloads with token counters or Slack
+  watermarks decode into flags only; nothing else survives.
+
+- A reset-churn readout over `conversation_generations`, keyed by routing peer and bumped only on
+  reset boundaries (`hermes_state_common.py:153`) and never pruned by design (`:460-487`): top chats
+  by generation plus the lifetime reset total. The collector remembers the row count between
+  refreshes, and because upstream never garbage-collects the table, a shrinking count between
+  refreshes raises a panel warning instead of quietly reporting fewer chats.
+
+- Active-surface lease rows now show a **joinable** chip when the registry entry advertises
+  `metadata.shared_runtime_url` — the loopback origin upstream's cooperative attach handshake
+  requires (`hermes_cli/shared_session_attach.py:32-47`). Presence is the whole signal: hermesd
+  never probes the handshake, never stores the URL, and never displays more than the chip. The lease
+  surface vocabulary now includes gateway surfaces recorded as `gateway:<platform>`
+  (`gateway/run_busy.py:187`), and bot delivery consumers carry
+  `metadata.bot_live_delivery_consumer` (`tui_gateway/session_lifecycle.py:36`).
+
+- Terminal breadcrumbs under `terminal-sessions/` (PROFILE-scoped, matching upstream's
+  `get_hermes_home()` writer, `hermes_cli/terminal_breadcrumbs.py:26-28,85-92`, pruned at 30 days
+  `:19-21,63-73`) render as a "CLI Terminals" section: the count of files touched in the last 24
+  hours is labelled an upper bound on open CLI terminals — a breadcrumb proves a terminal recorded a
+  session recently, not that the terminal is still alive — with terminal id, session id, cwd and age
+  for the newest rows.
+
 - Added a separate, root-scoped Desktop plugin inventory. It reports the bounded presence of regular `desktop-plugins/*/plugin.js` entries without reading JavaScript or claiming that a plugin is loaded or enabled, and keeps truncation and source-health state distinct from the Agent Plugins inventory.
 
 - The Operations panel now reports the API server's durable run reservations, which had no reader anywhere in hermesd. A new `api_runs` health source opens `runs_idempotency.db` — PROFILE-scoped, exactly where upstream resolves it (`get_hermes_home()/"runs_idempotency.db"`, `gateway/platforms/api_server_run_idempotency.py:67`, permissions tightened to 0600 including the `-wal`/`-shm` sidecars at `:116-124`) — through the shared read-only connector, so a store with a WAL sidecar is copied to a private temp dir before it is opened and nothing is ever written back to `~/.hermes`. The section is labelled **Retained API Run Reservations** rather than "API Runs" because the table is a replay window and not an activity ledger, and the panel says why on every pass: `_prune_stale_terminal_locked` (`:168-186`) runs inside *every* `reserve` and `lookup` and deletes an aged row **only once its stored run status is terminal** (`TERMINAL_STATUSES = {completed, failed, cancelled, interrupted}`, `:17`), while long room runs push `retention_until` out (`extend_retention`, `:205-214`; `api_server_runs.py:56-61,222-232`) — so **an empty store is not evidence that the API was idle**. Nor is a present store proof the gateway is using it: when the file cannot be opened upstream logs "Run idempotency storage is unavailable; falling back to process memory, so replay will not survive a restart" and connects `":memory:"`, setting `_db_path = None` so `durable` is False (`:63-84`), and that capability is advertised only over HTTP (`api_server.py:2276`, `_idempotency_capabilities` `api_server_runs.py:108-113`) and never written to disk — hermesd therefore cannot detect the fallback and does not pretend to. An empty-but-present store renders `no reservations retained — not evidence that the API was idle` instead of a blank table. What is reported: store size, reservation count, a distinct-`scope` count, acknowledged and pid-recorded counts, how many rows are already past `retention_until`, the newest `updated_at` and oldest `created_at` as ages against the injected clock, and a bounded eight-row table of run id, status, created/updated ages, retention remaining or overdue, and ownership. Statuses are allowlisted against the vocabulary upstream actually sets — `queued` (`api_server_runs.py:475`), `running` (`:705`), `waiting_for_approval` (`:592`), `stopping` (`:871`) and the four terminal ones — and anything else renders as `unknown` rather than being dropped or guessed, because the store outlives the enumeration. `status_json` is parsed no further than that single word under a 16 KiB cap, and `fingerprint`, `idempotency_key` and `scope` are never selected: the tenant scope appears only as `COUNT(DISTINCT scope)`. `owner_started` is deliberately *not* carried as a timestamp — upstream fills it from `gateway/status.get_process_start_time` (`api_server_runs.py:81-87`), which returns `/proc` ticks on Linux and psutil centiseconds elsewhere, so it is same-host comparable only and this branch has already been bitten by exactly that unit split (`runtime/active_sessions.json` stores epoch seconds while `gateway_state.json` stores centiseconds); hermesd reduces it to `identity recorded` / `identity unverified` beside the pid and its liveness, so a pid that cannot be distinguished from a recycled one is labelled as such. Columns added by upstream's `_MIGRATIONS` (`:29-34`) are gated on a `PRAGMA table_info` set read once per connection, and every column is selected **by name** rather than positionally, because column order is not stable across databases. As with the other database sources, an absent or unreadable store reports `db_present=False` without failing the source, while one that disappears, corrupts or is replaced by an unsafe symlink after a good read raises so the panel keeps its last-good values and `api_runs` appears in `health.failed_sources`.

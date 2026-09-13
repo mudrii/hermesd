@@ -25,7 +25,9 @@ from tests.conftest import (
     _unreadable,
     _write_minimal_state_db,
     create_kanban_db_tables,
+    create_session_coordination_tables,
     create_state_db_tables,
+    insert_turn_lease,
 )
 from tests.test_collector_operations import (
     create_projects_db_tables,
@@ -1372,3 +1374,59 @@ def test_gateway_launch_files_are_root_scoped_under_a_profile(
     assert gateway.dashboard_client_last_frame_age_seconds is not None
     assert gateway.exit_diag_recorded is True
     assert gateway.exit_diag_last_tag == "gateway.asyncio_main_return"
+
+
+def test_profiled_collector_reads_session_coordination_from_the_profile_db(
+    profiled_hermes_home: Path,
+) -> None:
+    """Leases, hygiene, routing and generation rows are PROFILE state.db data
+    (upstream opens ``get_hermes_home()/"state.db"``, ``hermes_state.py:160,178``),
+    and terminal breadcrumbs are PROFILE files
+    (``hermes_cli/terminal_breadcrumbs.py:26-28``): a profiled collector must see
+    the selected profile's rows and never the root's."""
+    now = time.time()
+
+    def seed(db_path: Path, marker: str) -> None:
+        conn = sqlite3.connect(db_path)
+        create_session_coordination_tables(conn)
+        insert_turn_lease(
+            conn, f"{marker}-conv", f"pid={111}:tid=1:agent=a:nonce=b", now, now + 300
+        )
+        conn.execute("INSERT INTO gateway_hygiene_state VALUES (?, 4)", (f"{marker}:42:7",))
+        conn.execute(
+            "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) VALUES (?,?,?,?)",
+            ("/sessions/dir", f"{marker}:42:7", json.dumps({"session_id": f"{marker}-sess"}), now),
+        )
+        conn.execute(
+            "INSERT INTO conversation_generations VALUES ('cli', ?, 5)", (f"{marker}-key",)
+        )
+        conn.commit()
+        conn.close()
+
+    seed(profiled_hermes_home / "state.db", "profile")
+    seed(profiled_hermes_home / "profiles" / "coding" / "state.db", "coding")
+
+    def seed_terminals(home: Path, marker: str) -> None:
+        directory = home / "terminal-sessions"
+        directory.mkdir(exist_ok=True)
+        (directory / "tty-dev-pts-1").write_text(
+            json.dumps({"session_id": f"{marker}-tty", "cwd": f"/{marker}", "ts": now})
+        )
+
+    seed_terminals(profiled_hermes_home, "root")
+    seed_terminals(profiled_hermes_home / "profiles" / "coding", "profile")
+
+    profiled = Collector(profiled_hermes_home, profile_name="coding")
+    state = profiled.collect()
+    profiled.close()
+    assert [lease.key for lease in state.session_coordination.leases] == ["coding-conv"]
+    assert [row.session_key for row in state.session_coordination.hygiene] == ["coding:42:7"]
+    assert [route.session_id for route in state.session_coordination.routes] == ["coding-sess"]
+    assert [gen.session_key for gen in state.session_coordination.generations] == ["coding-key"]
+    assert [row.cwd for row in state.terminal_sessions.sessions] == ["/profile"]
+
+    root = Collector(profiled_hermes_home)
+    state = root.collect()
+    root.close()
+    assert [lease.key for lease in state.session_coordination.leases] == ["profile-conv"]
+    assert [row.cwd for row in state.terminal_sessions.sessions] == ["/root"]
