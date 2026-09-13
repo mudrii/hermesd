@@ -3423,6 +3423,27 @@ def test_exit_diag_unclean_count_window_is_24h(hermes_home: Path):
     assert gateway.exit_diag_unclean_24h == 2
 
 
+def test_exit_diag_future_stamp_is_not_counted_as_unclean(hermes_home: Path):
+    """A stamp in the future is clock skew, not an unclean exit yet.
+
+    The window is ``0 <= now - stamp <= day``: admitting a negative delta
+    counted a record that has not happened as a current unclean exit, and the
+    sibling starts reader already rejects future stamps for the same reason.
+    """
+    _write_gateway_state(hermes_home)
+    _write_exit_diag(
+        hermes_home,
+        [
+            {"ts": _iso(NOW + 600), "tag": "gateway.previous_unclean_exit", "pid": 9},
+            {"ts": _iso(NOW - 3600), "tag": "gateway.previous_unclean_exit", "pid": 10},
+        ],
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.exit_diag_unclean_24h == 1
+
+
 def test_forensic_companions_are_stat_only(hermes_home: Path, monkeypatch: pytest.MonkeyPatch):
     """Companion logs are reported by size alone; their contents are never read."""
     _write_gateway_state(hermes_home)

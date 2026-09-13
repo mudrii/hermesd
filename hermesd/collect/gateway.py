@@ -868,7 +868,7 @@ def _read_exit_diag(path: Path, root: Path, now: float, tail_bytes: int) -> _Exi
         stamp = _iso_to_epoch(record.get("ts"))
         if stamp is not None:
             last_age = _age_seconds(stamp, now)
-            if tag == _UNCLEAN_EXIT_TAG and now - stamp <= _DAY_SECONDS:
+            if tag == _UNCLEAN_EXIT_TAG and 0 <= now - stamp <= _DAY_SECONDS:
                 unclean_24h += 1
     return _ExitDiag(
         recorded=True,
