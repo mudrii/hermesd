@@ -26,13 +26,19 @@ from hermesd.models import (
     DashboardState,
     DbRecoveryState,
     DelegationInfo,
+    DelegationLiveManifest,
+    DelegationLiveTask,
     DiscoveredRepoSummary,
+    ForensicFile,
+    GatewayHygieneState,
+    GatewayRouteState,
     GatewayState,
     GoalSummary,
     HookInfo,
     HostedRoomState,
     HostedRoomSummary,
     KanbanBoardSummary,
+    KanbanNotifySubSummary,
     KanbanRunSummary,
     KanbanState,
     KanbanTaskLink,
@@ -50,15 +56,21 @@ from hermesd.models import (
     PlatformStatus,
     PluginInfo,
     PRMonitorSummary,
+    ProcessReceipt,
+    ProcessReceiptsState,
     ProfilesState,
     ProfileSummary,
     ProjectSummary,
     ProviderInfo,
     RetiredWalGeneration,
+    SessionCoordinationState,
     SessionInfo,
+    SessionLease,
     SkillInfo,
     SkillsMemory,
     SkillsPromptSnapshot,
+    TerminalBreadcrumb,
+    TerminalSessionReadout,
     TokenAnalytics,
     TokenBreakdown,
     ToolGatewayRoute,
@@ -105,6 +117,8 @@ def _state_for(panel_num: int) -> DashboardState:
                 last_update_from_version=INJECT,
                 last_update_to_version=INJECT,
                 last_update_failed_step=INJECT,
+                exit_diag_last_tag=INJECT,
+                forensic_files=[ForensicFile(name=INJECT, size_bytes=1, age_seconds=1.0)],
                 served_profiles=[INJECT],
                 platforms=[
                     PlatformStatus(
@@ -181,6 +195,47 @@ def _state_for(panel_num: int) -> DashboardState:
                     track_liveness=True,
                 )
             ],
+            session_coordination=SessionCoordinationState(
+                leases=[
+                    SessionLease(
+                        key=INJECT,
+                        holder=INJECT,
+                        pid=42,
+                        held_seconds=60.0,
+                        expires_in_seconds=60.0,
+                    )
+                ],
+                hygiene=[
+                    GatewayHygieneState(
+                        session_key=INJECT,
+                        failure_streak=4,
+                        suspended=True,
+                        compression_failure_error=INJECT,
+                    )
+                ],
+                routes=[
+                    GatewayRouteState(
+                        session_key=INJECT,
+                        session_id=INJECT,
+                        platform=INJECT,
+                        chat_type=INJECT,
+                        display_name=INJECT,
+                        resume_reason=INJECT,
+                        auto_reset_reason=INJECT,
+                        suspended=True,
+                        resume_pending=True,
+                        was_auto_reset=True,
+                    )
+                ],
+            ),
+            terminal_sessions=TerminalSessionReadout(
+                sessions=[
+                    TerminalBreadcrumb(
+                        terminal=INJECT, session_id=INJECT, cwd=INJECT, age_seconds=60.0
+                    )
+                ],
+                count=1,
+            ),
         )
     if panel_num == 3:  # Tokens / Cost
         return DashboardState(
@@ -430,6 +485,7 @@ def _state_for(panel_num: int) -> DashboardState:
             workspace_path=INJECT,
             goal_mode=INJECT,
             current_step_key=INJECT,
+            completion_contract=INJECT,
         )
         return DashboardState(
             kanban=KanbanState(
@@ -446,6 +502,23 @@ def _state_for(panel_num: int) -> DashboardState:
                     )
                 ],
                 status_counts={INJECT: 1},
+                notify_sub_count=1,
+                notify_platform_counts={INJECT: 1},
+                notify_backlog_total=1,
+                notify_max_backlog=1,
+                notify_backlog_subs=[
+                    KanbanNotifySubSummary(
+                        task_id=INJECT,
+                        platform=INJECT,
+                        notifier_profile=INJECT,
+                        delivery_mode=INJECT,
+                        last_event_id=1,
+                        max_event_id=2,
+                        backlog=1,
+                    )
+                ],
+                notify_orphan_profile_count=1,
+                notify_orphan_profiles=[INJECT],
                 active_tasks=[task],
                 problem_tasks=[task],
                 task_links=[KanbanTaskLink(parent_id=INJECT, child_id=INJECT)],
@@ -573,6 +646,42 @@ def _state_for(panel_num: int) -> DashboardState:
                     scope_count=1,
                     reservations=[ApiRunReservation(run_id=INJECT)],
                 ),
+                process_receipts=ProcessReceiptsState(
+                    dir_present=True,
+                    receipt_count=1,
+                    receipts=[
+                        ProcessReceipt(
+                            process_id=INJECT,
+                            command=INJECT,
+                            exit_code=0,
+                            completion_reason=INJECT,
+                            termination_source=INJECT,
+                            started_age_seconds=60.0,
+                            finished_age_seconds=10.0,
+                            output_tail=INJECT,
+                        )
+                    ],
+                ),
+                delegation_live_manifest_count=1,
+                delegation_live_manifests=[
+                    DelegationLiveManifest(
+                        delegation_id=INJECT,
+                        model=INJECT,
+                        provider=INJECT,
+                        started=INJECT,
+                        completed=INJECT,
+                        tasks=[
+                            DelegationLiveTask(
+                                index=0,
+                                goal=INJECT,
+                                status=INJECT,
+                                exit_reason=INJECT,
+                                log_name=INJECT,
+                                log_tail=[INJECT],
+                            )
+                        ],
+                    )
+                ],
             ),
         )
     if panel_num == 13:  # Curator
