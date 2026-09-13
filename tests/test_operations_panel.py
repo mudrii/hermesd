@@ -97,6 +97,19 @@ def test_detail_renders_delegation_table():
     assert "alive" in text
 
 
+def test_detail_delegation_rows_show_process_accounting_counts():
+    state = _ops_state(
+        delegation_count=2,
+        delegations=[
+            _delegation(handed_off_count=2, orphaned_count=1, unread_completion_count=3),
+            _delegation(delegation_id="deleg_2c320307"),
+        ],
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=160)
+    assert "2 handed · 1 orphaned · 3 unread" in text
+    assert "—" in text  # a delegation with no accounting still gets a placeholder
+
+
 def test_detail_renders_state_db_section():
     state = _ops_state(
         state_db_schema_version=6,
@@ -234,9 +247,10 @@ def test_operations_detail_escapes_blocked_script_names() -> None:
     assert "[bold red]evil.sh" in text
 
 
-def _placeholder_rows(text: str) -> list[list[str]]:
-    """Every rendered line that is nothing but seven em-dash cells."""
-    return [cells for line in text.splitlines() if (cells := line.split()) == ["—"] * 7]
+def _placeholder_rows(text: str, cells_count: int) -> list[list[str]]:
+    """Every rendered line that is nothing but em-dash cells."""
+    row = ["—"] * cells_count
+    return [cells for line in text.splitlines() if (cells := line.split()) == row]
 
 
 def test_operations_detail_delegations_table_placeholder_row_when_list_empty() -> None:
@@ -245,7 +259,7 @@ def test_operations_detail_delegations_table_placeholder_row_when_list_empty() -
     text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
 
     assert "Delegations (3 total · 0 live logs)" in text
-    assert _placeholder_rows(text) == [["—"] * 7]
+    assert _placeholder_rows(text, 8) == [["—"] * 8]
 
 
 def test_operations_detail_reports_no_verification_events_when_ledger_empty() -> None:
@@ -264,7 +278,7 @@ def test_operations_detail_projects_table_placeholder_row_when_list_empty() -> N
 
     assert "Projects" in text
     assert "Slug" in text
-    assert _placeholder_rows(text) == [["—"] * 7]
+    assert _placeholder_rows(text, 7) == [["—"] * 7]
 
 
 def test_operations_detail_goal_waiting_falls_back_to_session() -> None:

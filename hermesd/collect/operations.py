@@ -236,7 +236,9 @@ def _delegation_from_row(
     dispatched_at = _coerce_float(row.get("dispatched_at"))
     completed_at = _coerce_float(row.get("completed_at")) or None
     task = _json_object_capped(row.get("task_json")) or {}
-    result = _first_delegation_result(row.get("result_json"))
+    result_object = _json_object_capped(row.get("result_json")) or {}
+    result = _first_delegation_result(result_object)
+    handed_off, orphaned, unread = _delegation_process_counts(result_object)
     owner_pid = _coerce_int(row.get("owner_pid"))
     return DelegationInfo(
         delegation_id=str(row.get("delegation_id") or ""),
@@ -253,7 +255,31 @@ def _delegation_from_row(
             str(result.get("error") or "") or str(result.get("summary") or "")
         ),
         owner_alive=bool(owner_pid) and pid_exists(owner_pid),
+        handed_off_count=handed_off,
+        orphaned_count=orphaned,
+        unread_completion_count=unread,
     )
+
+
+def _delegation_process_counts(result: dict[str, Any]) -> tuple[int, int, int]:
+    """Sum the per-child background-process accounting across one payload.
+
+    Upstream stamps each finished child entry with ``handed_off_processes``,
+    ``orphaned_processes`` (with ``runtime_seconds``) and
+    ``unread_completions`` (with ``exit_code`` and an output tail) before the
+    combined result is persisted (``tools/delegate_tool_child_run.py:744-762``,
+    ``tools/async_delegation.py:198-225``). A still-running unit carries the
+    same shape under ``partial: true`` (``record_unit_child``, ``:208-225``), so
+    partial rows count identically. hermesd keeps the counts only: session ids,
+    commands and output tails never leave the payload.
+    """
+    handed_off = orphaned = unread = 0
+    for entry in _as_list(result.get("results")):
+        data = _as_dict(entry)
+        handed_off += len(_as_list(data.get("handed_off_processes")))
+        orphaned += len(_as_list(data.get("orphaned_processes")))
+        unread += len(_as_list(data.get("unread_completions")))
+    return handed_off, orphaned, unread
 
 
 def _delegation_duration(
@@ -267,8 +293,8 @@ def _delegation_duration(
     return max(0.0, end - dispatched_at)
 
 
-def _first_delegation_result(raw: object) -> dict[str, Any]:
-    results = _as_list((_json_object_capped(raw) or {}).get("results"))
+def _first_delegation_result(result_object: dict[str, Any]) -> dict[str, Any]:
+    results = _as_list(result_object.get("results"))
     if results and isinstance(results[0], dict):
         return results[0]
     return {}

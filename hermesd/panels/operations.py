@@ -17,6 +17,7 @@ from hermesd.models import (
     ApiRunReservationsState,
     DashboardState,
     DbRecoveryState,
+    DelegationInfo,
     HostedRoomState,
     HostedRoomSummary,
     OperationsState,
@@ -592,6 +593,7 @@ def _delegations_table(ops: OperationsState, theme: Theme) -> Table:
     table.add_column("Took", justify="right", style=theme.banner_dim)
     table.add_column("Goal", style=theme.banner_text)
     table.add_column("Result", style=theme.banner_dim)
+    table.add_column("Procs", style=theme.banner_dim)
     for delegation in ops.delegations:
         delivery = escape(delegation.delivery_state) or "—"
         if delegation.delivery_attempts:
@@ -604,10 +606,24 @@ def _delegations_table(ops: OperationsState, theme: Theme) -> Table:
             _duration_label(delegation.duration_seconds),
             escape(delegation.goal) or "—",
             escape(delegation.error_excerpt) or escape(delegation.result_status) or "—",
+            _delegation_procs_label(delegation),
         )
     if not ops.delegations:
-        table.add_row("—", "—", "—", "—", "—", "—", "—")
+        table.add_row("—", "—", "—", "—", "—", "—", "—", "—")
     return table
+
+
+def _delegation_procs_label(delegation: DelegationInfo) -> str:
+    """Background-process accounting for one delegation; only non-zero buckets
+    render, so an old payload without the keys stays visually quiet."""
+    parts = []
+    if delegation.handed_off_count:
+        parts.append(f"{delegation.handed_off_count} handed")
+    if delegation.orphaned_count:
+        parts.append(f"{delegation.orphaned_count} orphaned")
+    if delegation.unread_completion_count:
+        parts.append(f"{delegation.unread_completion_count} unread")
+    return " · ".join(parts) if parts else "—"
 
 
 def _state_db_table(ops: OperationsState, theme: Theme) -> Table:

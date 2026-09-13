@@ -1468,6 +1468,15 @@ class DelegationInfo(BaseModel):
     result_status: str = ""
     error_excerpt: str = ""
     owner_alive: bool = False
+    # Background-process handoff accounting, summed across the result payload's
+    # per-child entries (``tools/delegate_tool_child_run.py:744-762``, persisted
+    # by ``tools/async_delegation.py:198-225``). This is the only durable trace
+    # of the handoff feature — the live roster lives in gateway memory — so the
+    # counts are kept even though the session ids, commands and output tails
+    # they summarize never leave the payload.
+    handed_off_count: int = 0
+    orphaned_count: int = 0
+    unread_completion_count: int = 0
 
 
 class RetiredWalGeneration(BaseModel):

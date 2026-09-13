@@ -1367,6 +1367,105 @@ def test_delegation_detail_rows_capped_at_ten_newest(hermes_home: Path):
     assert ops.delegations[0].delegation_id == "deleg_14"
 
 
+def test_delegation_process_accounting_counts_across_result_entries(hermes_home: Path):
+    """Per-child background-process accounting is summed across the payload.
+
+    Upstream stamps each child entry with ``handed_off_processes``,
+    ``orphaned_processes`` and ``unread_completions`` before the result is
+    persisted (``tools/delegate_tool_child_run.py:744-762``), and the combined
+    result lands in ``result_json`` (``tools/async_delegation.py:198-205``).
+    """
+    conn = _open_state_db(hermes_home)
+    create_async_delegations_table(conn)
+    result = {
+        "results": [
+            {
+                "status": "ok",
+                "handed_off_processes": [{"session_id": "proc_a", "command": "sleep 100"}],
+                "orphaned_processes": [
+                    {"session_id": "proc_b", "command": "watch", "runtime_seconds": 12}
+                ],
+                "unread_completions": [
+                    {
+                        "session_id": "proc_c",
+                        "command": "build",
+                        "exit_code": 3,
+                        "output_tail": "error: boom",
+                    }
+                ],
+            },
+            {
+                "status": "error",
+                "orphaned_processes": [
+                    {"session_id": "proc_d", "command": "tail -f", "runtime_seconds": 1},
+                    {"session_id": "proc_e", "command": "top", "runtime_seconds": 2},
+                ],
+            },
+        ],
+        "process_notes": ["Handed off to you: proc_a (sleep 100) — you own it now."],
+    }
+    insert_delegation(conn, "deleg_procs", result_json=json.dumps(result))
+    conn.commit()
+    conn.close()
+
+    entry = _collect_ops(hermes_home).operations.delegations[0]
+    assert entry.handed_off_count == 1
+    assert entry.orphaned_count == 3
+    assert entry.unread_completion_count == 1
+
+
+def test_delegation_process_accounting_counts_partial_rows(hermes_home: Path):
+    """A still-running unit's mid-flight row counts the same shape.
+
+    ``record_unit_child`` persists ``{"results": [...], "partial": true}``
+    (``tools/async_delegation.py:208-225``); the counts must survive the join.
+    """
+    conn = _open_state_db(hermes_home)
+    create_async_delegations_table(conn)
+    insert_delegation(
+        conn,
+        "deleg_partial",
+        state="running",
+        result_json=json.dumps(
+            {
+                "results": [
+                    {
+                        "status": "ok",
+                        "unread_completions": [
+                            {"session_id": "proc_x", "exit_code": 0, "output_tail": "done"}
+                        ],
+                    }
+                ],
+                "partial": True,
+            }
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    entry = _collect_ops(hermes_home).operations.delegations[0]
+    assert entry.handed_off_count == 0
+    assert entry.orphaned_count == 0
+    assert entry.unread_completion_count == 1
+
+
+def test_delegation_process_accounting_defaults_to_zero(hermes_home: Path):
+    """Payloads without the accounting keys — and unparseable ones — read as 0."""
+    conn = _open_state_db(hermes_home)
+    create_async_delegations_table(conn)
+    insert_delegation(conn, "deleg_plain")
+    insert_delegation(conn, "deleg_junk", result_json="[[[")
+    conn.commit()
+    conn.close()
+
+    by_id = {d.delegation_id: d for d in _collect_ops(hermes_home).operations.delegations}
+    for delegation_id in ("deleg_plain", "deleg_junk"):
+        entry = by_id[delegation_id]
+        assert entry.handed_off_count == 0
+        assert entry.orphaned_count == 0
+        assert entry.unread_completion_count == 0
+
+
 def test_delegation_undelivered_counts_only_completed_rows(hermes_home: Path):
     conn = _open_state_db(hermes_home)
     create_async_delegations_table(conn)
