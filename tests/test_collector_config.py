@@ -818,3 +818,202 @@ def test_absent_config_yaml_does_not_fail_config_source(hermes_home: Path):
         assert "config" not in c.collect().health.failed_sources
     finally:
         c.close()
+
+
+_CONFIG_BACKUP_IMPORT = "hermesd.collect.config"
+
+
+class TestConfigBackupGroupReader:
+    def test_parses_reason_groups_and_newest_stamp(self):
+        from hermesd.collect.config import _config_backup_groups
+
+        groups, truncated = _config_backup_groups(
+            [
+                "config.yaml.good.20260907-143000",
+                "config.yaml.good.20260907-120000",
+                "config.yaml.corrupt.20260906-090000",
+            ],
+            now=1_783_000_000.0,
+        )
+
+        assert truncated is False
+        by_reason = {group.reason: group for group in groups}
+        assert set(by_reason) == {"good", "corrupt"}
+        good = by_reason["good"]
+        assert good.kind == "good"
+        assert good.count == 2
+        assert good.newest_stamp == "20260907-143000"
+        corrupt = by_reason["corrupt"]
+        assert corrupt.kind == "corrupt"
+        assert corrupt.count == 1
+        assert corrupt.newest_stamp == "20260906-090000"
+        assert corrupt.newest_age_seconds == max(
+            0.0, 1_783_000_000.0 - corrupt_stamp_epoch("20260906-090000")
+        )
+
+    def test_stamp_age_uses_the_writers_local_time(self):
+        from datetime import datetime
+
+        from hermesd.collect.config import _config_backup_groups
+
+        stamp = "20260907-143000"
+        local_epoch = datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp()
+        groups, _ = _config_backup_groups([f"config.yaml.good.{stamp}"], now=local_epoch + 60)
+
+        assert groups[0].newest_age_seconds == 60.0
+
+    def test_setup_and_migration_reasons_are_typed_for_the_audit_trail(self):
+        from hermesd.collect.config import _config_backup_groups
+
+        groups, _ = _config_backup_groups(
+            [
+                "config.yaml.pre-setup.20260901-101010",
+                "config.yaml.pre-migrate-xai.20260902-111111",
+                "config.yaml.pre-docker-migrate.20260903-121212",
+                "config.yaml.weekly-snapshot.20260904-131313",
+            ],
+            now=1_783_000_000.0,
+        )
+
+        kinds = {group.reason: group.kind for group in groups}
+        assert kinds["pre-setup"] == "setup"
+        assert kinds["pre-migrate-xai"] == "migration"
+        assert kinds["pre-docker-migrate"] == "migration"
+        assert kinds["weekly-snapshot"] == "other"
+
+    def test_names_that_are_not_config_backups_are_ignored(self):
+        from hermesd.collect.config import _config_backup_groups
+
+        groups, _ = _config_backup_groups(
+            [
+                "config.yaml",
+                "config.yaml.good",
+                "config.yaml.bak-my-note",
+                "config.yaml.good.20260907-143000.bak",
+                "other.yaml.good.20260907-143000",
+                "config.yaml..20260907-143000",
+                "config.yaml.good.not-a-stamp",
+                ".hidden",
+            ],
+            now=1_783_000_000.0,
+        )
+
+        # Only the writer's own "<reason>.<stamp>" scheme carries evidence;
+        # hand-named copies (config.yaml.bak-my-note) are the user's and are
+        # not backups this writer made.
+        assert groups == []
+
+    def test_groups_are_capped_and_mark_truncation(self):
+        from hermesd.collect.config import (
+            _CONFIG_BACKUP_GROUP_LIMIT,
+            _config_backup_groups,
+        )
+
+        names = [
+            f"config.yaml.reason-{index:03d}.20260907-1430{index % 60:02d}"
+            for index in range(_CONFIG_BACKUP_GROUP_LIMIT + 3)
+        ]
+        groups, truncated = _config_backup_groups(names, now=1_783_000_000.0)
+
+        assert len(groups) == _CONFIG_BACKUP_GROUP_LIMIT
+        assert truncated is True
+
+    def test_empty_input_is_empty(self):
+        from hermesd.collect.config import _config_backup_groups
+
+        assert _config_backup_groups([], now=0.0) == ([], False)
+
+
+def corrupt_stamp_epoch(stamp: str) -> float:
+    from datetime import datetime
+
+    return datetime.strptime(stamp, "%Y%m%d-%H%M%S").timestamp()
+
+
+def _write_config_backup(home: Path, name: str) -> Path:
+    backups = home / "backups" / "config"
+    backups.mkdir(parents=True, exist_ok=True)
+    path = backups / name
+    path.write_text("# backup\n")
+    return path
+
+
+def test_collect_config_backups_groups_by_reason(hermes_home: Path):
+    _write_config_backup(hermes_home, "config.yaml.good.20260907-143000")
+    _write_config_backup(hermes_home, "config.yaml.good.20260907-120000")
+    _write_config_backup(hermes_home, "config.yaml.corrupt.20260906-090000")
+    _write_config_backup(hermes_home, "config.yaml.pre-setup.20260901-101010")
+    _write_config_backup(hermes_home, "config.yaml.pre-migrate-xai.20260902-111111")
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    config = state.config
+    assert config.config_backups_present is True
+    assert config.config_backup_groups_truncated is False
+    by_reason = {group.reason: group for group in config.config_backup_groups}
+    assert by_reason["good"].count == 2
+    assert by_reason["good"].newest_stamp == "20260907-143000"
+    assert by_reason["corrupt"].count == 1
+    assert by_reason["pre-setup"].kind == "setup"
+    assert by_reason["pre-migrate-xai"].kind == "migration"
+    assert "config_backups" not in state.health.failed_sources
+
+
+def test_collect_config_backups_absent_dir_is_an_healthy_empty(hermes_home: Path):
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.config.config_backups_present is False
+    assert state.config.config_backup_groups == []
+    assert state.config.config_backup_groups_truncated is False
+    assert "config_backups" not in state.health.failed_sources
+
+
+def test_collect_config_backups_symlinked_dir_is_not_present(hermes_home: Path, tmp_path: Path):
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    _write_config_backup(outside, "config.yaml.good.20260907-143000")
+    real = hermes_home / "backups" / "config"
+    real.mkdir(parents=True)
+    real.rmdir()
+    real.symlink_to(outside / "backups" / "config", target_is_directory=True)
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.config.config_backups_present is False
+    assert "config_backups" in state.health.failed_sources
+
+
+def test_collect_config_backups_failure_keeps_last_good_fields(
+    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _write_config_backup(hermes_home, "config.yaml.good.20260907-143000")
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert first.config.config_backups_present is True
+
+        import hermesd.collector as collector_module
+
+        def boom(names, *, now):
+            raise RuntimeError("scan exploded")
+
+        monkeypatch.setattr(collector_module, "_config_backup_groups", boom)
+        second = c.collect()
+    finally:
+        c.close()
+
+    assert "config_backups" in second.health.failed_sources
+    assert second.config.config_backups_present is True
+    assert second.config.model == first.config.model

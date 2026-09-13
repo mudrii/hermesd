@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from datetime import datetime
 from typing import Any
 
-from hermesd.collect.common import _as_dict, _as_list, _coerce_int
+from hermesd.collect.common import _age_seconds, _as_dict, _as_list, _coerce_int
 from hermesd.collect.redaction import _API_KEY_FIELD_NAMES, _OAUTH_FIELD_NAMES
-from hermesd.models import PlatformStatus
+from hermesd.models import ConfigBackupGroup, PlatformStatus
 
 # Upper bound on name lists surfaced from config/cache mappings.
 _MAX_LISTED_NAMES = 20
@@ -141,6 +143,110 @@ def _plain_str(value: object) -> str:
 
 def _proxy_configured(network: dict[str, Any]) -> bool:
     return any(bool(network.get(key)) for key in ("proxy", "http_proxy", "https_proxy"))
+
+
+# backups/config/ naming, mirrored from hermes_cli/config_backups.py:29-69:
+# ``config.yaml.<reason>.<YYYYMMDD-HHMMSS>``, at most five copies kept per
+# reason, byte-identical repeats skipped. Observed writer reasons:
+# "good" (config.py:2217), "corrupt" (config.py:86,497), "pre-setup"
+# (setup.py:655), "pre-migrate-xai" (xai_retirement.py:164) and
+# "pre-docker-migrate" (scripts/docker_config_migrate.py:28).
+_BACKUP_CONFIG_PREFIX = "config.yaml."
+_BACKUP_STAMP_FORMAT = "%Y%m%d-%H%M%S"
+_BACKUP_STAMP_CHARS = 15
+_CONFIG_BACKUP_GROUP_LIMIT = 8
+_CONFIG_BACKUP_ENTRY_LIMIT = 512
+
+_GOOD_REASON = "good"
+_CORRUPT_REASON = "corrupt"
+
+
+def _backup_reason_kind(reason: str) -> str:
+    """Coarse bucket for the audit trail: setup/migration stamps vs the rest."""
+    if reason == _GOOD_REASON:
+        return _GOOD_REASON
+    if reason == _CORRUPT_REASON:
+        return _CORRUPT_REASON
+    if reason.startswith("pre-setup"):
+        return "setup"
+    if "migrate" in reason:
+        return "migration"
+    return "other"
+
+
+def _config_backup_stamp_epoch(stamp: str) -> float | None:
+    """Local-time epoch for a backup filename stamp.
+
+    Upstream builds the stamp with ``time.strftime`` (``config_backups.py:59``),
+    so the name carries the writer's *local* time; parsing it as a naive
+    datetime and reading ``.timestamp()`` evaluates it against the same local
+    clock instead of pretending it was UTC.
+    """
+    if len(stamp) != _BACKUP_STAMP_CHARS:
+        return None
+    try:
+        return datetime.strptime(stamp, _BACKUP_STAMP_FORMAT).timestamp()
+    except ValueError:
+        return None
+
+
+def _config_backup_groups(
+    names: Iterable[str], *, now: float
+) -> tuple[list[ConfigBackupGroup], bool]:
+    """Group ``config.yaml.<reason>.<stamp>`` filenames by reason.
+
+    Names are what the backups directory listed (any order); each group keeps
+    its full count and its newest stamp. Junk and hand-named copies
+    (``config.yaml.bak-my-note``) are skipped — only the writer's own naming
+    scheme carries a reason. Both caps are display hygiene for a hostile
+    directory: the entry cap bounds the scan, the group cap bounds the model,
+    and either firing marks the result truncated.
+    """
+    kept: list[str] = []
+    scan_truncated = False
+    for name in names:
+        if len(kept) >= _CONFIG_BACKUP_ENTRY_LIMIT:
+            scan_truncated = True
+            break
+        kept.append(name)
+
+    stamps_by_reason: dict[str, list[tuple[str, float]]] = {}
+    for name in kept:
+        if not name.startswith(_BACKUP_CONFIG_PREFIX):
+            continue
+        reason, separator, stamp = name[len(_BACKUP_CONFIG_PREFIX) :].rpartition(".")
+        if not separator or not reason:
+            continue
+        epoch = _config_backup_stamp_epoch(stamp)
+        if epoch is None:
+            continue
+        stamps_by_reason.setdefault(reason, []).append((stamp, epoch))
+
+    groups = []
+    for reason, stamps in sorted(stamps_by_reason.items()):
+        stamps.sort()
+        newest_stamp, newest_epoch = stamps[-1]
+        groups.append(
+            ConfigBackupGroup(
+                reason=reason,
+                kind=_backup_reason_kind(reason),
+                count=len(stamps),
+                newest_stamp=newest_stamp,
+                newest_age_seconds=_age_seconds(newest_epoch, now),
+            )
+        )
+    truncated = scan_truncated or len(groups) > _CONFIG_BACKUP_GROUP_LIMIT
+    return groups[:_CONFIG_BACKUP_GROUP_LIMIT], truncated
+
+
+def _provider_free_tier(entry: dict[str, Any]) -> bool:
+    """The Nous free-tier identity: ``auth_method`` and ``account_tier`` both
+    "anonymous" (``hermes_cli/anon_auth.py:39-41``, ``is_guest_state`` at
+    ``:88-89``, minted state at ``:271-272``). Key names only — the entry's
+    token values are never read, and a dead guest credential is removed rather
+    than marked, so the tier simply disappears when it lapses.
+    """
+    return entry.get("auth_method") == "anonymous" and entry.get("account_tier") == "anonymous"
 
 
 def _provider_model_label(cfg: dict[str, Any]) -> str:

@@ -23,6 +23,7 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from hermesd.collect.common import _as_list
 from hermesd.collect.redaction import _redact_secret_url
 from hermesd.models import _FULL_REVISION_PATTERN, MANIFEST_NAMES, PluginActivation
 
@@ -113,6 +114,30 @@ class CatalogProvenance:
     sha: str = ""
     tier: str = ""
     installed_at: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogCacheEntry:
+    """One live-catalog entry, from the ``cache/plugin-catalog.json`` cache.
+
+    The cache holds the raw published mappings (``extract-plugins.py:149-151``)
+    that ``entry_from_mapping`` would validate upstream; hermesd keeps only the
+    fields its three derived states need.
+    """
+
+    name: str
+    sha: str = ""
+    repo: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class RemovedCatalogEntry:
+    """One kill-list row (``plugin_catalog.py:39-44``)."""
+
+    name: str
+    repo: str = ""
+    reason: str = ""
+    date: str = ""
 
 
 def plugin_name_set(value: object) -> frozenset[str]:
@@ -313,6 +338,103 @@ def declared_capabilities(value: object) -> tuple[list[str], int]:
         if capability:
             seen.setdefault(capability[:_MAX_CAPABILITY_CHARS], None)
     return list(seen)[:DECLARED_CAPABILITY_LIMIT], len(seen)
+
+
+# --------------------------------------------------------------------------
+# live catalog cache
+# --------------------------------------------------------------------------
+
+
+def normalize_repo(value: object) -> str:
+    """Upstream's repo normalization (``plugin_catalog.py:194-195``): ``.git``/
+    trailing-slash/case insensitive, so a kill-list row cannot be dodged by
+    respelling the URL."""
+    if not isinstance(value, str):
+        return ""
+    return value.strip().rstrip("/").removesuffix(".git").lower()
+
+
+def parse_catalog_cache(
+    data: object,
+) -> tuple[dict[str, CatalogCacheEntry], list[RemovedCatalogEntry]]:
+    """Entries and kill-list rows from ``cache/plugin-catalog.json``.
+
+    The cache is what ``fetch_live_catalog`` writes
+    (``plugin_catalog.py:221-248``): ``{"entries": [...], "removed": [...]}``.
+    Any other shape is an empty cache, never an error — an absent or corrupt
+    cache only means the drift/removal checks are unavailable this pass.
+    """
+    if not isinstance(data, dict):
+        return {}, []
+    entries: dict[str, CatalogCacheEntry] = {}
+    for raw in _as_list(data.get("entries")):
+        if not isinstance(raw, dict):
+            continue
+        name = raw.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        entries[name] = CatalogCacheEntry(
+            name=name,
+            sha=_revision(raw.get("sha")),
+            repo=normalize_repo(raw.get("repo")),
+        )
+    removed: list[RemovedCatalogEntry] = []
+    for raw in _as_list(data.get("removed")):
+        if not isinstance(raw, dict):
+            continue
+        name = raw.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        removed.append(
+            RemovedCatalogEntry(
+                name=name,
+                # Kept as written: the repo is display text upstream too
+                # (plugin_catalog.py:144); matching normalizes both sides.
+                repo=_bounded(raw.get("repo"), _MAX_PROVENANCE_CHARS),
+                reason=_bounded(raw.get("reason"), _MAX_PROVENANCE_CHARS),
+                date=_bounded(raw.get("date"), _MAX_PROVENANCE_CHARS),
+            )
+        )
+    return entries, removed
+
+
+def removed_catalog_match(
+    *candidates: str,
+    removed: list[RemovedCatalogEntry],
+) -> RemovedCatalogEntry | None:
+    """The first kill-list row matching any candidate name or repo.
+
+    Mirrors ``find_removed`` (``plugin_catalog.py:198-211``) via
+    ``removed_annotation`` (``plugins_cmd_catalog.py:96-103``): a candidate
+    matches a row by exact name or by normalized repo; a row without a repo
+    matches by name only.
+    """
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate_repo = normalize_repo(candidate)
+        for row in removed:
+            if candidate == row.name or (row.repo and candidate_repo == normalize_repo(row.repo)):
+                return row
+    return None
+
+
+def catalog_update_available(sidecar_sha: str, cache_entry: CatalogCacheEntry | None) -> bool:
+    """Whether the catalog pins a different commit than the one reviewed here.
+
+    Compares the sidecar's recorded sha against the live entry's pin, as
+    ``catalog_row_fields`` does (``plugins_cmd_catalog.py:283-291``). Both
+    sides must be full 40-hex revisions first: a malformed sha is a corrupt
+    sidecar, not a move, and claiming drift from it would invent a comparison
+    hermesd cannot make (same discipline as ``PluginInfo.provenance_drift``).
+    """
+    if cache_entry is None:
+        return False
+    if not _FULL_REVISION_PATTERN.fullmatch(sidecar_sha.lower()):
+        return False
+    if not _FULL_REVISION_PATTERN.fullmatch(cache_entry.sha.lower()):
+        return False
+    return sidecar_sha.lower() != cache_entry.sha.lower()
 
 
 # --------------------------------------------------------------------------

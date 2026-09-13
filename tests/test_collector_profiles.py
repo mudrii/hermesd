@@ -415,6 +415,76 @@ def test_profiled_collector_rejects_profile_root_swapped_to_outside(
     assert "tools_index" in second.health.failed_sources
 
 
+def test_plugin_catalog_cache_is_read_from_the_shared_root_under_a_profile(
+    profiled_hermes_home: Path,
+):
+    """The live-catalog cache is ROOT like the plugins/ directory it describes.
+
+    Comparing a root-installed plugin's sidecar sha against a profile-local
+    cache would manufacture drift, so both sides of the comparison must come
+    from one home.
+    """
+    root_cache = profiled_hermes_home / "cache"
+    root_cache.mkdir(exist_ok=True)
+    (root_cache / "plugin-catalog.json").write_text(
+        json.dumps(
+            {
+                "entries": [{"name": "root-weather", "sha": "a" * 40}],
+                "removed": [{"name": "root-evil", "reason": "malicious"}],
+            }
+        )
+    )
+    profile_cache = profiled_hermes_home / "profiles" / "coding" / "cache"
+    profile_cache.mkdir(parents=True)
+    (profile_cache / "plugin-catalog.json").write_text(json.dumps({"entries": [], "removed": []}))
+    plugin_dir = profiled_hermes_home / "plugins" / "root-weather"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text("name: root-weather\n")
+    (plugin_dir / ".hermes-catalog.json").write_text(
+        json.dumps({"catalog_name": "root-weather", "sha": "b" * 40})
+    )
+
+    c = Collector(profiled_hermes_home, profile_name="coding")
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    sm = state.skills_memory
+    assert sm.plugin_catalog_cache_present is True
+    assert sm.plugin_catalog_update_count == 1
+    assert sm.plugin_catalog_removed_count == 0
+    assert sm.plugins[0].catalog_update_available is True
+    c.close()
+
+
+def test_profiled_collector_keeps_config_backups_on_the_shared_root(profiled_hermes_home: Path):
+    """backups/config/ inherits the config.yaml decision.
+
+    The copies are point-in-time snapshots of the same root config.yaml hermesd
+    reads, so reporting a profile-local backups directory would date a config
+    the dashboard never displays.
+    """
+    root_backups = profiled_hermes_home / "backups" / "config"
+    root_backups.mkdir(parents=True)
+    (root_backups / "config.yaml.good.20260907-143000").write_text("model: root\n")
+    profile_backups = profiled_hermes_home / "profiles" / "coding" / "backups" / "config"
+    profile_backups.mkdir(parents=True)
+    (profile_backups / "config.yaml.good.20260908-150000").write_text("model: profile\n")
+
+    c = Collector(profiled_hermes_home, profile_name="coding")
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    good = next(group for group in state.config.config_backup_groups if group.kind == "good")
+    assert good.newest_stamp == "20260907-143000"
+    assert good.count == 1
+    assert state.config.config_backups_present is True
+    c.close()
+
+
 def test_profiled_collector_keeps_shared_root_config_and_auth(profiled_hermes_home: Path):
     c = Collector(profiled_hermes_home, profile_name="coding")
     state = c.collect()

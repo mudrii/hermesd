@@ -12,6 +12,27 @@ and this project uses date-based versions in `YYYY.M.D` form.
 - Gateway panel (1) now probes the loop-tick witness socket (`state/gateway.loop-tick.<pid>.sock`, or its 127.0.0.1 TCP port on Windows) and shows an authoritative `alive` badge when the gateway's own loop answers — the heartbeat file has been written off-loop since #90502, so freshness alone no longer proves the loop dispatches. Escalation to `wedged` requires silence across consecutive probes plus a stale heartbeat, mirroring upstream's sustained window; a heartbeat that predates the witness key renders as `legacy heartbeat`, where staleness alone is evidence. The detail view explains which witness decided the verdict.
 - Gateway panel (1) shows crash forensics: `previous exit unclean` and `suspected OOM` carry flags from the lifecycle sentinel, the respawn-storm ledger (`gateway-starts.log`) as starts-per-2-minutes against the cap with a `respawn backoff` badge, the tail of the `gateway-exit-diag.log` crash ledger (last exit tag, unclean exits in 24h, size with an oversized warning — upstream never prunes it), and stat-only metadata for the event-only companion logs (`gateway-shutdown-diag.log`, `gateway_faulthandler.log`, `launchd-reload.log`), where growth, not absence, is the signal.
 - Gateway panel (1) shows web-dashboard attachment from the `state/dashboard_clients.heartbeat` marker (mtime only; a `web client` chip when one attached in the last minute), respawn-storm counts, and per-served-profile mirror URLs synthesized from the default profile's `listener_base` (`Inbound callback URLs on the shared listener`), redacted and suppressed exactly like recorded ingress URLs.
+- Skills/Integrations panel: plugin catalog drift is now visible. Each installed
+  plugin is compared against the live catalog cache (`cache/plugin-catalog.json`):
+  "update available" when the catalog pins a different commit than the reviewed
+  sidecar, "removed" when name/catalog name/repo is on the kill list (reason
+  shown), and "unmanaged" when neither provenance sidecar recorded anything. An
+  absent cache renders honestly as "checks unavailable", never as "up to date".
+- Config panel: point-in-time `backups/config/` snapshots are now shown. The newest
+  `good` copy is rendered as "config last changed" (a good copy is written only when
+  config.yaml's bytes change, so an old stamp is an unchanged config, not a stale
+  reader), `corrupt` snapshot counts are a hard alert, and `pre-setup`/migration
+  stamps appear as an audit trail. Stamps are the writer's local time.
+- Curator panel: skill-library hygiene from `skills/.usage.json` — how many skills
+  were patched but never re-used (the patch-reuse loop), state counts
+  (active/stale/archived), pinned skills, and each skill's distance to the
+  curator's stale/archive thresholds (14/30 days by default, honoring
+  `curator.stale_after_days` / `curator.archive_after_days` overrides). Windows run
+  from the last use/view/patch; `created_at` stays excluded upstream.
+- Skills/Integrations panel: a "Nous free tier" badge now marks the free-tier
+  identity (`providers.nous` with `auth_method`/`account_tier` "anonymous" in
+  auth.json), next to the provider list in both views. Key names only — no
+  credential values are read or shown.
 
 ### CI/CD
 

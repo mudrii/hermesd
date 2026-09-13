@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 import pytest
 import yaml
 
+from hermesd.collect.operations import _SKILL_WINDOW_LIMIT
 from hermesd.collector import (
     Collector,
     _count_skills,
@@ -23,6 +25,7 @@ from tests.conftest import (
     _count_opens,
     _skip_if_root,
     _unreadable,
+    iso_ago,
     render_to_str,
 )
 
@@ -1080,3 +1083,181 @@ def test_mcp_cache_and_prompt_sources_are_registered(hermes_home: Path):
     assert state.health.total_sources > 0
     assert "mcp_cache" not in state.health.failed_sources
     assert "skills_prompt" not in state.health.failed_sources
+
+
+def _write_usage(home: Path, records: dict[str, dict[str, object]]) -> Path:
+    usage = home / "skills" / ".usage.json"
+    usage.write_text(json.dumps(records))
+    return usage
+
+
+def test_curator_threshold_defaults_without_config(hermes_home: Path):
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.curator.stale_after_days == 14
+    assert state.curator.archive_after_days == 30
+    assert state.curator.thresholds_customized is False
+
+
+def test_curator_threshold_config_overrides(hermes_home: Path):
+    (hermes_home / "config.yaml").write_text(
+        yaml.dump({"curator": {"stale_after_days": 7, "archive_after_days": 21}})
+    )
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.curator.stale_after_days == 7
+    assert state.curator.archive_after_days == 21
+    assert state.curator.thresholds_customized is True
+
+
+def test_curator_threshold_junk_override_falls_back_to_default(hermes_home: Path):
+    (hermes_home / "config.yaml").write_text(yaml.dump({"curator": {"stale_after_days": "soon"}}))
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.curator.stale_after_days == 14
+    assert state.curator.archive_after_days == 30
+    assert state.curator.thresholds_customized is True
+
+
+def test_curator_usage_hygiene_counts(hermes_home: Path):
+    now = time.time()
+    _write_usage(
+        hermes_home,
+        {
+            # Patch fully re-used: not pending.
+            "dev-lint": {
+                "state": "active",
+                "pinned": True,
+                "patch_generation": 3,
+                "last_reused_patch_generation": 3,
+                "last_used_at": iso_ago(3600, now=now),
+            },
+            # Patched but never re-used: the loop hermesd should surface.
+            "research": {
+                "state": "active",
+                "patch_generation": 2,
+                "last_reused_patch_generation": 0,
+                "last_patched_at": iso_ago(1 * 86400, now=now),
+            },
+            # Stale by its own state, close to the archive threshold.
+            "old-habit": {
+                "state": "stale",
+                "last_used_at": iso_ago(20 * 86400, now=now),
+            },
+            "archived-one": {
+                "state": "archived",
+                "archived_at": iso_ago(40 * 86400, now=now),
+                "last_viewed_at": iso_ago(45 * 86400, now=now),
+            },
+            # Never used, never viewed, never patched: created_at is excluded
+            # upstream, so no activity window may be derived from it.
+            "never-used": {"state": "active", "created_at": iso_ago(2 * 86400, now=now)},
+            "weird-state": {"state": "mystery"},
+        },
+    )
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    cur = state.curator
+    assert cur.managed_skill_count == 6
+    assert cur.patch_pending_reuse_count == 1
+    assert cur.state_active_count == 3
+    assert cur.state_stale_count == 1
+    assert cur.state_archived_count == 1
+    assert cur.state_unknown_count == 1
+    assert cur.pinned_count == 1
+    windows = {window.name: window for window in cur.skill_windows}
+    assert windows["research"].patch_pending_reuse is True
+    assert windows["research"].days_until_stale == pytest.approx(13.0, abs=0.01)
+    assert windows["research"].days_until_archive == pytest.approx(29.0, abs=0.01)
+    assert windows["dev-lint"].days_until_stale == pytest.approx(13.96, abs=0.01)
+    assert windows["dev-lint"].pinned is True
+    assert windows["never-used"].last_activity_age_seconds is None
+    assert windows["never-used"].days_until_stale is None
+    assert windows["never-used"].days_until_archive is None
+    assert "curator" not in state.health.failed_sources
+
+
+def test_curator_usage_windows_are_soonest_first_and_bounded(hermes_home: Path):
+    now = time.time()
+    records = {}
+    for index in range(_SKILL_WINDOW_LIMIT + 5):
+        age_days = index + 1  # later index = older = sooner to go stale
+        records[f"skill-{index:02d}"] = {
+            "state": "active",
+            "last_used_at": iso_ago(age_days * 86400, now=now),
+        }
+    _write_usage(hermes_home, records)
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    cur = state.curator
+    assert cur.managed_skill_count == _SKILL_WINDOW_LIMIT + 5
+    assert len(cur.skill_windows) == _SKILL_WINDOW_LIMIT
+    stale_days = [window.days_until_stale for window in cur.skill_windows]
+    assert stale_days == sorted(stale_days)
+    # The soonest skills survive the cap; the youngest are the ones cut.
+    assert cur.skill_windows[0].days_until_stale == pytest.approx(14 - 25, abs=0.01)
+    assert cur.skill_windows[-1].days_until_stale == pytest.approx(14 - 6, abs=0.01)
+
+
+def test_curator_hygiene_without_usage_file_is_a_healthy_zero(hermes_home: Path):
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.curator.managed_skill_count == 0
+    assert state.curator.skill_windows == []
+    assert state.curator.patch_pending_reuse_count == 0
+    assert "curator" not in state.health.failed_sources
+
+
+def test_curator_hygiene_survives_malformed_usage_json(hermes_home: Path):
+    usage = _write_usage(hermes_home, {"dev-lint": {"state": "active", "patch_generation": 2}})
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert first.curator.patch_pending_reuse_count == 1
+
+        usage.write_text("{not valid json")
+        second = c.collect()
+    finally:
+        c.close()
+
+    assert second.curator.patch_pending_reuse_count == 1
+    assert "curator" not in second.health.failed_sources
+
+
+def test_curator_hygiene_ignores_non_mapping_records(hermes_home: Path):
+    usage = hermes_home / "skills" / ".usage.json"
+    usage.write_text(json.dumps({"dev-lint": "just a string", "other": {"state": "stale"}}))
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.curator.managed_skill_count == 1
+    assert state.curator.state_stale_count == 1

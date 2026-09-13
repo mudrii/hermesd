@@ -932,6 +932,23 @@ class ToolGatewayRoute(BaseModel):
     token_present: bool = False
 
 
+class ConfigBackupGroup(BaseModel):
+    """One backup-reason group inside ``backups/config/``.
+
+    Upstream writes ``config.yaml.<reason>.<YYYYMMDD-HHMMSS>`` copies and keeps
+    the newest five per reason (``hermes_cli/config_backups.py:29-69``). The
+    stamp is the writer's ``time.strftime`` value, i.e. *local* time, so ages
+    are computed against the same local clock — never against the file mtime,
+    which a later ``hermes update`` may have reset.
+    """
+
+    reason: str
+    kind: str = ""
+    count: int = 0
+    newest_stamp: str = ""
+    newest_age_seconds: float | None = None
+
+
 class ConfigSummary(BaseModel):
     model: str = ""
     provider: str = ""
@@ -1019,6 +1036,13 @@ class ConfigSummary(BaseModel):
     logging_level: str = ""
     # Presence only — a proxy URL can embed credentials.
     network_proxy_configured: bool = False
+    # backups/config/ point-in-time copies of this file, grouped by writer
+    # reason. The newest "good" stamp is the honest "config last changed" date:
+    # a good copy is written only when the bytes change, so an old stamp is an
+    # unchanged config, not a stale reader. "corrupt" counts are a hard alert.
+    config_backups_present: bool = False
+    config_backup_groups: list[ConfigBackupGroup] = Field(default_factory=list)
+    config_backup_groups_truncated: bool = False
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -1040,6 +1064,11 @@ class ConfigSummary(BaseModel):
 class ProviderInfo(BaseModel):
     name: str
     is_active: bool = False
+    # The Nous free-tier identity marker: providers.<name> with
+    # auth_method == "anonymous" and account_tier == "anonymous"
+    # (hermes_cli/anon_auth.py:39-41,88-89). Presence of the marker only — the
+    # state's token values are never read, and quota state never reaches disk.
+    free_tier: bool = False
 
 
 class CredentialPoolEntry(BaseModel):
@@ -1138,6 +1167,13 @@ class PluginInfo(BaseModel):
     catalog_sha: str = ""
     catalog_tier: str = ""
     catalog_installed_at: str = ""
+    # cache/plugin-catalog.json comparisons (the live catalog's view of this
+    # plugin): an entry sha that differs from the sidecar's reviewed sha, and
+    # the kill-list verdict for name/catalog name/repo. Neither is set when the
+    # cache is absent — no cache, no claim.
+    catalog_update_available: bool = False
+    catalog_removed: bool = False
+    catalog_removed_reason: str = ""
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -1164,6 +1200,20 @@ class PluginInfo(BaseModel):
     def pinned(self) -> bool:
         """Derived: upstream records a pin only beside the revision it pins."""
         return bool(self.pinned_revision)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def unmanaged(self) -> bool:
+        """Derived: neither provenance sidecar recorded anything usable.
+
+        A catalog sidecar would fill ``catalog_*`` and an install record would
+        fill ``installed_revision``/``install_source``; neither existing means
+        the directory was never installed by the plugin tooling — a local or
+        hand-copied plugin, which is a fact about the files, not an error.
+        """
+        return not (
+            self.catalog_name or self.catalog_sha or self.installed_revision or self.install_source
+        )
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -1218,6 +1268,13 @@ class SkillsMemory(BaseModel):
     boot_md_present: bool = False
     boot_md_mtime: float | None = None
     skills: list[SkillInfo] = Field(default_factory=list)
+    # cache/plugin-catalog.json — the live catalog's view of the installed
+    # plugins above. Absent cache means the drift/removal checks made no
+    # claims this pass, which must not read as "everything is current".
+    plugin_catalog_cache_present: bool = False
+    plugin_catalog_cache_age_seconds: float | None = None
+    plugin_catalog_update_count: int = 0
+    plugin_catalog_removed_count: int = 0
 
 
 class ToolsetAvailability(BaseModel):
@@ -2200,6 +2257,24 @@ class OperationsState(BaseModel):
         )
 
 
+class SkillCurationWindow(BaseModel):
+    """One skill's distance to the curator's stale/archive thresholds.
+
+    The window runs from the skill's last real activity (use, view or patch);
+    ``created_at`` is deliberately excluded upstream
+    (``tools/skill_usage.py:106-111``), so a never-used skill has no window at
+    all rather than one that silently starts at its creation.
+    """
+
+    name: str
+    state: str = ""
+    pinned: bool = False
+    patch_pending_reuse: bool = False
+    last_activity_age_seconds: float | None = None
+    days_until_stale: float | None = None
+    days_until_archive: float | None = None
+
+
 class CuratorRun(BaseModel):
     run_present: bool = False
     stamp: str = ""
@@ -2225,6 +2300,23 @@ class CuratorRun(BaseModel):
     scheduler_last_run_at: str = ""
     scheduler_last_report_path: str = ""
     consolidate_enabled: bool = False
+    # Patch-reuse loop and threshold hygiene over skills/.usage.json, using the
+    # same effective thresholds the curator's transitions use
+    # (agent/curator.py:29,115-120): 14/30 days by default, overridable via
+    # curator.stale_after_days / curator.archive_after_days in config.yaml.
+    stale_after_days: int = 14
+    archive_after_days: int = 30
+    thresholds_customized: bool = False
+    managed_skill_count: int = 0
+    patch_pending_reuse_count: int = 0
+    state_active_count: int = 0
+    state_stale_count: int = 0
+    state_archived_count: int = 0
+    state_unknown_count: int = 0
+    pinned_count: int = 0
+    # Display-bounded slice of the per-skill windows, soonest deadline first;
+    # managed_skill_count is the complete number.
+    skill_windows: list[SkillCurationWindow] = Field(default_factory=list)
 
 
 class HealthSummary(BaseModel):

@@ -64,6 +64,16 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         f"{plugin_count} plug (agent)  {desktop_count} plug (desktop)  {len(sm.mcp_servers)} mcp\n",
         style=theme.banner_text,
     )
+    if sm.plugin_catalog_update_count or sm.plugin_catalog_removed_count:
+        lines.append("  Catalog: ", style=theme.ui_label)
+        catalog_style = theme.ui_warn if sm.plugin_catalog_removed_count else theme.banner_text
+        parts = []
+        if sm.plugin_catalog_update_count:
+            parts.append(f"{sm.plugin_catalog_update_count} updates")
+        if sm.plugin_catalog_removed_count:
+            parts.append(f"{sm.plugin_catalog_removed_count} removed")
+        lines.append(" · ".join(parts), style=catalog_style)
+        lines.append("\n", style=theme.banner_text)
     if state.mcp_cache.mcp_cached_server_count:
         lines.append("  Schema cache: ", style=theme.ui_label)
         lines.append(
@@ -76,6 +86,8 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         color = theme.ui_ok if p.is_active else theme.banner_dim
         lines.append(f"  {sym} ", style=color)
         lines.append(f"{sanitize_terminal_text(p.name)} ", style=theme.banner_text)
+        if p.free_tier:
+            lines.append("Nous free tier", style=theme.ui_ok)
 
     return Panel(
         lines,
@@ -293,13 +305,14 @@ def _providers_table(sm: SkillsMemory, theme: Theme) -> Table:
     prov_table = Table(box=None, show_header=False, padding=(0, 2))
     prov_table.add_column("Status", width=3)
     prov_table.add_column("Name", style=theme.banner_text)
+    prov_table.add_column("Identity", style=theme.ui_ok)
     for p in sm.providers:
         sym = (
             Text("●", style=f"bold {theme.ui_ok}")
             if p.is_active
             else Text("○", style=theme.banner_dim)
         )
-        prov_table.add_row(sym, escape(p.name))
+        prov_table.add_row(sym, escape(p.name), "Nous free tier" if p.free_tier else "")
     return prov_table
 
 
@@ -354,6 +367,7 @@ def _plugins_table(sm: SkillsMemory, theme: Theme) -> Table:
     plugins_table.add_column("Activation", style=theme.banner_text, min_width=11)
     plugins_table.add_column("Declares", style=theme.banner_text, min_width=8)
     plugins_table.add_column("Provenance", style=theme.banner_text, min_width=18)
+    plugins_table.add_column("Catalog", style=theme.banner_text, min_width=10)
     plugins_table.add_column("Dashboard", style=theme.banner_text, min_width=9)
     plugins_table.add_column("Hooks", justify="right", min_width=5)
     plugins_table.add_column("Tools", justify="right", min_width=5)
@@ -365,12 +379,29 @@ def _plugins_table(sm: SkillsMemory, theme: Theme) -> Table:
             _activation_label(plugin.activation),
             _declares_label(plugin),
             _provenance_label(plugin),
+            _catalog_state_label(plugin),
             "Yes" if plugin.dashboard_enabled else "No",
             str(plugin.hook_count),
             str(plugin.tool_count),
             escape(plugin.description),
         )
     return plugins_table
+
+
+def _catalog_state_label(plugin: PluginInfo) -> str:
+    """The live catalog's verdict for this install, when the cache allows one.
+
+    Removal outranks an available update: a plugin on the kill list should not
+    be updated at all. ``unmanaged`` is a fact about the files (no provenance
+    sidecar recorded anything), not an error state.
+    """
+    if plugin.catalog_removed:
+        return "removed"
+    if plugin.catalog_update_available:
+        return "update available"
+    if plugin.unmanaged:
+        return "unmanaged"
+    return "—"
 
 
 def _desktop_plugins_table(sm: SkillsMemory, theme: Theme) -> Table:
@@ -473,10 +504,16 @@ _PROVENANCE_NOTE = (
 _CONFLICT_NOTE_LIMIT = 3
 
 
+# Catalog-cache note: an absent cache must not read as "everything current" —
+# the drift/removal checks simply made no claims that pass.
+_CATALOG_NOTE_LIMIT = 3
+
+
 def _plugins_note(sm: SkillsMemory, theme: Theme) -> Text:
     """What the plugins table cannot fit in a cell."""
     note = Text()
     note.append(f"\n{_PROVENANCE_NOTE}\n", style=theme.banner_dim)
+    _append_catalog_note(sm, note, theme)
     if sm.plugin_scan_truncated:
         note.append(
             "  ⚠ plugin list truncated: the directory scan hit its budget, so the"
@@ -511,6 +548,37 @@ def _plugins_note(sm: SkillsMemory, theme: Theme) -> Text:
                 f"    (+{len(conflicts) - _CONFLICT_NOTE_LIMIT} more)\n", style=theme.banner_dim
             )
     return note
+
+
+def _append_catalog_note(sm: SkillsMemory, note: Text, theme: Theme) -> None:
+    """Catalog drift/removal counts and the cache state behind them."""
+    if not sm.plugin_catalog_cache_present:
+        note.append(
+            "  no catalog cache observed — update/removal checks unavailable\n",
+            style=theme.banner_dim,
+        )
+        return
+    age = sm.plugin_catalog_cache_age_seconds
+    cache_line = "catalog cache observed" if age is None else f"catalog cache {_age_label(age)} old"
+    note.append(f"  {cache_line}: ", style=theme.banner_dim)
+    parts = []
+    if sm.plugin_catalog_update_count:
+        parts.append(f"{sm.plugin_catalog_update_count} update(s) available")
+    if sm.plugin_catalog_removed_count:
+        parts.append(f"{sm.plugin_catalog_removed_count} removed from catalog")
+    note.append(
+        " · ".join(parts) + "\n" if parts else "plugins match the catalog\n",
+        style=theme.banner_dim,
+    )
+    removed = [plugin for plugin in sm.plugins if plugin.catalog_removed]
+    for plugin in removed[:_CATALOG_NOTE_LIMIT]:
+        reason = plugin.catalog_removed_reason or "no reason recorded"
+        note.append(
+            f"    {sanitize_terminal_text(plugin.name)}: {sanitize_terminal_text(reason)}\n",
+            style=theme.banner_dim,
+        )
+    if len(removed) > _CATALOG_NOTE_LIMIT:
+        note.append(f"    (+{len(removed) - _CATALOG_NOTE_LIMIT} more)\n", style=theme.banner_dim)
 
 
 def _mcp_servers_table(sm: SkillsMemory, theme: Theme) -> Table:

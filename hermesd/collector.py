@@ -50,13 +50,16 @@ from hermesd.collect.common import (
     _today_epoch,
 )
 from hermesd.collect.config import (
+    _CONFIG_BACKUP_ENTRY_LIMIT,
     _channel_capabilities,
     _config_agent_limits,
+    _config_backup_groups,
     _credential_auth_type,
     _credential_expiry,
     _mcp_tool_filter_summary,
     _moa_config_summary,
     _platform_family_label,
+    _provider_free_tier,
     _provider_model_label,
     _provider_routing_summary,
     _scale_to_zero_relay_only,
@@ -127,6 +130,7 @@ from hermesd.collect.migration import (
 from hermesd.collect.operations import (
     StateDbRead,
     _count_delegation_live_logs,
+    _curator_thresholds,
     _curator_with_scheduler_state,
     _is_dashboard_process,
     _iso_age_seconds,
@@ -139,6 +143,7 @@ from hermesd.collect.operations import (
     _read_projects_state,
     _read_state_snapshots,
     _read_verification_evidence,
+    _skill_curation_hygiene,
     _state_db_update,
     _state_transition_label,
 )
@@ -151,17 +156,22 @@ from hermesd.collect.plugins import (
     MANIFEST_NAMES,
     MAX_PLUGIN_SCAN_DEPTH,
     PLUGIN_KIND_STANDALONE,
+    CatalogCacheEntry,
     CatalogProvenance,
     ManifestChoice,
+    RemovedCatalogEntry,
     catalog_provenance,
+    catalog_update_available,
     category_prefix,
     choose_manifest,
     declared_capabilities,
     gate_plugin,
     install_provenance,
+    parse_catalog_cache,
     parse_portable_manifest,
     plugin_key,
     plugin_name_set,
+    removed_catalog_match,
     requires_hermes_spec,
     resolve_plugin_kind,
 )
@@ -310,6 +320,22 @@ _PLUGIN_LIMIT = 200
 # The desktop inventory enriches SkillsMemory through an independent health
 # source so a transient root listing failure cannot blank agent integrations.
 _DESKTOP_PLUGIN_FIELDS = ("desktop_plugins", "desktop_plugin_scan_truncated")
+# backups/config/ scan — the fields the config-backups source owns on
+# ConfigSummary, so its last-good fallback restores exactly those.
+_CONFIG_BACKUP_FIELDS = (
+    "config_backups_present",
+    "config_backup_groups",
+    "config_backup_groups_truncated",
+)
+# The catalog-cache enrichment owns these SkillsMemory fields plus the flags it
+# stamps onto the plugin rows, so its last-good fallback restores both.
+_PLUGIN_CATALOG_FIELDS = (
+    "plugins",
+    "plugin_catalog_cache_present",
+    "plugin_catalog_cache_age_seconds",
+    "plugin_catalog_update_count",
+    "plugin_catalog_removed_count",
+)
 # cache/blocked-scripts/ scan bounds and the fields the source owns.
 _BLOCKED_SCRIPT_SCAN_LIMIT = 200
 _BLOCKED_SCRIPT_NAME_LIMIT = 3
@@ -903,6 +929,19 @@ class Collector:
             ),
             _SourceSpec("checkpoints", "checkpoints", self._collect_checkpoints, list),
             _SourceSpec("config", "config", self._collect_config, ConfigSummary),
+            # Second writer of the `config` field: backups/config/ is scanned and
+            # grouped on its own source so a hostile directory (or a symlink
+            # swap) degrades only the backup audit trail, not the settings read
+            # out of config.yaml itself.
+            _SourceSpec(
+                "config",
+                "config_backups",
+                lambda: self._with_config_backups(results["config"]),
+                lambda: results["config"],
+                fallback=lambda: self._last_source_fields(
+                    "config_backups", results["config"], _CONFIG_BACKUP_FIELDS
+                ),
+            ),
             _SourceSpec("cron", "cron", self._collect_cron, CronState),
             # Split from "cron" so a corrupt executions.db keeps jobs.json data.
             _SourceSpec(
@@ -1027,6 +1066,19 @@ class Collector:
                 lambda: results["skills_memory"],
                 fallback=lambda: self._last_source_fields(
                     "desktop_plugins", results["skills_memory"], _DESKTOP_PLUGIN_FIELDS
+                ),
+            ),
+            # Second writer of the `skills_memory` field: the live catalog cache
+            # adds drift/removal verdicts on top of the discovered plugins. An
+            # unreadable cache fails only this enrichment — the discovered
+            # plugin inventory beside it stays fresh.
+            _SourceSpec(
+                "skills_memory",
+                "plugin_catalog",
+                lambda: self._with_plugin_catalog(results["skills_memory"]),
+                lambda: results["skills_memory"],
+                fallback=lambda: self._last_source_fields(
+                    "plugin_catalog", results["skills_memory"], _PLUGIN_CATALOG_FIELDS
                 ),
             ),
             _SourceSpec("mcp_cache", "mcp_cache", self._collect_mcp_cache, MCPSchemaCache),
@@ -2076,6 +2128,52 @@ class Collector:
             **_config_agent_limits(cfg),
         )
 
+    def _with_config_backups(self, current: ConfigSummary) -> ConfigSummary:
+        """Group the point-in-time config copies recorded beside config.yaml.
+
+        Upstream writes ``config.yaml.<reason>.<YYYYMMDD-HHMMSS>`` copies under
+        ``<config dir>/backups/config`` (``hermes_cli/config_backups.py:29-69``),
+        keeping the newest five per reason and skipping byte-identical repeats.
+        The config path upstream copies is ``get_config_path()`` —
+        ``hermes_constants.py:1132-1135`` — so the directory inherits whatever
+        home that resolves to; hermesd keeps the ROOT copy on purpose, the same
+        decision as the ``config`` source (see .codex/rules/source-ownership.md).
+
+        Consequences worth rendering honestly: a "good" copy lands only when
+        config.yaml's bytes change, so an old stamp means *unchanged*, not
+        stale; and the stamps are the writer's local time.
+        """
+        backups_dir = self._paths.shared_path("backups", "config")
+        if not _exists_strict(backups_dir) or not backups_dir.is_dir():
+            return current.model_copy(
+                update={
+                    "config_backups_present": False,
+                    "config_backup_groups": [],
+                    "config_backup_groups_truncated": False,
+                }
+            )
+        if backups_dir.is_symlink() or not _path_resolves_under(backups_dir, self._paths.root_home):
+            # Same hardening as the curator run-dir scan: a planted symlink must
+            # fail this source (keeping last-good) instead of being read.
+            raise RuntimeError(f"unsafe config backups directory: {backups_dir.name}")
+        # The directory scan is bounded before sorting: a hostile directory can
+        # hold far more entries than the five-per-reason writer would leave.
+        examined = list(islice(backups_dir.iterdir(), _CONFIG_BACKUP_ENTRY_LIMIT + 1))
+        scan_truncated = len(examined) > _CONFIG_BACKUP_ENTRY_LIMIT
+        entries = sorted(
+            entry.name
+            for entry in examined[:_CONFIG_BACKUP_ENTRY_LIMIT]
+            if entry.is_file() and not entry.is_symlink()
+        )
+        groups, groups_truncated = _config_backup_groups(entries, now=self._clock())
+        return current.model_copy(
+            update={
+                "config_backups_present": True,
+                "config_backup_groups": groups,
+                "config_backup_groups_truncated": scan_truncated or groups_truncated,
+            }
+        )
+
     def _collect_tool_gateway_routes(self, cfg: dict[str, Any]) -> list[ToolGatewayRoute]:
         token_present = bool(self._env.get("TOOL_GATEWAY_USER_TOKEN"))
         routes = []
@@ -2811,7 +2909,27 @@ class Collector:
             self._paths.profile_path("skills", ".curator_state")
         )
         curator_cfg = _as_dict(self._read_yaml_reporting_stale().get("curator"))
-        base_run = _curator_with_scheduler_state(CuratorRun(), scheduler_state, curator_cfg)
+        stale_days, archive_days, thresholds_customized = _curator_thresholds(curator_cfg)
+        # skills/.usage.json is PROFILE-scoped (tools/skill_usage.py:50): the
+        # patch-reuse loop and per-skill threshold windows describe the
+        # selected profile's library, while the thresholds themselves are the
+        # ROOT config's curator overrides — the existing mixed `curator` row.
+        hygiene = _skill_curation_hygiene(
+            self._read_json_cached(self._paths.profile_path("skills", ".usage.json")),
+            now=self._clock(),
+            stale_after_days=stale_days,
+            archive_after_days=archive_days,
+        )
+        base_run = _curator_with_scheduler_state(
+            CuratorRun(), scheduler_state, curator_cfg
+        ).model_copy(
+            update={
+                "stale_after_days": stale_days,
+                "archive_after_days": archive_days,
+                "thresholds_customized": thresholds_customized,
+                **hygiene,
+            }
+        )
         curator_dir = self._paths.shared_path("logs", "curator")
         if (
             curator_dir.is_symlink()
@@ -3122,6 +3240,73 @@ class Collector:
             }
         )
 
+    def _with_plugin_catalog(self, current: SkillsMemory) -> SkillsMemory:
+        """Flag catalog drift, catalog removals and unmanaged installs.
+
+        Upstream compares an installed plugin's ``.hermes-catalog.json`` sha
+        with the live catalog's pin (``plugins_cmd_catalog.py:277-291``) and
+        blocks installs whose name/catalog name/repo is on the kill list
+        (``plugin_catalog.py:198-211``, ``plugins_cmd_catalog.py:96-103``). The
+        live catalog reaches disk through ``cache/plugin-catalog.json``
+        (``plugin_catalog.py:216-218``), refreshed on a 6h mtime TTL. hermesd
+        reads that cache from the ROOT home — the same divergence as the
+        ``plugins/`` directory it describes, kept so both sides of the
+        comparison describe one home (see .codex/rules/source-ownership.md).
+
+        No cache means no claims: update/removal flags stay False and the panel
+        says the checks are unavailable, never "everything is current".
+        """
+        cache_path = self._paths.shared_path("cache", "plugin-catalog.json")
+        if not _exists_strict(cache_path) or not cache_path.is_file():
+            return current.model_copy(
+                update={
+                    "plugin_catalog_cache_present": False,
+                    "plugin_catalog_cache_age_seconds": None,
+                    "plugin_catalog_update_count": 0,
+                    "plugin_catalog_removed_count": 0,
+                }
+            )
+        if cache_path.is_symlink() or not _path_resolves_under(cache_path, self._paths.root_home):
+            raise RuntimeError(f"unsafe plugin catalog cache: {cache_path.name}")
+        entries, removed = parse_catalog_cache(self._read_json_cached(cache_path))
+        plugins = [
+            self._flag_plugin_with_catalog(plugin, entries, removed) for plugin in current.plugins
+        ]
+        return current.model_copy(
+            update={
+                "plugins": plugins,
+                "plugin_catalog_cache_present": True,
+                "plugin_catalog_cache_age_seconds": self._file_age_seconds(cache_path),
+                "plugin_catalog_update_count": sum(
+                    1 for plugin in plugins if plugin.catalog_update_available
+                ),
+                "plugin_catalog_removed_count": sum(
+                    1 for plugin in plugins if plugin.catalog_removed
+                ),
+            }
+        )
+
+    def _flag_plugin_with_catalog(
+        self,
+        plugin: PluginInfo,
+        entries: dict[str, CatalogCacheEntry],
+        removed: list[RemovedCatalogEntry],
+    ) -> PluginInfo:
+        entry = entries.get(plugin.catalog_name) if plugin.catalog_name else None
+        update = catalog_update_available(plugin.catalog_sha, entry)
+        match = removed_catalog_match(
+            plugin.name, plugin.catalog_name, plugin.catalog_repo, removed=removed
+        )
+        if not update and match is None:
+            return plugin
+        return plugin.model_copy(
+            update={
+                "catalog_update_available": update,
+                "catalog_removed": match is not None,
+                "catalog_removed_reason": match.reason if match else "",
+            }
+        )
+
     def _collect_desktop_plugins(self) -> tuple[list[DesktopPluginInfo], bool]:
         """Read the app-level root defined by desktop-plugins-root.ts:1-38."""
         return read_desktop_plugins(
@@ -3401,7 +3586,14 @@ class Collector:
         pool = _as_dict(data.get("credential_pool"))
         providers_section = _as_dict(data.get("providers"))
         all_names = set(pool.keys()) | set(providers_section.keys())
-        return [ProviderInfo(name=name, is_active=(name == active)) for name in sorted(all_names)]
+        return [
+            ProviderInfo(
+                name=name,
+                is_active=(name == active),
+                free_tier=_provider_free_tier(_as_dict(providers_section.get(name))),
+            )
+            for name in sorted(all_names)
+        ]
 
     def _collect_credential_pools(self, data: dict[str, Any]) -> list[CredentialPoolEntry]:
         if not data:
