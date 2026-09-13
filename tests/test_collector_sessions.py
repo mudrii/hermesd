@@ -1838,7 +1838,10 @@ def test_active_surface_pid_coercion_never_raises(
         {"entries": [{"session_id": "sess_new", "surface": "cli", "pid": raw_pid}]},
     )
 
-    state = _collect_once(hermes_home, pid_exists=_pid_exists)
+    # A deterministic liveness stub: implausible pids must stay dead without
+    # consulting the host process table (a small pid like 3 exists on some
+    # runners, which made the real check flaky).
+    state = _collect_once(hermes_home, pid_exists=lambda pid: False)
 
     surface = state.active_surfaces[0]
     assert surface.pid == expected

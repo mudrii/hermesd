@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -594,9 +595,21 @@ def test_an_unparseable_last_attempt_yields_no_age(hermes_home: Path, stamp: str
 
 
 @pytest.mark.parametrize("moment", [datetime.min, datetime.max])
-def test_an_out_of_range_stamp_is_never_an_age(moment: datetime) -> None:
-    """``timestamp()`` overflows at both ends of the range; neither is an epoch."""
-    assert _local_iso_to_epoch(moment.isoformat(timespec="seconds")) is None
+def test_an_out_of_range_stamp_is_never_an_age(
+    moment: datetime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``timestamp()`` overflows at both ends of the range; neither is an age.
+
+    The overflow is host-timezone dependent — a UTC host happily converts
+    ``datetime.max`` — so pin a far-east offset where both extremes provably
+    overflow, making the assertion deterministic on every runner.
+    """
+    monkeypatch.setenv("TZ", "Etc/GMT-14")  # UTC+14, the farthest positive offset
+    time.tzset()
+    try:
+        assert _local_iso_to_epoch(moment.isoformat(timespec="seconds")) is None
+    finally:
+        time.tzset()
 
 
 @pytest.mark.parametrize("value", [None, 1788832752, ["2026-09-12T21:48:03"], b"x"])
