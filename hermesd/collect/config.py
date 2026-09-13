@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 
-from hermesd.collect.common import _age_seconds, _as_dict, _as_list, _coerce_int
+from hermesd.collect.common import _age_seconds, _as_dict, _as_list, _coerce_bool, _coerce_int
 from hermesd.collect.redaction import _API_KEY_FIELD_NAMES, _OAUTH_FIELD_NAMES
 from hermesd.models import ConfigBackupGroup, PlatformStatus
 
@@ -363,7 +363,13 @@ def _stale_alias_count(aliases: dict[str, Any]) -> int:
     for entries in aliases.values():
         for value in _as_dict(entries).values():
             entry = _as_dict(value)
-            if entry and bool(entry.get("stale") or entry.get("is_stale") or entry.get("expired")):
+            # State payload written by the gateway: a stringified flag is
+            # corruption, never truth (``bool("false")`` is True).
+            if entry and (
+                _coerce_bool(entry.get("stale"))
+                or _coerce_bool(entry.get("is_stale"))
+                or _coerce_bool(entry.get("expired"))
+            ):
                 count += 1
     return count
 

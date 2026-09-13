@@ -3466,3 +3466,27 @@ def test_gateway_reads_stringified_state_flags_strictly(hermes_home: Path):
     platform = next(p for p in gateway.platforms if p.name == "telegram")
     assert platform.needs_attention is False
     assert gateway.config_sources[0].exists is False
+
+
+def test_stale_alias_count_ignores_stringified_flags(hermes_home: Path):
+    """`channel_aliases.json` is a state payload: `"false"` is not stale.
+
+    Each alias entry carries real JSON booleans upstream; a stringified flag is
+    corruption, and `bool("false")` would count a live alias as stale.
+    """
+    (hermes_home / "channel_aliases.json").write_text(
+        json.dumps(
+            {
+                "telegram": {
+                    "1": {"label": "Live", "stale": "false"},
+                    "2": {"label": "Also live", "is_stale": "0"},
+                    "3": {"label": "Really stale", "stale": True},
+                }
+            }
+        )
+    )
+
+    state = _collect(hermes_home)
+
+    assert state.channels.alias_count == 3
+    assert state.channels.stale_alias_count == 1
