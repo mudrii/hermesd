@@ -9,7 +9,7 @@ Brief description of the change.
 ## Testing
 
 - [ ] Full local gate passes:
-      `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy hermesd`,
+      `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy hermesd scripts`,
       `uv run python -m compileall hermesd`,
       `uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing`,
       `uv run pip-audit`, `uv lock --check`, `uv build`, wheel/sdist smoke install,

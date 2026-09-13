@@ -19,6 +19,28 @@
       # it from pyproject.toml, so the two cannot drift apart.
       hermesdVersion = pkgs: (pkgs.lib.importTOML ./pyproject.toml).project.version;
 
+      # The pinned nixpkgs revision provides hatchling 1.31, while the package
+      # requires hatchling>=1.32 for current core metadata. Supply that build
+      # dependency from its hash-verified PyPI wheel.
+      mkHatchling = pkgs:
+        pkgs.python312.pkgs.buildPythonPackage rec {
+          pname = "hatchling";
+          version = "1.32.0";
+          format = "wheel";
+          src = pkgs.fetchurl {
+            url = "https://files.pythonhosted.org/packages/a9/84/1798b6d85ecde0e31546004efd25c5de1b1f49250644a60cce460e12593a/hatchling-1.32.0-py3-none-any.whl";
+            hash = "sha256-DhfJw7mqfGJazI0PW2IvEH1QSa+ez1raTeGq2lvnzbw=";
+          };
+          dependencies = with pkgs.python312.pkgs; [
+            packaging
+            pathspec
+            pluggy
+            tomlkit
+            trove-classifiers
+          ];
+          doCheck = false;
+        };
+
       mkHermesd = pkgs:
         let
           python = pkgs.python312;
@@ -30,7 +52,12 @@
 
           src = ./.;
 
-          build-system = [ python.pkgs.hatchling ];
+          build-system = [ (mkHatchling pkgs) ];
+
+          # PyPI installs use the exact runtime pins in pyproject.toml. Nix
+          # supplies its own package-set versions and validates that set with
+          # the build-time test suite and installed CLI smoke below.
+          dontCheckRuntimeDeps = true;
 
           dependencies = with python.pkgs; [
             rich
@@ -41,7 +68,16 @@
           # The package build itself executes the pytest suite (checkPhase),
           # so `nix build .#hermesd` and `nix flake check` both prove that the
           # packaged code passes its tests — not merely that it evaluates.
-          nativeCheckInputs = [ python.pkgs.pytestCheckHook ];
+          nativeCheckInputs = [
+            python.pkgs.pytestCheckHook
+            python.pkgs.packaging
+            pkgs.git
+          ];
+          pytestFlags = [ "tests" ];
+
+          # Checkpoint collection invokes git after installation, so keep it
+          # on PATH for consumers of the Nix application as well as tests.
+          makeWrapperArgs = [ "--prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git ]}" ];
 
           meta = with pkgs.lib; {
             description = "TUI monitoring dashboard for Hermes AI agent";
@@ -104,6 +140,37 @@
                 echo "installed hermesd does not report version $expectedVersion" >&2
                 exit 1
               }
+              touch "$out"
+            '';
+
+          # Set up the fixture with an absolute git path, then rely on the
+          # installed hermesd wrapper to provide git to checkpoint collection.
+          hermesd-checkpoint-smoke = pkgs.runCommand "hermesd-checkpoint-smoke"
+            {
+              nativeBuildInputs = [ hermesd ];
+              meta.timeout = 300;
+            }
+            ''
+              home="$TMPDIR/.hermes"
+              workdir="$TMPDIR/workspaces/project-alpha"
+              repo="$home/checkpoints/smoke000000000000"
+              mkdir -p "$home"/{logs,sessions,skills,memories,cron} "$workdir" "$repo"
+              echo "$workdir" > "$repo/HERMES_WORKDIR"
+
+              git_bin=${pkgs.git}/bin/git
+              "$git_bin" init --quiet --bare "$repo"
+              "$git_bin" --git-dir "$repo" --work-tree "$workdir" config user.email smoke@example.invalid
+              "$git_bin" --git-dir "$repo" --work-tree "$workdir" config user.name "Smoke Test"
+              echo "checkpoint smoke" > "$workdir/notes.txt"
+              "$git_bin" --git-dir "$repo" --work-tree "$workdir" add -A
+              "$git_bin" --git-dir "$repo" --work-tree "$workdir" commit --quiet -m "checkpoint 0"
+              echo "checkpoint smoke v1" > "$workdir/notes.txt"
+              "$git_bin" --git-dir "$repo" --work-tree "$workdir" add -A
+              "$git_bin" --git-dir "$repo" --work-tree "$workdir" commit --quiet -m "checkpoint 1"
+
+              hermesd --hermes-home "$home" --snapshot-panel 4 --no-color > snapshot.txt
+              grep -F "Checkpoints (1)" snapshot.txt > /dev/null
+              grep -F "checkpoint 1" snapshot.txt > /dev/null
               touch "$out"
             '';
         });

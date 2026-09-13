@@ -20,12 +20,12 @@ import hashlib
 import json
 import os
 import sqlite3
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+import hermesd.collect.recovery as recovery_module
 from hermesd.collect.recovery import _local_iso_to_epoch, _read_db_recovery
 from hermesd.collector import Collector
 from hermesd.models import (
@@ -594,22 +594,23 @@ def test_an_unparseable_last_attempt_yields_no_age(hermes_home: Path, stamp: str
     assert recovery.last_attempt_age_seconds is None
 
 
-@pytest.mark.parametrize("moment", [datetime.min, datetime.max])
-def test_an_out_of_range_stamp_is_never_an_age(
-    moment: datetime, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("error_type", [OverflowError, OSError, ValueError])
+def test_an_unrepresentable_stamp_is_never_an_age(
+    error_type: type[Exception], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``timestamp()`` overflows at both ends of the range; neither is an age.
+    """Platform timestamp conversion failures never become an age."""
 
-    The overflow is host-timezone dependent — a UTC host happily converts
-    ``datetime.max`` — so pin a far-east offset where both extremes provably
-    overflow, making the assertion deterministic on every runner.
-    """
-    monkeypatch.setenv("TZ", "Etc/GMT-14")  # UTC+14, the farthest positive offset
-    time.tzset()
-    try:
-        assert _local_iso_to_epoch(moment.isoformat(timespec="seconds")) is None
-    finally:
-        time.tzset()
+    class UnrepresentableDatetime:
+        @classmethod
+        def fromisoformat(cls, value: str) -> UnrepresentableDatetime:
+            return cls()
+
+        def timestamp(self) -> float:
+            raise error_type("unrepresentable local time")
+
+    monkeypatch.setattr(recovery_module, "datetime", UnrepresentableDatetime)
+
+    assert _local_iso_to_epoch("9999-12-31T23:59:59") is None
 
 
 @pytest.mark.parametrize("value", [None, 1788832752, ["2026-09-12T21:48:03"], b"x"])

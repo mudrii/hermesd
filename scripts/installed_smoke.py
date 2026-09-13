@@ -40,13 +40,14 @@ def hermesd(*args: str, home: Path | None = None) -> subprocess.CompletedProcess
     command = [sys.executable, "-I", "-m", "hermesd"]
     if home is not None:
         command += ["--hermes-home", str(home)]
-    return subprocess.run(
-        [*command, *args],
-        capture_output=True,
-        text=True,
-        cwd=tempfile.mkdtemp(prefix="hermesd-smoke-cwd-"),
-        check=False,
-    )
+    with tempfile.TemporaryDirectory(prefix="hermesd-smoke-cwd-") as working_directory:
+        return subprocess.run(
+            [*command, *args],
+            capture_output=True,
+            text=True,
+            cwd=working_directory,
+            check=False,
+        )
 
 
 def build_home(root: Path, *, populated: bool) -> Path:
@@ -60,9 +61,9 @@ def build_home(root: Path, *, populated: bool) -> Path:
         "model:\n  default: smoke-model\n  provider: smoke-provider\ndisplay:\n  skin: default\n",
         encoding="utf-8",
     )
-    (home / "logs" / "hermesd.log").write_text(
-        "2026-09-13 12:00:00 INFO smoke log line one\n"
-        "2026-09-13 12:00:01 INFO smoke log line two\n",
+    (home / "logs" / "agent.log").write_text(
+        "2026-09-13 12:00:00,000 - hermes - INFO - smoke log line one\n"
+        "2026-09-13 12:00:01,000 - hermes - INFO - smoke log line two\n",
         encoding="utf-8",
     )
     skill_dir = home / "skills" / "notes" / "readme"
@@ -82,7 +83,16 @@ def snapshot_state(home: Path) -> dict[Path, str]:
     return state
 
 
-def check_snapshots(home: Path, label: str) -> None:
+def check_missing_home(home: Path) -> None:
+    """Verify the installed CLI rejects an absent Hermes home without creating it."""
+    result = hermesd("--snapshot", "--no-color", home=home)
+    assert result.returncode == 1, f"missing home: unexpected exit {result.returncode}"
+    assert not result.stdout, f"missing home: unexpected output: {result.stdout!r}"
+    assert "does not exist" in result.stderr, f"missing home: wrong error: {result.stderr!r}"
+    assert not home.exists(), "missing home: hermesd created the absent home"
+
+
+def check_snapshots(home: Path, label: str, *, populated: bool) -> None:
     before = snapshot_state(home)
 
     overview = hermesd("--snapshot", "--no-color", home=home)
@@ -93,7 +103,24 @@ def check_snapshots(home: Path, label: str) -> None:
     assert full_json.returncode == 0, f"{label}: full JSON failed: {full_json.stderr}"
     payload = json.loads(full_json.stdout)
     assert payload["panel_num"] is None, f"{label}: unexpected panel annotation"
-    assert "state" in payload, f"{label}: JSON payload missing state"
+    state = payload.get("state")
+    assert isinstance(state, dict), f"{label}: JSON payload missing state"
+    if populated:
+        assert state["config"]["model"] == "smoke-model", f"{label}: fixture model not collected"
+        assert state["config"]["provider"] == "smoke-provider", (
+            f"{label}: fixture provider not collected"
+        )
+        assert state["skills_memory"]["skills"] == [
+            {
+                "category": "notes",
+                "description": "Smoke fixture skill",
+                "name": "readme",
+            }
+        ], f"{label}: fixture skill not collected"
+        assert [line["message"] for line in state["logs"]["agent_lines"]] == [
+            "smoke log line one",
+            "smoke log line two",
+        ], f"{label}: fixture logs not collected"
 
     panel_json = hermesd("--snapshot-format", "json", "--snapshot-panel", "12", home=home)
     assert panel_json.returncode == 0, f"{label}: panel JSON failed: {panel_json.stderr}"
@@ -103,7 +130,9 @@ def check_snapshots(home: Path, label: str) -> None:
 
     panel_text = hermesd("--snapshot-panel", "8", "--no-color", home=home)
     assert panel_text.returncode == 0, f"{label}: panel text failed: {panel_text.stderr}"
-    assert panel_text.stdout.strip(), f"{label}: empty panel text output"
+    assert "[8] Logs" in panel_text.stdout, f"{label}: wrong text panel output"
+    if populated:
+        assert "smoke log line two" in panel_text.stdout, f"{label}: fixture log not rendered"
 
     after = snapshot_state(home)
     changed = {key for key in before if before[key] != after.get(key)} | (set(before) ^ set(after))
@@ -159,8 +188,13 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="hermesd-smoke-home-") as directory:
         root = Path(directory)
-        check_snapshots(build_home(root / "populated", populated=True), "populated home")
-        check_snapshots(build_home(root / "empty", populated=False), "empty home")
+        check_missing_home(root / "missing")
+        check_snapshots(
+            build_home(root / "populated", populated=True),
+            "populated home",
+            populated=True,
+        )
+        check_snapshots(build_home(root / "empty", populated=False), "empty home", populated=False)
 
     print(f"installed smoke OK: hermesd {version} (text/JSON snapshots, panels, read-only)")
     return 0

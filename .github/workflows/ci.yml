@@ -18,6 +18,9 @@ jobs:
     name: Classify changed files
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       docker: ${{ steps.filter.outputs.docker }}
       nix: ${{ steps.filter.outputs.nix }}
@@ -33,25 +36,54 @@ jobs:
             # every file the build copies or reads (pyproject, lockfile,
             # README, LICENSE are package metadata and build inputs).
             docker:
-              - '.github/workflows/ci.yml'
+              - '.codex/rules/**'
+              - '.github/**'
               - '.dockerignore'
+              - 'CHANGELOG.md'
+              - 'CONTRIBUTING.md'
               - 'Dockerfile'
               - 'LICENSE'
               - 'README.md'
+              - 'SECURITY.md'
+              - 'docs/**'
               - 'hermesd/**'
               - 'pyproject.toml'
+              - 'scripts/**'
+              - 'tests/**'
               - 'uv.lock'
             # Nix inputs: flake definition plus the same packaged source and
             # metadata the flake build consumes.
             nix:
-              - '.github/workflows/ci.yml'
+              - '.codex/rules/**'
+              - '.github/**'
+              - 'CHANGELOG.md'
+              - 'CONTRIBUTING.md'
               - 'flake.nix'
               - 'flake.lock'
               - 'LICENSE'
               - 'README.md'
+              - 'SECURITY.md'
+              - 'docs/**'
               - 'hermesd/**'
               - 'pyproject.toml'
+              - 'scripts/**'
+              - 'tests/**'
               - 'uv.lock'
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@595b5aeba73380359d98a5e087f648dbb0edce1b # v4.7.3
+        with:
+          fail-on-severity: moderate
+          fail-on-scopes: runtime, development, unknown
+          retry-on-snapshot-warnings: true
 
   static:
     name: Static analysis
@@ -67,7 +99,7 @@ jobs:
       - name: Format check (ruff)
         run: uv run ruff format --check .
       - name: Type check (mypy)
-        run: uv run mypy hermesd
+        run: uv run mypy hermesd scripts
       - name: Compile check
         run: uv run python -m compileall hermesd
 
@@ -235,7 +267,7 @@ jobs:
           PY
 
   nix:
-    name: Nix (${{ matrix.os }})
+    name: Nix (${{ matrix.system }})
     needs: changes
     if: >-
       needs.changes.outputs.nix == 'true' ||
@@ -243,8 +275,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
-    runs-on: ${{ matrix.os }}
+        include:
+          - runner: ubuntu-24.04
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+          - runner: macos-15-intel
+            system: x86_64-darwin
+          - runner: macos-15
+            system: aarch64-darwin
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -262,7 +302,7 @@ jobs:
   # jobs, and a failed changes job — as a failed gate (audit CI-14).
   gate:
     name: CI gate
-    needs: [changes, static, security, test, macos, package, docker, nix]
+    needs: [changes, dependency-review, static, security, test, macos, package, docker, nix]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -271,6 +311,7 @@ jobs:
         env:
           RESULTS: >-
             changes=${{ needs.changes.result }}
+            dependency-review=${{ needs.dependency-review.result }}
             static=${{ needs.static.result }}
             security=${{ needs.security.result }}
             test=${{ needs.test.result }}
@@ -280,19 +321,25 @@ jobs:
             nix=${{ needs.nix.result }}
           DOCKER_EXPECTED: ${{ needs.changes.outputs.docker == 'true' || github.event_name != 'pull_request' }}
           NIX_EXPECTED: ${{ needs.changes.outputs.nix == 'true' || github.event_name != 'pull_request' }}
+          DEPENDENCY_REVIEW_EXPECTED: ${{ github.event_name == 'pull_request' }}
         run: |
           status=0
           for pair in $RESULTS; do
             job="${pair%%=*}"
             result="${pair#*=}"
             case "$job" in
+              dependency-review) expected="$DEPENDENCY_REVIEW_EXPECTED" ;;
               docker) expected="$DOCKER_EXPECTED" ;;
               nix) expected="$NIX_EXPECTED" ;;
               *) expected="true" ;;
             esac
-            [ "$expected" = "true" ] || continue
-            if [ "$result" != "success" ]; then
-              echo "::error::required job '$job' finished with '$result'"
+            if [ "$expected" = "true" ]; then
+              if [ "$result" != "success" ]; then
+                echo "::error::required job '$job' finished with '$result'"
+                status=1
+              fi
+            elif [ "$result" != "skipped" ]; then
+              echo "::error::unexpected job '$job' finished with '$result'"
               status=1
             fi
           done

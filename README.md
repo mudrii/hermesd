@@ -448,7 +448,7 @@ uv sync --locked --all-extras --dev
 # CI runs the same checks across Python 3.11, 3.12, 3.13, and 3.14.
 uv run ruff check .
 uv run ruff format --check .
-uv run mypy hermesd
+uv run mypy hermesd scripts
 uv run python -m compileall hermesd
 uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing
 uv run python scripts/pip_audit_gate.py

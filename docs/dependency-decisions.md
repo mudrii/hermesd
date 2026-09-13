@@ -6,6 +6,23 @@ itself, and the policy that produced it. Versions always come from
 `uv.lock`; the exact-pins policy for published runtime requirements is
 documented in [`ci-release-policy.md`](ci-release-policy.md).
 
+## 2026-09: retained development-tool updates
+
+**Decision: upgrade.** The three retained maintenance changes were applied to
+the development lock together: pytest 9.0.3 → 9.1.1, Ruff 0.15.11 → 0.16.6,
+and types-PyYAML 6.0.12.20260408 → 6.0.12.20260906. They remain development
+dependencies and do not change hermesd's published runtime requirements.
+
+The refreshed lock passes `uv lock --check`; the selected Ruff version passes
+the repository lint and format gates, and the CI/package policy tests pass
+with pytest 9.1.1 and the newer type stubs installed. Complete supported-Python,
+artifact, and audit evidence is recorded in
+[`../reports/cicd-implementation-review-2026-09-13.md`](../reports/cicd-implementation-review-2026-09-13.md).
+
+**Policy applied:** minor/patch development tooling updates may be reviewed
+together, but each selected version must pass hermesd's own gates. A matching
+version in another project is supporting context, not acceptance evidence.
+
 ## 2026-09: Pydantic 2.12.5 → 2.13.4 (core 2.41.5 → 2.46.4)
 
 **Decision: upgrade.** hermes-agent upgraded to pydantic 2.13.4/core 2.46.4

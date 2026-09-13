@@ -16,7 +16,7 @@ uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd -
 uv run pytest tests/ -q --cov=hermesd --cov-report=term-missing  # coverage (CI gate: 96%)
 uv run ruff check .                 # lint
 uv run ruff format --check .        # format check
-uv run mypy hermesd                 # type check
+uv run mypy hermesd scripts         # type check
 uv run python -m compileall hermesd # compile check
 uv run pip-audit                    # dependency audit
 uv lock --check                     # lockfile freshness

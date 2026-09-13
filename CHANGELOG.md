@@ -7,8 +7,18 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ## [Unreleased]
 
+## [2026.9.13] - 2026-09-13
+
+Release preparation. This release includes all changes since the published
+`v2026.7.11`, including the unpublished `2026.9.8` development milestone below.
+See the [consolidated release notes](docs/releases/2026.9.13.md) for the complete
+release scope grouped by dashboard area.
+
 ### Fixed
 
+- Kanban can read a WAL-mode board with no sidecars through the immutable path, while still refusing an unreadable WAL sidecar instead of silently serving old data.
+- Cron incident copy now describes the detected incident without claiming that its existence proves alert delivery is broken. Fire-claim checks use an explicitly supplied hostname, and execution handoff flags use strict boolean parsing.
+- Delegation receipt tails and Kanban completion contracts are redacted before clipping or entering dashboard state.
 - The Curator panel dropped its whole hygiene rollup whenever a run report existed: `logs/curator/<stamp>/run.json` is read into a fresh `CuratorRun`, and that object carried none of the thresholds or the `skills/.usage.json` counts computed for the same pass. On a home with 20 run reports the panel showed no hygiene section at all — while its usage file manages 72 skills (59 active, 13 stale) — and a configured 7/9 threshold pair rendered as 14/30. Both shapes now apply one shared overlay, so a field cannot land on only one of them.
 - The gateway loop verdict had a 90-300 s band that always answered `stale`, so a gateway whose witness was armed and silent for four minutes still read as a slow heartbeat and a witness-less legacy writer in that band read as one too. Upstream opens the escalation band at its 90 s stale budget (three missed 30 s beats); the band is gone, the three-strike silence guard still stands, and `legacy`/`unknown` now apply from 90 s.
 - The kanban breaker fired on healthy tasks: `breaker_tripped` compared the raw failure counter against the limit, so a task with `max_retries: 0` and no failures rendered `0/0 breaker tripped` in alert style. Upstream increments before every comparison, so the trip test now floors the limit at one failure while still reporting the stored 0.
@@ -32,7 +42,7 @@ and this project uses date-based versions in `YYYY.M.D` form.
 - A corrupt `cache/plugin-catalog.json` (or any payload that is not the `{"entries": [...]}` object upstream writes) was read as an empty catalog, so the panel answered "plugins match the catalog" from a file it had not read. It now renders "catalog cache … is unreadable — update/removal checks unavailable"; a cache that parsed and is empty still counts as evidence of no drift.
 - The config-backup group cap could delete the alert it exists to show: groups were sorted by *reason* before the cut, so eight alphabetically earlier reasons dropped the `good` and `corrupt` groups and the panel printed "no good copy" / "Corrupt snapshots: none". Kinds are ranked now, and truncation is flagged in the compact view too.
 - The respawn-storm verdict used a hardcoded 5 starts / 120 s while upstream's effective policy is `gateway.respawn_storm.{max_starts,window_seconds}` from `config.yaml` — a raised cap produced a false "respawn backoff", a lowered one hid a real storm, and a longer window dropped starts from the count. The reader now takes the configured cap and window (defaulting to 5 / 120 s), renders the window label instead of a fixed "2m", and treats `max_starts <= 0` (writer disabled) as no verdict at all. `gateway_starts_2m` is renamed `gateway_starts_window` to match.
-- A task with an explicit `max_retries: 0` was read as "unset" and shown with the config/default breaker limit; upstream honours `0` and trips immediately. `NULL` and `0` are now distinguished, and the comment claiming otherwise is corrected.
+- A task with an explicit `max_retries: 0` was read as "unset" and shown with the config/default breaker limit; upstream honours `0` and trips on the first recorded failure. `NULL` and `0` are now distinguished, and the comment claiming otherwise is corrected.
 - Listener mirror URLs were gated by the *ingress* deny-list, so an adapter in any state but `fatal`/`disconnected`/`stopped` — `paused`, `starting`, or a missing state — still produced a `/p/<profile>/v1` callback URL. The mirror path now uses upstream's serving allow-list (`connected`, `connecting`, `retrying`), leaving the ingress rule untouched.
 - The reset-churn shrink warning was unreachable in its own worst case: the panel gated the whole section on a non-zero chat total, so a *wiped* `conversation_generations` table — the exact invariant break the flag detects — rendered nothing. The warning now renders on the flag alone, with a compact marker.
 - Loop-tick silence strikes were counted in one shared counter across gateway restarts, so two misses from a dead process made the replacement's *first* silent probe the third strike and escalated it to `wedged`. Strikes are keyed to the witness pid now.
@@ -76,6 +86,8 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ### CI/CD
 
+- Follow-up validation binds release eligibility to protected-main ancestry and the latest attempt of the exact-SHA main-push CI workflow, makes dependency review part of the required aggregate gate, and rejects cancelled, missing, or unexpected gate outcomes. Both release test and build caches are disabled. Scanner reports are validated for shape, completeness and exit-code agreement; wheel pins reject duplicate requirements; sdists include their helper scripts, lockfile and policy documents. Nix restores the required Hatchling build tool and installed Git support, with package, CLI and checkpoint checks configured for all four Linux/macOS architecture targets. GitHub publication-environment and tag-policy configuration remain separate pre-publication requirements; these notes do not claim they are already enforced.
+- Validated development-tool updates include pytest 9.1.1, Ruff 0.16.6 and types-PyYAML 6.0.12.20260906. Cross-version JSON-error and platform timestamp tests now exercise failures deterministically.
 - Hardened the whole pipeline per the consolidated CI/CD audit. Nix now proves buildability: the flake derives its version from `pyproject.toml` (single source of truth), declares `checks` outputs that build the package, run its pytest suite, and smoke the installed CLI, and CI builds `.#hermesd` on Linux and macOS instead of merely evaluating. Published runtime requirements are exact pins matching `uv.lock` (`rich==14.3.3`, `pyyaml==6.0.3`, `pydantic==2.13.4`), enforced against wheel metadata by `scripts/check_wheel_pins.py`; the pydantic upgrade itself was validated on hermesd's own full Python 3.11–3.14 matrix, mypy, and snapshot/threading surfaces before landing (decision and evidence in `docs/dependency-decisions.md`).
 - CI now separates lint/format/types into a `static` job, dependency auditing into a `security` job (per-interpreter, marker-aware), and keeps the test matrix to behavior; a composite `locked-env` action defines toolchain setup once so CI and the publication workflow cannot drift, with release builds keeping uv caching disabled to preserve the publication trust boundary.
 - Docker and Nix jobs are classified by changed inputs on pull requests — always including application source and package metadata — behind an always-reporting **CI gate** that fails on any non-success outcome of expected work (failure, cancellation, or skipped-but-expected), giving branch protection one stable required check.
@@ -91,9 +103,9 @@ and this project uses date-based versions in `YYYY.M.D` form.
   root-anchored `kanban.db` the board itself comes from — `kanban_home()` = `get_default_hermes_root()`,
   "Shared across profiles BY DESIGN" (`hermes_cli/kanban_db.py:382-401`), so the source stays ROOT-scoped
   under `--profile` — and reports, per subscription, the unseen-event backlog
-  `max(task_events.id) - last_event_id` (upstream's notifier claims events with `id > last_event_id`,
-  `hermes_cli/kanban_db_notify.py:186-232`): a backlog that only grows means the gateway watcher that owns
-  the subscription is wedged or gone. The panel shows subscriber counts rolled up per platform
+  the count of that task's events with `id > last_event_id` (upstream's notifier claims the same events,
+  `hermes_cli/kanban_db_notify.py:186-232`): a backlog that keeps growing is a reason to inspect the gateway watcher that owns
+  the subscription, rather than proof of its liveness state. The panel shows subscriber counts rolled up per platform
   (case-insensitively, matching notifier routing), the total and worst backlog, a bounded table of the
   subscriptions that actually have unseen events (task, platform, delivery mode, owning profile, cursor,
   newest event, backlog), and the subscriptions whose `notifier_profile` names a profile that no longer
@@ -206,13 +218,7 @@ and this project uses date-based versions in `YYYY.M.D` form.
   (`cron/jobs.py:1600-1630`), so an operator can see what an unpinned job will actually run instead
   of assuming a pin that is not there.
 
-- The Cron panel's Open Incidents table now labels a `detected` incident **never alerted** and
-  states the acknowledgement semantics beside the table. Upstream moves a row `detected` →
-  `alerted` only when a failure ping actually leaves the process (`cron/scheduler.py:2745-2746`),
-  so a row still `detected` — in particular one whose `last_seen_at` has gone stale — means the
-  alert delivery path itself is broken rather than a merely unacknowledged failure. And because
-  `acked_at` is only ever written together with `closed_at` by the terminal closing transition
-  (`cron/incidents.py:186-195`), an open incident can never be acknowledged away.
+- The Cron panel's Open Incidents table labels a `detected` incident **no delivered failure ping** and explains acknowledgement beside the table. Upstream marks a row `alerted` only when the ping leaves the process; a notice may also be intentionally suppressed or have no route, so a detected record warrants investigation without proving the delivery path is broken. Because `acked_at` is written together with `closed_at` by the terminal closing transition, an open incident cannot be acknowledged independently of closure.
 
 ### Fixed
 
@@ -282,6 +288,9 @@ and this project uses date-based versions in `YYYY.M.D` form.
 - Platform writer-identity stamps (`writer_pid` / `writer_start_time`) are retained in `PlatformStatus` because the ownership verdict is computed from them, but upstream classifies them as private process recon and strips them from its public status endpoint. A parametrized test now pins that neither value reaches a rendered panel in compact or detail view — only the derived verdict does.
 
 ## [2026.9.8] - 2026-09-08
+
+Unpublished development milestone; all changes in this section are included in
+the `2026.9.13` release preparation.
 
 ### Added
 

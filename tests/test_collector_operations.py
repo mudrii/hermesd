@@ -2440,13 +2440,29 @@ def test_delegation_live_manifest_dir_absent_is_healthy(hermes_home: Path, sampl
     assert ops.delegation_live_manifests == []
 
 
-def test_delegation_live_manifest_deeply_nested_json_is_healthy(hermes_home: Path, sample_db: Path):
-    """Nesting deep enough to trip json.loads' RecursionError is junk, not a
-    broken source: it must be refused like any other unparseable manifest."""
+@pytest.fixture
+def recursion_error_json(monkeypatch: pytest.MonkeyPatch) -> str:
+    """JSON marker whose decode simulates a platform recursion refusal."""
+    marker = "__json_recursion_error__"
+    real_loads = json.loads
+
+    def loads(value, *args, **kwargs):
+        if isinstance(value, str) and marker in value:
+            raise RecursionError("simulated JSON nesting limit")
+        return real_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(json, "loads", loads)
+    return marker
+
+
+def test_delegation_live_manifest_json_recursion_error_is_healthy(
+    hermes_home: Path, sample_db: Path, recursion_error_json: str
+):
+    """A decoder recursion refusal is junk, not a broken source."""
     live = hermes_home / "cache" / "delegation" / "live"
     run_dir = live / "deleg_nested"
     run_dir.mkdir(parents=True)
-    (run_dir / "manifest.json").write_text('{"tasks": ' + "[" * 3000 + "]" * 3000 + "}")
+    (run_dir / "manifest.json").write_text(f'{{"tasks": "{recursion_error_json}"}}')
 
     state = _collect_ops(hermes_home)
     assert "delegation_live" not in state.health.failed_sources
@@ -2743,12 +2759,13 @@ def test_process_receipts_junk_and_oversized_are_counted_not_listed(
     assert len(receipts.receipts[0].output_tail) <= 400
 
 
-def test_process_receipts_deeply_nested_json_is_healthy(hermes_home: Path, sample_db: Path):
-    """Same recursion guard as the manifest reader: junk nesting is counted,
-    listed nowhere, and never fails the source."""
+def test_process_receipts_json_recursion_error_is_healthy(
+    hermes_home: Path, sample_db: Path, recursion_error_json: str
+):
+    """A refused receipt is counted, listed nowhere, and keeps the source healthy."""
     receipts_dir = hermes_home / "logs" / "process-results"
     receipts_dir.mkdir(parents=True, exist_ok=True)
-    (receipts_dir / "proc_nested.json").write_text('{"output": ' + "[" * 3000 + "]" * 3000 + "}")
+    (receipts_dir / "proc_nested.json").write_text(f'{{"output": "{recursion_error_json}"}}')
 
     state = _collect_ops(hermes_home)
     assert "process_receipts" not in state.health.failed_sources
@@ -2756,13 +2773,13 @@ def test_process_receipts_deeply_nested_json_is_healthy(hermes_home: Path, sampl
     assert state.operations.process_receipts.receipts == []
 
 
-def test_json_decode_helpers_treat_deep_nesting_as_junk(tmp_path: Path):
-    """The recursion guard covers the other untrusted decode sites too: a DB
-    JSON column and an MoA trace line."""
-    nested = "[" * 3000 + "]" * 3000
-    assert operations_module._json_list_count(nested) == 0
+def test_json_decode_helpers_treat_recursion_error_as_junk(
+    tmp_path: Path, recursion_error_json: str
+):
+    """The recursion guard covers a DB JSON column and an MoA trace line."""
+    assert operations_module._json_list_count(f'["{recursion_error_json}"]') == 0
     trace = tmp_path / "trace.jsonl"
-    trace.write_text('{"event": "x", "payload": ' + nested + "}\n")
+    trace.write_text(f'{{"event": "x", "payload": "{recursion_error_json}"}}\n')
     assert operations_module._moa_latest_record_summary(trace, 64_000) == ("", [])
 
 

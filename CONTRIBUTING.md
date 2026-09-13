@@ -32,7 +32,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
    ```bash
    uv run ruff check .
    uv run ruff format --check .
-   uv run mypy hermesd
+   uv run mypy hermesd scripts
    uv run python -m compileall hermesd
    uv run pip-audit
    uv lock --check

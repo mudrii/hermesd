@@ -14,26 +14,29 @@ and their evidence live in [`dependency-decisions.md`](dependency-decisions.md).
 | Tests | CI `test` matrix + `macos` job | behavior on Python 3.11–3.14 and macOS |
 | Package | CI `package` job | wheel/sdist build, exact-pin metadata, install + behavior smoke, twine |
 | Docker | CI `docker` job | image builds; installed CLI and git-checkpoint support work |
-| Nix | CI `nix` job (Linux + macOS) | flake builds the package, runs its pytest suite, smokes the installed CLI |
-| **CI gate** | CI `gate` job | single aggregate required check: every expected job succeeded |
+| Nix | CI `nix` matrix (Linux + macOS, x86_64 + arm64) | flake builds the package, runs its pytest suite, smokes the installed CLI and Git checkpoint collection |
+| Dependency review | CI `dependency-review` job (pull requests) | changed runtime, development, and unknown-scope dependencies meet the vulnerability policy |
+| **CI gate** | CI `gate` job | single aggregate required check: every expected job succeeded or every intentionally omitted job was skipped |
 
 Rules that keep the gate honest:
 
 - The gate always runs and treats **any non-success outcome of expected
-  work** as failure — including cancelled jobs and skipped-by-classification
-  jobs whose filters say they should have run. Nothing but `success` passes.
+  work** as failure. An intentionally omitted job must report `skipped`; a
+  cancelled, missing, failed, or unexpectedly executed job fails closed.
 - Docker and Nix run on pull requests only when their classified inputs
-  changed. The classification includes application source (`hermesd/**`),
-  package metadata (`pyproject.toml`, `uv.lock`, `README.md`, `LICENSE`), and
-  the CI workflow itself, so relevant changes cannot silently skip them.
-  Pushes to `main` and manual dispatch always run everything.
+  changed. The conservative classification includes application source,
+  tests, CI helpers, package/release metadata, project rules, documentation,
+  scripts, and workflows, so a relevant change cannot silently skip them.
+  The classifier has explicit read access to pull-request file metadata.
+  Pushes to `main` and manual dispatch always run Docker and Nix.
 - pip-audit outcomes are classified by `scripts/pip_audit_gate.py`:
   vulnerabilities block; scanner/network failures retry once, then fail as
   infrastructure errors so a broken scan can never look clean.
 
 ## Branch protection (CI-03)
 
-`main` is protected by ruleset. Policy:
+`main` is protected by a classic branch protection rule, not a ruleset.
+Policy:
 
 1. Integration into `main` is pull-request-only; direct pushes are rejected.
 2. Required check: the **`CI gate`** context (plus the job contexts, if
@@ -48,34 +51,50 @@ Rules that keep the gate honest:
 
 A tag is publish-eligible only when all of the following hold:
 
-1. The tagged commit is the tip of `main` (or an ancestor reached through the
-   protected merge history above).
-2. The exact tagged commit carries a completed, successful **`CI gate`** run.
-   The `release-eligibility` job in `python-publish.yml` enforces this
-   mechanically: missing, failed, cancelled, stale, or still-running
-   validation refuses to publish.
+1. The tagged commit belongs to the currently protected `main` history.
+2. The `release-eligibility` job resolves the CI workflow currently present
+   on `main`, selects the newest `main` push run for the exact release SHA,
+   refreshes its latest attempt, and requires that attempt's **`CI gate`** job
+   to have the expected workflow provenance, completed status, and successful
+   conclusion. Missing, failed, cancelled, stale, or still-running evidence
+   refuses publication.
 3. Tag/package-version/changelog agreement (checked in `release-build`).
-4. The `pypi` GitHub environment is restricted to `main`-based deployments
-   and publishes only through OIDC trusted publishing.
+4. The `pypi` GitHub environment must restrict deployment to approved release
+   tag refs under the selected reviewer policy; the eligibility check above
+   separately proves protected `main` history. Publication uses OIDC trusted
+   publishing.
 
-Tag protection (CI-04): `v*` tags are created only from protected `main`
-history; tag creation/update rights follow the same restriction as pushes.
+**Observed repository state (13 September 2026):** the `pypi` environment uses
+a custom deployment policy that allows only the `main` branch. A release job
+runs from a tag ref, so this branch-only rule blocks the intended `v*` tag
+deployment. The environment has no required reviewers and permits administrator
+bypass. CI-04 remains open until the allowed release-tag pattern and reviewer/
+bypass policy are chosen, configured, and verified.
+
+Tag protection target (CI-04): `v*` tags are created only from protected
+`main` history, and tag creation/update rights follow the same restriction as
+pushes. No active tag ruleset currently enforces this target.
 
 ## Dependency policy (CI-06/07/08/13)
 
-- **Published runtime requirements are exact pins** matching `uv.lock`
-  (currently enforced by `scripts/check_wheel_pins.py` in the package and
-  release builds). A fresh install resolves to the same versions exercised by
-  CI. Bump the pin and the lock together.
+- **Published direct runtime requirements are exact pins** matching their
+  entries in `uv.lock` (enforced by `scripts/check_wheel_pins.py` in package
+  and release builds). This controls Rich, PyYAML, and Pydantic directly; it
+  does not claim that the complete set of transitive dependencies in an
+  independent PyPI install matches the development lock. Bump each direct pin
+  and the lock together.
 - Dev toolchain extras keep floor pins; `uv.lock` is the real development
-  environment. The Docker and Nix environments resolve their own locked
-  baselines and are validated independently.
+  environment. Docker installs that lock. Nix deliberately uses the versions
+  in its commit-pinned nixpkgs package set and validates that set independently
+  with the full tests and installed CLI/Git smoke checks.
 - Dependabot opens weekly PRs for GitHub Actions (minor/patch grouped,
   majors separate), uv, and Docker. Security alerts and security updates
   from repository settings are always active and unaffected by cadence.
-- Dependency changes in PRs pass the SHA-pinned `dependency-review` gate
-  (moderate severity or higher blocks; missing snapshots are retried and
-  reported, never silently passed).
+- Dependency changes in PRs pass the SHA-pinned `dependency-review` job inside
+  the required **`CI gate`**. Moderate-or-higher findings in runtime,
+  development, or unknown scope block; missing snapshots are retried and
+  reported rather than silently passed. GitHub's dependency snapshot includes
+  `uv.lock` changes, as verified on retained dependency PRs.
 - Pydantic-style cross-project alignment is a hint, not a justification:
   upgrades land only after the full matrix and type gates pass on hermesd,
   recorded in [`dependency-decisions.md`](dependency-decisions.md).
@@ -85,9 +104,10 @@ history; tag creation/update rights follow the same restriction as pushes.
 - **Release matrix re-validation is retained** until branch protection and
   the eligibility gate above have been observed working in practice; only
   then consider reusing exact-SHA evidence (CI-15).
-- **Release-build caching stays disabled** (the locked-env composite is
-  explicitly `enable-cache: "false"` there). Changing release-sensitive
-  caching requires a written cache-trust assessment first (CI-16).
+- **Release test and release-build caching stay disabled** (both locked-env
+  invocations explicitly set `enable-cache: "false"`). Changing
+  release-sensitive caching requires a written cache-trust assessment first
+  (CI-16).
 - **Containers are local-build only.** hermesd documents `docker build` for
   local use; there is no published image registry. If that changes, define
   registry, architectures, tags, cadence, and scanning first — and keep any
