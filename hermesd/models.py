@@ -567,7 +567,9 @@ class GatewayRouteState(BaseModel):
     @property
     def turn_never_unwound(self) -> bool:
         """Derived: a turn token older than the unwind grace — a crash marker."""
-        return self.turn_age_seconds is not None and self.turn_age_seconds > _TURN_UNWIND_GRACE_SECONDS
+        return (
+            self.turn_age_seconds is not None and self.turn_age_seconds > _TURN_UNWIND_GRACE_SECONDS
+        )
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -641,8 +643,6 @@ class SessionCoordinationState(BaseModel):
     generation_reset_total: int = 0
     # The never-prune invariant broke: the row count shrank between refreshes.
     generation_count_shrank: bool = False
-
-
 
 
 class ActiveSurface(BaseModel):
@@ -2167,12 +2167,8 @@ class DashboardState(BaseModel):
     gateway: GatewayState = Field(default_factory=GatewayState)
     migration: MigrationState = Field(default_factory=MigrationState)
     sessions: list[SessionInfo] = Field(default_factory=list)
-    session_coordination: SessionCoordinationState = Field(
-        default_factory=SessionCoordinationState
-    )
-    terminal_sessions: TerminalSessionReadout = Field(
-        default_factory=TerminalSessionReadout
-    )
+    session_coordination: SessionCoordinationState = Field(default_factory=SessionCoordinationState)
+    terminal_sessions: TerminalSessionReadout = Field(default_factory=TerminalSessionReadout)
     active_surfaces: list[ActiveSurface] = Field(default_factory=list)
     active_surface_count: int = 0
     active_surfaces_truncated: bool = False

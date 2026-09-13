@@ -6,7 +6,7 @@ import json
 import re
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -34,7 +34,6 @@ from hermesd.models import (
     GatewayHygieneState,
     GatewayRouteState,
     ProcessLiveness,
-    SessionCoordinationState,
     SessionLease,
     SessionLeaseKind,
     TokenBreakdown,

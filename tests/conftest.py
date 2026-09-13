@@ -339,7 +339,9 @@ def insert_compression_lock(
     )
 
 
-def insert_gateway_route(conn: sqlite3.Connection, session_key: str, entry: dict, updated_at: float) -> None:
+def insert_gateway_route(
+    conn: sqlite3.Connection, session_key: str, entry: dict, updated_at: float
+) -> None:
     conn.execute(
         "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) VALUES (?,?,?,?)",
         ("/sessions/dir", session_key, json.dumps(entry), updated_at),

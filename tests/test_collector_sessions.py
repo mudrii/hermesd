@@ -18,7 +18,6 @@ from hermesd.collector import (
     _ACTIVE_SURFACE_LIMIT,
     Collector,
     _estimate_cost,
-    _pid_exists,
     _resolved_session_cost,
     _summarize_breakdown,
     _summarize_tokens,
@@ -2034,6 +2033,7 @@ def test_collect_model_usage_populates_cost_split_fields(hermes_home: Path):
     finally:
         c.close()
 
+
 # ── Item 6: turn leases and compression locks ───────────────────────────────
 
 _COORD_NOW = 1_800_000_000.0
@@ -2050,14 +2050,18 @@ def _make_coordination_db(hermes_home: Path) -> sqlite3.Connection:
 def test_turn_leases_and_compression_locks_surface_with_liveness(hermes_home: Path) -> None:
     conn = _make_coordination_db(hermes_home)
     insert_turn_lease(
-        conn, "conv-root",
+        conn,
+        "conv-root",
         _HOLDER_FMT.format(pid=101, tid=7, agent="1f", nonce="abcd1234"),
-        _COORD_NOW - 60, _COORD_NOW + 240,
+        _COORD_NOW - 60,
+        _COORD_NOW + 240,
     )
     insert_compression_lock(
-        conn, "sess-lock",
+        conn,
+        "sess-lock",
         _HOLDER_FMT.format(pid=102, tid=7, agent="2a", nonce="beefcafe"),
-        _COORD_NOW - 120, _COORD_NOW - 30,
+        _COORD_NOW - 120,
+        _COORD_NOW - 30,
     )
     conn.commit()
     conn.close()
@@ -2095,9 +2099,11 @@ def test_expired_lease_with_live_holder_is_not_orphaned(hermes_home: Path) -> No
     stolen (hermes_state_compression.py:433-439), so expiry alone is benign."""
     conn = _make_coordination_db(hermes_home)
     insert_compression_lock(
-        conn, "sess-lock",
+        conn,
+        "sess-lock",
         _HOLDER_FMT.format(pid=101, tid=7, agent="2a", nonce="beefcafe"),
-        _COORD_NOW - 600, _COORD_NOW - 10,
+        _COORD_NOW - 600,
+        _COORD_NOW - 10,
     )
     conn.commit()
     conn.close()
@@ -2151,9 +2157,7 @@ def test_junk_lease_columns_coerce_without_failing_the_source(hermes_home: Path)
     """The writer's columns are NOT NULL, but legacy tooling can still put text
     in epoch columns: coercion must degrade the row, never the source."""
     conn = _make_coordination_db(hermes_home)
-    conn.execute(
-        "INSERT INTO session_turn_leases VALUES ('conv-null', '', 'not-a-number', 'x')"
-    )
+    conn.execute("INSERT INTO session_turn_leases VALUES ('conv-null', '', 'not-a-number', 'x')")
     conn.commit()
     conn.close()
     c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
@@ -2181,12 +2185,8 @@ def test_hygiene_rows_join_session_error_and_mark_suspension(hermes_home: Path) 
         "VALUES ('sess_h', 'gateway', ?, 'telegram:42:7', 'summary model timeout')",
         (_COORD_NOW - 30,),
     )
-    conn.execute(
-        "INSERT INTO gateway_hygiene_state VALUES ('telegram:42:7', 4)"
-    )
-    conn.execute(
-        "INSERT INTO gateway_hygiene_state VALUES ('discord:9:1', 2)"
-    )
+    conn.execute("INSERT INTO gateway_hygiene_state VALUES ('telegram:42:7', 4)")
+    conn.execute("INSERT INTO gateway_hygiene_state VALUES ('discord:9:1', 2)")
     conn.commit()
     conn.close()
     c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
@@ -2335,9 +2335,7 @@ def test_gateway_route_without_token_has_no_turn_age(hermes_home: Path) -> None:
 
 
 def test_gateway_route_with_unknown_session_is_dangling(hermes_home: Path) -> None:
-    _insert_route_with_session(
-        hermes_home, _route_entry(session_id="ghost-session")
-    )
+    _insert_route_with_session(hermes_home, _route_entry(session_id="ghost-session"))
     c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
     state = c.collect()
     c.close()

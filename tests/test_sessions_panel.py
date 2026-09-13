@@ -644,9 +644,7 @@ def test_detail_labels_orphaned_and_expired_leases() -> None:
     rendered = render_to_str(
         render_sessions(
             _coordination_state(
-                session_coordination=SessionCoordinationState(
-                    leases=leases, lease_total=2
-                )
+                session_coordination=SessionCoordinationState(leases=leases, lease_total=2)
             ),
             Theme(),
             detail=True,
@@ -686,7 +684,9 @@ def test_compact_counts_leases_and_flags() -> None:
         ],
         lease_total=2,
     )
-    rendered = render_to_str(render_sessions(_coordination_state(session_coordination=coord), Theme()))
+    rendered = render_to_str(
+        render_sessions(_coordination_state(session_coordination=coord), Theme())
+    )
     assert "2 lease(s)" in rendered
     assert "1 expired" in rendered
     assert "1 orphaned" in rendered
@@ -717,7 +717,9 @@ def test_compact_shows_hygiene_badge_with_streak() -> None:
     coord = SessionCoordinationState(
         hygiene=[GatewayHygieneState(session_key="telegram:42:7", failure_streak=4, suspended=True)]
     )
-    rendered = render_to_str(render_sessions(_coordination_state(session_coordination=coord), Theme()))
+    rendered = render_to_str(
+        render_sessions(_coordination_state(session_coordination=coord), Theme())
+    )
     assert "hygiene" in rendered
     assert "1" in rendered
 
@@ -783,7 +785,10 @@ def test_detail_terminal_copy_says_upper_bound() -> None:
     assert "CLI Terminals" in rendered
     assert "24 hours" in rendered
     assert "upper bound" in rendered
-    assert "/repo/checkout" in rendered
+    # cwd renders under the panel's last-segment convention (as the Runtime table)
+    assert "checkout" in rendered
+    assert "tty-dev-pts-3" in rendered
+    assert "sess_t" in rendered
 
 
 def test_detail_joinable_chip_on_surface_rows() -> None:
@@ -798,9 +803,7 @@ def test_detail_joinable_chip_on_surface_rows() -> None:
     ]
     rendered = render_to_str(
         render_sessions(
-            _coordination_state(
-                active_surfaces=surfaces, active_surface_count=1
-            ),
+            _coordination_state(active_surfaces=surfaces, active_surface_count=1),
             Theme(),
             detail=True,
         )
@@ -826,9 +829,7 @@ def test_compact_shows_joinable_count() -> None:
     ]
     rendered = render_to_str(
         render_sessions(
-            _coordination_state(
-                active_surfaces=surfaces, active_surface_count=2
-            ),
+            _coordination_state(active_surfaces=surfaces, active_surface_count=2),
             Theme(),
         )
     )
@@ -859,3 +860,44 @@ def test_coordination_free_text_is_escaped() -> None:
     plain = rendered
     for hostile in ("[b]evil", "[i]boom", "[red]name"):
         assert hostile in plain  # escaped: markup text survives rendering
+
+
+def test_detail_lease_dash_states_and_sub_threshold_streak() -> None:
+    coord = SessionCoordinationState(
+        leases=[
+            _lease(
+                pid=0,
+                held_seconds=None,
+                expires_in_seconds=None,
+                liveness=ProcessLiveness.UNVERIFIABLE,
+            )
+        ],
+        hygiene=[GatewayHygieneState(session_key="telegram:1:2", failure_streak=2)],
+        routes=[GatewayRouteState(session_key="telegram:1:2", suspended=True)],
+    )
+    rendered = render_to_str(
+        render_sessions(_coordination_state(session_coordination=coord), Theme(), detail=True)
+    )
+    assert "—" in rendered  # no usable hold/TTL stamps
+    assert "unverified" in rendered
+    assert "compaction cooldown backoff" in rendered
+    assert "suspended" in rendered  # the route flag, not the streak effect
+
+
+def test_reset_churn_and_terminals_render_heads_without_rows() -> None:
+    coord = SessionCoordinationState(
+        generations=[],
+        generation_chat_total=5,
+        generation_reset_total=21,
+    )
+    term = TerminalSessionReadout(sessions=[], count=2)
+    rendered = render_to_str(
+        render_sessions(
+            _coordination_state(session_coordination=coord, terminal_sessions=term),
+            Theme(),
+            detail=True,
+        )
+    )
+    assert "lifetime resets 21" in rendered
+    assert "across 5 chat(s)" in rendered
+    assert "2 open CLI terminals in the last 24 hours" in rendered

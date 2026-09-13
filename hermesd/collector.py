@@ -159,18 +159,18 @@ from hermesd.collect.redaction import (
     _safe_exception_text,
 )
 from hermesd.collect.sessions import (
-    _SessionCoordinationRows,
     _background_process_from_ledger,
     _context_limit_for,
     _count_cost_statuses,
     _estimate_cost,  # noqa: F401  # re-exported for hermesd.collector compatibility
-    _generation_fields,
     _gateway_route_fields,
+    _generation_fields,
     _hygiene_fields,
     _read_session_coordination_rows,
     _read_session_tools,
     _resolved_session_cost,
     _session_lease_fields,
+    _SessionCoordinationRows,
     _summarize_breakdown,
     _summarize_tokens,
     _summarize_window,
@@ -976,9 +976,7 @@ class Collector:
             _SourceSpec(
                 "session_coordination",
                 "gateway_hygiene",
-                lambda: self._with_gateway_hygiene(
-                    results["session_coordination"], session_rows
-                ),
+                lambda: self._with_gateway_hygiene(results["session_coordination"], session_rows),
                 lambda: results["session_coordination"],
                 fallback=lambda: self._last_source_fields(
                     "gateway_hygiene", results["session_coordination"], _HYGIENE_FIELDS
@@ -987,7 +985,9 @@ class Collector:
             _SourceSpec(
                 "session_coordination",
                 "gateway_routes",
-                lambda: self._with_gateway_routes(results["session_coordination"], results["sessions"]),
+                lambda: self._with_gateway_routes(
+                    results["session_coordination"], results["sessions"]
+                ),
                 lambda: results["session_coordination"],
                 fallback=lambda: self._last_source_fields(
                     "gateway_routes", results["session_coordination"], _GATEWAY_ROUTE_FIELDS

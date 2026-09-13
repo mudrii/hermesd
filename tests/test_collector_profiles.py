@@ -1169,7 +1169,9 @@ def test_profiled_collector_reads_session_coordination_from_the_profile_db(
     def seed(db_path: Path, marker: str) -> None:
         conn = sqlite3.connect(db_path)
         create_session_coordination_tables(conn)
-        insert_turn_lease(conn, f"{marker}-conv", f"pid={111}:tid=1:agent=a:nonce=b", now, now + 300)
+        insert_turn_lease(
+            conn, f"{marker}-conv", f"pid={111}:tid=1:agent=a:nonce=b", now, now + 300
+        )
         conn.execute("INSERT INTO gateway_hygiene_state VALUES (?, 4)", (f"{marker}:42:7",))
         conn.execute(
             "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) VALUES (?,?,?,?)",
