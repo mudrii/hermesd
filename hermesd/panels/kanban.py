@@ -184,6 +184,18 @@ def _summary_table(kanban: KanbanState, theme: Theme) -> Table:
             else "0 unseen"
         )
         summary.add_row("Notify Backlog", backlog)
+    if kanban.notify_platform_counts:
+        # Named platforms only reach the panel here: the backlog table lists the
+        # worst subscriptions, which says nothing about who is watching at all.
+        summary.add_row(
+            "Notify Platforms",
+            escape(
+                " · ".join(
+                    f"{name} {count}"
+                    for name, count in sorted(kanban.notify_platform_counts.items())
+                )
+            ),
+        )
     if kanban.notify_orphan_profile_count:
         summary.add_row(
             "Orphan Profiles",

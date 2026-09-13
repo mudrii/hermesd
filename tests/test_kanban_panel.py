@@ -230,3 +230,25 @@ def test_kanban_detail_notify_backlog_zero_reads_as_none_unseen() -> None:
     text = render_to_str(render_kanban(state, Theme(), detail=True), width=160, no_color=True)
 
     assert "0 unseen" in text
+
+
+def test_kanban_detail_renders_notify_platform_counts() -> None:
+    """The per-platform subscription rollup is collected; the panel must show it.
+
+    It was the one notify field with no consumer outside the JSON snapshot, so
+    "which platform's watchers are subscribed" — the first question when a
+    backlog grows — had no answer in the UI.
+    """
+    state = DashboardState(
+        kanban=KanbanState(
+            db_present=True,
+            notify_sub_count=3,
+            notify_platform_counts={"discord": 2, "slack": 1},
+        )
+    )
+
+    text = render_to_str(render_kanban(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "Notify Platforms" in text
+    assert "discord 2" in text
+    assert "slack 1" in text
