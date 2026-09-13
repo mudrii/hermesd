@@ -50,8 +50,10 @@ from hermesd.collect.common import (
     _today_epoch,
 )
 from hermesd.collect.config import (
+    _CONFIG_BACKUP_ENTRY_LIMIT,
     _channel_capabilities,
     _config_agent_limits,
+    _config_backup_groups,
     _credential_auth_type,
     _credential_expiry,
     _mcp_tool_filter_summary,
@@ -292,6 +294,13 @@ _PLUGIN_LIMIT = 200
 # The desktop inventory enriches SkillsMemory through an independent health
 # source so a transient root listing failure cannot blank agent integrations.
 _DESKTOP_PLUGIN_FIELDS = ("desktop_plugins", "desktop_plugin_scan_truncated")
+# backups/config/ scan — the fields the config-backups source owns on
+# ConfigSummary, so its last-good fallback restores exactly those.
+_CONFIG_BACKUP_FIELDS = (
+    "config_backups_present",
+    "config_backup_groups",
+    "config_backup_groups_truncated",
+)
 # cache/blocked-scripts/ scan bounds and the fields the source owns.
 _BLOCKED_SCRIPT_SCAN_LIMIT = 200
 _BLOCKED_SCRIPT_NAME_LIMIT = 3
@@ -800,6 +809,19 @@ class Collector:
             ),
             _SourceSpec("checkpoints", "checkpoints", self._collect_checkpoints, list),
             _SourceSpec("config", "config", self._collect_config, ConfigSummary),
+            # Second writer of the `config` field: backups/config/ is scanned and
+            # grouped on its own source so a hostile directory (or a symlink
+            # swap) degrades only the backup audit trail, not the settings read
+            # out of config.yaml itself.
+            _SourceSpec(
+                "config",
+                "config_backups",
+                lambda: self._with_config_backups(results["config"]),
+                lambda: results["config"],
+                fallback=lambda: self._last_source_fields(
+                    "config_backups", results["config"], _CONFIG_BACKUP_FIELDS
+                ),
+            ),
             _SourceSpec("cron", "cron", self._collect_cron, CronState),
             # Split from "cron" so a corrupt executions.db keeps jobs.json data.
             _SourceSpec(
@@ -1836,6 +1858,52 @@ class Collector:
             moa_save_traces=bool(moa_cfg.get("save_traces")),
             moa_trace_dir=str(moa_cfg.get("trace_dir") or ""),
             **_config_agent_limits(cfg),
+        )
+
+    def _with_config_backups(self, current: ConfigSummary) -> ConfigSummary:
+        """Group the point-in-time config copies recorded beside config.yaml.
+
+        Upstream writes ``config.yaml.<reason>.<YYYYMMDD-HHMMSS>`` copies under
+        ``<config dir>/backups/config`` (``hermes_cli/config_backups.py:29-69``),
+        keeping the newest five per reason and skipping byte-identical repeats.
+        The config path upstream copies is ``get_config_path()`` —
+        ``hermes_constants.py:1132-1135`` — so the directory inherits whatever
+        home that resolves to; hermesd keeps the ROOT copy on purpose, the same
+        decision as the ``config`` source (see .codex/rules/source-ownership.md).
+
+        Consequences worth rendering honestly: a "good" copy lands only when
+        config.yaml's bytes change, so an old stamp means *unchanged*, not
+        stale; and the stamps are the writer's local time.
+        """
+        backups_dir = self._paths.shared_path("backups", "config")
+        if not _exists_strict(backups_dir) or not backups_dir.is_dir():
+            return current.model_copy(
+                update={
+                    "config_backups_present": False,
+                    "config_backup_groups": [],
+                    "config_backup_groups_truncated": False,
+                }
+            )
+        if backups_dir.is_symlink() or not _path_resolves_under(backups_dir, self._paths.root_home):
+            # Same hardening as the curator run-dir scan: a planted symlink must
+            # fail this source (keeping last-good) instead of being read.
+            raise RuntimeError(f"unsafe config backups directory: {backups_dir.name}")
+        # The directory scan is bounded before sorting: a hostile directory can
+        # hold far more entries than the five-per-reason writer would leave.
+        examined = list(islice(backups_dir.iterdir(), _CONFIG_BACKUP_ENTRY_LIMIT + 1))
+        scan_truncated = len(examined) > _CONFIG_BACKUP_ENTRY_LIMIT
+        entries = sorted(
+            entry.name
+            for entry in examined[:_CONFIG_BACKUP_ENTRY_LIMIT]
+            if entry.is_file() and not entry.is_symlink()
+        )
+        groups, groups_truncated = _config_backup_groups(entries, now=self._clock())
+        return current.model_copy(
+            update={
+                "config_backups_present": True,
+                "config_backup_groups": groups,
+                "config_backup_groups_truncated": scan_truncated or groups_truncated,
+            }
         )
 
     def _collect_tool_gateway_routes(self, cfg: dict[str, Any]) -> list[ToolGatewayRoute]:

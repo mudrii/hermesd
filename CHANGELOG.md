@@ -7,6 +7,14 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ## [Unreleased]
 
+### Added
+
+- Config panel: point-in-time `backups/config/` snapshots are now shown. The newest
+  `good` copy is rendered as "config last changed" (a good copy is written only when
+  config.yaml's bytes change, so an old stamp is an unchanged config, not a stale
+  reader), `corrupt` snapshot counts are a hard alert, and `pre-setup`/migration
+  stamps appear as an audit trail. Stamps are the writer's local time.
+
 ### CI/CD
 
 - Hardened the whole pipeline per the consolidated CI/CD audit. Nix now proves buildability: the flake derives its version from `pyproject.toml` (single source of truth), declares `checks` outputs that build the package, run its pytest suite, and smoke the installed CLI, and CI builds `.#hermesd` on Linux and macOS instead of merely evaluating. Published runtime requirements are exact pins matching `uv.lock` (`rich==14.3.3`, `pyyaml==6.0.3`, `pydantic==2.13.4`), enforced against wheel metadata by `scripts/check_wheel_pins.py`; the pydantic upgrade itself was validated on hermesd's own full Python 3.11–3.14 matrix, mypy, and snapshot/threading surfaces before landing (decision and evidence in `docs/dependency-decisions.md`).

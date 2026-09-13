@@ -825,6 +825,23 @@ class ToolGatewayRoute(BaseModel):
     token_present: bool = False
 
 
+class ConfigBackupGroup(BaseModel):
+    """One backup-reason group inside ``backups/config/``.
+
+    Upstream writes ``config.yaml.<reason>.<YYYYMMDD-HHMMSS>`` copies and keeps
+    the newest five per reason (``hermes_cli/config_backups.py:29-69``). The
+    stamp is the writer's ``time.strftime`` value, i.e. *local* time, so ages
+    are computed against the same local clock — never against the file mtime,
+    which a later ``hermes update`` may have reset.
+    """
+
+    reason: str
+    kind: str = ""
+    count: int = 0
+    newest_stamp: str = ""
+    newest_age_seconds: float | None = None
+
+
 class ConfigSummary(BaseModel):
     model: str = ""
     provider: str = ""
@@ -912,6 +929,13 @@ class ConfigSummary(BaseModel):
     logging_level: str = ""
     # Presence only — a proxy URL can embed credentials.
     network_proxy_configured: bool = False
+    # backups/config/ point-in-time copies of this file, grouped by writer
+    # reason. The newest "good" stamp is the honest "config last changed" date:
+    # a good copy is written only when the bytes change, so an old stamp is an
+    # unchanged config, not a stale reader. "corrupt" counts are a hard alert.
+    config_backups_present: bool = False
+    config_backup_groups: list[ConfigBackupGroup] = Field(default_factory=list)
+    config_backup_groups_truncated: bool = False
 
     @computed_field  # type: ignore[prop-decorator]
     @property

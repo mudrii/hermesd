@@ -6,9 +6,9 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from hermesd.models import ConfigSummary, DashboardState
+from hermesd.models import ConfigBackupGroup, ConfigSummary, DashboardState
 from hermesd.panels.formatting import escape_terminal_text as escape
-from hermesd.panels.formatting import sanitize_terminal_text, section_heading
+from hermesd.panels.formatting import fmt_age_seconds, sanitize_terminal_text, section_heading
 from hermesd.theme import Theme
 
 
@@ -21,6 +21,7 @@ def render_config(state: DashboardState, theme: Theme, detail: bool = False) -> 
 def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     c = state.config
     gateway_count = sum(1 for route in c.tool_gateway_routes if route.mode == "gateway")
+    corrupt_count = _corrupt_backup_count(c)
     lines = Text()
     lines.append("  Model: ", style=theme.ui_label)
     lines.append(f"{sanitize_terminal_text(c.model) or '—'}\n", style=theme.ui_accent)
@@ -37,9 +38,16 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append("  Integrations: ", style=theme.ui_label)
     lines.append(
         f"mcp {c.mcp_server_count} · plugins {c.plugin_enabled_count} "
-        f"· goals {c.goals_max_turns or '—'}",
+        f"· goals {c.goals_max_turns or '—'}\n",
         style=theme.banner_text,
     )
+    lines.append("  Backups: ", style=theme.ui_label)
+    if not c.config_backups_present:
+        lines.append("—", style=theme.banner_dim)
+    else:
+        lines.append(_newest_good_backup_stamp(c) or "no good copy", style=theme.banner_text)
+        if corrupt_count:
+            lines.append(f" · corrupt {corrupt_count}", style=theme.ui_error)
 
     return Panel(
         lines,
@@ -57,6 +65,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     sections.extend(_session_capacity_section(c, theme))
     sections.extend(_kv_section("Agent limits", _agent_limit_rows(c), theme))
     sections.extend(_kv_section("Integrations", _integration_rows(c), theme))
+    sections.extend(_backup_section(c, theme))
 
     if c.tool_gateway_routes:
         sections.append(section_heading("Tool Gateway (dashboard-local env)", theme))
@@ -223,6 +232,82 @@ def _integration_rows(c: ConfigSummary) -> list[tuple[str, str]]:
     if c.network_proxy_configured:
         rows.append(("Network Proxy", "configured"))
     return rows
+
+
+# Backup audit-trail caveats: a "good" copy is written only when the file's
+# bytes change, so its stamp dates the *config*, not the reader; and the stamp
+# is the writer's local time (time.strftime), so ages follow the local clock.
+_BACKUP_NOTE_LINES = (
+    "A good copy lands only when config.yaml's bytes change — an old stamp is an",
+    "unchanged config, not a stale one. Stamps are the writer's local time.",
+)
+
+_AUDIT_TRAIL_LIMIT = 4
+
+
+def _corrupt_backup_count(c: ConfigSummary) -> int:
+    for group in c.config_backup_groups:
+        if group.kind == "corrupt":
+            return group.count
+    return 0
+
+
+def _newest_good_backup_stamp(c: ConfigSummary) -> str:
+    for group in c.config_backup_groups:
+        if group.kind == "good":
+            return group.newest_stamp
+    return ""
+
+
+def _backup_section(c: ConfigSummary, theme: Theme) -> list[RenderableType]:
+    """The backups/config/ audit trail: last-changed date, corrupt alert, stamps."""
+    heading = section_heading("Config Backups", theme)
+    if not c.config_backups_present:
+        return [heading, Text("  no backups directory observed", style=theme.banner_dim)]
+
+    table = Table(box=None, show_header=False, padding=(0, 2))
+    table.add_column("Key", style=theme.ui_label)
+    table.add_column("Value", style=theme.ui_accent)
+    newest_good = _newest_good_backup_stamp(c)
+    newest_good_age = _newest_good_backup_age(c)
+    if newest_good:
+        changed = newest_good
+        if newest_good_age is not None:
+            changed = f"{newest_good} ({fmt_age_seconds(int(newest_good_age))} ago)"
+        table.add_row("Last changed", escape(changed))
+    else:
+        table.add_row("Last changed", "no good copy")
+    corrupt_count = _corrupt_backup_count(c)
+    table.add_row("Corrupt snapshots", str(corrupt_count) if corrupt_count else "none")
+    audit = [group for group in c.config_backup_groups if group.kind not in ("good", "corrupt")]
+    if audit:
+        table.add_row(
+            "Audit trail",
+            escape(_audit_trail_label(audit[:_AUDIT_TRAIL_LIMIT], len(audit))),
+        )
+    if c.config_backup_groups_truncated:
+        table.add_row("Groups", "truncated — the scan hit its entry budget")
+    note = Text("\n".join(f"  {line}" for line in _BACKUP_NOTE_LINES), style=theme.banner_dim)
+    return [heading, table, note]
+
+
+def _newest_good_backup_age(c: ConfigSummary) -> float | None:
+    for group in c.config_backup_groups:
+        if group.kind == "good":
+            return group.newest_age_seconds
+    return None
+
+
+def _audit_trail_label(groups: list[ConfigBackupGroup], total: int) -> str:
+    parts = [
+        f"{group.reason} x{group.count}"
+        + (f" (newest {group.newest_stamp})" if group.newest_stamp else "")
+        for group in groups
+    ]
+    hidden = total - len(groups)
+    if hidden > 0:
+        parts.append(f"(+{hidden} more)")
+    return " · ".join(parts)
 
 
 def _tool_gateway_table(c: ConfigSummary, theme: Theme) -> Table:

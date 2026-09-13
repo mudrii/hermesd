@@ -415,6 +415,33 @@ def test_profiled_collector_rejects_profile_root_swapped_to_outside(
     assert "tools_index" in second.health.failed_sources
 
 
+def test_profiled_collector_keeps_config_backups_on_the_shared_root(profiled_hermes_home: Path):
+    """backups/config/ inherits the config.yaml decision.
+
+    The copies are point-in-time snapshots of the same root config.yaml hermesd
+    reads, so reporting a profile-local backups directory would date a config
+    the dashboard never displays.
+    """
+    root_backups = profiled_hermes_home / "backups" / "config"
+    root_backups.mkdir(parents=True)
+    (root_backups / "config.yaml.good.20260907-143000").write_text("model: root\n")
+    profile_backups = profiled_hermes_home / "profiles" / "coding" / "backups" / "config"
+    profile_backups.mkdir(parents=True)
+    (profile_backups / "config.yaml.good.20260908-150000").write_text("model: profile\n")
+
+    c = Collector(profiled_hermes_home, profile_name="coding")
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    good = next(group for group in state.config.config_backup_groups if group.kind == "good")
+    assert good.newest_stamp == "20260907-143000"
+    assert good.count == 1
+    assert state.config.config_backups_present is True
+    c.close()
+
+
 def test_profiled_collector_keeps_shared_root_config_and_auth(profiled_hermes_home: Path):
     c = Collector(profiled_hermes_home, profile_name="coding")
     state = c.collect()
