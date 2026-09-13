@@ -709,9 +709,9 @@ class Collector:
         self._last_good_by_source: dict[str, Any] = {}
         self._last_session_rows: list[dict[str, Any]] = []
         # conversation_generations is never pruned upstream, so its row count
-        # must never shrink between refreshes; remembering the last count is
-        # what turns a shrink into a visible warning instead of a silent
-        # "fewer chats than last tick".
+        # must never shrink between refreshes; remembering the high-water count
+        # is what turns a shrink into a visible warning — one that stands until
+        # the table recovers — instead of a silent "fewer chats than last tick".
         self._last_generation_chat_count: int | None = None
         self._log_stream_cache: dict[str, tuple[float | None, int, LogStream]] = {}
         self._cron_excerpt_cache: dict[
@@ -2038,7 +2038,13 @@ class Collector:
         garbage-collected upstream (``hermes_state_common.py:460-487``), so the
         row count is remembered across refreshes and a shrink sets the panel's
         invariant-break warning. The remembered count advances only on a
-        successful read; a failed source never invents a shrink."""
+        successful read; a failed source never invents a shrink.
+
+        The remembered count is a *high-water* mark, not last-seen: a shrink is
+        an invariant break, so the warning has to stand until the table
+        recovers to the count seen before it. Comparing against last-seen would
+        clear the warning on the very next refresh, leaving the operator's only
+        cue to the one interval that happened to observe the drop."""
         readout = self._read_state_db()
         if readout is None:
             last = self._last_good_by_source.get("generation_churn")
@@ -2046,11 +2052,9 @@ class Collector:
                 raise RuntimeError("state.db generations disappeared or became unsafe")
             return coord
         rows = readout.coordination
-        shrank = (
-            self._last_generation_chat_count is not None
-            and rows.generation_chat_total < self._last_generation_chat_count
-        )
-        self._last_generation_chat_count = rows.generation_chat_total
+        previous = self._last_generation_chat_count
+        shrank = previous is not None and rows.generation_chat_total < previous
+        self._last_generation_chat_count = max(previous or 0, rows.generation_chat_total)
         return coord.model_copy(
             update={
                 **_generation_fields(rows),

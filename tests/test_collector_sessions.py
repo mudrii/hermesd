@@ -2488,25 +2488,52 @@ def test_generation_churn_top_chats_and_lifetime_total(hermes_home: Path) -> Non
 def test_generation_churn_flags_a_shrinking_table(hermes_home: Path) -> None:
     """conversation_generations is never pruned upstream
     (hermes_state_common.py:460-487): a shrink between refreshes means
-    something broke the no-prune invariant, so it surfaces as a warning."""
+    something broke the no-prune invariant, so it surfaces as a warning.
+
+    The warning latches on the high-water count: re-reading the same shrunken
+    table must not clear it after one refresh, because the operator's only cue
+    would then depend on catching the exact refresh that saw the drop.
+    """
     conn = _make_coordination_db(hermes_home)
     conn.executemany(
         "INSERT INTO conversation_generations VALUES (?,?,?)",
-        [("cli", "k1", 5), ("cli", "k2", 9)],
+        [("cli", "k1", 5), ("cli", "k2", 9), ("cli", "k3", 2)],
     )
     conn.commit()
     conn.close()
     c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
     state = c.collect()
+    assert state.session_coordination.generation_chat_total == 3
     assert state.session_coordination.generation_count_shrank is False
     conn = sqlite3.connect(hermes_home / "state.db")
-    conn.execute("DELETE FROM conversation_generations WHERE session_key = 'k2'")
+    conn.executemany(
+        "DELETE FROM conversation_generations WHERE session_key = ?", [("k2",), ("k3",)]
+    )
+    conn.commit()
+    conn.close()
+    state = c.collect()
+    assert state.session_coordination.generation_chat_total == 1
+    assert state.session_coordination.generation_count_shrank is True
+    # Still shrunken on the next refresh: the warning stands.
+    state = c.collect()
+    assert state.session_coordination.generation_count_shrank is True
+    # A partial recovery below the pre-shrink count is still a shrink.
+    conn = sqlite3.connect(hermes_home / "state.db")
+    conn.execute("INSERT INTO conversation_generations VALUES ('cli','k4',2)")
+    conn.commit()
+    conn.close()
+    state = c.collect()
+    assert state.session_coordination.generation_chat_total == 2
+    assert state.session_coordination.generation_count_shrank is True
+    # Recovering to the pre-shrink count clears it.
+    conn = sqlite3.connect(hermes_home / "state.db")
+    conn.execute("INSERT INTO conversation_generations VALUES ('cli','k5',2)")
     conn.commit()
     conn.close()
     state = c.collect()
     c.close()
-    assert state.session_coordination.generation_chat_total == 1
-    assert state.session_coordination.generation_count_shrank is True
+    assert state.session_coordination.generation_chat_total == 3
+    assert state.session_coordination.generation_count_shrank is False
 
 
 # ── Item 22 (sessions half): terminal breadcrumbs ───────────────────────────
