@@ -218,18 +218,18 @@ def test_dependabot_tracks_github_actions_versions() -> None:
 
     assert dependabot["version"] == 2
     updates = dependabot["updates"]
-    assert {
-        "package-ecosystem": "github-actions",
-        "directory": "/",
-        "schedule": {"interval": "weekly"},
-        "open-pull-requests-limit": 5,
-    } in updates
-    assert {
-        "package-ecosystem": "docker",
-        "directory": "/",
-        "schedule": {"interval": "weekly"},
-        "open-pull-requests-limit": 5,
-    } in updates
+    by_ecosystem = {update["package-ecosystem"]: update for update in updates}
+    for ecosystem in ("github-actions", "uv", "docker"):
+        update = by_ecosystem[ecosystem]
+        assert update["directory"] == "/"
+        assert update["schedule"] == {"interval": "weekly"}
+        assert update["open-pull-requests-limit"] == 5
+    # Routine minor/patch action updates are grouped; majors stay separate.
+    groups = by_ecosystem["github-actions"]["groups"]
+    assert groups["actions-minor-and-patch"]["update-types"] == [
+        "version-update:semver-minor",
+        "version-update:semver-patch",
+    ]
 
 
 def test_typed_marker_and_sdist_support_files_are_packaged() -> None:
