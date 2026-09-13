@@ -145,10 +145,11 @@ and this project uses date-based versions in `YYYY.M.D` form.
 - Active-surface lease rows now show a **joinable** chip when the registry entry advertises
   `metadata.shared_runtime_url` — the loopback origin upstream's cooperative attach handshake
   requires (`hermes_cli/shared_session_attach.py:32-47`). Presence is the whole signal: hermesd
-  never probes the handshake, never stores the URL, and never displays more than the chip. The lease
-  surface vocabulary now includes gateway surfaces recorded as `gateway:<platform>`
-  (`gateway/run_busy.py:187`), and bot delivery consumers carry
-  `metadata.bot_live_delivery_consumer` (`tui_gateway/session_lifecycle.py:36`).
+  never probes the handshake, never stores the URL, and never displays more than the chip. The
+  lease's `surface` value is carried verbatim, never allowlisted, so a gateway surface recorded as
+  `gateway:<platform>` (`gateway/run_busy.py:187`) and a bot delivery consumer carrying
+  `metadata.bot_live_delivery_consumer` (`tui_gateway/session_lifecycle.py:36`) both render
+  without a vocabulary change.
 
 - Terminal breadcrumbs under `terminal-sessions/` (PROFILE-scoped, matching upstream's
   `get_hermes_home()` writer, `hermes_cli/terminal_breadcrumbs.py:26-28,85-92`, pruned at 30 days

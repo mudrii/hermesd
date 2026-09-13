@@ -771,10 +771,11 @@ class ActiveSurface(BaseModel):
     # present (``hermes_cli/shared_session_attach.py:32-47`` — presence is the
     # whole signal; the handshake is HTTP and hermesd never probes it). The URL
     # itself is deliberately not stored: only gateway surfaces that advertise it
-    # show the joinable chip. Gateway leases record surface "gateway:<platform>"
-    # (``gateway/run_busy.py:187``) and bot delivery consumers carry
-    # metadata.bot_live_delivery_consumer
-    # (``tui_gateway/session_lifecycle.py:36``).
+    # show the joinable chip. ``surface`` is carried verbatim, never
+    # allowlisted, so gateway leases recording "gateway:<platform>"
+    # (``gateway/run_busy.py:187``) and bot delivery consumers carrying
+    # metadata.bot_live_delivery_consumer (``tui_gateway/session_lifecycle.py:36``)
+    # both render as written.
     joinable: bool = False
 
     @computed_field  # type: ignore[prop-decorator]

@@ -327,7 +327,10 @@ def _heartbeat_liveness(
 # The heartbeat moved off-loop (#90502), so a fresh file no longer proves the loop
 # dispatches. The gateway arms a witness served *by the loop itself*
 # (gateway/shutdown_watchdog.py:288-302) and advertises it on the heartbeat as
-# ``loop_tick_socket`` (POSIX) or ``loop_tick_tcp_port`` (Windows). The protocol is
+# ``loop_tick_socket`` plus, when the loop bound a loopback listener, the
+# ``loop_tick_tcp_port`` to reach it — both derived from the same server, so a
+# port without the flag is not a shape the writer produces (the flag is true on
+# POSIX and Windows alike; an unbound listener nulls both). The protocol is
 # one byte: connect, expect b"1", close — the client sends nothing, so probing is
 # non-mutating and safe for a read-only tool. Verdict vocabulary mirrors
 # ``classify`` in hermes_cli/gateway.py:425-497.
