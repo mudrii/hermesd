@@ -19,6 +19,30 @@
       # it from pyproject.toml, so the two cannot drift apart.
       hermesdVersion = pkgs: (pkgs.lib.importTOML ./pyproject.toml).project.version;
 
+      # hermesd's build-system requires hatchling>=1.32,<2 (Core Metadata 2.5;
+      # see pyproject.toml), but the pinned nixpkgs rev tops out at 1.31.0 and
+      # nixos-unstable had not moved past it either. Take hatchling from PyPI
+      # directly, hash-validated, so the Nix build satisfies the same floor as
+      # the locked environments.
+      mkHatchling = pkgs:
+        pkgs.python312.pkgs.buildPythonPackage rec {
+          pname = "hatchling";
+          version = "1.32.0";
+          format = "wheel";
+          src = pkgs.fetchurl {
+            url = "https://files.pythonhosted.org/packages/a9/84/1798b6d85ecde0e31546004efd25c5de1b1f49250644a60cce460e12593a/hatchling-1.32.0-py3-none-any.whl";
+            hash = "sha256-DhfJw7mqfGJazI0PW2IvEH1QSa+ez1raTeGq2lvnzbw=";
+          };
+          dependencies = with pkgs.python312.pkgs; [
+            packaging
+            pathspec
+            pluggy
+            tomlkit
+            trove-classifiers
+          ];
+          doCheck = false;
+        };
+
       mkHermesd = pkgs:
         let
           python = pkgs.python312;
@@ -30,7 +54,7 @@
 
           src = ./.;
 
-          build-system = [ python.pkgs.hatchling ];
+          build-system = [ (mkHatchling pkgs) ];
 
           dependencies = with python.pkgs; [
             rich
