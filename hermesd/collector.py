@@ -1185,9 +1185,7 @@ class Collector:
             _SourceSpec(
                 "session_coordination",
                 "gateway_routes",
-                lambda: self._with_gateway_routes(
-                    results["session_coordination"], results["sessions"]
-                ),
+                lambda: self._with_gateway_routes(results["session_coordination"]),
                 lambda: results["session_coordination"],
                 fallback=lambda: self._last_source_fields(
                     "gateway_routes", results["session_coordination"], _GATEWAY_ROUTE_FIELDS
@@ -2009,26 +2007,25 @@ class Collector:
             )
         )
 
-    def _with_gateway_routes(
-        self, coord: SessionCoordinationState, sessions: list[SessionInfo]
-    ) -> SessionCoordinationState:
+    def _with_gateway_routes(self, coord: SessionCoordinationState) -> SessionCoordinationState:
         """Decoded routing entries (PROFILE ``state.db``, table
         ``gateway_routing`` — ``hermes_state.py:160,178``; payload writer
         ``gateway/session.py:535-545``). Dangling routes are those whose
-        session id has no row in the (possibly last-good) session list."""
+        session id has no row at all: the target set is the *unfiltered* id
+        list, because upstream hides a session from the default listing while
+        keeping it resumable (``hermes_state_sessions.py:898-900``)."""
         readout = self._read_state_db()
         if readout is None:
             last = self._last_good_by_source.get("gateway_routes")
             if last is not None and last.route_total:
                 raise RuntimeError("state.db gateway routes disappeared or became unsafe")
             return coord
-        known = frozenset(session.session_id for session in sessions if session.session_id)
         return coord.model_copy(
             update=_gateway_route_fields(
                 readout.coordination.routing_rows,
                 route_total=readout.coordination.routing_total,
                 now=self._clock(),
-                known_session_ids=known,
+                known_session_ids=readout.coordination.session_ids,
             )
         )
 

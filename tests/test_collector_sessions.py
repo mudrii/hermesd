@@ -2345,6 +2345,36 @@ def test_gateway_route_with_unknown_session_is_dangling(hermes_home: Path) -> No
     assert route.dangling is True
 
 
+def test_gateway_route_to_hidden_session_is_not_dangling(hermes_home: Path) -> None:
+    """Hidden means "out of the default listing", not "gone".
+
+    ``hermes_state_sessions.py:898-900`` hides a session from the listing while
+    keeping it resumable, and ``get_session`` (:737-746) looks it up by id with
+    no hidden filter; canonical bot chats are born hidden. Resolving routes
+    against the visible listing reported those targets as pointing at a
+    nonexistent session.
+    """
+    _insert_route_with_session(hermes_home, _route_entry(session_id="sess_r"))
+    conn = sqlite3.connect(hermes_home / "state.db")
+    # The v0.21 column the listing filter keys on; the minimal fixture schema
+    # does not carry it.
+    conn.execute("ALTER TABLE sessions ADD COLUMN hidden INTEGER DEFAULT 0")
+    conn.execute("UPDATE sessions SET hidden = 1 WHERE id = 'sess_r'")
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    (route,) = state.session_coordination.routes
+    assert route.dangling is False
+    # The listing still omits it: the two questions have different answers.
+    assert [session.session_id for session in state.sessions] == []
+
+
 def test_gateway_route_display_name_is_redacted(hermes_home: Path) -> None:
     _insert_route_with_session(
         hermes_home, _route_entry(display_name="bot api_key: sk-live-abc123")

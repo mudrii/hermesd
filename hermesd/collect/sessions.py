@@ -357,6 +357,9 @@ class _SessionCoordinationRows:
     generation_rows: tuple[dict[str, Any], ...] = ()
     generation_chat_total: int = 0
     generation_reset_total: int = 0
+    # Every session id in the store, *including* hidden ones. Route targets are
+    # resolved against this set, not against the visible listing.
+    session_ids: frozenset[str] = frozenset()
 
 
 def _read_session_coordination_rows(conn: Any) -> _SessionCoordinationRows:
@@ -444,6 +447,19 @@ def _read_session_coordination_rows(conn: Any) -> _SessionCoordinationRows:
         generation_reset_total = _count_rows(
             conn, "SELECT COALESCE(SUM(COALESCE(generation, 0)), 0) FROM conversation_generations"
         )
+    # Route targets: the *unfiltered* id set. Upstream hides a session from the
+    # default listing while keeping it resumable (``hermes_state_sessions.py:898-900``;
+    # ``get_session`` ``:737-746`` selects by id with no hidden filter), and
+    # canonical bot chats are born hidden — so a route to a hidden session is a
+    # live route, not a dangling one. Only ids are read: 64-bit integers plus the
+    # id string, one indexed column scan on the same cached connection.
+    session_ids = frozenset()
+    if _table_exists(conn, "sessions"):
+        session_ids = frozenset(
+            str(row.get("id"))
+            for row in _query_rows(conn, "SELECT id FROM sessions")
+            if row.get("id")
+        )
     return _SessionCoordinationRows(
         lease_rows=lease_rows,
         lock_rows=lock_rows,
@@ -455,6 +471,7 @@ def _read_session_coordination_rows(conn: Any) -> _SessionCoordinationRows:
         generation_rows=generation_rows,
         generation_chat_total=generation_chat_total,
         generation_reset_total=generation_reset_total,
+        session_ids=session_ids,
     )
 
 
