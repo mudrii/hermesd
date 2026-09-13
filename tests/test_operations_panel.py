@@ -436,6 +436,36 @@ def test_detail_omits_live_manifest_section_when_absent():
     assert "Live Delegation Transcripts" not in text
 
 
+def test_detail_live_manifest_reports_dispatched_age():
+    state = _ops_state(
+        delegation_live_manifest_count=1,
+        delegation_live_manifests=[_live_manifest()],
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+    # The run-dir mtime is set at dispatch write time, not by later log appends
+    # or manifest rewrites, so the row must not claim to be a liveness signal.
+    assert "Dispatched" in text
+    assert "Dir Age" not in text
+
+
+def test_detail_live_manifest_states_task_truncation_once():
+    state = _ops_state(
+        delegation_live_manifest_count=1,
+        delegation_live_manifests=[
+            _live_manifest(
+                task_count=12,
+                running_task_count=0,
+                tasks=[DelegationLiveTask(index=index, status="completed") for index in range(8)],
+                tasks_truncated=True,
+            )
+        ],
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=200, no_color=True)
+    assert text.count("Tasks") == 1  # one summary row, no duplicate key
+    assert "Task List" in text
+    assert "showing 8 of 12 — the counts above cover the whole table" in text
+
+
 def test_detail_escapes_hostile_live_manifest_text():
     state = _ops_state(
         delegation_live_manifest_count=1,
@@ -477,6 +507,22 @@ def test_compact_shows_live_delegation_line_when_present():
     assert "Live delegations:" in populated
     assert "2 live · 1 running" in populated
     assert "Live delegations:" not in absent
+
+
+def test_compact_live_line_marks_the_running_sum_as_displayed():
+    text = render_to_str(
+        render_operations(
+            _ops_state(
+                delegation_live_manifest_count=2,
+                delegation_live_manifests=[_live_manifest()],
+            ),
+            Theme(),
+        ),
+        no_color=True,
+    )
+    # The manifest count covers every run dir; the running sum only covers the
+    # cards the collector parsed, so the copy has to say which is which.
+    assert "2 live · 1 running (shown)" in text
 
 
 # --- process completion receipts (item 13) ----------------------------------
@@ -523,8 +569,29 @@ def test_detail_renders_process_receipt_section():
 
 
 def test_detail_receipt_section_states_no_receipts_yet_when_dir_absent():
-    state = _ops_state(process_receipts=ProcessReceiptsState())
+    # Another artifact keeps the panel out of its fully-empty state, where the
+    # single "No operations artifacts found" line replaces this section.
+    state = _ops_state(process_receipts=ProcessReceiptsState(), state_db_size_bytes=4096)
     text = render_to_str(render_operations(state, Theme(), detail=True), width=160, no_color=True)
+    assert "no receipts yet" in text
+
+
+def test_detail_empty_state_renders_a_single_message():
+    text = render_to_str(
+        render_operations(_ops_state(), Theme(), detail=True), width=160, no_color=True
+    )
+    assert "No operations artifacts found" in text
+    assert "no receipts yet" not in text
+    assert "Process Receipts" not in text
+
+
+def test_detail_marker_readout_suppresses_the_no_artifacts_message():
+    state = _ops_state(
+        checkpoint_prune_marker_present=True,
+        checkpoint_prune_marker_age_seconds=3600.0,
+    )
+    text = render_to_str(render_operations(state, Theme(), detail=True), width=160, no_color=True)
+    assert "No operations artifacts found" not in text
     assert "no receipts yet" in text
 
 
