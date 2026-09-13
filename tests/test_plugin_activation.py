@@ -176,23 +176,41 @@ def test_declared_kind_wins_over_source_markers():
 
 @pytest.mark.parametrize("marker", ["register_memory_provider", "MemoryProvider"])
 def test_undeclared_kind_detects_an_exclusive_memory_provider(marker: str):
-    assert resolve_plugin_kind(None, f"from x import y\nclass Foo({marker}): ...") == "exclusive"
+    assert (
+        resolve_plugin_kind(
+            None,
+            f"from x import y\nclass Foo({marker}): ...",
+            declared_present=False,
+        )
+        == "exclusive"
+    )
 
 
 def test_undeclared_kind_detects_a_model_provider():
     source = "def register_provider(p: ProviderProfile): ..."
 
-    assert resolve_plugin_kind(None, source) == "model-provider"
+    assert resolve_plugin_kind(None, source, declared_present=False) == "model-provider"
 
 
 def test_model_provider_detection_needs_both_markers():
-    assert resolve_plugin_kind(None, "def register_provider(p): ...") == "standalone"
-    assert resolve_plugin_kind(None, "class ProviderProfile: ...") == "standalone"
+    assert (
+        resolve_plugin_kind(None, "def register_provider(p): ...", declared_present=False)
+        == "standalone"
+    )
+    assert (
+        resolve_plugin_kind(None, "class ProviderProfile: ...", declared_present=False)
+        == "standalone"
+    )
 
 
 def test_undeclared_kind_without_source_is_standalone():
-    assert resolve_plugin_kind(None, "") == "standalone"
+    assert resolve_plugin_kind(None, "", declared_present=False) == "standalone"
     assert detect_kind_from_source("") == "standalone"
+
+
+@pytest.mark.parametrize("declared", [None, "", "   ", 7, ["exclusive"], "unknown"])
+def test_present_invalid_kind_is_standalone_without_source_detection(declared: object):
+    assert resolve_plugin_kind(declared, "class Provider(MemoryProvider): ...") == "standalone"
 
 
 def test_kind_detection_scan_is_bounded():
@@ -200,7 +218,7 @@ def test_kind_detection_scan_is_bounded():
     source = "# padding\n" * 2000 + "register_memory_provider"
 
     assert len(source) > 8192
-    assert resolve_plugin_kind(None, source) == "standalone"
+    assert resolve_plugin_kind(None, source, declared_present=False) == "standalone"
 
 
 # --------------------------------------------------------------------------
@@ -322,6 +340,45 @@ def test_collector_routes_an_undeclared_memory_provider_to_its_category(hermes_h
     assert plugin.kind == "exclusive"
     assert plugin.activation == ACTIVATION_CATEGORY_OWNED
     assert plugin.enabled is False
+
+
+def test_collector_detects_an_undeclared_memoryprovider_even_when_allowlisted(
+    hermes_home: Path,
+) -> None:
+    _write_config(hermes_home, {"enabled": ["memx"]})
+    _write_plugin(
+        hermes_home,
+        "memx",
+        "name: memx\n",
+        init_source="class Memx(MemoryProvider): ...\n",
+    )
+
+    plugin = _by_name(_collect(hermes_home))["memx"]
+
+    assert plugin.kind == "exclusive"
+    assert plugin.activation == ACTIVATION_CATEGORY_OWNED
+
+
+@pytest.mark.parametrize(
+    "kind_yaml",
+    ["null", "''", "[]", "unknown"],
+    ids=["null", "empty", "non-string", "unknown"],
+)
+def test_collector_does_not_auto_detect_when_kind_is_present_but_invalid(
+    hermes_home: Path, kind_yaml: str
+) -> None:
+    _write_config(hermes_home, {"enabled": ["memx"]})
+    _write_plugin(
+        hermes_home,
+        "memx",
+        f"name: memx\nkind: {kind_yaml}\n",
+        init_source="class Memx(MemoryProvider): ...\n",
+    )
+
+    plugin = _by_name(_collect(hermes_home))["memx"]
+
+    assert plugin.kind == "standalone"
+    assert plugin.activation == ACTIVATION_ENABLED
 
 
 def test_collector_reports_unknown_for_an_unreadable_manifest(hermes_home: Path):

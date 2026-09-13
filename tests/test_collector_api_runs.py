@@ -21,6 +21,7 @@ the opposite of the ROOT-scoped ``shared-state.db`` the hosted-room reader uses.
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -280,8 +281,8 @@ def test_api_runs_counts_and_ages_come_from_the_injected_clock(hermes_home: Path
     assert api_runs.oldest_age_seconds == pytest.approx(30 * _HOUR)
     assert api_runs.acknowledged_count == 1
     assert api_runs.owner_recorded_count == 1
-    # Two rows are past retention_until; only a terminal status lets upstream
-    # actually delete them, which is why they are still here.
+    # One row is past retention_until and awaits a later request-triggered
+    # pruning pass.
     assert api_runs.retention_expired_count == 1
 
 
@@ -416,6 +417,40 @@ def test_api_runs_reads_a_wal_database_through_a_snapshot(hermes_home: Path):
         db_path.with_name("runs_idempotency.db-shm"),
         db_path.with_name("runs_idempotency.db-wal"),
     }
+
+
+def test_api_runs_dangling_wal_keeps_last_good_instead_of_reporting_zero(
+    hermes_home: Path, tmp_path: Path
+):
+    source_db = tmp_path / "source-runs.db"
+    writer = sqlite3.connect(str(source_db))
+    try:
+        create_runs_db(writer)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        insert_reservation(writer, "run-wal", status="queued")
+        writer.commit()
+
+        db_path = hermes_home / "runs_idempotency.db"
+        wal_path = db_path.with_name("runs_idempotency.db-wal")
+        shutil.copy2(source_db, db_path)
+        shutil.copy2(source_db.with_name("source-runs.db-wal"), wal_path)
+        c = Collector(hermes_home, clock=lambda: _NOW)
+        try:
+            first = c.collect()
+            assert first.operations.api_runs.reservation_count == 1
+            assert [item.run_id for item in first.operations.api_runs.reservations] == ["run-wal"]
+
+            wal_path.unlink()
+            wal_path.symlink_to(tmp_path / "missing-runs-wal")
+            second = c.collect()
+        finally:
+            c.close()
+    finally:
+        writer.close()
+
+    assert second.operations.api_runs == first.operations.api_runs
+    assert "api_runs" in second.health.failed_sources
 
 
 def test_api_run_null_and_garbage_status_json_reads_as_unknown(hermes_home: Path):

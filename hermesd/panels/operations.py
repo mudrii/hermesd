@@ -29,7 +29,7 @@ from hermesd.theme import Theme
 # numbers above can mean, so the section is never read as a health verdict.
 _RECOVERY_NOTE_LINES = (
     "Presence and metadata only: hermesd never repairs, checkpoints, integrity-checks or",
-    "hashes the database — the live state.db is hundreds of megabytes.",
+    "hashes the database.",
     'A successful repair deletes the ledger, so "none" is not evidence the database is healthy.',
     '"budget exhausted" counts the ledger\'s recorded failures; hermesd does not recompute the',
     "fingerprint upstream matches them against, so it cannot tell whether the file changed since.",
@@ -44,9 +44,8 @@ _HOSTED_ROOM_NOTE_LINES = (
     "actors, revoked-grant scope keys and the hosted_room_policy_transcript* tables are never",
     "selected. Only counts, ids, names, timestamps, epochs, revisions, event bytes and the",
     "closed event-kind vocabulary leave the file.",
-    "ROOT-scoped: read from <root>/shared-state.db even under --profile, and never from the",
-    "master state.db — whose own hosted_room* tables are empty legacy leftovers, so reading",
-    "them would report a dead table as the coordination state.",
+    "ROOT-scoped: <root>/shared-state.db is authoritative even under --profile; hermesd",
+    "never reads the legacy hosted_room* tables in state.db for this section.",
     f"Upstream ceilings: {MAX_ACTIVE_HOSTED_ROOMS} active rooms, "
     f"{MAX_DISBANDED_HOSTED_ROOM_TOMBSTONES} disbanded tombstones retained "
     f"{HOSTED_ROOM_DISBANDED_RETENTION_SECONDS // 86400} days, "
@@ -375,7 +374,7 @@ def _api_run_summary_table(api_runs: ApiRunReservationsState, theme: Theme) -> T
     if api_runs.retention_expired_count:
         table.add_row(
             "Past Retention",
-            f"{api_runs.retention_expired_count} awaiting a terminal status",
+            f"{api_runs.retention_expired_count} past retention deadline",
         )
     if api_runs.reservations_truncated:
         table.add_row(

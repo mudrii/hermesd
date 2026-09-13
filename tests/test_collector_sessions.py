@@ -344,7 +344,9 @@ def test_collect_response_store_ignores_symlinked_db_outside_home(
     c.close()
 
 
-def test_collect_response_store_ignores_symlinked_wal_sidecar(hermes_home: Path, tmp_path: Path):
+def test_collect_response_store_refuses_symlinked_wal_and_keeps_last_good(
+    hermes_home: Path, tmp_path: Path
+):
     db_path = hermes_home / "response_store.db"
     conn = sqlite3.connect(str(db_path))
     conn.executescript(
@@ -355,17 +357,21 @@ def test_collect_response_store_ignores_symlinked_wal_sidecar(hermes_home: Path,
     )
     conn.commit()
     conn.close()
+    c = Collector(hermes_home)
+    first = c.collect()
+    assert first.operations.response_store_present is True
+    assert first.operations.conversation_count == 1
+    assert first.operations.response_count == 1
+
     outside_wal = tmp_path / "outside-response-store-wal"
     outside_wal.write_bytes(b"not a sqlite wal")
     (hermes_home / "response_store.db-wal").symlink_to(outside_wal)
+    second = c.collect()
 
-    c = Collector(hermes_home)
-    state = c.collect()
-
-    assert state.operations.response_store_present is True
-    assert state.operations.conversation_count == 1
-    assert state.operations.response_count == 1
-    assert "operations" not in state.health.failed_sources
+    assert second.operations.response_store_present is True
+    assert second.operations.conversation_count == 1
+    assert second.operations.response_count == 1
+    assert "operations" in second.health.failed_sources
     c.close()
 
 
@@ -1809,7 +1815,8 @@ def test_active_surfaces_are_bounded_and_cost_one_liveness_probe_each(hermes_hom
     state = _collect_once(hermes_home, pid_exists=lambda pid: probed.append(pid) or False)
 
     assert len(state.active_surfaces) == _ACTIVE_SURFACE_LIMIT
-    assert state.active_surface_count == _ACTIVE_SURFACE_LIMIT
+    assert state.active_surface_count == 500
+    assert state.active_surfaces_truncated is True
     assert len(probed) == _ACTIVE_SURFACE_LIMIT
     # The cap keeps the head of the file, in file order.
     assert state.active_surfaces[0].session_id == "sess_0000"

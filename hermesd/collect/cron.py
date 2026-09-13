@@ -12,6 +12,7 @@ from typing import Any
 
 from hermesd.collect.common import (
     _EXCERPT_MAX_CHARS,
+    _MAX_TEXT_READ_BYTES,
     _age_seconds,
     _as_dict,
     _coerce_float,
@@ -654,6 +655,14 @@ def _cron_marker_present(cron_dir: Path, name: str, root: Path) -> bool:
     return _exists_strict(path) and _safe_child_path(path, root)
 
 
+def _read_cron_marker_text_strict(path: Path, root: Path) -> str:
+    """Read a confined marker without treating an I/O failure as empty text."""
+    if not _safe_child_path(path, root):
+        return ""
+    with path.open("rb") as handle:
+        return handle.read(_MAX_TEXT_READ_BYTES).decode("utf-8", errors="replace")
+
+
 def _cron_catch_up_occurrences(cron_dir: Path, root: Path) -> tuple[int, bool]:
     """``cron/catch_up_occurrences`` plus whether a count was actually observed.
 
@@ -667,7 +676,7 @@ def _cron_catch_up_occurrences(cron_dir: Path, root: Path) -> tuple[int, bool]:
     """
     if not _cron_marker_present(cron_dir, _CATCH_UP_OCCURRENCES_MARKER, root):
         return 0, False
-    raw = _read_text_capped(cron_dir / _CATCH_UP_OCCURRENCES_MARKER, root).strip()
+    raw = _read_cron_marker_text_strict(cron_dir / _CATCH_UP_OCCURRENCES_MARKER, root).strip()
     try:
         # Upstream clamps with max(0, ...); a negative marker is still a marker.
         return max(0, int(raw)), True
@@ -697,7 +706,7 @@ def _cron_ticker_last_error(
     """
     if not _cron_marker_present(cron_dir, _TICKER_ERROR_MARKER, root):
         return "", None
-    lines = _read_text_capped(cron_dir / _TICKER_ERROR_MARKER, root).splitlines()
+    lines = _read_cron_marker_text_strict(cron_dir / _TICKER_ERROR_MARKER, root).splitlines()
     if len(lines) < _TICKER_ERROR_MIN_LINES:
         return "", None
     message = _cron_error_excerpt("\n".join(lines[1:]))

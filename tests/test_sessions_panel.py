@@ -196,7 +196,35 @@ def test_detail_limits_surfaces_to_filtered_sessions() -> None:
         width=200,
     )
 
-    assert "Live Surfaces" not in rendered
+    assert "Live Surfaces" in rendered
+    assert "3 registry entries" in rendered
+    assert "0 shown" in rendered
+
+
+def test_filtered_surface_rows_do_not_hide_registry_capacity_warning() -> None:
+    state = _rich_state()
+    state.config.max_concurrent_sessions = 3
+
+    rendered = render_to_str(
+        render_sessions(state, Theme(), detail=True, filter_query="id:sess_abcdef12"),
+        width=200,
+    )
+
+    assert "cap 3 leases" in rendered
+    assert "3 registry entries" in rendered
+    assert "2 shown" in rendered
+
+
+def test_detail_labels_a_truncated_active_surface_registry() -> None:
+    state = _rich_state().model_copy(
+        update={"active_surface_count": 201, "active_surfaces_truncated": True}
+    )
+
+    rendered = render_to_str(render_sessions(state, Theme(), detail=True), width=200)
+
+    assert "201 registry entries" in rendered
+    assert "3 shown from the first 3 retained" in rendered
+    assert "capacity uses the full registry count" in rendered
 
 
 def test_detail_warns_about_compression_failures() -> None:

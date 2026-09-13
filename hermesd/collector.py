@@ -80,6 +80,7 @@ from hermesd.collect.cron import (
     _read_cron_executions_state,
     _tail_latest_cron_output,
 )
+from hermesd.collect.desktop_plugins import read_desktop_plugins
 from hermesd.collect.gateway import (
     _config_generation,
     _config_stale,
@@ -212,6 +213,7 @@ from hermesd.models import (
     CronState,
     CuratorRun,
     DashboardState,
+    DesktopPluginInfo,
     GatewayLoopHealth,
     GatewayState,
     HealthSummary,
@@ -287,6 +289,9 @@ _ACTIVE_SURFACE_LIMIT = 200
 # bounded inventory never presents itself as a complete one.
 _PLUGIN_DIR_ENTRY_LIMIT = 200
 _PLUGIN_LIMIT = 200
+# The desktop inventory enriches SkillsMemory through an independent health
+# source so a transient root listing failure cannot blank agent integrations.
+_DESKTOP_PLUGIN_FIELDS = ("desktop_plugins", "desktop_plugin_scan_truncated")
 # cache/blocked-scripts/ scan bounds and the fields the source owns.
 _BLOCKED_SCRIPT_SCAN_LIMIT = 200
 _BLOCKED_SCRIPT_NAME_LIMIT = 3
@@ -363,6 +368,17 @@ class _ModelUsageBundle:
 
 
 _EMPTY_MODEL_USAGE_BUNDLE = _ModelUsageBundle()
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveSurfaceReadout:
+    """Bounded lease rows plus the selected registry's complete occupancy."""
+
+    surfaces: tuple[ActiveSurface, ...] = ()
+    total_count: int = 0
+
+
+_EMPTY_ACTIVE_SURFACE_READOUT = _ActiveSurfaceReadout()
 
 
 def _model_usage_from_rows(rows: list[dict[str, Any]]) -> tuple[ModelUsage, ...]:
@@ -546,6 +562,9 @@ class Collector:
             | None
         ) = None
         self._available_tools_cache_value: tuple[int, list[str]] = (0, [])
+        # Once a gateway_state.json writer is observed dead, the unchanged file
+        # cannot become authoritative merely because that numeric PID reappears.
+        self._invalidated_gateway_state_signature: tuple[str, int, int] | None = None
         self._session_tool_names_cache: dict[
             str, tuple[tuple[str, int, int] | None, tuple[str, ...]]
         ] = {}
@@ -729,7 +748,9 @@ class Collector:
             _SourceSpec(
                 "migration",
                 "migration",
-                lambda: self._collect_migration(results["gateway"]),
+                lambda: self._collect_migration(
+                    results["gateway"], gateway_fresh="gateway" not in health.failed_sources
+                ),
                 MigrationState,
             ),
             _SourceSpec(
@@ -860,6 +881,15 @@ class Collector:
                 ),
             ),
             _SourceSpec("skills_memory", "skills", self._collect_skills_memory, SkillsMemory),
+            _SourceSpec(
+                "skills_memory",
+                "desktop_plugins",
+                lambda: self._with_desktop_plugins(results["skills_memory"]),
+                lambda: results["skills_memory"],
+                fallback=lambda: self._last_source_fields(
+                    "desktop_plugins", results["skills_memory"], _DESKTOP_PLUGIN_FIELDS
+                ),
+            ),
             _SourceSpec("mcp_cache", "mcp_cache", self._collect_mcp_cache, MCPSchemaCache),
             _SourceSpec(
                 "skills_prompt",
@@ -885,10 +915,10 @@ class Collector:
                 fallback=self._last_model_usage,
             ),
             _SourceSpec(
-                "active_surfaces",
+                "active_surface_readout",
                 "active_sessions",
                 self._collect_active_surfaces,
-                list,
+                lambda: _EMPTY_ACTIVE_SURFACE_READOUT,
             ),
             _SourceSpec(
                 "runtime",
@@ -925,6 +955,7 @@ class Collector:
 
         tool_count, tool_names = results.pop("available_tools")
         model_usage = results.pop("model_usage")
+        active_surface_readout = results.pop("active_surface_readout")
         results["token_analytics"] = results["token_analytics"].model_copy(
             update={
                 "usage_source": model_usage.usage_source,
@@ -949,7 +980,11 @@ class Collector:
             health=health_summary,
             available_tools=tool_count,
             available_tool_names=tool_names,
-            active_surface_count=len(results["active_surfaces"]),
+            active_surfaces=list(active_surface_readout.surfaces),
+            active_surface_count=active_surface_readout.total_count,
+            active_surfaces_truncated=(
+                active_surface_readout.total_count > len(active_surface_readout.surfaces)
+            ),
             **results,
         )
 
@@ -1118,17 +1153,31 @@ class Collector:
         data = self._read_json_reporting_stale(path)
         if not data:
             return GatewayState()
+        state_signature = _file_signature(path)
+        if (
+            state_signature is not None
+            and self._invalidated_gateway_state_signature is not None
+            and state_signature != self._invalidated_gateway_state_signature
+        ):
+            self._invalidated_gateway_state_signature = None
         now = self._clock()
         writer = _record_writer(data)
         # A non-positive PID is absent, never a target: os.kill(0)/os.kill(-1)
         # would signal a process group or every process the user owns.
-        pid = max(0, _coerce_int(data.get("pid")))
+        recorded_pid = writer.pid or 0
+        pid = recorded_pid
         running = data.get("gateway_state") == "running"
+        recorded_writer_live = False
         # The PID in gateway_state.json can be stale if launchd restarted
-        # the gateway. Check both the recorded PID and the launchd PID.
+        # the gateway. A replacement PID proves a process is running, but it does
+        # not make topology written by the previous process current.
         if running:
             if pid:
-                if not self._pid_exists(pid):
+                if self._pid_exists(pid):
+                    recorded_writer_live = self._invalidated_gateway_state_signature is None
+                else:
+                    if state_signature is not None:
+                        self._invalidated_gateway_state_signature = state_signature
                     # Recorded PID is dead — check if launchd has a live gateway
                     launchd_pid = self._find_gateway_launchd_pid()
                     if launchd_pid:
@@ -1136,15 +1185,17 @@ class Collector:
                     else:
                         running = False
             else:
+                if state_signature is not None:
+                    self._invalidated_gateway_state_signature = state_signature
                 launchd_pid = self._find_gateway_launchd_pid()
                 if launchd_pid:
                     pid = launchd_pid
                 else:
                     running = False
-        # Built after `running` because a platform entry's recorded ingress URL is
-        # only surfaced while the gateway that recorded it is live.
+        # Built after liveness resolution because a platform entry's recorded
+        # ingress URL is surfaced only while the state-file writer is still live.
         platforms = [
-            _platform_status(str(name), info, now, writer, running=running)
+            _platform_status(str(name), info, now, writer, record_current=recorded_writer_live)
             for name, raw_info in _as_dict(data.get("platforms")).items()
             if (info := _as_dict(raw_info))
         ]
@@ -1152,9 +1203,9 @@ class Collector:
         # while a real list (even []) from a live gateway is authoritative — the
         # distinction upstream's recorded_served_profiles() makes by returning
         # None instead of []. The names are kept either way; only the marker is
-        # gated on liveness, so a dead gateway's record reads as preserved.
+        # gated on state-writer liveness, so an old writer's record stays preserved.
         raw_served = data.get("served_profiles")
-        served_recorded = running and isinstance(raw_served, list)
+        served_recorded = recorded_writer_live and isinstance(raw_served, list)
         version, behind = self._collect_hermes_version()
         cfg = self._read_yaml_reporting_stale()
         gateway_cfg = _as_dict(cfg.get("gateway"))
@@ -1278,7 +1329,7 @@ class Collector:
             return gateway
         return gateway.model_copy(update=_gateway_ledger_fields(readout.ledgers, self._clock()))
 
-    def _collect_migration(self, gateway: GatewayState) -> MigrationState:
+    def _collect_migration(self, gateway: GatewayState, *, gateway_fresh: bool) -> MigrationState:
         """Read ``gateway_migration.json`` and judge it against the live artifacts.
 
         ROOT-scoped: upstream anchors the manifest at the *default* profile home
@@ -1292,6 +1343,9 @@ class Collector:
         is marked failed and its last-good verdict stays on display instead of
         silently reporting "no migration".
         """
+        if not gateway_fresh:
+            raise RuntimeError("gateway dependency is stale; keeping last-good migration verdict")
+
         path = self._paths.shared_path(_MANIFEST_NAME)
         last = self._last_good_by_source.get("migration")
         had_last_good = bool(last is not None and last.manifest_present)
@@ -1446,7 +1500,7 @@ class Collector:
             last_7d=_model_usage_from_rows(usage["7d"]),
         )
 
-    def _collect_active_surfaces(self) -> list[ActiveSurface]:
+    def _collect_active_surfaces(self) -> _ActiveSurfaceReadout:
         """Lease entries from runtime/active_sessions.json.
 
         An existing pid is not the recorded process: pids get reused, so liveness
@@ -1470,12 +1524,13 @@ class Collector:
         """
         data = self._read_json_confined(self._paths.profile_path("runtime", "active_sessions.json"))
         entries: list[dict[str, Any]] = []
+        total_count = 0
         for raw_entry in _as_list(data.get("entries")):
             entry = _as_dict(raw_entry)
             if str(entry.get("session_id") or ""):
-                entries.append(entry)
-            if len(entries) >= _ACTIVE_SURFACE_LIMIT:
-                break
+                total_count += 1
+                if len(entries) < _ACTIVE_SURFACE_LIMIT:
+                    entries.append(entry)
         pids = sorted({_coerce_int(entry.get("pid")) for entry in entries} - {0})
         observed = self._process_start_times(pids) if pids else {}
         now = self._clock()
@@ -1501,7 +1556,7 @@ class Collector:
                     track_liveness=bool(entry.get("track_liveness")),
                 )
             )
-        return surfaces
+        return _ActiveSurfaceReadout(surfaces=tuple(surfaces), total_count=total_count)
 
     def _last_model_usage(self) -> _ModelUsageBundle:
         bundle: _ModelUsageBundle = self._last_good_by_source.get(
@@ -2697,6 +2752,23 @@ class Collector:
         ]
         return plugins, truncated
 
+    def _with_desktop_plugins(self, current: SkillsMemory) -> SkillsMemory:
+        """Add the root app-extension inventory without coupling its health to skills."""
+        plugins, truncated = self._collect_desktop_plugins()
+        return current.model_copy(
+            update={
+                "desktop_plugins": plugins,
+                "desktop_plugin_scan_truncated": truncated,
+            }
+        )
+
+    def _collect_desktop_plugins(self) -> tuple[list[DesktopPluginInfo], bool]:
+        """Read the app-level root defined by desktop-plugins-root.ts:1-38."""
+        return read_desktop_plugins(
+            self._paths.shared_path("desktop-plugins"),
+            self._paths.root_home,
+        )
+
     def _scan_plugin_dirs(self, base: Path) -> tuple[list[tuple[Path, str, ManifestChoice]], bool]:
         """``(plugin_dir, key prefix, winning manifest)`` triples under ``base``.
 
@@ -2793,7 +2865,11 @@ class Collector:
             name = str(raw.get("name") or plugin_dir.name)
             version = str(raw.get("version") or "")
             description = str(raw.get("description") or "")
-            kind = resolve_plugin_kind(raw.get("kind"), self._plugin_init_source(plugin_dir))
+            kind = resolve_plugin_kind(
+                raw.get("kind"),
+                self._plugin_init_source(plugin_dir),
+                declared_present="kind" in raw,
+            )
             key = plugin_key(prefix=prefix, dirname=plugin_dir.name, name=name)
             requires = requires_hermes_spec(raw.get("requires_hermes"))
             caps, cap_count = declared_capabilities(raw.get("capabilities"))

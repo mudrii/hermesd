@@ -232,4 +232,4 @@ def test_typed_marker_and_sdist_support_files_are_packaged() -> None:
     assert Path("hermesd/py.typed").is_file()
 
     includes = set(project["tool"]["hatch"]["build"]["targets"]["sdist"]["include"])
-    assert {".github/", "flake.nix"} <= includes
+    assert {".codex/rules/source-ownership.md", ".github/", "flake.nix"} <= includes

@@ -51,9 +51,21 @@ def _panel_num_by_name(name: str) -> int:
 
 
 _LOG_PANEL_NUM = _panel_num_by_name("Logs")
+_GATEWAY_PANEL_NUM = _panel_num_by_name("Gateway & Platforms")
 _SESSIONS_PANEL_NUM = _panel_num_by_name("Sessions")
+_CRON_PANEL_NUM = _panel_num_by_name("Cron")
 _SKILLS_PANEL_NUM = _panel_num_by_name("Skills / Integrations")
 _PROFILES_PANEL_NUM = _panel_num_by_name("Profiles")
+_OPERATIONS_PANEL_NUM = _panel_num_by_name("Operations")
+_RENDERED_VIEWPORT_PANEL_NUMS = frozenset(
+    {
+        _GATEWAY_PANEL_NUM,
+        _SESSIONS_PANEL_NUM,
+        _CRON_PANEL_NUM,
+        _SKILLS_PANEL_NUM,
+        _OPERATIONS_PANEL_NUM,
+    }
+)
 _WIDE_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
     ("row1", 4, (1,)),
     ("row2", None, (2, 3)),
@@ -597,7 +609,7 @@ class DashboardApp:
         detail_panel = self._view.detail_panel
         if detail_panel is None:
             return False
-        if detail_panel == _SESSIONS_PANEL_NUM:
+        if detail_panel in _RENDERED_VIEWPORT_PANEL_NUMS:
             return True
         with self._lock:
             state = self._state
@@ -672,13 +684,16 @@ class DashboardApp:
                 detail=True,
                 log_sub_view=log_sub_view,
                 scroll_offset=scroll_offset,
+                expand_skills=detail_panel == _SKILLS_PANEL_NUM,
                 profile_view_index=profile_view_index,
                 filter_query=filter_query,
                 session_sort=session_sort,
                 session_message_match_ids=session_message_match_ids,
             )
-            if detail_panel == _SESSIONS_PANEL_NUM:
-                viewport, max_offset = _sessions_viewport(panel, render_console, scroll_offset)
+            if detail_panel in _RENDERED_VIEWPORT_PANEL_NUMS:
+                viewport, max_offset = _rendered_detail_viewport(
+                    panel, render_console, scroll_offset
+                )
                 layout["body"].update(viewport)
             else:
                 layout["body"].update(panel)
@@ -855,7 +870,7 @@ class DashboardApp:
         if mode == "overview":
             self._append_overview_footer_actions(t, active_theme)
         else:
-            scrollable = panel == _SESSIONS_PANEL_NUM or (
+            scrollable = panel in _RENDERED_VIEWPORT_PANEL_NUMS or (
                 panel is not None
                 and _detail_max_scroll_offset(panel, state, sub_view, query) is not None
             )
@@ -914,7 +929,14 @@ class DashboardApp:
         if panel == _SESSIONS_PANEL_NUM:
             self._append_footer_action(text, theme, "[s]", " Sort  ")
             text.append(f"sort={sort_mode}  ", style=f"{theme.banner_dim} on {theme.status_bar_bg}")
-        if panel in {_SESSIONS_PANEL_NUM, _SKILLS_PANEL_NUM, _LOG_PANEL_NUM}:
+        if panel in {
+            _GATEWAY_PANEL_NUM,
+            _SESSIONS_PANEL_NUM,
+            _CRON_PANEL_NUM,
+            _SKILLS_PANEL_NUM,
+            _LOG_PANEL_NUM,
+            _OPERATIONS_PANEL_NUM,
+        }:
             self._append_footer_action(text, theme, "[g/G]", " Top/bottom  ")
         if panel == _PROFILES_PANEL_NUM:
             self._append_footer_action(text, theme, "[p]", " Cycle profile  ")
@@ -1090,7 +1112,7 @@ def _decode_input_keys_with_remainder(data: bytes) -> tuple[list[str], bytes]:
     return keys, b""
 
 
-def _sessions_viewport(panel: Panel, console: Console, offset: int) -> tuple[Segments, int]:
+def _rendered_detail_viewport(panel: Panel, console: Console, offset: int) -> tuple[Segments, int]:
     # Scroll the complete rendered detail, not just its last table: preceding
     # sections may themselves exceed the terminal height. Header/footer use two
     # rows, and removing the height constraint keeps Rich from cropping first.
@@ -1113,17 +1135,13 @@ def _detail_max_scroll_offset(
 ) -> int | None:
     """Effective max scroll offset for scrollable detail panels, else None.
 
-    Logs delegates to its panel's own clamp; skills mirrors the row clamp in
-    hermesd/panels/overview.py. Sessions uses a rendered-line viewport instead.
+    Logs delegates to its panel's own clamp. Gateway, Sessions, Cron, Skills
+    and Operations use a rendered-line viewport instead.
     """
     if panel_num == _LOG_PANEL_NUM:
         from hermesd.panels.logs import max_detail_scroll_offset
 
         return max_detail_scroll_offset(state, log_sub_view, filter_query)
-    if panel_num == _SKILLS_PANEL_NUM:
-        from hermesd.panels.overview import max_skills_scroll_offset
-
-        return max_skills_scroll_offset(state)
     return None
 
 

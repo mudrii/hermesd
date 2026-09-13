@@ -113,8 +113,8 @@ def _read_api_runs(
             "owner_pid",
             "SELECT COUNT(*) FROM run_idempotency WHERE COALESCE(owner_pid, 0) > 0",
         ),
-        # Past retention_until but still here: upstream can only delete these
-        # once their stored status is terminal.
+        # Rows past retention_until can remain until a later request triggers
+        # upstream's opportunistic pruning.
         retention_expired_count=_gated_count(
             conn,
             columns,

@@ -28,14 +28,25 @@ from hermesd.app import (
     _truncate_for_osc52,
 )
 from hermesd.models import (
+    ApiRunReservationsState,
+    CronExecution,
+    CronExecutionsState,
+    CronJob,
+    CronState,
     DashboardState,
+    DesktopPluginInfo,
+    GatewayState,
     HealthSummary,
+    HostedRoomState,
     LogLine,
     LogState,
     LogStream,
+    MigrationProfileRecord,
+    MigrationState,
+    OperationsState,
+    PluginInfo,
     RuntimeStatus,
     SessionInfo,
-    SkillInfo,
 )
 from hermesd.panels import PANEL_NAMES
 from hermesd.theme import Theme, load_theme
@@ -332,15 +343,29 @@ def test_jump_bottom_then_scroll_up_changes_logs_offset(populated_hermes_home: P
 
 def test_jump_bottom_then_scroll_up_changes_skills_offset(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    skills = [SkillInfo(name=f"skill-{i}") for i in range(30)]
-    skills_memory = app._state.skills_memory.model_copy(update={"skills": skills})
+    plugins = [PluginInfo(name=f"agent-{i}") for i in range(40)]
+    skills_memory = app._state.skills_memory.model_copy(
+        update={
+            "plugins": plugins,
+            "desktop_plugins": [DesktopPluginInfo(name="desktop-lower")],
+        }
+    )
     app._set_state(app._state.model_copy(update={"skills_memory": skills_memory}))
     app.handle_key("7")
+    app._console = Console(file=io.StringIO(), width=100, height=24, no_color=True)
+    with app._console.capture() as top_capture:
+        app._console.print(app._build_layout())
+    assert "desktop-lower" not in top_capture.get()
+
     app.handle_key("G")
-    app._build_layout()
-    assert app._view.scroll_offset == 10  # 30 rows - 20-row window
+    with app._console.capture() as bottom_capture:
+        app._console.print(app._build_layout())
+    assert "desktop-lower" in bottom_capture.get()
+    assert app._view.scroll_offset > 0
+    bottom_offset = app._view.scroll_offset
+
     app.handle_key("k")
-    assert app._view.scroll_offset == 9
+    assert app._view.scroll_offset == bottom_offset - 1
     app.close()
 
 
@@ -473,6 +498,136 @@ def test_sessions_copy_clamps_its_view_without_mutating_live_offset(populated_he
         copied = app.copy_current_view()
         assert "sess0000" in copied
         assert app._snapshot_view_state() == before
+    finally:
+        app.close()
+
+
+def test_operations_detail_scroll_reaches_lower_sections_and_reclamps(
+    populated_hermes_home: Path,
+):
+    app = DashboardApp(populated_hermes_home, no_color=True)
+    try:
+        operations = OperationsState(
+            state_db_size_bytes=1024,
+            hosted_rooms=HostedRoomState(db_present=True),
+            api_runs=ApiRunReservationsState(db_present=True),
+        )
+        app._set_state(app._state.model_copy(update={"operations": operations}))
+        app._console = Console(file=io.StringIO(), width=100, height=24, no_color=True)
+        app._view.enter_detail(_panel_num_by_name("Operations"))
+
+        with app._console.capture() as top_capture:
+            app._console.print(app._build_layout())
+        assert "Retained API Run Reservations" not in top_capture.get()
+
+        app.handle_key("G")
+        with app._console.capture() as bottom_capture:
+            app._console.print(app._build_layout())
+        assert "Retained API Run Reservations" in bottom_capture.get()
+        assert app._view.scroll_offset > 0
+        bottom = app._view.scroll_offset
+
+        app.handle_key("k")
+        app._build_layout()
+        assert app._view.scroll_offset == bottom - 1
+
+        app._view.jump_bottom()
+        app._build_layout()
+        short_bottom = app._view.scroll_offset
+        app._console.height = 40
+        app._build_layout()
+        assert app._view.scroll_offset == max(0, short_bottom - 16)
+
+        before = app._snapshot_view_state()
+        app.copy_current_view()
+        assert app._snapshot_view_state() == before
+
+        footer = app._build_footer(app._state).plain
+        assert "Scroll" in footer
+        assert "Top/bottom" in footer
+    finally:
+        app.close()
+
+
+@pytest.mark.parametrize(
+    ("panel_name", "state", "lower_marker"),
+    [
+        (
+            "Gateway & Platforms",
+            DashboardState(
+                gateway=GatewayState(
+                    running=True,
+                    served_profiles=["default", "dev", "coding"],
+                    served_profiles_recorded=True,
+                ),
+                migration=MigrationState(
+                    manifest_present=True,
+                    manifest_parsed=True,
+                    manifest_schema_valid=True,
+                    manifest_version=1,
+                    default_profile=MigrationProfileRecord(profile="default", served=True),
+                    secondaries=[
+                        MigrationProfileRecord(profile="dev", served=True),
+                        MigrationProfileRecord(
+                            profile="coding",
+                            home="/h/.hermes/profiles/coding",
+                            served=True,
+                        ),
+                    ],
+                    secondary_count=2,
+                    multiplex_flag_on=True,
+                    default_gateway_live=True,
+                    served_recorded=True,
+                ),
+            ),
+            "/h/.hermes/profiles/coding",
+        ),
+        (
+            "Cron",
+            DashboardState(
+                cron=CronState(job_count=1, jobs=[CronJob(job_id="job-a", name="alpha")]),
+                cron_executions=CronExecutionsState(
+                    db_present=True,
+                    retained_total_count=40,
+                    retained_terminal_count=40,
+                    retention_cap=1000,
+                    oldest_claimed_age_seconds=7200.0,
+                    newest_claimed_age_seconds=60.0,
+                    recent=[
+                        CronExecution(
+                            execution_id="e1",
+                            job_id="job-a",
+                            job_name="alpha",
+                            status="completed",
+                        )
+                    ],
+                ),
+            ),
+            "Recent Executions",
+        ),
+    ],
+)
+def test_long_gateway_and_cron_details_reach_lower_sections(
+    populated_hermes_home: Path,
+    panel_name: str,
+    state: DashboardState,
+    lower_marker: str,
+):
+    app = DashboardApp(populated_hermes_home, no_color=True)
+    try:
+        app._set_state(state)
+        app._console = Console(file=io.StringIO(), width=100, height=24, no_color=True)
+        app._view.enter_detail(_panel_num_by_name(panel_name))
+
+        with app._console.capture() as top_capture:
+            app._console.print(app._build_layout())
+        assert lower_marker not in top_capture.get()
+
+        app.handle_key("G")
+        with app._console.capture() as bottom_capture:
+            app._console.print(app._build_layout())
+        assert lower_marker in bottom_capture.get()
+        assert app._view.scroll_offset > 0
     finally:
         app.close()
 

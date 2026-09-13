@@ -105,6 +105,26 @@ def _profile_record(
     )
 
 
+def _manifest_schema_valid(manifest: JsonMapping) -> bool:
+    version = manifest.get("version")
+    if type(version) is not int or version != 1:
+        return False
+
+    default = manifest.get("default")
+    if not isinstance(default, dict) or default.get("profile") != "default":
+        return False
+
+    secondaries = manifest.get("secondaries")
+    if not isinstance(secondaries, list):
+        return False
+    return all(
+        isinstance(entry, dict)
+        and isinstance(entry.get("profile"), str)
+        and bool(entry["profile"].strip())
+        for entry in secondaries
+    )
+
+
 def _migration_state(
     manifest: JsonMapping,
     *,
@@ -137,6 +157,7 @@ def _migration_state(
     return MigrationState(
         manifest_present=True,
         manifest_parsed=True,
+        manifest_schema_valid=_manifest_schema_valid(manifest),
         manifest_version=_coerce_int(manifest.get("version")),
         migrated_at=migrated_at,
         migrated_at_age_seconds=_age_seconds(_iso_to_epoch(migrated_at), now),

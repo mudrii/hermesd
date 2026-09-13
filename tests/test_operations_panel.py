@@ -541,7 +541,7 @@ def test_operations_detail_shows_an_overdue_retention_window() -> None:
             reservations=[
                 ApiRunReservation(
                     run_id="run-overdue",
-                    status="waiting_for_approval",
+                    status="completed",
                     retention_remaining_seconds=-300.0,
                 )
             ]
@@ -551,6 +551,8 @@ def test_operations_detail_shows_an_overdue_retention_window() -> None:
 
     assert "5m overdue" in text
     assert "Past Retention" in text
+    assert "1 past retention deadline" in text
+    assert "awaiting a terminal status" not in text
 
 
 def test_operations_detail_shows_a_reservation_with_no_retention_deadline() -> None:

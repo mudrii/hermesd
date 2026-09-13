@@ -2516,10 +2516,11 @@ def test_collect_cron_stale_ticker_is_not_downgraded_by_a_recorded_error(
     assert cron.ticker_health is CronTickerHealth.STALE
 
 
-def test_cron_marker_read_failure_keeps_last_good_and_fails_the_source(
-    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("marker_name", ["catch_up_occurrences", "ticker_last_error"])
+def test_cron_marker_open_failure_keeps_last_good_and_fails_the_source(
+    hermes_home: Path, monkeypatch: pytest.MonkeyPatch, marker_name: str
 ):
-    """A marker that stops being readable fails `cron` and keeps the last good read."""
+    """A marker that fails after stat must fail `cron` and keep its last good read."""
     (hermes_home / "cron" / "catch_up_occurrences").write_text("3")
     (hermes_home / "cron" / "ticker_last_error").write_text(
         f"{_FIXED_NOW - 5}\nRuntimeError: boom\n"
@@ -2531,16 +2532,16 @@ def test_cron_marker_read_failure_keeps_last_good_and_fails_the_source(
         assert first.cron.ticker_last_error == "RuntimeError: boom"
         assert "cron" not in first.health.failed_sources
 
-        def boom(cron_dir: object, name: str, root: object) -> bool:
-            raise OSError("marker read failed")
+        blocked_path = hermes_home / "cron" / marker_name
+        blocked_path.stat()
+        real_open = Path.open
 
-        # Patch the presence probe these two readers own, not _read_text_capped:
-        # that one is shared with the ticker stamps, so patching it would prove
-        # only that a pre-existing reader fails the source. Restore by name rather
-        # than monkeypatch.undo(), which would also drop the autouse fixture that
-        # keeps this suite off the host process table.
-        real_present = cron_module._cron_marker_present
-        monkeypatch.setattr(cron_module, "_cron_marker_present", boom)
+        def fail_marker_open(self: Path, *args: object, **kwargs: object):
+            if self == blocked_path:
+                raise PermissionError("marker read failed after stat")
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", fail_marker_open)
         second = c.collect()
 
         assert "cron" in second.health.failed_sources
@@ -2548,7 +2549,7 @@ def test_cron_marker_read_failure_keeps_last_good_and_fails_the_source(
         assert second.cron.catch_up_occurrences_recorded is True
         assert second.cron.ticker_last_error == "RuntimeError: boom"
 
-        monkeypatch.setattr(cron_module, "_cron_marker_present", real_present)
+        monkeypatch.setattr(Path, "open", real_open)
         third = c.collect()
 
         assert "cron" not in third.health.failed_sources

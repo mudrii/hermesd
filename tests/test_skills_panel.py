@@ -324,11 +324,23 @@ def test_skills_detail_scroll_clamps_to_full_window():
     assert "skill-20" in text
 
 
-def test_detail_max_scroll_offset_skills_accounts_for_window():
+def test_skills_detail_can_expand_all_rows_for_app_viewport():
+    state = build_skills_state(40)
+    text = render_to_str(
+        render_panel(7, state, Theme(), detail=True, expand_skills=True),
+        width=100,
+        no_color=True,
+    )
+    assert "[1-40/40]" in text
+    assert "skill-0" in text
+    assert "skill-39" in text
+
+
+def test_detail_max_scroll_offset_skills_uses_rendered_viewport():
     from hermesd.app import _SKILLS_PANEL_NUM, _detail_max_scroll_offset
 
     state = build_skills_state(30)
-    assert _detail_max_scroll_offset(_SKILLS_PANEL_NUM, state, "", "") == 10
+    assert _detail_max_scroll_offset(_SKILLS_PANEL_NUM, state, "", "") is None
 
 
 def test_skills_detail_uses_dash_for_empty_descriptions_after_scrolling():

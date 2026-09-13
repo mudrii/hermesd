@@ -12,20 +12,22 @@ install, a portable Agent Plugin and every category plugin were invisible — an
 invisible ones were exactly the ones an operator would most want to see, because a
 category plugin is gated on its path-derived key.
 
-Two deliberate divergences are pinned here:
+One deliberate divergence is pinned here:
 
 * upstream accepts a **symlinked** ``plugin.json``; hermesd refuses every symlink,
   because its confinement helpers are what stop a plugin tree from steering a read
-  outside ``~/.hermes``;
-* upstream never reads a ``key:`` field from a manifest — the key is always the
-  manifest name (flat) or the path (category). hermesd keeps honouring an explicit
-  ``key:`` for a *flat* plugin, which is pre-existing behaviour with its own test.
+  outside ``~/.hermes``.
+
+Like upstream, hermesd always derives a plugin key from its manifest name (flat)
+or path (category) and never reads a manifest ``key:`` field.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
+
+import pytest
 
 from hermesd.collect.plugins import (
     MANIFEST_NAMES,
@@ -248,6 +250,72 @@ def test_a_portable_manifest_with_a_non_string_description_is_rejected():
 
     assert parsed is None
     assert "description" in error
+
+
+@pytest.mark.parametrize("field", ["homepage", "repository", "license"])
+def test_a_portable_manifest_rejects_non_string_link_and_license_fields(field: str):
+    parsed, error = parse_portable_manifest({"$schema": _SCHEMA, "name": "ok", field: 7})
+
+    assert parsed is None
+    assert field in error
+
+
+@pytest.mark.parametrize("keywords", ["tools", ["tools", 7], {"tools": True}, None])
+def test_a_portable_manifest_rejects_malformed_keywords(keywords: object):
+    parsed, error = parse_portable_manifest(
+        {"$schema": _SCHEMA, "name": "ok", "keywords": keywords}
+    )
+
+    assert parsed is None
+    assert "keywords" in error
+
+
+@pytest.mark.parametrize(
+    "author",
+    ["Alice", {"name": "Alice", "role": "maintainer"}, {"name": 7}, None],
+)
+def test_a_portable_manifest_rejects_malformed_author(author: object):
+    parsed, error = parse_portable_manifest({"$schema": _SCHEMA, "name": "ok", "author": author})
+
+    assert parsed is None
+    assert "author" in error
+
+
+def test_a_portable_manifest_rejects_non_object_extension_namespaces():
+    parsed, error = parse_portable_manifest(
+        {"$schema": _SCHEMA, "name": "ok", "extensions": {"tools": "invalid"}}
+    )
+
+    assert parsed is None
+    assert "extension" in error
+
+
+def test_a_non_object_extensions_field_is_ignored_like_upstream_diagnostic():
+    parsed, error = parse_portable_manifest(
+        {"$schema": _SCHEMA, "name": "ok", "extensions": "invalid"}
+    )
+
+    assert error == ""
+    assert parsed is not None
+
+
+def test_valid_portable_metadata_is_accepted_without_being_retained():
+    parsed, error = parse_portable_manifest(
+        {
+            "$schema": _SCHEMA,
+            "name": "ok",
+            "homepage": "https://example.test",
+            "repository": "https://example.test/repo",
+            "license": "MIT",
+            "keywords": ["tools", "weather"],
+            "author": {"name": "Alice", "email": "alice@example.test", "url": "https://a.test"},
+            "extensions": {"example.test/settings": {"unit": "metric"}},
+        }
+    )
+
+    assert error == ""
+    assert parsed is not None
+    assert parsed.name == "ok"
 
 
 def test_a_non_mapping_portable_manifest_is_rejected():

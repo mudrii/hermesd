@@ -178,6 +178,8 @@ class HermesDB:
         if self._allowed_root is not None and not _safe_child_path(self._path, self._allowed_root):
             raise OSError(f"Refusing to open database outside allowed root: {self._path}")
         wal_path = self._path.with_name(f"{self._path.name}-wal")
+        if wal_path.is_symlink():
+            raise OSError(f"Refusing to open database with unsafe SQLite WAL sidecar: {wal_path}")
         # _exists_strict, not Path.exists(): on Python 3.14 an unreadable -wal
         # would otherwise read as "no WAL" and silently route to immutable=1,
         # serving checkpoint-lagging data instead of failing the source.
@@ -706,8 +708,8 @@ def snapshot_wal_database(
     """Copy a WAL-mode database and its sidecars into a fresh temp dir.
 
     Returns the TemporaryDirectory (caller owns cleanup) and the snapshot db
-    path. Sidecars are copied only when they safely resolve under db_path's
-    directory.
+    path. Missing sidecars are allowed; present sidecars must resolve safely
+    under db_path's directory or the snapshot is refused.
     """
     snapshot_dir = tempfile.TemporaryDirectory(prefix=prefix)
     snapshot_root = Path(snapshot_dir.name)
@@ -716,8 +718,13 @@ def snapshot_wal_database(
         shutil.copy2(db_path, snapshot_db)
         for suffix in ("-wal", "-shm"):
             source = db_path.with_name(f"{db_path.name}{suffix}")
-            if source.exists() and _safe_child_path(source, db_path.parent):
-                shutil.copy2(source, snapshot_root / source.name)
+            if source.is_symlink():
+                raise OSError(f"Refusing to snapshot unsafe SQLite sidecar: {source}")
+            if not _exists_strict(source):
+                continue
+            if not _safe_child_path(source, db_path.parent):
+                raise OSError(f"Refusing to snapshot unsafe SQLite sidecar: {source}")
+            shutil.copy2(source, snapshot_root / source.name)
     except OSError:
         snapshot_dir.cleanup()
         raise

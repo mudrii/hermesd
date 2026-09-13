@@ -495,7 +495,7 @@ def test_gateway_detail_labels_a_served_record_that_outlived_its_writer() -> Non
 
     rendered = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
 
-    assert "Served Profiles (record, gateway not live): default, coding" in rendered
+    assert "Served Profiles (record, writer not current): default, coding" in rendered
 
 
 def test_gateway_detail_stays_quiet_without_any_served_record() -> None:
@@ -518,6 +518,7 @@ def _migration_dashboard(**overrides) -> DashboardState:
     migration = MigrationState(
         manifest_present=True,
         manifest_parsed=True,
+        manifest_schema_valid=True,
         manifest_version=1,
         migrated_at="2026-09-13T00:52:11+0200",
         migrated_at_age_seconds=10_800.0,
@@ -563,6 +564,7 @@ def test_gateway_detail_reports_a_verified_multiplex_topology() -> None:
         ({"default_gateway_live": False}, "the default gateway is not live"),
         ({"multiplex_flag_on": False}, "gateway.multiplex_profiles is off as recorded in config"),
         ({"manifest_parsed": False}, "gateway_migration.json is present but unreadable"),
+        ({"manifest_schema_valid": False}, "manifest schema is malformed or unsupported"),
     ],
 )
 def test_gateway_detail_names_the_missing_evidence(

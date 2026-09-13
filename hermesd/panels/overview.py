@@ -36,9 +36,10 @@ def render_overview(
     theme: Theme,
     detail: bool = False,
     scroll_offset: int = 0,
+    expand_skills: bool = False,
 ) -> Panel:
     if detail:
-        return _render_detail(state, theme, scroll_offset)
+        return _render_detail(state, theme, scroll_offset, expand_skills)
     return _render_compact(state, theme)
 
 
@@ -54,7 +55,15 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     # A trailing "+" marks a walk that hit its directory budget: the number is
     # what hermesd retained, not what is on disk.
     plugin_count = f"{len(sm.plugins)}+" if sm.plugin_scan_truncated else f"{len(sm.plugins)}"
-    lines.append(f"{plugin_count} plug  {len(sm.mcp_servers)} mcp\n", style=theme.banner_text)
+    desktop_count = (
+        f"{len(sm.desktop_plugins)}+"
+        if sm.desktop_plugin_scan_truncated
+        else f"{len(sm.desktop_plugins)}"
+    )
+    lines.append(
+        f"{plugin_count} plug (agent)  {desktop_count} plug (desktop)  {len(sm.mcp_servers)} mcp\n",
+        style=theme.banner_text,
+    )
     if state.mcp_cache.mcp_cached_server_count:
         lines.append("  Schema cache: ", style=theme.ui_label)
         lines.append(
@@ -78,7 +87,12 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     )
 
 
-def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> Panel:
+def _render_detail(
+    state: DashboardState,
+    theme: Theme,
+    scroll_offset: int,
+    expand_skills: bool,
+) -> Panel:
     sm = state.skills_memory
     sections: list[RenderableType] = [
         section_heading("Providers", theme, leading_blank=False),
@@ -98,6 +112,11 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
         sections.append(_plugins_table(sm, theme))
         sections.append(_plugins_note(sm, theme))
 
+    if sm.desktop_plugins or sm.desktop_plugin_scan_truncated:
+        sections.append(section_heading("Desktop Plugins", theme))
+        sections.append(_desktop_plugins_table(sm, theme))
+        sections.append(_desktop_plugins_note(sm, theme))
+
     if sm.mcp_servers:
         sections.append(section_heading("MCP Servers", theme))
         sections.append(_mcp_servers_table(sm, theme))
@@ -114,7 +133,7 @@ def _render_detail(state: DashboardState, theme: Theme, scroll_offset: int) -> P
         sections.append(boot_text)
 
     if sm.skills:
-        sections.extend(_skills_sections(sm, theme, scroll_offset))
+        sections.extend(_skills_sections(sm, theme, scroll_offset, expand_skills=expand_skills))
 
     return Panel(
         Group(*sections),
@@ -354,6 +373,32 @@ def _plugins_table(sm: SkillsMemory, theme: Theme) -> Table:
     return plugins_table
 
 
+def _desktop_plugins_table(sm: SkillsMemory, theme: Theme) -> Table:
+    plugins_table = Table(box=None, show_header=True, padding=(0, 1))
+    plugins_table.add_column("Folder", style=theme.ui_accent, min_width=16)
+    plugins_table.add_column("Entry", style=theme.banner_text)
+    for plugin in sm.desktop_plugins:
+        plugins_table.add_row(
+            escape(sanitize_terminal_text(plugin.name)),
+            "plugin.js present",
+        )
+    return plugins_table
+
+
+def _desktop_plugins_note(sm: SkillsMemory, theme: Theme) -> Text:
+    note = Text(
+        "\nInventory only: hermesd does not read or execute plugin.js and cannot observe "
+        "enabled or loaded state.\n",
+        style=theme.banner_dim,
+    )
+    if sm.desktop_plugin_scan_truncated:
+        note.append(
+            "  ⚠ desktop plugin list truncated: the directory scan hit its budget\n",
+            style=theme.banner_dim,
+        )
+    return note
+
+
 # Activation is read from config.yaml and the manifest: it says what hermes-agent
 # would do, and a plugin that clears the gate can still fail to import.
 _ACTIVATION_LABELS = {
@@ -538,13 +583,23 @@ def _skills_table(theme: Theme, visible: list[tuple[str, str, str]], offset: int
     return skills_table
 
 
-def _skills_sections(sm: SkillsMemory, theme: Theme, scroll_offset: int) -> list[RenderableType]:
+def _skills_sections(
+    sm: SkillsMemory,
+    theme: Theme,
+    scroll_offset: int,
+    *,
+    expand_skills: bool = False,
+) -> list[RenderableType]:
     rows = _skill_rows(sm)
     total = len(rows)
-    # Apply scroll — clamp both ends so the rendered page stays a full window;
-    # a negative offset would slice from the end and render nothing.
-    offset = max(0, min(scroll_offset, max(0, total - _DETAIL_VISIBLE_SKILL_ROWS)))
-    visible = rows[offset : offset + _DETAIL_VISIBLE_SKILL_ROWS]
+    if expand_skills:
+        offset = 0
+        visible = rows
+    else:
+        # Apply scroll — clamp both ends so the rendered page stays a full
+        # window; a negative offset would slice from the end and render nothing.
+        offset = max(0, min(scroll_offset, max(0, total - _DETAIL_VISIBLE_SKILL_ROWS)))
+        visible = rows[offset : offset + _DETAIL_VISIBLE_SKILL_ROWS]
     return [
         _skills_header(sm, theme, offset, len(visible), total),
         _skills_table(theme, visible, offset),

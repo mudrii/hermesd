@@ -104,6 +104,8 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             lines.append(f" {live} live", style=f"bold {theme.ui_ok}")
         if unverified:
             lines.append(f" {unverified} unverified", style=theme.ui_warn)
+        if state.active_surfaces_truncated:
+            lines.append(f"  first {len(state.active_surfaces)} retained", style=theme.banner_dim)
         # Capacity is a third number, not a restatement of either above: the
         # configured cross-process lease cap. `max_live_sessions` caps a different
         # resource (the gateway's in-memory sessions) and is never rendered here.
@@ -161,12 +163,19 @@ def _render_detail(
         sections.append(activity_table)
     surfaces = _visible_surfaces(state, sessions, filter_query)
     surfaces_table = _surfaces_table(surfaces, theme)
-    if surfaces or state.config.active_session_cap_configured:
+    if state.active_surface_count or state.config.active_session_cap_configured:
         sections.append(section_heading("Live Surfaces", theme))
         sections.append(_capacity_line(state, surfaces, theme))
         if surfaces_table is not None:
             sections.append(surfaces_table)
         sections.append(Text(f"  {_SURFACE_CAPACITY_NOTE}", style=theme.banner_dim))
+        if state.active_surfaces_truncated:
+            sections.append(
+                Text(
+                    "  Registry rows were truncated; capacity uses the full registry count.",
+                    style=theme.banner_dim,
+                )
+            )
     warnings = _compression_warnings(sessions, theme, now=state.collected_at)
     if warnings is not None:
         sections.append(section_heading("Warnings", theme))
@@ -541,9 +550,9 @@ def _visible_surfaces(
     """The leases this detail view lists.
 
     A filtered view lists only the surfaces of the sessions it shows; the
-    unfiltered view lists every surface, including ones whose session row is not
-    in the table. The capacity numbers below are computed from *this* list, so a
-    filtered view never reports registry-wide occupancy beside a filtered table.
+    unfiltered view lists every retained surface, including ones whose session
+    row is not in the table. Registry occupancy and capacity remain global to the
+    selected registry and are labelled separately from these visible rows.
     """
     if not filter_query:
         return state.active_surfaces
@@ -564,19 +573,24 @@ def _capacity_line(state: DashboardState, surfaces: list[ActiveSurface], theme: 
     ``distinct pids`` is a fourth number again: several leases can share one
     process, so occupancy is not a process count.
     """
-    executing = sum(1 for surface in surfaces if surface.liveness is ProcessLiveness.LIVE)
-    unverified = sum(1 for surface in surfaces if surface.liveness is ProcessLiveness.UNVERIFIABLE)
-    dead = sum(1 for surface in surfaces if surface.liveness is ProcessLiveness.DEAD)
-    pids = len({surface.pid for surface in surfaces if surface.pid > 0})
+    displayed = surfaces[:_DETAIL_MAX_SURFACE_ROWS]
+    executing = sum(1 for surface in displayed if surface.liveness is ProcessLiveness.LIVE)
+    unverified = sum(1 for surface in displayed if surface.liveness is ProcessLiveness.UNVERIFIABLE)
+    dead = sum(1 for surface in displayed if surface.liveness is ProcessLiveness.DEAD)
+    pids = len({surface.pid for surface in displayed if surface.pid > 0})
     line = Text()
     cap = state.config.max_concurrent_sessions
     if cap is None:
         line.append("  no active-session cap configured", style=theme.banner_dim)
     else:
-        style = f"bold {theme.ui_warn}" if len(surfaces) >= cap else theme.ui_accent
+        style = f"bold {theme.ui_warn}" if state.active_surface_count >= cap else theme.ui_accent
         line.append(f"  cap {cap} leases", style=style)
+    shown_label = f"{len(displayed)} shown"
+    if state.active_surfaces_truncated:
+        shown_label += f" from the first {len(state.active_surfaces)} retained"
     line.append(
-        f" · {len(surfaces)} registry entries · {executing} verified executing"
+        f" · {state.active_surface_count} registry entries · {shown_label}"
+        f" · {executing} verified executing"
         f" · {unverified} unverified · {dead} dead · {pids} distinct pids",
         style=theme.banner_text,
     )

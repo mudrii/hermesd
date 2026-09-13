@@ -62,3 +62,26 @@ def test_absent_wal_sidecar_still_uses_the_immutable_open(tmp_path: Path) -> Non
 
     with _connect_readonly_sqlite(db_path) as ro:
         assert ro.execute("SELECT a FROM t").fetchone()[0] == 7
+
+
+def test_dangling_wal_symlink_is_refused_before_immutable_open(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    writer = sqlite3.connect(str(db_path))
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("CREATE TABLE t (a INTEGER)")
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        writer.execute("INSERT INTO t VALUES (7)")
+        writer.commit()
+        wal_path = db_path.with_name("state.db-wal")
+        assert wal_path.exists()
+        wal_path.unlink()
+        wal_path.symlink_to(tmp_path / "missing-wal-target")
+
+        with (
+            pytest.raises(OSError, match="unsafe SQLite WAL sidecar"),
+            _connect_readonly_sqlite(db_path) as ro,
+        ):
+            ro.execute("SELECT COUNT(*) FROM t").fetchone()
+    finally:
+        writer.close()

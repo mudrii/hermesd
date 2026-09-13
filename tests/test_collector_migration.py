@@ -26,12 +26,16 @@ from hermesd.collect.migration import (
 )
 from hermesd.collector import Collector
 from hermesd.models import GatewayState, MigrationState, MigrationVerificationGap
+from hermesd.panels import render_panel
+from hermesd.theme import Theme
+from tests.conftest import render_to_str
 
 NOW = 1_800_000_000.0
 # The only local-time, uncolonned-offset stamp hermesd reads: upstream builds it
 # with time.strftime("%Y-%m-%dT%H:%M:%S%z") (gateway_migrate.py:529).
 MIGRATED_AT = "2026-09-13T00:52:11+0200"
 MIGRATED_AT_EPOCH = 1_789_253_531.0
+_MISSING = object()
 
 
 def _clock() -> float:
@@ -46,12 +50,20 @@ def _collect(home: Path, *, live_pid: int = 4242):
         collector.close()
 
 
-def _write_gateway_state(home: Path, *, served: object = None, running: bool = True) -> None:
+def _write_gateway_state(
+    home: Path,
+    *,
+    served: object = None,
+    running: bool = True,
+    pid: object = 4242,
+    platforms: object = None,
+) -> None:
     payload: dict[str, object] = {
-        "pid": 4242,
         "gateway_state": "running" if running else "stopped",
-        "platforms": {},
+        "platforms": {} if platforms is None else platforms,
     }
+    if pid is not _MISSING:
+        payload["pid"] = pid
     if served is not None:
         payload["served_profiles"] = served
     (home / "gateway_state.json").write_text(json.dumps(payload))
@@ -135,6 +147,7 @@ def test_a_live_multiplexer_matching_the_manifest_is_verified(hermes_home: Path)
     assert migration.migration_verified is True
     assert migration.verification_gap is MigrationVerificationGap.NONE
     assert migration.manifest_parsed is True
+    assert migration.manifest_schema_valid is True
     assert migration.multiplex_flag_on is True
     assert migration.default_gateway_live is True
     assert migration.served_recorded is True
@@ -282,6 +295,203 @@ def test_an_unfinished_update_receipt_does_not_decide_the_migration_verdict(
     assert state.migration.migration_verified is True
 
 
+def test_migration_waits_for_a_fresh_gateway_source_then_recovers(hermes_home: Path):
+    """A newly written manifest cannot verify against the gateway source's fallback."""
+    _write_gateway_state(hermes_home, served=["default", "dev", "coding"])
+    _write_config(hermes_home)
+    collector = Collector(hermes_home, pid_exists=lambda pid: pid == 4242, clock=_clock)
+    try:
+        before_manifest = collector.collect()
+        assert before_manifest.migration.migration_verified is False
+
+        (hermes_home / "gateway_state.json").write_text("{broken")
+        _write_manifest(hermes_home)
+        stale = collector.collect()
+
+        assert stale.gateway.served_profiles_recorded is True
+        assert stale.migration.manifest_present is False
+        assert stale.migration.migration_verified is False
+        assert {"gateway", "migration"} <= set(stale.health.failed_sources)
+
+        _write_gateway_state(hermes_home, served=["default", "dev", "coding"])
+        recovered = collector.collect()
+    finally:
+        collector.close()
+
+    assert recovered.migration.manifest_present is True
+    assert recovered.migration.migration_verified is True
+    assert "gateway" not in recovered.health.failed_sources
+    assert "migration" not in recovered.health.failed_sources
+
+
+def test_gateway_dependency_failure_preserves_a_prior_verified_migration(
+    hermes_home: Path,
+):
+    _multiplexed(hermes_home)
+    collector = Collector(hermes_home, pid_exists=lambda pid: pid == 4242, clock=_clock)
+    try:
+        verified = collector.collect()
+        assert verified.migration.migration_verified is True
+
+        (hermes_home / "gateway_state.json").write_text("{broken")
+        stale = collector.collect()
+    finally:
+        collector.close()
+
+    assert stale.migration == verified.migration
+    assert stale.migration.migration_verified is True
+    assert {"gateway", "migration"} <= set(stale.health.failed_sources)
+
+
+def test_an_unrelated_gateway_enrichment_failure_does_not_block_migration(
+    hermes_home: Path,
+):
+    _multiplexed(hermes_home)
+    heartbeat = hermes_home / "state" / "gateway.heartbeat"
+    heartbeat.parent.mkdir()
+    heartbeat.write_text(json.dumps({"updated_at": "2026-09-13T00:00:00+00:00"}))
+    collector = Collector(hermes_home, pid_exists=lambda pid: pid == 4242, clock=_clock)
+    try:
+        assert collector.collect().migration.migration_verified is True
+        heartbeat.write_text("{broken")
+        state = collector.collect()
+    finally:
+        collector.close()
+
+    assert state.migration.migration_verified is True
+    assert "gateway_heartbeat" in state.health.failed_sources
+    assert "migration" not in state.health.failed_sources
+
+
+def test_a_live_replacement_does_not_authorize_the_previous_writers_topology(
+    hermes_home: Path,
+):
+    ingress_url = "https://gw.example/p/dev/telegram/webhook"
+    _write_config(hermes_home)
+    _write_manifest(hermes_home)
+    _write_gateway_state(
+        hermes_home,
+        served=["default", "dev", "coding"],
+        pid=4242,
+        platforms={
+            "dev:telegram": {
+                "state": "connected",
+                "updated_at": "",
+                "ingress_url": ingress_url,
+            }
+        },
+    )
+    collector = Collector(hermes_home, pid_exists=lambda pid: pid == 9999, clock=_clock)
+    try:
+        collector._find_gateway_launchd_pid = lambda: 9999
+        state = collector.collect()
+    finally:
+        collector.close()
+
+    assert state.gateway.running is True
+    assert state.gateway.pid == 9999
+    assert state.gateway.served_profiles == ["default", "dev", "coding"]
+    assert state.gateway.served_profiles_recorded is False
+    assert state.gateway.platforms[0].ingress_url == ""
+    assert ingress_url not in json.dumps(state.model_dump(mode="json"))
+    assert state.migration.default_gateway_live is True
+    assert state.migration.served_recorded is False
+    assert state.migration.migration_verified is False
+    assert state.migration.verification_gap is MigrationVerificationGap.SERVED_NOT_RECORDED
+    assert not state.health.failed_sources
+    rendered = render_to_str(render_panel(1, state, Theme(), detail=True), width=200, no_color=True)
+    assert "Served Profiles (record, writer not current): default, dev, coding" in rendered
+    assert ingress_url not in rendered
+
+
+@pytest.mark.parametrize("recorded_pid", [_MISSING, 0], ids=["missing", "zero"])
+def test_a_live_fallback_without_a_matching_recorded_pid_cannot_authorize_topology(
+    hermes_home: Path,
+    recorded_pid: object,
+):
+    _write_config(hermes_home)
+    _write_manifest(hermes_home)
+    _write_gateway_state(
+        hermes_home,
+        served=["default", "dev", "coding"],
+        pid=recorded_pid,
+    )
+    collector = Collector(hermes_home, pid_exists=lambda pid: pid == 9999, clock=_clock)
+    try:
+        collector._find_gateway_launchd_pid = lambda: 9999
+        state = collector.collect()
+    finally:
+        collector.close()
+
+    assert state.gateway.running is True
+    assert state.gateway.pid == 9999
+    assert state.gateway.served_profiles_recorded is False
+    assert state.migration.migration_verified is False
+
+
+def test_a_same_pid_fallback_cannot_authorize_the_recorded_topology(hermes_home: Path):
+    """A dead-then-live numeric PID may be reuse, not the recorded writer returning."""
+    _write_config(hermes_home)
+    _write_manifest(hermes_home)
+    _write_gateway_state(
+        hermes_home,
+        served=["default", "dev", "coding"],
+        platforms={
+            "dev:telegram": {
+                "state": "connected",
+                "ingress_url": "https://gw.example/p/dev/telegram/webhook",
+            }
+        },
+    )
+    collector = Collector(hermes_home, pid_exists=lambda _pid: False, clock=_clock)
+    try:
+        collector._find_gateway_launchd_pid = lambda: 4242
+        state = collector.collect()
+    finally:
+        collector.close()
+
+    assert state.gateway.running is True
+    assert state.gateway.pid == 4242
+    assert state.gateway.served_profiles_recorded is False
+    assert state.gateway.platforms[0].ingress_url == ""
+    assert state.migration.migration_verified is False
+
+
+def test_an_invalidated_writer_stays_non_authoritative_until_the_state_is_rewritten(
+    hermes_home: Path,
+):
+    _multiplexed(hermes_home)
+    probe_count = 0
+
+    def pid_exists(_pid: int) -> bool:
+        nonlocal probe_count
+        probe_count += 1
+        return probe_count > 1
+
+    collector = Collector(hermes_home, pid_exists=pid_exists, clock=_clock)
+    try:
+        collector._find_gateway_launchd_pid = lambda: 4242
+        first = collector.collect()
+        second = collector.collect()
+
+        _write_gateway_state(
+            hermes_home,
+            served=["default", "dev", "coding"],
+            platforms={"telegram": {"state": "connected"}},
+        )
+        rewritten = collector.collect()
+    finally:
+        collector.close()
+
+    assert first.gateway.running is True
+    assert first.gateway.served_profiles_recorded is False
+    assert first.migration.migration_verified is False
+    assert second.gateway.served_profiles_recorded is False
+    assert second.migration.migration_verified is False
+    assert rewritten.gateway.served_profiles_recorded is True
+    assert rewritten.migration.migration_verified is True
+
+
 # --------------------------------------------------------------------------
 # B. recorded intent, kept separate from progress and from the verdict
 # --------------------------------------------------------------------------
@@ -336,9 +546,76 @@ def test_a_missing_version_or_stamp_degrades_to_defaults(hermes_home: Path):
     migration = _collect(hermes_home).migration
 
     assert migration.manifest_parsed is True
+    assert migration.manifest_schema_valid is False
     assert migration.manifest_version == 0
     assert migration.migrated_at == ""
     assert migration.migrated_at_age_seconds is None
+    assert migration.migration_verified is False
+    assert migration.verification_gap is MigrationVerificationGap.MANIFEST_INVALID
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {"anything": True},
+        _manifest(version=2),
+        _manifest(version=True),
+        _manifest(default=None),
+        _manifest(default={"profile": ""}),
+        _manifest(default={"profile": "other"}),
+        _manifest(secondaries="bad"),
+        _manifest(secondaries=["dev"]),
+        _manifest(secondaries=[{"profile": ""}]),
+        _manifest(secondaries=[{"profile": 7}]),
+    ],
+    ids=[
+        "arbitrary-mapping",
+        "unsupported-version",
+        "boolean-version",
+        "missing-default-record",
+        "blank-default-profile",
+        "wrong-default-profile",
+        "wrong-secondaries-shape",
+        "non-record-secondary",
+        "blank-secondary-profile",
+        "non-string-secondary-profile",
+    ],
+)
+def test_malformed_or_unsupported_manifest_never_verifies(manifest: dict[str, object]):
+    migration = _migration_state(
+        manifest,
+        now=NOW,
+        cfg={"multiplex_profiles": True},
+        gateway=GatewayState(
+            running=True,
+            served_profiles=["default", "dev", "coding"],
+            served_profiles_recorded=True,
+        ),
+    )
+
+    assert migration.manifest_present is True
+    assert migration.manifest_parsed is True
+    assert migration.manifest_schema_valid is False
+    assert migration.migration_verified is False
+    assert migration.verification_gap is MigrationVerificationGap.MANIFEST_INVALID
+
+
+def test_unsupported_manifest_keeps_recorded_intent_without_verifying():
+    migration = _migration_state(
+        _manifest(version=2),
+        now=NOW,
+        cfg={"multiplex_profiles": True},
+        gateway=GatewayState(
+            running=True,
+            served_profiles=["default", "dev", "coding"],
+            served_profiles_recorded=True,
+        ),
+    )
+
+    assert migration.manifest_version == 2
+    assert migration.default_profile.profile == "default"
+    assert [record.profile for record in migration.secondaries] == ["dev", "coding"]
+    assert migration.migration_verified is False
 
 
 def test_garbage_secondary_entries_are_never_counted_as_covered(hermes_home: Path):
@@ -348,8 +625,9 @@ def test_garbage_secondary_entries_are_never_counted_as_covered(hermes_home: Pat
     migration = _collect(hermes_home).migration
 
     assert migration.secondary_count == 3
+    assert migration.manifest_schema_valid is False
     assert migration.migration_verified is False
-    assert migration.verification_gap is MigrationVerificationGap.PROFILES_UNSERVED
+    assert migration.verification_gap is MigrationVerificationGap.MANIFEST_INVALID
 
 
 def test_secondaries_past_the_retained_limit_cannot_verify(hermes_home: Path):
@@ -638,6 +916,7 @@ def test_the_verdict_needs_every_clause():
 
     refutations = {
         "manifest": verified.model_copy(update={"manifest_parsed": False}),
+        "manifest schema": verified.model_copy(update={"manifest_schema_valid": False}),
         "flag": verified.model_copy(update={"multiplex_flag_on": False}),
         "liveness": verified.model_copy(update={"default_gateway_live": False}),
         "served record": verified.model_copy(update={"served_recorded": False}),

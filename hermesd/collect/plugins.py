@@ -33,6 +33,9 @@ _LEGACY_RELAY_PLUGIN_KEYS = frozenset({"nemo_relay", "observability/nemo_relay"}
 # scans for provider markers.
 PLUGIN_KIND_STANDALONE = "standalone"
 _KIND_SOURCE_SCAN_CHARS = 8192
+_VALID_PLUGIN_KINDS = frozenset(
+    {PLUGIN_KIND_STANDALONE, "backend", "exclusive", "platform", "model-provider"}
+)
 
 # One level of category recursion. Depth 0 is the flat ``<root>/<name>/`` shape,
 # depth 1 is ``<root>/<cat>/<name>/``; a manifest-less directory at depth 1 is
@@ -132,7 +135,12 @@ def detect_kind_from_source(source_text: str) -> str:
     return PLUGIN_KIND_STANDALONE
 
 
-def resolve_plugin_kind(declared: object, init_source: str) -> str:
+def resolve_plugin_kind(
+    declared: object,
+    init_source: str,
+    *,
+    declared_present: bool = True,
+) -> str:
     """Normalize a manifest ``kind``, auto-detecting only when it is undeclared.
 
     Most real manifests — including every bundled memory provider — omit ``kind``
@@ -140,8 +148,9 @@ def resolve_plugin_kind(declared: object, init_source: str) -> str:
     discovery. ``init_source`` is that text ("" when there is no ``__init__.py``),
     so hermesd matches the routing without importing anything.
     """
-    if isinstance(declared, str) and declared.strip():
-        return declared.strip().lower()
+    if declared_present:
+        kind = declared.strip().lower() if isinstance(declared, str) else PLUGIN_KIND_STANDALONE
+        return kind if kind in _VALID_PLUGIN_KINDS else PLUGIN_KIND_STANDALONE
     if init_source:
         return detect_kind_from_source(init_source[:_KIND_SOURCE_SCAN_CHARS])
     return PLUGIN_KIND_STANDALONE
@@ -228,8 +237,10 @@ def plugin_key(*, prefix: str, dirname: str, name: str) -> str:
 def parse_portable_manifest(data: object) -> tuple[PortableManifest | None, str]:
     """Validate a ``plugin.json`` mapping: ``(manifest, "")`` or ``(None, reason)``.
 
-    Mirrors ``agent_plugins._validate_manifest`` (``:87-118``) for the fields
-    hermesd displays. Upstream raises ``AgentPluginError`` and logs a warning;
+    Mirrors every load-blocking check in ``agent_plugins._validate_manifest``
+    (``:87-118``), while retaining only the three fields upstream carries into
+    ``PluginManifest``. A non-object ``extensions`` value is diagnostic-only
+    upstream and remains non-fatal here. Upstream raises ``AgentPluginError``;
     hermesd returns the reason so the caller can report
     :attr:`PluginActivation.UNKNOWN` — a portable manifest that does not parse is
     still a plugin directory, and dropping it silently would hide the only
@@ -246,9 +257,23 @@ def parse_portable_manifest(data: object) -> tuple[PortableManifest | None, str]
         or _PORTABLE_NAME_PATTERN.fullmatch(name) is None
     ):
         return None, "plugin.json name does not satisfy the v1 constraints"
-    for field in ("version", "description"):
+    for field in ("version", "description", "homepage", "repository", "license"):
         if field in data and not isinstance(data[field], str):
             return None, f"plugin.json {field} must be a string"
+    keywords = data.get("keywords", [])
+    if not isinstance(keywords, list) or not all(isinstance(value, str) for value in keywords):
+        return None, "plugin.json keywords must be an array of strings"
+    author = data.get("author", {})
+    if not isinstance(author, dict):
+        return None, "plugin.json author must be an object"
+    author_fields = {"name", "email", "url"}
+    if set(author) - author_fields or not all(isinstance(value, str) for value in author.values()):
+        return None, "plugin.json author may contain only string name, email, and url fields"
+    extensions = data.get("extensions", {})
+    if isinstance(extensions, dict) and any(
+        not isinstance(value, dict) for value in extensions.values()
+    ):
+        return None, "plugin.json extension namespace values must be objects"
     return PortableManifest(
         name=name,
         version=str(data.get("version") or ""),

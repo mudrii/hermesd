@@ -135,6 +135,7 @@ check_untyped_defs = false
 include = [
     "hermesd/",
     "tests/",
+    ".codex/rules/source-ownership.md",
     ".github/",
     "CHANGELOG.md",
     "CONTRIBUTING.md",

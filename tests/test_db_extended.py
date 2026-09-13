@@ -688,22 +688,107 @@ def test_wal_sidecar_probe_uses_exists_strict(tmp_path: Path, monkeypatch):
     assert wal_path in probed
 
 
-def test_wal_snapshot_ignores_symlinked_sidecars_outside_home(tmp_path: Path):
-    db_path = tmp_path / "state.db"
-    conn = sqlite3.connect(str(db_path))
-    create_state_db_tables(conn, include_schema_version=False)
-    conn.execute("INSERT INTO sessions (id, source, started_at) VALUES ('sess_safe', 'cli', 1.0)")
-    conn.commit()
-    conn.close()
-    outside_wal = tmp_path / "outside-wal-dir"
-    outside_wal.mkdir()
-    db_path.with_name("state.db-wal").symlink_to(outside_wal)
+@pytest.mark.parametrize("dangling", [False, True])
+def test_wal_snapshot_refusal_keeps_last_good_sessions(tmp_path: Path, dangling: bool):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source_db = source_dir / "state.db"
+    writer = sqlite3.connect(str(source_db))
+    writer.execute("PRAGMA journal_mode=WAL")
+    create_state_db_tables(writer, include_schema_version=False)
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    writer.execute("INSERT INTO sessions (id, source, started_at) VALUES ('sess_wal', 'cli', 1.0)")
+    writer.commit()
 
-    db = HermesDB(db_path)
+    db_path = tmp_path / "state.db"
+    wal_path = db_path.with_name("state.db-wal")
+    shutil.copy2(source_db, db_path)
+    shutil.copy2(source_db.with_name("state.db-wal"), wal_path)
+
+    db = HermesDB(db_path, allowed_root=tmp_path)
     try:
-        assert [row["id"] for row in db.read_sessions()] == ["sess_safe"]
+        assert [row["id"] for row in db.read_sessions()] == ["sess_wal"]
+        assert db.last_read_sessions_stale is False
+
+        outside_wal = tmp_path.parent / f"{tmp_path.name}-outside-wal"
+        if not dangling:
+            shutil.copy2(wal_path, outside_wal)
+        wal_path.unlink()
+        wal_path.symlink_to(outside_wal)
+        db._connect()
+
+        assert [row["id"] for row in db.read_sessions()] == ["sess_wal"]
+        assert db.last_read_sessions_stale is True
+        assert db._snapshot_dir is None
     finally:
         db.close()
+        writer.close()
+
+
+@pytest.mark.parametrize("dangling", [False, True])
+@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+def test_wal_snapshot_refuses_unsafe_sidecars_and_cleans_temp_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str, dangling: bool
+):
+    db_path = tmp_path / "state.db"
+    db_path.write_bytes(b"database")
+    db_path.with_name("state.db-wal").write_bytes(b"wal")
+    outside = tmp_path.parent / f"{tmp_path.name}{suffix}"
+    if not dangling:
+        outside.write_bytes(b"outside")
+    unsafe_sidecar = db_path.with_name(f"state.db{suffix}")
+    if unsafe_sidecar.exists():
+        unsafe_sidecar.unlink()
+    unsafe_sidecar.symlink_to(outside)
+    created = []
+    real_temporary_directory = db_module.tempfile.TemporaryDirectory
+
+    def tracking_temporary_directory(*args: object, **kwargs: object):
+        directory = real_temporary_directory(*args, **kwargs)
+        created.append(directory)
+        return directory
+
+    monkeypatch.setattr(db_module.tempfile, "TemporaryDirectory", tracking_temporary_directory)
+
+    with pytest.raises(OSError, match="unsafe SQLite sidecar"):
+        db_module.snapshot_wal_database(db_path, prefix="hermesd-test-")
+
+    assert len(created) == 1
+    assert not Path(created[0].name).exists()
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+def test_wal_snapshot_propagates_sidecar_probe_failures_and_cleans_temp_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str
+):
+    db_path = tmp_path / "state.db"
+    db_path.write_bytes(b"database")
+    db_path.with_name("state.db-wal").write_bytes(b"wal")
+    denied_sidecar = db_path.with_name(f"state.db{suffix}")
+    if suffix == "-shm":
+        denied_sidecar.write_bytes(b"shm")
+    created = []
+    real_temporary_directory = db_module.tempfile.TemporaryDirectory
+    real_exists_strict = db_module._exists_strict
+
+    def tracking_temporary_directory(*args: object, **kwargs: object):
+        directory = real_temporary_directory(*args, **kwargs)
+        created.append(directory)
+        return directory
+
+    def denied_probe(path: Path) -> bool:
+        if path == denied_sidecar:
+            raise PermissionError("sidecar temporarily unreadable")
+        return real_exists_strict(path)
+
+    monkeypatch.setattr(db_module.tempfile, "TemporaryDirectory", tracking_temporary_directory)
+    monkeypatch.setattr(db_module, "_exists_strict", denied_probe)
+
+    with pytest.raises(PermissionError, match="temporarily unreadable"):
+        db_module.snapshot_wal_database(db_path, prefix="hermesd-test-")
+
+    assert len(created) == 1
+    assert not Path(created[0].name).exists()
 
 
 def test_read_only_uri_handles_uri_metacharacters(tmp_path: Path):

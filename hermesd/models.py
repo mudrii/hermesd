@@ -225,6 +225,7 @@ class MigrationVerificationGap(StrEnum):
     NONE = ""
     NO_MANIFEST = "no_manifest"
     MANIFEST_UNREADABLE = "manifest_unreadable"
+    MANIFEST_INVALID = "manifest_invalid"
     FLAG_OFF = "flag_off"
     GATEWAY_NOT_LIVE = "gateway_not_live"
     SERVED_NOT_RECORDED = "served_not_recorded"
@@ -294,6 +295,9 @@ class MigrationState(BaseModel):
     # A present manifest hermesd could not parse: upstream writes it with a plain
     # write_text, so a torn file is observable mid-write. Distinct from absent.
     manifest_parsed: bool = False
+    # Parsed JSON can still be an unsupported or malformed migration schema.
+    # Its intent remains displayable, but it cannot license a verified verdict.
+    manifest_schema_valid: bool = False
     manifest_version: int = 0
     migrated_at: str = ""
     migrated_at_age_seconds: float | None = None
@@ -311,7 +315,11 @@ class MigrationState(BaseModel):
     @property
     def flag_flipped(self) -> bool:
         """Progress, not success: the config now differs from the recorded prior value."""
-        return self.manifest_parsed and self.multiplex_flag_on != self.flag_was
+        return (
+            self.manifest_parsed
+            and self.manifest_schema_valid
+            and self.multiplex_flag_on != self.flag_was
+        )
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -334,6 +342,8 @@ class MigrationState(BaseModel):
             return MigrationVerificationGap.NO_MANIFEST
         if not self.manifest_parsed:
             return MigrationVerificationGap.MANIFEST_UNREADABLE
+        if not self.manifest_schema_valid:
+            return MigrationVerificationGap.MANIFEST_INVALID
         if not self.multiplex_flag_on:
             return MigrationVerificationGap.FLAG_OFF
         if not self.default_gateway_live:
@@ -1077,6 +1087,12 @@ class MCPServerInfo(BaseModel):
     tool_filter: str = ""
 
 
+class DesktopPluginInfo(BaseModel):
+    """One app-level Desktop plugin folder with a regular ``plugin.js`` entry."""
+
+    name: str
+
+
 class SkillsMemory(BaseModel):
     skill_count: int = 0
     skill_categories: int = 0
@@ -1089,6 +1105,8 @@ class SkillsMemory(BaseModel):
     # therefore a capped list, and this says when the cap cut it short — a
     # truncated scan must never read as a complete inventory.
     plugin_scan_truncated: bool = False
+    desktop_plugins: list[DesktopPluginInfo] = Field(default_factory=list)
+    desktop_plugin_scan_truncated: bool = False
     mcp_servers: list[MCPServerInfo] = Field(default_factory=list)
     boot_md_present: bool = False
     boot_md_mtime: float | None = None
@@ -1830,8 +1848,8 @@ class ApiRunReservationsState(BaseModel):
     reservations_truncated: bool = False
     acknowledged_count: int = 0
     owner_recorded_count: int = 0
-    # Rows already past ``retention_until`` that are still here because their
-    # status is not terminal — direct evidence for the caveat above.
+    # Rows already past ``retention_until`` that remain until an opportunistic
+    # request-triggered pruning pass.
     retention_expired_count: int = 0
     # Age of the most recently *updated* row, and of the oldest *created* one.
     newest_age_seconds: float | None = None
@@ -1960,6 +1978,7 @@ class DashboardState(BaseModel):
     sessions: list[SessionInfo] = Field(default_factory=list)
     active_surfaces: list[ActiveSurface] = Field(default_factory=list)
     active_surface_count: int = 0
+    active_surfaces_truncated: bool = False
     session_message_match_query: str = ""
     session_message_match_ids: set[str] = Field(default_factory=set)
     tokens_today: TokenSummary = Field(default_factory=TokenSummary)

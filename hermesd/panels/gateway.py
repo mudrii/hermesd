@@ -264,7 +264,7 @@ def _append_served_profiles(header: Text, gw: GatewayState, theme: Theme) -> Non
         )
         return
     if gw.served_profiles:
-        header.append("\n  Served Profiles (record, gateway not live): ", style=theme.ui_warn)
+        header.append("\n  Served Profiles (record, writer not current): ", style=theme.ui_warn)
         header.append(escape(", ".join(gw.served_profiles)), style=theme.banner_dim)
 
 
@@ -471,6 +471,8 @@ def _migration_gap_sentence(mig: MigrationState) -> str:
     gap = mig.verification_gap
     if gap is MigrationVerificationGap.MANIFEST_UNREADABLE:
         return "gateway_migration.json is present but unreadable"
+    if gap is MigrationVerificationGap.MANIFEST_INVALID:
+        return "the manifest schema is malformed or unsupported"
     if gap is MigrationVerificationGap.FLAG_OFF:
         return "gateway.multiplex_profiles is off as recorded in config"
     if gap is MigrationVerificationGap.GATEWAY_NOT_LIVE:

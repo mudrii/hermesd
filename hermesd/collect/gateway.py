@@ -146,27 +146,33 @@ def _split_platform_key(key: str) -> tuple[str, str]:
     return profile, platform
 
 
-def _recorded_ingress_url(info: dict[str, Any], *, state: str, running: bool) -> str:
+def _recorded_ingress_url(info: dict[str, Any], *, state: str, record_current: bool) -> str:
     """The entry's ingress URL, or ``""`` wherever upstream would suppress it.
 
     Mirrors ``served_profile_ingress_urls`` (``hermes_cli/gateway_multiplex_served.py:46-70``):
-    nothing is surfaced when the default gateway pid is not live (``running`` here,
-    which the collector resolves from the recorded pid plus ``gateway.pid``), when
-    the recorded URL is falsy, or when the adapter state is fatal, disconnected or
-    stopped. ``hermes_cli/web_routers/messaging.py:263`` applies the same liveness
-    rule to plain platform keys, which is why this is not restricted to namespaced
-    ones. The value is redacted *here*, at the data boundary: an ingress URL is
-    exactly the shape that carries userinfo or a secret query parameter, and a
-    panel must never be the first thing to see it.
+    nothing is surfaced unless the process that wrote ``gateway_state.json`` is
+    still live (``record_current`` here); a falsy recorded URL or a fatal,
+    disconnected or stopped adapter is also suppressed. A different live
+    ``gateway.pid`` proves a replacement process is running but cannot authorize
+    its predecessor's URL. ``hermes_cli/web_routers/messaging.py:263`` applies the
+    same liveness rule to plain platform keys, which is why this is not restricted
+    to namespaced ones. The value is redacted *here*, at the data boundary: an
+    ingress URL is exactly the shape that carries userinfo or a secret query
+    parameter, and a panel must never be the first thing to see it.
     """
-    if not running or state in _INGRESS_SUPPRESSED_STATES:
+    if not record_current or state in _INGRESS_SUPPRESSED_STATES:
         return ""
     url = str(info.get("ingress_url") or "")
     return _redact_secret_url(url) if url else ""
 
 
 def _platform_status(
-    key: str, info: dict[str, Any], now: float, writer: _RecordWriter, *, running: bool
+    key: str,
+    info: dict[str, Any],
+    now: float,
+    writer: _RecordWriter,
+    *,
+    record_current: bool,
 ) -> PlatformStatus:
     profile, name = _split_platform_key(key)
     state = str(info.get("state") or "unknown")
@@ -174,7 +180,7 @@ def _platform_status(
     return PlatformStatus(
         name=name,
         profile=profile,
-        ingress_url=_recorded_ingress_url(info, state=state, running=running),
+        ingress_url=_recorded_ingress_url(info, state=state, record_current=record_current),
         state=state,
         updated_at=str(info.get("updated_at") or ""),
         error_code=str(info.get("error_code") or ""),
