@@ -2189,6 +2189,8 @@ def test_terminal_breadcrumb_scan_is_bounded_and_flags_truncation(hermes_home: P
     [
         (True, True),
         (1, True),
+        (1.0, True),
+        (0.0, False),
         ("1", True),
         ("true", True),
         ("on", True),

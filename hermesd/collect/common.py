@@ -223,14 +223,14 @@ def _coerce_bool(value: object) -> bool:
 
     ``bool("false")`` is True, so a corrupted or foreign payload could flip a
     warning on with a stringified flag. Only the shapes the writers actually
-    produce count as truth: JSON ``true``, SQLite ``1``, and the ``"1"`` /
+    produce count as truth: JSON ``true``, SQLite ``1`` (or a float), and the ``"1"`` /
     ``"true"`` / ``"yes"`` / ``"on"`` spellings upstream itself accepts
     (``gateway/scale_to_zero.py:38``). Everything else — including ``"false"``,
     ``"0"``, ``None`` and junk — is False.
     """
     if isinstance(value, bool):
         return value
-    if isinstance(value, int):
+    if isinstance(value, int | float):
         return value != 0
     if isinstance(value, str):
         return value.strip().lower() in _TRUTHY_STATE_VALUES
