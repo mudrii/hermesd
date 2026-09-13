@@ -2330,3 +2330,178 @@ def test_discovered_repos_read_error_fails_source_and_keeps_last_good(
         assert [r.root for r in third.operations.discovered_repos] == ["/repo/hermesd"]
     finally:
         c.close()
+
+
+# --- live delegation manifests (item 12) ------------------------------------
+
+
+def _write_live_delegation(
+    live: Path,
+    delegation_id: str,
+    manifest: dict[str, object],
+    *,
+    logs: dict[str, str] | None = None,
+) -> Path:
+    run_dir = live / delegation_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "manifest.json").write_text(json.dumps(manifest))
+    for name, content in (logs or {}).items():
+        (run_dir / name).write_text(content)
+    return run_dir
+
+
+def _sample_manifest(**overrides: object) -> dict[str, object]:
+    manifest: dict[str, object] = {
+        "delegation_id": "deleg_live01",
+        "started": "2026-07-10 10:00:00",
+        "task_count": 2,
+        "model": "Hermes-4.5",
+        "provider": "nous",
+        "tasks": [
+            {"index": 0, "goal": "crawl the docs", "status": "completed", "log": "x"},
+            {
+                "index": 1,
+                "goal": "summarize",
+                "status": "max_iterations",
+                "exit_reason": "max_iterations",
+                "log": "y",
+            },
+        ],
+    }
+    manifest.update(overrides)
+    return manifest
+
+
+def test_delegation_live_manifests_are_parsed(hermes_home: Path, sample_db: Path):
+    live = hermes_home / "cache" / "delegation" / "live"
+    _write_live_delegation(
+        live,
+        "deleg_live01",
+        _sample_manifest(),
+        logs={"task-0.log": "line one\n", "task-1.log": "12:00:00 assistant | working\n"},
+    )
+    c = Collector(hermes_home, clock=_fixed_clock)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+    ops = state.operations
+
+    assert "delegation_live" not in state.health.failed_sources
+    assert ops.delegation_live_manifest_count == 1
+    assert len(ops.delegation_live_manifests) == 1
+    manifest = ops.delegation_live_manifests[0]
+    assert manifest.delegation_id == "deleg_live01"
+    assert manifest.model == "Hermes-4.5"
+    assert manifest.provider == "nous"
+    assert manifest.task_count == 2
+    assert manifest.manifest_present is True
+    assert manifest.started == "2026-07-10 10:00:00"
+    assert manifest.dir_age_seconds is not None
+    assert [task.status for task in manifest.tasks] == ["completed", "max_iterations"]
+    assert manifest.tasks[1].exit_reason == "max_iterations"
+    assert manifest.running_task_count == 0
+    # The task-0 tail was read; the manifest's opaque "log" path is not carried.
+    assert manifest.tasks[0].log_name == "task-0.log"
+    assert manifest.tasks[0].log_tail == ["line one"]
+    assert manifest.tasks[1].log_name == "task-1.log"
+    assert manifest.tasks[1].log_tail == ["12:00:00 assistant | working"]
+
+
+def test_delegation_live_manifest_absent_dirs_and_files_are_healthy(
+    hermes_home: Path, sample_db: Path
+):
+    live = hermes_home / "cache" / "delegation" / "live"
+    live.mkdir(parents=True)
+    (live / "deleg_nomanifest").mkdir()  # dir without a manifest: not counted
+
+    ops = _collect_ops(hermes_home).operations
+    assert ops.delegation_live_manifest_count == 0
+    assert ops.delegation_live_manifests == []
+
+
+def test_delegation_live_manifest_junk_json_is_healthy(hermes_home: Path, sample_db: Path):
+    """A torn manifest still marks a live delegation dir (presence count) but
+    yields no card; it must never fail the source."""
+    live = hermes_home / "cache" / "delegation" / "live"
+    run_dir = live / "deleg_junk"
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text("{not json")
+
+    ops = _collect_ops(hermes_home).operations
+    assert ops.delegation_live_manifest_count == 1
+    assert ops.delegation_live_manifests == []
+
+
+def test_delegation_live_manifest_dir_absent_is_healthy(hermes_home: Path, sample_db: Path):
+    ops = _collect_ops(hermes_home).operations
+    assert ops.delegation_live_manifest_count == 0
+    assert ops.delegation_live_manifests == []
+
+
+def test_delegation_live_log_tail_is_redacted_and_clipped(hermes_home: Path, sample_db: Path):
+    live = hermes_home / "cache" / "delegation" / "live"
+    tail = "\n".join(f"12:00:0{i} assistant | line {i}" for i in range(6))
+    _write_live_delegation(
+        live,
+        "deleg_secret",
+        _sample_manifest(delegation_id="deleg_secret"),
+        logs={
+            "task-0.log": (
+                tail + "\n"
+                "12:00:06 assistant | export API_TOKEN=sk-super-secret-123\n"
+                "12:09:99 assistant | [bold]styled[/bold] output\n"
+            )
+        },
+    )
+    ops = _collect_ops(hermes_home).operations
+    manifest = ops.delegation_live_manifests[0]
+    task = manifest.tasks[0]
+    joined = "\n".join(task.log_tail)
+    assert "sk-super-secret-123" not in joined
+    assert "REDACTED" in joined
+    # Only the newest lines survive the cap.
+    assert len(task.log_tail) <= 4
+    assert "line 5" in joined
+    assert "line 0" not in joined
+
+
+def test_delegation_live_manifest_symlinked_run_dir_is_ignored(
+    hermes_home: Path, sample_db: Path, tmp_path: Path
+):
+    outside = tmp_path / "outside-live"
+    outside.mkdir()
+    manifest_path = outside / "manifest.json"
+    manifest_path.write_text(json.dumps(_sample_manifest()))
+    live = hermes_home / "cache" / "delegation" / "live"
+    live.mkdir(parents=True)
+    (live / "deleg_evil").symlink_to(outside, target_is_directory=True)
+
+    ops = _collect_ops(hermes_home).operations
+    assert ops.delegation_live_manifest_count == 0
+    assert ops.delegation_live_manifests == []
+
+
+def test_delegation_live_manifest_scan_is_bounded(hermes_home: Path, sample_db: Path):
+    live = hermes_home / "cache" / "delegation" / "live"
+    live.mkdir(parents=True)
+    for index in range(30):
+        _write_live_delegation(live, f"deleg_{index:02d}", _sample_manifest())
+    ops = _collect_ops(hermes_home).operations
+    # Newest manifests first, and the rendered list is capped below the count.
+    assert ops.delegation_live_manifest_count == 30
+    assert len(ops.delegation_live_manifests) == 5
+    assert {m.delegation_id for m in ops.delegation_live_manifests} <= {
+        f"deleg_{index:02d}" for index in range(30)
+    }
+
+
+def test_delegation_live_manifest_task_list_is_capped(hermes_home: Path, sample_db: Path):
+    live = hermes_home / "cache" / "delegation" / "live"
+    tasks = [{"index": index, "goal": f"g{index}", "status": "running"} for index in range(12)]
+    _write_live_delegation(live, "deleg_many", _sample_manifest(task_count=12, tasks=tasks))
+    ops = _collect_ops(hermes_home).operations
+    manifest = ops.delegation_live_manifests[0]
+    assert manifest.task_count == 12
+    assert len(manifest.tasks) < 12
+    assert manifest.running_task_count == 12  # counted over every entry, not the cap

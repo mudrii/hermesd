@@ -1479,6 +1479,49 @@ class DelegationInfo(BaseModel):
     unread_completion_count: int = 0
 
 
+class DelegationLiveTask(BaseModel):
+    """One per-child entry of a live delegation manifest.
+
+    ``status``/``exit_reason`` are the writer's best-effort updates after the
+    batch joins (``tools/delegation_live_log.py:270-286``); a crash before the
+    join leaves the task marked ``running`` forever. ``log_tail`` holds the last
+    few redacted lines of ``task-<index>.log`` for the detail view — the file
+    upstream pre-redacts per line, and hermesd redacts again before it leaves
+    the collector.
+    """
+
+    index: int = 0
+    goal: str = ""
+    status: str = ""
+    exit_reason: str = ""
+    log_name: str = ""
+    log_tail: list[str] = Field(default_factory=list)
+
+
+class DelegationLiveManifest(BaseModel):
+    """Per-delegation card from ``cache/delegation/live/<id>/manifest.json``.
+
+    Written at dispatch and amended after the join
+    (``tools/delegation_live_log.py:255-287``): model, provider, task count and
+    per-task status. This is the *manifest*, not the live roster — tool counts,
+    steer state and depth exist only in gateway memory and over RPC, so nothing
+    here claims to show them. ``dir_age_seconds`` comes from the directory
+    mtime, which is the only liveness signal hermesd has.
+    """
+
+    delegation_id: str = ""
+    model: str = ""
+    provider: str = ""
+    started: str = ""
+    completed: str = ""
+    manifest_present: bool = False
+    dir_age_seconds: float | None = None
+    task_count: int = 0
+    running_task_count: int = 0
+    tasks: list[DelegationLiveTask] = Field(default_factory=list)
+    tasks_truncated: bool = False
+
+
 class RetiredWalGeneration(BaseModel):
     """The newest ``state.db.retired-wal-*`` capture, from its ``manifest.json``.
 
@@ -1904,6 +1947,10 @@ class OperationsState(BaseModel):
     delegation_failed_count: int = 0
     delegation_undelivered_count: int = 0
     delegation_live_log_count: int = 0
+    # Written by its own source (``delegation_live``) so a torn manifest keeps
+    # the last-good card list instead of blanking the panel.
+    delegation_live_manifests: list[DelegationLiveManifest] = Field(default_factory=list)
+    delegation_live_manifest_count: int = 0
     state_db_schema_version: int = 0
     state_db_size_bytes: int = 0
     state_db_wal_size_bytes: int = 0

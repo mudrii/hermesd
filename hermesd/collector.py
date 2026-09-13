@@ -120,6 +120,7 @@ from hermesd.collect.operations import (
     _iso_age_seconds,
     _moa_latest_record_summary,
     _model_cache_counts,
+    _read_delegation_live_manifests,
     _read_projects_state,
     _read_state_snapshots,
     _read_verification_evidence,
@@ -308,6 +309,11 @@ _DB_RECOVERY_FIELDS = ("db_recovery",)
 # field, so a corrupt shared-state.db or runs_idempotency.db degrades only itself.
 _HOSTED_ROOM_FIELDS = ("hosted_rooms",)
 _API_RUN_FIELDS = ("api_runs",)
+_DELEGATION_LIVE_FIELDS = (
+    "delegation_live_manifests",
+    "delegation_live_manifest_count",
+)
+_PROCESS_RECEIPT_FIELDS = ("process_receipts",)
 _STATE_SNAPSHOT_FIELDS = ("snapshot_count", "snapshot_total_bytes", "newest_snapshot_age_seconds")
 _LIFECYCLE_FIELDS = (
     "lifecycle_phase",
@@ -878,6 +884,19 @@ class Collector:
                 lambda: results["operations"],
                 fallback=lambda: self._last_source_fields(
                     "api_runs", results["operations"], _API_RUN_FIELDS
+                ),
+            ),
+            # Seventh writer of `operations`: the live delegation manifests are a
+            # ROOT-scoped cache directory (the same open divergence as the
+            # delegation_live_log_count read inside `operations`), and a torn
+            # manifest must keep the last-good cards instead of blanking them.
+            _SourceSpec(
+                "operations",
+                "delegation_live",
+                lambda: self._with_delegation_live(results["operations"]),
+                lambda: results["operations"],
+                fallback=lambda: self._last_source_fields(
+                    "delegation_live", results["operations"], _DELEGATION_LIVE_FIELDS
                 ),
             ),
             _SourceSpec("skills_memory", "skills", self._collect_skills_memory, SkillsMemory),
@@ -2443,6 +2462,31 @@ class Collector:
                 pid_exists=self._pid_exists,
             )
         return operations.model_copy(update={"api_runs": api_runs})
+
+    def _with_delegation_live(self, operations: OperationsState) -> OperationsState:
+        """Live delegation manifests from ``cache/delegation/live/``.
+
+        ROOT-scoped, matching the ``delegation_live_log_count`` read beside it in
+        `_with_goals` — an existing open divergence recorded in
+        ``.codex/rules/source-ownership.md``: upstream resolves the directory
+        through ``get_hermes_dir("cache/delegation", "delegation_cache")/live``
+        (``tools/delegation_live_log.py:40-43``), i.e. the profile home, while
+        hermesd keeps the whole delegation cluster on the root resolver.
+
+        The manifest is written at dispatch and amended after the batch joins
+        (``tools/delegation_live_log.py:255-287``). Nothing here reads the live
+        roster: per-task tool counts, steer state and depth exist only in
+        gateway memory and over RPC. Absent directory, junk manifests and
+        symlinked run dirs are healthy empty defaults, never errors.
+        """
+        live_root = self._paths.shared_path("cache", "delegation", "live")
+        return operations.model_copy(
+            update=_read_delegation_live_manifests(
+                live_root,
+                self._paths.root_home,
+                now=self._clock(),
+            )
+        )
 
     def _collect_curator(self) -> CuratorRun:
         # Read the scheduler state and curator config once for the whole pass;

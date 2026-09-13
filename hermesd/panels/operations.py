@@ -18,12 +18,13 @@ from hermesd.models import (
     DashboardState,
     DbRecoveryState,
     DelegationInfo,
+    DelegationLiveManifest,
     HostedRoomState,
     HostedRoomSummary,
     OperationsState,
 )
 from hermesd.panels.formatting import escape_terminal_text as escape
-from hermesd.panels.formatting import fmt_age_seconds
+from hermesd.panels.formatting import fmt_age_seconds, sanitize_terminal_text
 from hermesd.theme import Theme
 
 # Rendered under the Database Recovery section. Every line is a limit on what the
@@ -70,6 +71,17 @@ _API_RUN_NOTE_LINES = (
     "elsewhere), so it is reduced to 'identity recorded' and never compared to a timestamp.",
 )
 
+# Rendered under Live Delegation Transcripts. The first block is the thing an
+# operator will most expect and hermesd cannot have: the live roster (per-task
+# tool counts, steer state, depth) exists only in gateway memory and over RPC.
+# The second covers the writer's own best-effort status updates.
+_LIVE_MANIFEST_NOTE_LINES = (
+    "Manifests and task-log tails only: the live roster — per-task tool counts, steer",
+    "state, depth — exists in gateway memory and over RPC, and hermesd cannot see it.",
+    "Task statuses are the writer's best-effort post-join updates; a crashed join",
+    "leaves tasks marked running. Tails are redacted again before rendering.",
+)
+
 # Rendered whenever a bounded list was cut short, so a display cap can never be
 # mistaken for the size of the table it came from.
 _TRUNCATION_LABEL = "showing {shown} of {total} — the counts above cover the whole table"
@@ -100,6 +112,13 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     if delegation_line:
         lines.append("  Delegations: ", style=theme.ui_label)
         lines.append(f"{delegation_line}\n", style=theme.banner_text)
+    if ops.delegation_live_manifests:
+        running = sum(m.running_task_count for m in ops.delegation_live_manifests)
+        lines.append("  Live delegations: ", style=theme.ui_label)
+        lines.append(
+            f"{ops.delegation_live_manifest_count} live · {running} running\n",
+            style=theme.banner_text,
+        )
     # Counts only, like every other compact row here: room names and run ids are
     # untrusted free text and belong to the detail view.
     if ops.hosted_rooms.db_present:
@@ -163,6 +182,11 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         )
         sections.append(_delegations_table(ops, theme))
 
+    if ops.delegation_live_manifests:
+        sections.append(_heading("Live Delegation Transcripts", theme))
+        sections.extend(_live_manifest_sections(ops, theme))
+        sections.append(_note(_LIVE_MANIFEST_NOTE_LINES, theme))
+
     if ops.state_db_size_bytes or ops.state_db_schema_version:
         sections.append(_heading("State DB", theme))
         sections.append(_state_db_table(ops, theme))
@@ -217,6 +241,7 @@ def _has_no_artifacts(ops: OperationsState) -> bool:
         and not ops.projects_db_present
         and not ops.goal_count
         and not ops.delegation_count
+        and not ops.delegation_live_manifests
         and not ops.snapshot_count
         and not ops.state_db_size_bytes
         and not ops.web_ui_build_hash
@@ -611,6 +636,64 @@ def _delegations_table(ops: OperationsState, theme: Theme) -> Table:
     if not ops.delegations:
         table.add_row("—", "—", "—", "—", "—", "—", "—", "—")
     return table
+
+
+def _live_manifest_sections(ops: OperationsState, theme: Theme) -> list[RenderableType]:
+    """One card per parsed manifest, newest first, capped by the collector."""
+    parts: list[RenderableType] = []
+    for manifest in ops.delegation_live_manifests:
+        table = Table(box=None, show_header=False, padding=(0, 2))
+        table.add_column("Key", style=theme.ui_label)
+        table.add_column("Value", style=theme.banner_text)
+        table.add_row("Delegation", escape(manifest.delegation_id) or "—")
+        label = " / ".join(part for part in (manifest.provider, manifest.model) if part)
+        table.add_row("Model", escape(label) or "—")
+        table.add_row(
+            "Tasks", f"{manifest.task_count} total · {manifest.running_task_count} running"
+        )
+        if manifest.started:
+            table.add_row("Started", escape(manifest.started))
+        if manifest.completed:
+            table.add_row("Completed", escape(manifest.completed))
+        table.add_row("Dir Age", _age_span_label(manifest.dir_age_seconds))
+        if manifest.tasks_truncated:
+            table.add_row("Tasks", _truncation_label(len(manifest.tasks), manifest.task_count))
+        parts.append(table)
+        parts.append(_live_tasks_text(manifest, theme))
+    shown = len(ops.delegation_live_manifests)
+    if shown < ops.delegation_live_manifest_count:
+        parts.append(
+            Text(
+                "  "
+                + _truncation_label(shown, ops.delegation_live_manifest_count)
+                + " — newest first\n",
+                style=theme.banner_dim,
+            )
+        )
+    return parts
+
+
+def _live_tasks_text(manifest: DelegationLiveManifest, theme: Theme) -> Text:
+    """Per-task status lines with the optional redacted log tail.
+
+    Rich Text is literal (never markup-parsed), but the strings are escaped
+    anyway so the model layer stays untrusted end to end.
+    """
+    lines = Text()
+    if not manifest.tasks:
+        lines.append("  no task entries parsed\n", style=theme.banner_dim)
+        return lines
+    for task in manifest.tasks:
+        # Text() never parses markup, so sanitize (strip ANSI/control codes)
+        # rather than escape(): escaping here would show literal backslashes.
+        status = sanitize_terminal_text(task.status) or "unknown"
+        label = f"  task {task.index} · {status}"
+        if task.exit_reason:
+            label += f" · exit {sanitize_terminal_text(task.exit_reason)}"
+        lines.append(label + "\n", style=theme.banner_text)
+        for tail_line in task.log_tail:
+            lines.append(f"    {sanitize_terminal_text(tail_line)}\n", style=theme.banner_dim)
+    return lines
 
 
 def _delegation_procs_label(delegation: DelegationInfo) -> str:
