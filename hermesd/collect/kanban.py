@@ -337,6 +337,9 @@ def _kanban_board_present(paths: HermesPaths, board_slug: str) -> bool:
 
 _NOTIFY_BACKLOG_SUB_LIMIT = 10
 _NOTIFY_ORPHAN_PROFILE_LIMIT = 5
+# Bound on the per-platform rollup: the detail row joins every key, so a board
+# watched over many distinct platforms must not grow that row without end.
+_NOTIFY_PLATFORM_LIMIT = 6
 
 # "default" is what upstream get_active_profile_name() reports for the root
 # home (hermes_cli/profiles.py:1368-1382); it owns no profiles/ directory, so
@@ -371,8 +374,8 @@ def _read_kanban_notify_fields(
     The table is unbounded (one row per watcher), so the row list is capped
     like every sibling query in this module and nothing that claims to be a
     total is derived from it: the counts, the platform rollup, the backlog sum
-    and peak, and the distinct notifier profiles all come from their own
-    aggregates over the whole table.
+    and peak, the sub-with-backlog count, and the distinct notifier profiles
+    all come from their own aggregates over the whole table.
     """
     if not _table_exists(conn, "kanban_notify_subs"):
         return {}
@@ -413,6 +416,14 @@ def _read_kanban_notify_fields(
         platform = str(row.get("platform") or "")
         key = platform.lower() if platform else "unknown"
         platform_counts[key] = platform_counts.get(key, 0) + _coerce_int(row.get("subs"))
+    # The detail row joins every key, so the rollup keeps only the busiest
+    # platforms and flags the cut rather than growing without end.
+    platforms_truncated = len(platform_counts) > _NOTIFY_PLATFORM_LIMIT
+    platform_counts = dict(
+        sorted(platform_counts.items(), key=lambda item: (-item[1], item[0]))[
+            :_NOTIFY_PLATFORM_LIMIT
+        ]
+    )
     backlog_totals = (
         _query_rows(
             conn,
@@ -421,6 +432,11 @@ def _read_kanban_notify_fields(
         )
         or [{}]
     )[0]
+    # The count behind the worst-ten list's "showing 10 of N" label: subs with
+    # an unseen event, aggregated over the whole table like the other totals.
+    backlog_sub_count = _count_rows(
+        conn, f"SELECT COUNT(*) FROM kanban_notify_subs s WHERE {unseen_expr} > 0"
+    )
     orphan_names: set[str] = set()
     if known_profiles is not None:
         # Distinct stamps only: profile names are a handful, not one per sub.
@@ -445,8 +461,10 @@ def _read_kanban_notify_fields(
     return {
         "notify_sub_count": sub_count,
         "notify_platform_counts": platform_counts,
+        "notify_platforms_truncated": platforms_truncated,
         "notify_backlog_total": _coerce_int(backlog_totals.get("total")),
         "notify_max_backlog": _coerce_int(backlog_totals.get("peak")),
+        "notify_backlog_sub_count": backlog_sub_count,
         "notify_backlog_subs": backlog_subs,
         "notify_orphan_profile_count": len(orphans),
         "notify_orphan_profiles": orphans[:_NOTIFY_ORPHAN_PROFILE_LIMIT],

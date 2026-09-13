@@ -378,8 +378,10 @@ _API_RUN_FIELDS = ("api_runs",)
 _KANBAN_NOTIFY_FIELDS = (
     "notify_sub_count",
     "notify_platform_counts",
+    "notify_platforms_truncated",
     "notify_backlog_total",
     "notify_max_backlog",
+    "notify_backlog_sub_count",
     "notify_backlog_subs",
     "notify_orphan_profile_count",
     "notify_orphan_profiles",

@@ -1607,3 +1607,134 @@ def test_kanban_db_wal_is_copied_once_per_refresh(
     assert state.kanban.notify_sub_count == 1
     assert "kanban" not in state.health.failed_sources
     assert "kanban_notify" not in state.health.failed_sources
+
+
+def test_kanban_notify_backlog_sub_count_is_exact_while_the_list_is_capped(
+    hermes_home: Path,
+):
+    """The sub-with-backlog count is its own aggregate over the whole table, so
+    the worst-ten list can be labelled "showing 10 of N" even when the table
+    holds more backlogged subscriptions than the cap shows."""
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    conn.row_factory = sqlite3.Row
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('t1', 'Watched', 'review', 1)"
+    )
+    for event_id in range(1, 11):
+        conn.execute(
+            "INSERT INTO task_events (id, task_id, kind, created_at) VALUES (?, 't1', 'status', 1)",
+            (event_id,),
+        )
+    # Every fourth watcher is caught up (cursor at the newest event); the rest
+    # hold a real backlog.
+    for index in range(40):
+        _insert_notify_sub(
+            conn,
+            "t1",
+            "discord",
+            chat_id=f"chat-{index}",
+            last_event_id=10 if index % 4 == 0 else index % 5,
+        )
+    conn.commit()
+
+    fields = kanban_module._read_kanban_notify_fields(conn, known_profiles=frozenset())
+    conn.close()
+
+    assert fields["notify_sub_count"] == 40
+    assert fields["notify_backlog_sub_count"] == 30
+    assert fields["notify_backlog_total"] == sum(
+        10 - (index % 5) for index in range(40) if index % 4
+    )
+    assert len(fields["notify_backlog_subs"]) == 10
+
+
+def test_kanban_notify_backlog_sub_count_zero_without_task_events(hermes_home: Path):
+    """Without a task_events table every cursor reads as caught up: the backlog
+    sub count is 0, not an error or a guess from the sub count."""
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE kanban_notify_subs (
+            task_id TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL DEFAULT '',
+            notifier_profile TEXT,
+            delivery_mode TEXT NOT NULL DEFAULT 'notify',
+            created_at INTEGER NOT NULL,
+            last_event_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (task_id, platform, chat_id, thread_id)
+        );
+        """
+    )
+    _insert_notify_sub(conn, "t1", "discord", last_event_id=7)
+    conn.commit()
+
+    fields = kanban_module._read_kanban_notify_fields(conn, known_profiles=frozenset())
+    conn.close()
+
+    assert fields["notify_sub_count"] == 1
+    assert fields["notify_backlog_sub_count"] == 0
+    assert fields["notify_backlog_subs"] == []
+
+
+def test_kanban_notify_platform_rollup_is_capped_and_flagged(hermes_home: Path):
+    """The platform rollup joins into one detail row, so it is bounded like the
+    other displayed lists: the busiest platforms are kept and the cut is
+    flagged instead of silently hiding every other platform."""
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    conn.row_factory = sqlite3.Row
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('t1', 'Watched', 'review', 1)"
+    )
+    platforms = {
+        "discord": 30,
+        "slack": 20,
+        "telegram": 10,
+        "imessage": 5,
+        "sms": 4,
+        "signal": 3,
+        "whatsapp": 2,
+        "irc": 1,
+    }
+    for platform, count in platforms.items():
+        for index in range(count):
+            _insert_notify_sub(conn, "t1", platform, chat_id=f"{platform}-{index}")
+    conn.commit()
+
+    fields = kanban_module._read_kanban_notify_fields(conn, known_profiles=frozenset())
+    conn.close()
+
+    assert fields["notify_sub_count"] == 75
+    assert fields["notify_platforms_truncated"] is True
+    # The busiest platforms survive the cap; counts stay exact.
+    assert fields["notify_platform_counts"] == {
+        "discord": 30,
+        "slack": 20,
+        "telegram": 10,
+        "imessage": 5,
+        "sms": 4,
+        "signal": 3,
+    }
+
+
+def test_kanban_notify_platform_rollup_untruncated_under_the_cap(hermes_home: Path):
+    """Under the cap the rollup is complete and the flag stays False."""
+    conn = sqlite3.connect(str(hermes_home / "kanban.db"))
+    conn.row_factory = sqlite3.Row
+    create_kanban_db_tables(conn)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('t1', 'Watched', 'review', 1)"
+    )
+    _insert_notify_sub(conn, "t1", "discord")
+    _insert_notify_sub(conn, "t1", "slack", chat_id="chat-2")
+    conn.commit()
+
+    fields = kanban_module._read_kanban_notify_fields(conn, known_profiles=frozenset())
+    conn.close()
+
+    assert fields["notify_platform_counts"] == {"discord": 1, "slack": 1}
+    assert fields["notify_platforms_truncated"] is False
