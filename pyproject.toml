@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermesd"
-version = "2026.9.8"
+version = "2026.9.13"
 description = "TUI monitoring dashboard for Hermes AI agent"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -148,7 +148,10 @@ include = [
     "LICENSE",
     "README.md",
     "SECURITY.md",
+    "docs/",
     "flake.nix",
+    "scripts/",
+    "uv.lock",
 ]
 
 [tool.hatch.build.targets.wheel]

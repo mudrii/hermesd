@@ -600,7 +600,7 @@ def test_wal_snapshot_probe_failure_marks_stale_and_recovers(tmp_path: Path, mon
             self._real.close()
 
     def fake_connect(target: object, *args: object, **kwargs: object):
-        conn = original_connect(target, *args, **kwargs)  # type: ignore[arg-type]
+        conn = original_connect(target, *args, **kwargs)
         return _CantInitConnection(conn)
 
     monkeypatch.setattr(sqlite3, "connect", fake_connect)

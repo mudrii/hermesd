@@ -778,12 +778,30 @@ def test_gateway_renders_lifecycle_carry_flags() -> None:
     assert "suspected OOM" in detail
 
 
+def test_lifecycle_flags_note_the_replace_takeover_case() -> None:
+    """An unclean exit is not always a crash: ``gateway --replace`` looks the same.
+
+    Upstream's replacement path SIGTERMs the old gateway, waits ten seconds and
+    then SIGKILLs it (``gateway/run.py:4924-4926``); a kill past that grace
+    window never reaches ``mark_exited`` (``:5524-5529``), so the next boot's
+    ``detect_unclean_exit`` reports the "phantom unclean death" upstream names
+    (``:4699``) and hermesd renders it as an unclean exit / suspected OOM. The
+    flags are evidence, and the caveat belongs beside them.
+    """
+    state = _liveness_state(prior_unclean_exit=True, prior_suspected_oom=True)
+    detail = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+
+    assert "replace" in detail
+    assert "SIGKILL" in detail
+
+
 def test_gateway_renders_restart_storm_line_and_backoff() -> None:
     state = _liveness_state(
         gateway_starts_recorded=True,
-        gateway_starts_2m=2,
+        gateway_starts_window=2,
         gateway_starts_1h=9,
         restart_storm_cap=5,
+        restart_storm_window_seconds=120.0,
         seconds_since_last_gateway_start=45.0,
     )
     detail = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
@@ -793,9 +811,10 @@ def test_gateway_renders_restart_storm_line_and_backoff() -> None:
 
     storm = _liveness_state(
         gateway_starts_recorded=True,
-        gateway_starts_2m=6,
+        gateway_starts_window=6,
         gateway_starts_1h=11,
         restart_storm_cap=5,
+        restart_storm_window_seconds=120.0,
         seconds_since_last_gateway_start=12.0,
         in_respawn_backoff=True,
     )
@@ -895,3 +914,67 @@ def test_gateway_renders_shared_listener_mirrors() -> None:
     plain = _liveness_state(platforms=[PlatformStatus(name="telegram", state="connected")])
     detail = render_to_str(render_gateway(plain, Theme(), detail=True), width=200, no_color=True)
     assert "shared listener" not in detail
+
+
+def test_gateway_renders_truncated_mirror_roster_as_a_bound() -> None:
+    state = _liveness_state(
+        platforms=[
+            PlatformStatus(
+                name="api_server",
+                state="connected",
+                mirror_urls={"dev": "http://127.0.0.1:8088/p/dev/v1"},
+                mirror_urls_truncated=True,
+            )
+        ]
+    )
+    detail = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+    assert "more served profiles than this bound shows" in detail
+
+    bounded = _liveness_state(
+        platforms=[
+            PlatformStatus(
+                name="api_server",
+                state="connected",
+                mirror_urls={"dev": "http://127.0.0.1:8088/p/dev/v1"},
+            )
+        ]
+    )
+    detail = render_to_str(render_gateway(bounded, Theme(), detail=True), width=200, no_color=True)
+    assert "more served profiles" not in detail
+
+
+def test_gateway_detail_puts_each_liveness_diagnostic_on_its_own_line() -> None:
+    """Witness, Starts, Web client, Exit diagnostics and Event logs get a line each.
+
+    Each helper returns a bare labelled ``Text`` and the renderer appends them
+    in sequence, so without a leading break the detail view ran them together:
+    ``… witness answered  Starts: … Web client: … Exit diagnostics: …`` on one
+    line, which reads as a single claim instead of five separate facts.
+    """
+    state = _liveness_state(
+        loop_health=GatewayLoopHealth.ALIVE,
+        gateway_starts_recorded=True,
+        gateway_starts_window=2,
+        restart_storm_cap=5,
+        seconds_since_last_gateway_start=120.0,
+        dashboard_client_attached=True,
+        dashboard_client_last_frame_age_seconds=5.0,
+        exit_diag_recorded=True,
+        exit_diag_last_tag="gateway.start",
+        exit_diag_last_age_seconds=14400.0,
+        forensic_files=[
+            ForensicFile(name="gateway_faulthandler.log", size_bytes=4096, age_seconds=3600.0),
+        ],
+    )
+    detail = render_to_str(render_gateway(state, Theme(), detail=True), width=200, no_color=True)
+
+    labels = ["Witness:", "Starts:", "Web client:", "Exit diagnostics:", "Event logs:"]
+    lines = detail.splitlines()
+    for label in labels:
+        matching = [line for line in lines if label in line]
+        assert matching, label
+        # Each of these facts owns its line: no other diagnostic shares it.
+        assert all(sum(other in line for other in labels) == 1 for line in matching), label
+    # The ledger's newest record is not necessarily an exit: say what it is.
+    exit_line = next(line for line in lines if "Exit diagnostics:" in line)
+    assert "last record" in exit_line

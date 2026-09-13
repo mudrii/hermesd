@@ -14,6 +14,7 @@ import pytest
 from rich.console import Console
 
 import hermesd.collect.sqlite_util as sqlite_util_module
+from hermesd.collect.redaction import _redact_bare_credentials
 from hermesd.collector import (
     _ACTIVE_SURFACE_LIMIT,
     Collector,
@@ -34,6 +35,7 @@ from tests.conftest import (
     create_session_coordination_tables,
     create_state_db_tables,
     insert_compression_lock,
+    insert_gateway_route,
     insert_model_usage,
     insert_turn_lease,
 )
@@ -2042,7 +2044,7 @@ _HOLDER_FMT = "pid={pid}:tid={tid}:agent={agent}:nonce={nonce}"
 
 def _make_coordination_db(hermes_home: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(hermes_home / "state.db")
-    create_state_db_tables(conn, include_schema_version=False)
+    create_state_db_tables(conn, include_schema_version=False, include_session_key=True)
     create_session_coordination_tables(conn)
     return conn
 
@@ -2343,6 +2345,36 @@ def test_gateway_route_with_unknown_session_is_dangling(hermes_home: Path) -> No
     assert route.dangling is True
 
 
+def test_gateway_route_to_hidden_session_is_not_dangling(hermes_home: Path) -> None:
+    """Hidden means "out of the default listing", not "gone".
+
+    ``hermes_state_sessions.py:898-900`` hides a session from the listing while
+    keeping it resumable, and ``get_session`` (:737-746) looks it up by id with
+    no hidden filter; canonical bot chats are born hidden. Resolving routes
+    against the visible listing reported those targets as pointing at a
+    nonexistent session.
+    """
+    _insert_route_with_session(hermes_home, _route_entry(session_id="sess_r"))
+    conn = sqlite3.connect(hermes_home / "state.db")
+    # The v0.21 column the listing filter keys on; the minimal fixture schema
+    # does not carry it.
+    conn.execute("ALTER TABLE sessions ADD COLUMN hidden INTEGER DEFAULT 0")
+    conn.execute("UPDATE sessions SET hidden = 1 WHERE id = 'sess_r'")
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    (route,) = state.session_coordination.routes
+    assert route.dangling is False
+    # The listing still omits it: the two questions have different answers.
+    assert [session.session_id for session in state.sessions] == []
+
+
 def test_gateway_route_display_name_is_redacted(hermes_home: Path) -> None:
     _insert_route_with_session(
         hermes_home, _route_entry(display_name="bot api_key: sk-live-abc123")
@@ -2353,6 +2385,89 @@ def test_gateway_route_display_name_is_redacted(hermes_home: Path) -> None:
     (route,) = state.session_coordination.routes
     assert "sk-live-abc123" not in route.display_name
     assert "[REDACTED]" in route.display_name
+
+
+def test_gateway_route_display_name_scrubs_bare_credential(hermes_home: Path) -> None:
+    """A chat display name is remote-controlled free text: a bare token carries
+    no ``key = value`` label for the field redactor to key on."""
+    secret = "sk-live-abcdefghijklmnop"
+    _insert_route_with_session(hermes_home, _route_entry(display_name=f"Ops bot {secret}"))
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    (route,) = state.session_coordination.routes
+    assert route.display_name == "Ops bot [REDACTED]"
+    assert secret not in json.dumps(state.model_dump(mode="json"))
+
+
+def test_gateway_route_display_name_scrubs_jwt_and_github_token(hermes_home: Path) -> None:
+    jwt = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        ".eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+        ".dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    )
+    pat = "ghp_abcdefghijklmnopqrst"
+    _insert_route_with_session(hermes_home, _route_entry(display_name=f"a {jwt} b {pat}"))
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    (route,) = state.session_coordination.routes
+    assert route.display_name == "a [REDACTED] b [REDACTED]"
+
+
+def test_gateway_route_display_name_without_credentials_is_unchanged(hermes_home: Path) -> None:
+    _insert_route_with_session(hermes_home, _route_entry(display_name="Bob (ops)"))
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    (route,) = state.session_coordination.routes
+    assert route.display_name == "Bob (ops)"
+
+
+def test_gateway_route_reasons_scrub_bare_credentials(hermes_home: Path) -> None:
+    """The resume/auto-reset reasons reach the panel and the JSON snapshot too."""
+    _insert_route_with_session(
+        hermes_home,
+        _route_entry(
+            resume_pending=True,
+            resume_reason="auth failed for sk-live-abcdefghijklmnop",
+            was_auto_reset=True,
+            auto_reset_reason="xoxb-abcdefghijklmnopqrst",
+        ),
+    )
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    (route,) = state.session_coordination.routes
+    assert route.resume_reason == "auth failed for [REDACTED]"
+    assert route.auto_reset_reason == "[REDACTED]"
+
+
+def test_redact_bare_credentials_scrubs_known_prefixes() -> None:
+    for value in (
+        "sk-abcdefghijklmnop",
+        "pk-abcdefghijklmnop",
+        "rk-abcdefghijklmnop",
+        "ghp_abcdefghijklmnop",
+        "gho_abcdefghijklmnop",
+        "ghs_abcdefghijklmnop",
+        "github_pat_abcdefghijklmnop",
+        "xoxb-abcdefghijklmnop",
+        "xoxp-abcdefghijklmnop",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r",
+    ):
+        assert _redact_bare_credentials(f"name {value} tail") == "name [REDACTED] tail"
+    # Too short to be a real credential, and ordinary words, stay visible.
+    for value in (
+        "sk-short",
+        "ghp_short",
+        "Bob (ops)",
+        "task-list",
+        "eyJhbGci",
+        "risk-reward",
+        "x" * 30_000,
+    ):
+        assert _redact_bare_credentials(value) == value
 
 
 def test_gateway_route_junk_entry_json_degrades_to_key_only(hermes_home: Path) -> None:
@@ -2403,25 +2518,52 @@ def test_generation_churn_top_chats_and_lifetime_total(hermes_home: Path) -> Non
 def test_generation_churn_flags_a_shrinking_table(hermes_home: Path) -> None:
     """conversation_generations is never pruned upstream
     (hermes_state_common.py:460-487): a shrink between refreshes means
-    something broke the no-prune invariant, so it surfaces as a warning."""
+    something broke the no-prune invariant, so it surfaces as a warning.
+
+    The warning latches on the high-water count: re-reading the same shrunken
+    table must not clear it after one refresh, because the operator's only cue
+    would then depend on catching the exact refresh that saw the drop.
+    """
     conn = _make_coordination_db(hermes_home)
     conn.executemany(
         "INSERT INTO conversation_generations VALUES (?,?,?)",
-        [("cli", "k1", 5), ("cli", "k2", 9)],
+        [("cli", "k1", 5), ("cli", "k2", 9), ("cli", "k3", 2)],
     )
     conn.commit()
     conn.close()
     c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
     state = c.collect()
+    assert state.session_coordination.generation_chat_total == 3
     assert state.session_coordination.generation_count_shrank is False
     conn = sqlite3.connect(hermes_home / "state.db")
-    conn.execute("DELETE FROM conversation_generations WHERE session_key = 'k2'")
+    conn.executemany(
+        "DELETE FROM conversation_generations WHERE session_key = ?", [("k2",), ("k3",)]
+    )
+    conn.commit()
+    conn.close()
+    state = c.collect()
+    assert state.session_coordination.generation_chat_total == 1
+    assert state.session_coordination.generation_count_shrank is True
+    # Still shrunken on the next refresh: the warning stands.
+    state = c.collect()
+    assert state.session_coordination.generation_count_shrank is True
+    # A partial recovery below the pre-shrink count is still a shrink.
+    conn = sqlite3.connect(hermes_home / "state.db")
+    conn.execute("INSERT INTO conversation_generations VALUES ('cli','k4',2)")
+    conn.commit()
+    conn.close()
+    state = c.collect()
+    assert state.session_coordination.generation_chat_total == 2
+    assert state.session_coordination.generation_count_shrank is True
+    # Recovering to the pre-shrink count clears it.
+    conn = sqlite3.connect(hermes_home / "state.db")
+    conn.execute("INSERT INTO conversation_generations VALUES ('cli','k5',2)")
     conn.commit()
     conn.close()
     state = c.collect()
     c.close()
-    assert state.session_coordination.generation_chat_total == 1
-    assert state.session_coordination.generation_count_shrank is True
+    assert state.session_coordination.generation_chat_total == 3
+    assert state.session_coordination.generation_count_shrank is False
 
 
 # ── Item 22 (sessions half): terminal breadcrumbs ───────────────────────────
@@ -2465,6 +2607,33 @@ def test_terminal_breadcrumbs_absent_directory_is_empty(hermes_home: Path) -> No
     c.close()
     assert state.terminal_sessions.count == 0
     assert state.terminal_sessions.sessions == []
+
+
+def test_terminal_breadcrumbs_deeply_nested_json_reads_as_junk(hermes_home: Path) -> None:
+    """A nesting bomb is junk, not a failed source.
+
+    ``json.loads`` refuses nesting deep enough to exhaust the decoder with
+    ``RecursionError`` rather than a ``JSONDecodeError``, so the guard has to
+    name it: otherwise the terminal-sessions source lands in failed_sources
+    over one hostile breadcrumb.
+    """
+    directory = hermes_home / "terminal-sessions"
+    directory.mkdir()
+    (directory / "tty-bomb").write_text('{"ts": ' + "[" * 3000 + "]" * 3000 + "}")
+    _write_breadcrumb(
+        directory,
+        "tty-dev-pts-3",
+        {"session_id": "sess_t", "cwd": "/repo", "ts": _COORD_NOW - 60},
+    )
+
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "terminal_sessions" not in state.health.failed_sources
+    assert state.terminal_sessions.count == 1
 
 
 def test_terminal_breadcrumb_rows_are_bounded(hermes_home: Path) -> None:
@@ -2519,3 +2688,196 @@ def test_active_surface_joinable_chip_from_shared_runtime_url(hermes_home: Path)
     # The advertised URL must never be stored, let alone rendered.
     assert "127.0.0.1" not in str(state.active_surfaces)
     assert "8123" not in str(state.active_surfaces)
+
+
+def test_hygiene_rows_report_an_exact_total_beyond_the_capped_list(hermes_home: Path) -> None:
+    """A capped row list must never be presented as the count.
+
+    ``SessionCoordinationState``'s own rule is that totals are exact while the
+    lists are capped, and the compact marker used ``len()`` of the capped list.
+    """
+    conn = _make_coordination_db(hermes_home)
+    for index in range(55):
+        conn.execute(
+            "INSERT INTO gateway_hygiene_state (session_key, failure_streak) VALUES (?, ?)",
+            (f"telegram:{index}", index % 6 + 1),
+        )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW)
+    try:
+        coord = c.collect().session_coordination
+    finally:
+        c.close()
+
+    assert len(coord.hygiene) == 50
+    assert coord.hygiene_total == 55
+
+
+def test_route_total_is_reported_beside_capped_route_rows(hermes_home: Path) -> None:
+    conn = _make_coordination_db(hermes_home)
+    for index in range(55):
+        insert_gateway_route(
+            conn,
+            f"telegram:{index}",
+            {"session_id": "missing", "platform": "telegram", "suspended": True},
+            _COORD_NOW - 30,
+        )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: False)
+    try:
+        coord = c.collect().session_coordination
+    finally:
+        c.close()
+
+    assert len(coord.routes) == 50
+    assert coord.route_total == 55
+
+
+def test_lease_expiry_boundary_is_inclusive(hermes_home: Path) -> None:
+    """``expires_at <= now`` is already expired when the holder is alive.
+
+    Upstream's reclaim boundary is inclusive for turn leases
+    (``hermes_state_compression.py:519-536``); an exclusive comparison would
+    report a lease live for one more refresh than the writer honours.
+    """
+    conn = _make_coordination_db(hermes_home)
+    insert_turn_lease(
+        conn,
+        "conv-edge",
+        _HOLDER_FMT.format(pid=101, tid=7, agent="1f", nonce="abcd1234"),
+        _COORD_NOW - 300,
+        _COORD_NOW,
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: pid == 101)
+    try:
+        lease = c.collect().session_coordination.leases[0]
+    finally:
+        c.close()
+
+    assert lease.expires_in_seconds == 0.0
+    assert lease.expired is True
+    assert lease.liveness is ProcessLiveness.LIVE
+
+
+def test_lease_list_is_capped_while_the_total_stays_exact(hermes_home: Path) -> None:
+    conn = _make_coordination_db(hermes_home)
+    for index in range(45):
+        insert_turn_lease(
+            conn,
+            f"conv-{index}",
+            _HOLDER_FMT.format(pid=101, tid=index, agent="1f", nonce="abcd1234"),
+            _COORD_NOW - 10,
+            _COORD_NOW + 290,
+        )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: pid == 101)
+    try:
+        coord = c.collect().session_coordination
+    finally:
+        c.close()
+
+    assert len(coord.leases) == 40
+    assert coord.lease_total == 45
+
+
+def test_gateway_route_suspended_flag_survives_the_decode_path(hermes_home: Path) -> None:
+    """``suspended`` must be read from entry_json, not only painted by the panel."""
+    conn = _make_coordination_db(hermes_home)
+    insert_gateway_route(
+        conn,
+        "telegram:404",
+        {
+            "session_id": "sess-1",
+            "platform": "telegram",
+            "chat_type": "private",
+            "display_name": "Ops",
+            "suspended": True,
+            "resume_pending": False,
+            "was_auto_reset": False,
+        },
+        _COORD_NOW - 30,
+    )
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, session_key) VALUES (?,?,?,?)",
+        ("sess-1", "telegram", _COORD_NOW - 1000, "telegram:404"),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: False)
+    try:
+        route = c.collect().session_coordination.routes[0]
+    finally:
+        c.close()
+
+    assert route.suspended is True
+    assert route.needs_user_message is True
+    assert route.dangling is False
+
+
+def test_gateway_route_display_name_is_clipped(hermes_home: Path) -> None:
+    """A remote display name is clipped, not merely redacted."""
+    conn = _make_coordination_db(hermes_home)
+    insert_gateway_route(
+        conn,
+        "telegram:505",
+        {"session_id": "sess-1", "platform": "telegram", "display_name": "N" * 200},
+        _COORD_NOW - 30,
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: False)
+    try:
+        route = c.collect().session_coordination.routes[0]
+    finally:
+        c.close()
+
+    assert len(route.display_name) == 40
+    assert route.display_name == "N" * 40
+
+
+def test_gateway_route_reasons_are_clipped(hermes_home: Path) -> None:
+    """Both reasons are chat-controlled free text and need a bound, not just redaction.
+
+    ``entry_json`` is capped at 64 KiB, so a single route could put two
+    multi-thousand-character strings into the panel's flags cell and the JSON
+    snapshot. Redaction runs first, so a credential cannot survive as a prefix.
+    """
+    conn = _make_coordination_db(hermes_home)
+    insert_gateway_route(
+        conn,
+        "telegram:506",
+        {
+            "session_id": "sess-1",
+            "platform": "telegram",
+            "resume_pending": True,
+            "resume_reason": "R" * 5000,
+            "was_auto_reset": True,
+            # A credential just past the clip boundary: clipping before
+            # redacting would leave a recognisable token prefix in the cell.
+            "auto_reset_reason": "A" * 30 + "sk-live-abcdefghijklmnop",
+        },
+        _COORD_NOW - 30,
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: False)
+    try:
+        route = c.collect().session_coordination.routes[0]
+    finally:
+        c.close()
+
+    assert route.resume_reason == "R" * 40
+    assert route.auto_reset_reason == "A" * 30 + "[REDACTED]"
+    assert "sk-live" not in route.auto_reset_reason

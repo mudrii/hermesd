@@ -2440,6 +2440,36 @@ def test_delegation_live_manifest_dir_absent_is_healthy(hermes_home: Path, sampl
     assert ops.delegation_live_manifests == []
 
 
+@pytest.fixture
+def recursion_error_json(monkeypatch: pytest.MonkeyPatch) -> str:
+    """JSON marker whose decode simulates a platform recursion refusal."""
+    marker = "__json_recursion_error__"
+    real_loads = json.loads
+
+    def loads(value, *args, **kwargs):
+        if isinstance(value, str) and marker in value:
+            raise RecursionError("simulated JSON nesting limit")
+        return real_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(json, "loads", loads)
+    return marker
+
+
+def test_delegation_live_manifest_json_recursion_error_is_healthy(
+    hermes_home: Path, sample_db: Path, recursion_error_json: str
+):
+    """A decoder recursion refusal is junk, not a broken source."""
+    live = hermes_home / "cache" / "delegation" / "live"
+    run_dir = live / "deleg_nested"
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text(f'{{"tasks": "{recursion_error_json}"}}')
+
+    state = _collect_ops(hermes_home)
+    assert "delegation_live" not in state.health.failed_sources
+    assert state.operations.delegation_live_manifest_count == 1
+    assert state.operations.delegation_live_manifests == []
+
+
 def test_delegation_live_log_tail_is_redacted_and_clipped(hermes_home: Path, sample_db: Path):
     live = hermes_home / "cache" / "delegation" / "live"
     tail = "\n".join(f"12:00:0{i} assistant | line {i}" for i in range(6))
@@ -2497,6 +2527,41 @@ def test_delegation_live_manifest_scan_is_bounded(hermes_home: Path, sample_db: 
     }
 
 
+def test_delegation_live_counts_older_unparsed_manifests_without_tailing_hidden_cards(
+    hermes_home: Path, sample_db: Path
+):
+    live = hermes_home / "cache" / "delegation" / "live"
+    for index in range(6):
+        run_dir = _write_live_delegation(
+            live,
+            f"deleg_valid_{index}",
+            _sample_manifest(tasks=[{"index": 0, "status": "completed"}]),
+            logs={"task-0.log": "done\n"},
+        )
+        stamp = _FIXED_NOW - index
+        os.utime(run_dir, (stamp, stamp))
+    for index in range(2):
+        run_dir = live / f"deleg_junk_{index}"
+        run_dir.mkdir()
+        (run_dir / "manifest.json").write_text("{not json")
+        stamp = _FIXED_NOW - 100 - index
+        os.utime(run_dir, (stamp, stamp))
+
+    tailed: list[Path] = []
+
+    def counting_tail(path: Path, home: Path) -> list[str]:
+        tailed.append(path)
+        return operations_module._live_log_tail(path, home)
+
+    state = _collect_ops(hermes_home, live_log_tail=counting_tail)
+    ops = state.operations
+
+    assert ops.delegation_live_manifest_count == 8
+    assert len(ops.delegation_live_manifests) == operations_module._MAX_LIVE_MANIFESTS
+    assert ops.delegation_live_unparsed_count == 2
+    assert len(tailed) == operations_module._MAX_LIVE_MANIFESTS
+
+
 def test_delegation_live_manifest_task_list_is_capped(hermes_home: Path, sample_db: Path):
     live = hermes_home / "cache" / "delegation" / "live"
     tasks = [{"index": index, "goal": f"g{index}", "status": "running"} for index in range(12)]
@@ -2506,6 +2571,98 @@ def test_delegation_live_manifest_task_list_is_capped(hermes_home: Path, sample_
     assert manifest.task_count == 12
     assert len(manifest.tasks) < 12
     assert manifest.running_task_count == 12  # counted over every entry, not the cap
+
+
+def test_live_manifest_task_count_derives_from_the_entries(hermes_home: Path, sample_db: Path):
+    """The card's own count is the list it holds, not the file's self-report.
+
+    ``_truncation_label(shown, total)`` renders "showing 8 of 3" when the two
+    disagree, and upstream always writes ``task_count: len(task_list)``
+    (``tools/delegation_live_log.py:261``), so only a torn or doctored manifest
+    can differ — in which case the list is the trustworthy half.
+    """
+    live = hermes_home / "cache" / "delegation" / "live"
+    tasks = [{"index": index, "goal": f"g{index}", "status": "running"} for index in range(4)]
+    _write_live_delegation(live, "deleg_lying", _sample_manifest(task_count=3, tasks=tasks))
+
+    manifest = _collect_ops(hermes_home).operations.delegation_live_manifests[0]
+
+    assert manifest.task_count == 4
+
+
+def test_delegation_live_manifest_tails_only_the_displayed_tasks(
+    hermes_home: Path, sample_db: Path
+):
+    """Log tails are read for the displayed slice only; counts still cover all."""
+    live = hermes_home / "cache" / "delegation" / "live"
+    cap = operations_module._MAX_LIVE_TASKS
+    total = cap + 4
+    tasks = [
+        {
+            "index": index,
+            "goal": f"g{index}",
+            # Every task past the display cut is running, so a running count
+            # taken from the slice alone would read 0.
+            "status": "completed" if index < cap else "running",
+        }
+        for index in range(total)
+    ]
+    _write_live_delegation(
+        live,
+        "deleg_many_tasks",
+        _sample_manifest(task_count=total, tasks=tasks),
+        logs={f"task-{index}.log": f"log line {index}\n" for index in range(total)},
+    )
+
+    calls: list[Path] = []
+    real_tail = operations_module._live_log_tail
+
+    def counting_tail(path: Path, home: Path) -> list[str]:
+        calls.append(path)
+        return real_tail(path, home)
+
+    # Injected through the collector rather than patched onto the module: the
+    # property is a read *count*, which no fixture can observe from outside.
+    c = Collector(hermes_home, clock=_fixed_clock, live_log_tail=counting_tail)
+    try:
+        ops = c.collect().operations
+    finally:
+        c.close()
+    card = ops.delegation_live_manifests[0]
+
+    assert len(calls) == cap
+    assert len(card.tasks) == cap
+    assert [task.status for task in card.tasks] == ["completed"] * cap
+    assert card.tasks_truncated is True
+    assert card.task_count == total
+    assert card.running_task_count == total - cap
+
+
+def test_delegation_live_task_goal_is_redacted(hermes_home: Path, sample_db: Path):
+    """The goal sits beside an already-redacted tail but is free text of its
+    own, and it reaches --snapshot-format json."""
+    live = hermes_home / "cache" / "delegation" / "live"
+    _write_live_delegation(
+        live,
+        "deleg_goal_secret",
+        _sample_manifest(
+            delegation_id="deleg_goal_secret",
+            task_count=1,
+            tasks=[
+                {
+                    "index": 0,
+                    "goal": "deploy with token=sk-live-abc123",
+                    "status": "running",
+                }
+            ],
+        ),
+    )
+
+    state = _collect_ops(hermes_home)
+    assert "sk-live-abc123" not in json.dumps(state.model_dump(mode="json"))
+    goal = state.operations.delegation_live_manifests[0].tasks[0].goal
+    assert "[REDACTED]" in goal
+    assert goal.startswith("deploy with token=")
 
 
 # --- process completion receipts (item 13) -----------------------------------
@@ -2565,6 +2722,26 @@ def test_process_receipts_are_parsed_and_redacted(hermes_home: Path, sample_db: 
     assert "REDACTED" in abc.command
 
 
+def test_process_receipt_redacts_before_slicing_the_tail(hermes_home: Path, sample_db: Path):
+    """Slicing first can cut a credential's prefix off and leave the token raw.
+
+    ``output`` is remote-controlled log text: with the tail taken before
+    redaction, a token whose ``Bearer ``/``key=`` marker falls outside the cap
+    keeps 400 raw characters, because the redactor has nothing left to key on.
+    """
+    _write_receipt(
+        hermes_home,
+        "proc_tail.json",
+        _receipt_record(output="build log line\nBearer " + "T" * 900),
+    )
+
+    receipt = _collect_ops(hermes_home).operations.process_receipts.receipts[0]
+
+    assert "TTTT" not in receipt.output_tail
+    assert "[REDACTED]" in receipt.output_tail
+    assert len(receipt.output_tail) <= 400
+
+
 def test_process_receipts_newest_first_and_truncation_flag(hermes_home: Path, sample_db: Path):
     for index in range(11):
         path = _write_receipt(
@@ -2615,6 +2792,30 @@ def test_process_receipts_junk_and_oversized_are_counted_not_listed(
     assert receipts.receipt_count == 3
     assert [r.process_id for r in receipts.receipts] == ["proc_mid"]
     assert len(receipts.receipts[0].output_tail) <= 400
+
+
+def test_process_receipts_json_recursion_error_is_healthy(
+    hermes_home: Path, sample_db: Path, recursion_error_json: str
+):
+    """A refused receipt is counted, listed nowhere, and keeps the source healthy."""
+    receipts_dir = hermes_home / "logs" / "process-results"
+    receipts_dir.mkdir(parents=True, exist_ok=True)
+    (receipts_dir / "proc_nested.json").write_text(f'{{"output": "{recursion_error_json}"}}')
+
+    state = _collect_ops(hermes_home)
+    assert "process_receipts" not in state.health.failed_sources
+    assert state.operations.process_receipts.receipt_count == 1
+    assert state.operations.process_receipts.receipts == []
+
+
+def test_json_decode_helpers_treat_recursion_error_as_junk(
+    tmp_path: Path, recursion_error_json: str
+):
+    """The recursion guard covers a DB JSON column and an MoA trace line."""
+    assert operations_module._json_list_count(f'["{recursion_error_json}"]') == 0
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(f'{{"event": "x", "payload": "{recursion_error_json}"}}\n')
+    assert operations_module._moa_latest_record_summary(trace, 64_000) == ("", [])
 
 
 def test_process_receipts_symlinked_dir_reads_as_absent(
@@ -2710,3 +2911,213 @@ def test_spawn_ledger_corrupt_symlink_is_ignored(
 
     ops = _collect_ops(hermes_home).operations
     assert ops.spawn_ledger_corrupt_present is False
+
+
+def test_checkpoint_prune_interval_follows_the_configured_wrapper_cadence(
+    hermes_home: Path, sample_db: Path
+):
+    """The overdue window follows ``checkpoints.min_interval_hours``.
+
+    Upstream resolves the wrapper's cadence from config
+    (``checkpoints.min_interval_hours``, ``hermes_cli/cli.py:1133``,
+    ``gateway/run.py:3671``, default 24h), so a slower policy must not be
+    reported as overdue — and a faster one must not hide a missed pass.
+    """
+    checkpoints = hermes_home / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    (checkpoints / ".last_prune").write_text(str(_FIXED_NOW - 72 * 3600))
+
+    # Default cadence: 72h is overdue.
+    ops = _collect_ops(hermes_home).operations
+    assert ops.checkpoint_prune_interval_seconds == pytest.approx(24 * 3600)
+    assert ops.checkpoint_prune_overdue is True
+
+    # A weekly policy: the same marker is not overdue.
+    (hermes_home / "config.yaml").write_text("checkpoints:\n  min_interval_hours: 168\n")
+    ops = _collect_ops(hermes_home).operations
+    assert ops.checkpoint_prune_interval_seconds == pytest.approx(168 * 3600)
+    assert ops.checkpoint_prune_overdue is False
+
+    # A faster policy: an 8h cadence makes 17h overdue.
+    (checkpoints / ".last_prune").write_text(str(_FIXED_NOW - 17 * 3600))
+    (hermes_home / "config.yaml").write_text("checkpoints:\n  min_interval_hours: 8\n")
+    ops = _collect_ops(hermes_home).operations
+    assert ops.checkpoint_prune_interval_seconds == pytest.approx(8 * 3600)
+    assert ops.checkpoint_prune_overdue is True
+
+
+@pytest.mark.parametrize("value", ["junk", 0, -5, True, None])
+def test_checkpoint_prune_interval_ignores_unusable_config_values(
+    hermes_home: Path, sample_db: Path, value: object
+):
+    """Only a positive real number counts; anything else keeps the 24h default."""
+    (hermes_home / "config.yaml").write_text(f"checkpoints:\n  min_interval_hours: {value!r}\n")
+    ops = _collect_ops(hermes_home).operations
+    assert ops.checkpoint_prune_interval_seconds == pytest.approx(24 * 3600)
+
+
+@pytest.mark.parametrize(
+    "yaml_value",
+    [".nan", ".inf", "-.inf", "1.0e+308", str(10**400)],
+)
+def test_checkpoint_prune_interval_ignores_non_finite_values_when_rendering(
+    hermes_home: Path, sample_db: Path, yaml_value: str
+):
+    marker = hermes_home / "checkpoints" / ".last_prune"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(str(_FIXED_NOW - 3600))
+    (hermes_home / "config.yaml").write_text(f"checkpoints:\n  min_interval_hours: {yaml_value}\n")
+
+    state = _collect_ops(hermes_home)
+
+    assert state.operations.checkpoint_prune_interval_seconds == pytest.approx(24 * 3600)
+    text = render_to_str(render_panel(12, state, Theme(), detail=True), width=200, no_color=True)
+    assert "Checkpoint Prune" in text
+    assert "interval 1d" in text
+
+
+def test_process_receipts_symlinked_root_reads_as_absent(
+    hermes_home: Path, sample_db: Path, tmp_path: Path
+):
+    """The receipts *directory itself* replaced by a symlink is not followed."""
+    outside = tmp_path / "outside-results"
+    outside.mkdir()
+    _write_receipt(outside, "proc_out.json", _receipt_record(id="proc_out"))
+    logs = hermes_home / "logs"
+    logs.mkdir(exist_ok=True)
+    try:
+        (logs / "process-results").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are not supported here")
+
+    ops = _collect_ops(hermes_home).operations
+
+    assert ops.process_receipts.dir_present is False
+    assert ops.process_receipts.receipt_count == 0
+
+
+def test_delegation_live_manifest_reader_ignores_a_symlinked_live_root(
+    hermes_home: Path, sample_db: Path, tmp_path: Path
+):
+    """The manifest reader shares the count reader's escape guard."""
+    outside = tmp_path / "live"
+    run_dir = outside / "deleg_done"
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text(json.dumps({"tasks": [{"index": 0, "status": "done"}]}))
+    cache = hermes_home / "cache" / "delegation"
+    cache.mkdir(parents=True)
+    (cache / "live").symlink_to(outside, target_is_directory=True)
+
+    ops = _collect_ops(hermes_home).operations
+
+    assert ops.delegation_live_manifest_count == 0
+    assert ops.delegation_live_manifests == []
+
+
+def test_delegation_live_manifest_caps_are_literal(hermes_home: Path, sample_db: Path):
+    """A 70 KiB manifest is counted but not parsed; a 300 KiB one is not counted.
+
+    The parse cap is 64 KiB and the shared file cap 256 KiB; asserting both with
+    literal sizes keeps a widened cap from passing unnoticed.
+    """
+    live = hermes_home / "cache" / "delegation" / "live"
+    big = live / "deleg_big"
+    big.mkdir(parents=True)
+    payload = {"tasks": [{"index": 0, "status": "done"}]}
+    filler = {"index": 0, "status": "done", "goal": "x" * 900}
+    while True:
+        payload["tasks"].append(dict(filler))
+        encoded = json.dumps(payload)
+        if len(encoded) > 70 * 1024:
+            break
+    (big / "manifest.json").write_text(encoded)
+
+    ops = _collect_ops(hermes_home).operations
+    assert ops.delegation_live_manifest_count == 1
+    assert ops.delegation_live_manifests == []
+    # The counted-but-unreadable manifest is reported, not silently dropped.
+    assert ops.delegation_live_unparsed_count == 1
+
+    huge = live / "deleg_huge"
+    huge.mkdir()
+    (huge / "manifest.json").write_text(json.dumps({"tasks": []}) + " " * (300 * 1024))
+    ops = _collect_ops(hermes_home).operations
+    assert ops.delegation_live_manifest_count == 1  # only the 70 KiB one qualifies
+    assert ops.delegation_live_manifests == []
+    assert ops.delegation_live_unparsed_count == 1
+
+
+def test_live_manifest_counted_but_unparsed_is_explained(hermes_home: Path, sample_db: Path):
+    """A counted manifest with no card must be explained, not just omitted.
+
+    The scan counts every run dir holding a capped ``manifest.json`` while the
+    card parser refuses anything past 64 KiB, so a home whose only manifest is
+    oversized renders nothing at all — the count survived only in the JSON
+    snapshot, and in a mixed home the "showing N of M — newest first" label
+    blamed ordering instead of the parse cap.
+    """
+    live = hermes_home / "cache" / "delegation" / "live"
+    big = live / "deleg_oversized"
+    big.mkdir(parents=True)
+    (big / "manifest.json").write_text("{not json" + " " * (70 * 1024))
+
+    c = Collector(hermes_home, clock=_fixed_clock)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.operations.delegation_live_manifest_count == 1
+    text = render_to_str(render_panel(12, state, Theme(), detail=True), width=200, no_color=True)
+    assert "1 manifest" in text
+    assert "too large" in text
+
+
+def test_corrupt_ledger_marker_never_reads_the_parked_bytes(hermes_home: Path, sample_db: Path):
+    """The parking bay is stat'd for its mtime; its contents are corrupt bytes.
+
+    The file is made unreadable, which is the strongest available fixture: the
+    row is still reported with its age, so the bytes were never opened — a read
+    would have failed on the permission bits (and the byte count is never
+    surfaced either way).
+    """
+    path = hermes_home / "spawn-ledger.json.corrupt"
+    path.write_text("SECRET-PARKED-BYTES")
+    path.chmod(0o000)
+
+    try:
+        ops = _collect_ops(hermes_home).operations
+    finally:
+        path.chmod(0o600)
+
+    assert ops.spawn_ledger_corrupt_present is True
+    assert ops.spawn_ledger_corrupt_age_seconds is not None
+
+
+def test_curator_paused_flag_is_read_strictly(hermes_home: Path):
+    """``.curator_state`` is machine-written: a stringified flag is not truth.
+
+    Upstream stores ``"paused": bool(paused)`` (``agent/curator.py:44,65``), so
+    ``bool("false")`` would report the scheduler as paused. The paired
+    ``projects.archived`` read is INTEGER-affinity safe — SQLite converts a TEXT
+    ``'0'`` on insert — and is asserted here as the reason it is left alone.
+    """
+    db_path = hermes_home / "projects.db"
+    conn = sqlite3.connect(str(db_path))
+    create_projects_db_tables(conn)
+    conn.execute(
+        "INSERT INTO projects VALUES ('p1','live','live','','','','main','/repo/live',"
+        "'2026-07-10T00:00:00Z','0')"
+    )
+    conn.commit()
+    conn.close()
+    skills = hermes_home / "skills"
+    skills.mkdir(exist_ok=True)
+    (skills / ".curator_state").write_text(json.dumps({"paused": "false", "run_count": 2}))
+
+    state = _collect_ops(hermes_home)
+
+    assert state.operations.project_archived_count == 0
+    assert state.operations.projects[0].archived is False
+    assert state.curator.scheduler_state_present is True
+    assert state.curator.scheduler_paused is False

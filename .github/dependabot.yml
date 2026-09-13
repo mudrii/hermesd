@@ -10,8 +10,8 @@ updates:
     groups:
       actions-minor-and-patch:
         update-types:
-          - "version-update:semver-minor"
-          - "version-update:semver-patch"
+          - minor
+          - patch
   # hermesd maintains its own locked dependency baseline (uv.lock) and pushes
   # every bump through the full CI gate. Weekly PRs keep that maintenance
   # deliberate and reviewable; Dependabot security alerts and dependency

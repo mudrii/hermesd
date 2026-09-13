@@ -8,8 +8,6 @@ from rich.text import Text
 
 from hermesd.models import (
     API_RUN_RETENTION_SECONDS,
-    CHECKPOINT_PRUNE_INTERVAL_SECONDS,
-    CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS,
     HOSTED_ROOM_DISBANDED_RETENTION_SECONDS,
     MAX_ACTIVE_HOSTED_ROOMS,
     MAX_DISBANDED_HOSTED_ROOM_TOMBSTONES,
@@ -27,6 +25,7 @@ from hermesd.models import (
     HostedRoomSummary,
     OperationsState,
     ProcessReceiptsState,
+    checkpoint_prune_overdue_after,
 )
 from hermesd.panels.formatting import escape_terminal_text as escape
 from hermesd.panels.formatting import fmt_age_seconds, sanitize_terminal_text
@@ -128,11 +127,15 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     if delegation_line:
         lines.append("  Delegations: ", style=theme.ui_label)
         lines.append(f"{delegation_line}\n", style=theme.banner_text)
-    if ops.delegation_live_manifests:
+    if ops.delegation_live_manifest_count:
         running = sum(m.running_task_count for m in ops.delegation_live_manifests)
         lines.append("  Live delegations: ", style=theme.ui_label)
         lines.append(
-            f"{ops.delegation_live_manifest_count} live · {running} running\n",
+            # The count covers every run directory — finished delegations
+            # included, since only the parsed cards carry `completed` — so it is
+            # labelled "manifests". "running" is the parsed slice, marked as
+            # such. A count with no cards (an unreadable manifest) still shows.
+            f"{ops.delegation_live_manifest_count} manifests · {running} running (shown)\n",
             style=theme.banner_text,
         )
     # Counts only, like every other compact row here: room names and run ids are
@@ -187,6 +190,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
 
 def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     ops = state.operations
+    no_artifacts = _has_no_artifacts(ops)
     sections: list[RenderableType] = [_summary_table(ops, theme)]
 
     if ops.model_caches:
@@ -214,14 +218,19 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         )
         sections.append(_delegations_table(ops, theme))
 
-    if ops.delegation_live_manifests:
+    if ops.delegation_live_manifests or ops.delegation_live_unparsed_count:
+        # The heading also appears when every counted manifest was unreadable:
+        # otherwise an oversized-only home rendered nothing at all.
         sections.append(_heading("Live Delegation Transcripts", theme))
         sections.extend(_live_manifest_sections(ops, theme))
         sections.append(_note(_LIVE_MANIFEST_NOTE_LINES, theme))
 
-    # Always stated, even when the directory has never existed: an absent
-    # receipt store is the normal case on a quiet machine, not a failure.
-    sections.extend(_receipt_sections(ops.process_receipts, theme))
+    # Stated whenever the panel has anything else to show: an absent receipt
+    # store is the normal case on a quiet machine, not a failure. On a machine
+    # with no artifacts at all this section is replaced by the single
+    # "No operations artifacts found" line below instead of saying both.
+    if not no_artifacts:
+        sections.extend(_receipt_sections(ops.process_receipts, theme))
 
     if ops.state_db_size_bytes or ops.state_db_schema_version:
         sections.append(_heading("State DB", theme))
@@ -249,7 +258,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     if ops.api_runs.db_present:
         sections.extend(_api_run_sections(ops.api_runs, theme))
 
-    if _has_no_artifacts(ops):
+    if no_artifacts:
         sections.append(Text("\n  No operations artifacts found\n", style=theme.banner_dim))
 
     return Panel(
@@ -267,6 +276,12 @@ def _heading(label: str, theme: Theme) -> Text:
 
 
 def _has_no_artifacts(ops: OperationsState) -> bool:
+    """True when the detail view has nothing to read out but its own empty text.
+
+    Mirrors the section gates in ``_render_detail``: every marker and summary
+    readout that would render a row counts as an artifact, so the panel never
+    claims to be empty while showing one.
+    """
     return (
         not ops.model_caches
         and not ops.pr_monitors
@@ -281,8 +296,12 @@ def _has_no_artifacts(ops: OperationsState) -> bool:
         and not ops.process_receipts.receipt_count
         and not ops.snapshot_count
         and not ops.state_db_size_bytes
+        and not ops.state_db_schema_version
         and not ops.web_ui_build_hash
+        and not ops.desktop_build_stamp
         and not ops.blocked_script_count
+        and not ops.checkpoint_prune_marker_present
+        and not ops.spawn_ledger_corrupt_present
         and not ops.db_recovery.artifacts_present
         and not ops.hosted_rooms.db_present
         and not ops.api_runs.db_present
@@ -551,16 +570,19 @@ def _summary_table(ops: OperationsState, theme: Theme) -> Table:
 
 
 def _checkpoint_prune_label(ops: OperationsState) -> str:
-    """Marker age against upstream's 24h interval, with the overdue verdict.
+    """Marker age against the effective prune cadence, with the overdue verdict.
 
-    The caveat is part of the row: a fresh marker proves the wrapper ran, not
-    that pruning succeeded.
+    The cadence is upstream's default 24h or ``checkpoints.min_interval_hours``
+    when set, so the bound follows config rather than a fixed number. The caveat
+    is part of the row: a fresh marker proves the wrapper ran, not that pruning
+    succeeded.
     """
     age = _age_span_label(ops.checkpoint_prune_marker_age_seconds)
+    interval = ops.checkpoint_prune_interval_seconds
     verdict = (
-        f"OVERDUE (> {_age_span_label(float(CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS))})"
+        f"OVERDUE (> {_age_span_label(checkpoint_prune_overdue_after(interval))})"
         if ops.checkpoint_prune_overdue
-        else f"interval {_age_span_label(float(CHECKPOINT_PRUNE_INTERVAL_SECONDS))}"
+        else f"interval {_age_span_label(interval)}"
     )
     return f"last pass {age} ago · {verdict} · a fresh marker proves the wrapper ran, not that pruning succeeded"
 
@@ -719,9 +741,9 @@ def _live_manifest_sections(ops: OperationsState, theme: Theme) -> list[Renderab
             table.add_row("Started", escape(manifest.started))
         if manifest.completed:
             table.add_row("Completed", escape(manifest.completed))
-        table.add_row("Dir Age", _age_span_label(manifest.dir_age_seconds))
+        table.add_row("Dispatched", _age_span_label(manifest.dir_age_seconds))
         if manifest.tasks_truncated:
-            table.add_row("Tasks", _truncation_label(len(manifest.tasks), manifest.task_count))
+            table.add_row("Task List", _truncation_label(len(manifest.tasks), manifest.task_count))
         parts.append(table)
         parts.append(_live_tasks_text(manifest, theme))
     shown = len(ops.delegation_live_manifests)
@@ -734,14 +756,26 @@ def _live_manifest_sections(ops: OperationsState, theme: Theme) -> list[Renderab
                 style=theme.banner_dim,
             )
         )
+    if ops.delegation_live_unparsed_count:
+        # The count is presence-based while the cards need a readable manifest,
+        # so the gap is named instead of left to look like silent truncation.
+        noun = "manifest" if ops.delegation_live_unparsed_count == 1 else "manifests"
+        parts.append(
+            Text(
+                f"  {ops.delegation_live_unparsed_count} {noun} counted but not shown: "
+                "too large to read or unreadable\n",
+                style=theme.ui_warn,
+            )
+        )
     return parts
 
 
 def _live_tasks_text(manifest: DelegationLiveManifest, theme: Theme) -> Text:
     """Per-task status lines with the optional redacted log tail.
 
-    Rich Text is literal (never markup-parsed), but the strings are escaped
-    anyway so the model layer stays untrusted end to end.
+    Rich ``Text`` is literal — it never parses markup — so the strings are
+    *sanitized* (ANSI and control codes stripped) rather than escaped:
+    escaping here would render literal backslashes.
     """
     lines = Text()
     if not manifest.tasks:

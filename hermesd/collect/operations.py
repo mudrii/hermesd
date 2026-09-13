@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import shlex
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from itertools import islice
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -17,10 +18,12 @@ from hermesd.collect.common import (
     _age_seconds,
     _as_dict,
     _as_list,
+    _coerce_bool,
     _coerce_float,
     _coerce_int,
     _exists_strict,
     _iso_to_epoch,
+    _json_object_capped,
     _path_resolves_under,
     _read_tail_text,
     _read_text_capped,
@@ -38,7 +41,7 @@ from hermesd.collect.sqlite_util import (
     _table_exists,
 )
 from hermesd.models import (
-    CuratorRun,
+    CHECKPOINT_PRUNE_INTERVAL_SECONDS,
     DelegationInfo,
     DelegationLiveManifest,
     DelegationLiveTask,
@@ -48,7 +51,6 @@ from hermesd.models import (
     ProcessReceipt,
     ProcessReceiptsState,
     ProjectSummary,
-    SkillCurationWindow,
     VerificationEventSummary,
     VerificationRootSummary,
 )
@@ -139,9 +141,6 @@ def _goal_state_update(conn: sqlite3.Connection) -> dict[str, Any]:
 _DELEGATION_TERMINAL_STATES = ("completed", "error", "failed", "cancelled")
 _DELEGATION_FAILED_STATES = ("error", "failed")
 # Cap on any JSON object column decoded whole (delegation task/result payloads
-# and goal records). 64 KiB comfortably holds a real goal — which carries the
-# full contract and subgoal list — while still refusing a runaway blob.
-_JSON_COLUMN_MAX_BYTES = 64 * 1024
 _DELEGATION_TEXT_MAX_CHARS = 80
 _BOUNDED_SCAN_LIMIT = 200
 _STATE_META_MAINTENANCE_KEYS = (
@@ -311,25 +310,6 @@ def _first_delegation_result(result_object: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def _json_object_capped(
-    raw: object, max_bytes: int = _JSON_COLUMN_MAX_BYTES
-) -> dict[str, Any] | None:
-    """Decode a JSON object column, refusing payloads over ``max_bytes``.
-
-    None means "no usable object" — absent, over the cap, malformed, or not a
-    JSON object — which lets callers distinguish that from a genuine ``{}``.
-    """
-    if not isinstance(raw, str) or not raw:
-        return None
-    if len(raw.encode("utf-8", errors="replace")) > max_bytes:
-        return None
-    with contextlib.suppress(json.JSONDecodeError, ValueError):
-        decoded = json.loads(raw)
-        if isinstance(decoded, dict):
-            return decoded
-    return None
-
-
 def _clip_single_line(value: str) -> str:
     return " ".join(value.split())[:_DELEGATION_TEXT_MAX_CHARS]
 
@@ -404,110 +384,13 @@ def _count_delegation_live_logs(live_root: Path, home: Path) -> int:
 # Live-delegation manifest bounds. The manifest is a small dispatch-time
 # document (one entry per child task), 64 KiB refuses a runaway blob while
 # holding every realistic batch; the rendered card list is capped far below the
-# bounded directory scan, and only a few task logs are tailed per card.
+# bounded directory scan, and only the displayed tasks are tailed per card.
 _LIVE_MANIFEST_MAX_BYTES = 64 * 1024
 _MAX_LIVE_MANIFESTS = 5
 _MAX_LIVE_TASKS = 8
-_MAX_LIVE_LOG_TAILS = 4
 _LIVE_TAIL_MAX_BYTES = 1024
 _LIVE_TAIL_MAX_LINES = 4
 _LIVE_TAIL_LINE_MAX_CHARS = 160
-
-
-def _read_delegation_live_manifests(live_root: Path, home: Path, *, now: float) -> dict[str, Any]:
-    """Parse ``cache/delegation/live/<id>/manifest.json`` into per-delegation cards.
-
-    Upstream writes the manifest at dispatch and amends per-task statuses after
-    the batch joins (``tools/delegation_live_log.py:255-287``); task logs sit in
-    the same directory. hermesd derives each task's log name from the task index
-    (``task-<index>.log``) instead of trusting the manifest's stored path. Tails
-    are redacted through hermesd's own layer even though upstream pre-redacts
-    the file, because this is free text reaching a panel.
-
-    The bounded scan mirrors ``_count_delegation_live_logs``: symlinked run dirs
-    and any path that resolves outside ``home`` are skipped. The count is
-    presence-based (every run dir holding a capped ``manifest.json``), while
-    only the newest ``_MAX_LIVE_MANIFESTS`` directories are parsed into cards —
-    so the panel can say "showing N of M" instead of silently truncating. A
-    torn manifest still counts its delegation but yields no card; it must never
-    fail the source.
-    """
-    empty = {"delegation_live_manifests": [], "delegation_live_manifest_count": 0}
-    if not _safe_child_path(live_root, home) or not live_root.is_dir():
-        return empty
-    candidates: list[tuple[float, Path]] = []
-    count = 0
-    with contextlib.suppress(OSError):
-        for run_dir in islice(live_root.iterdir(), _BOUNDED_SCAN_LIMIT):
-            if run_dir.is_symlink() or not run_dir.is_dir():
-                continue
-            if not _path_resolves_under(run_dir, home):
-                continue
-            manifest_file = run_dir / "manifest.json"
-            if (
-                manifest_file.is_symlink()
-                or not _safe_capped_file(manifest_file, home)
-                or not _exists_strict(manifest_file)
-            ):
-                continue
-            count += 1
-            candidates.append((_safe_mtime(run_dir), run_dir))
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    manifests: list[DelegationLiveManifest] = []
-    for mtime, run_dir in candidates:
-        manifest = _live_manifest_from_dir(run_dir, home, mtime=mtime, now=now)
-        if manifest is not None:
-            manifests.append(manifest)
-            if len(manifests) >= _MAX_LIVE_MANIFESTS:
-                break
-    return {
-        "delegation_live_manifests": manifests,
-        "delegation_live_manifest_count": count,
-    }
-
-
-def _live_manifest_from_dir(
-    run_dir: Path, home: Path, *, mtime: float, now: float
-) -> DelegationLiveManifest | None:
-    """One delegation card, or None when the manifest is absent or unusable."""
-    data = _json_object_capped(
-        _read_text_capped(run_dir / "manifest.json", home),
-        max_bytes=_LIVE_MANIFEST_MAX_BYTES,
-    )
-    if data is None:
-        return None
-    task_entries = _as_list(data.get("tasks"))
-    tasks = [_live_task_from_entry(_as_dict(entry), run_dir, home) for entry in task_entries]
-    listed = tasks[:_MAX_LIVE_TASKS]
-    # The run dir IS the delegation id upstream (the writer names it so); the
-    # manifest's own field is ignored, so a doctored id cannot mislabel a card.
-    return DelegationLiveManifest(
-        delegation_id=run_dir.name,
-        model=str(data.get("model") or ""),
-        provider=str(data.get("provider") or ""),
-        started=str(data.get("started") or ""),
-        completed=str(data.get("completed") or ""),
-        manifest_present=True,
-        dir_age_seconds=_age_seconds(mtime, now),
-        task_count=_coerce_int(data.get("task_count")) or len(task_entries),
-        running_task_count=sum(1 for task in tasks if task.status == "running"),
-        tasks=listed,
-        tasks_truncated=len(tasks) > len(listed),
-    )
-
-
-def _live_task_from_entry(entry: dict[str, Any], run_dir: Path, home: Path) -> DelegationLiveTask:
-    index = _coerce_int(entry.get("index"))
-    log_name = f"task-{index}.log"
-    tail = _live_log_tail(run_dir / log_name, home)
-    return DelegationLiveTask(
-        index=index,
-        goal=_clip_single_line(str(entry.get("goal") or "")),
-        status=str(entry.get("status") or ""),
-        exit_reason=str(entry.get("exit_reason") or ""),
-        log_name=log_name if tail else "",
-        log_tail=tail,
-    )
 
 
 def _live_log_tail(log_path: Path, home: Path) -> list[str]:
@@ -539,6 +422,156 @@ def _live_log_tail(log_path: Path, home: Path) -> list[str]:
 # refuses files over the shared text cap instead of reading them whole.
 _MAX_PROCESS_RECEIPTS = 8
 _PROCESS_RECEIPT_TAIL_MAX_CHARS = 400
+
+
+def _read_delegation_live_manifests(
+    live_root: Path,
+    home: Path,
+    *,
+    now: float,
+    log_tail: Callable[[Path, Path], list[str]] = _live_log_tail,
+) -> dict[str, Any]:
+    """Parse ``cache/delegation/live/<id>/manifest.json`` into per-delegation cards.
+
+    Upstream writes the manifest at dispatch and amends per-task statuses after
+    the batch joins (``tools/delegation_live_log.py:255-287``); task logs sit in
+    the same directory. hermesd derives each task's log name from the task index
+    (``task-<index>.log``) instead of trusting the manifest's stored path. Tails
+    are redacted through hermesd's own layer even though upstream pre-redacts
+    the file, because this is free text reaching a panel.
+
+    The bounded scan mirrors ``_count_delegation_live_logs``: symlinked run dirs
+    and any path that resolves outside ``home`` are skipped. The count is
+    presence-based (every run dir holding a capped ``manifest.json``), while
+    only the newest ``_MAX_LIVE_MANIFESTS`` readable directories become cards —
+    so the panel can say "showing N of M" instead of silently truncating. Every
+    bounded candidate is still validated for the unparsed count. A card
+    materialises at most ``_MAX_LIVE_TASKS`` tasks, so at most that many
+    ``task-<index>.log`` files are opened per card regardless of how many
+    entries the manifest lists; ``running_task_count`` and ``tasks_truncated``
+    are still computed from every raw entry, so those counts describe the whole
+    batch rather than the displayed slice. A torn manifest still counts its
+    delegation but yields no card; it must never fail the source.
+    """
+    empty = {
+        "delegation_live_manifests": [],
+        "delegation_live_manifest_count": 0,
+        "delegation_live_unparsed_count": 0,
+    }
+    if not _safe_child_path(live_root, home) or not live_root.is_dir():
+        return empty
+    candidates: list[tuple[float, Path]] = []
+    count = 0
+    with contextlib.suppress(OSError):
+        for run_dir in islice(live_root.iterdir(), _BOUNDED_SCAN_LIMIT):
+            if run_dir.is_symlink() or not run_dir.is_dir():
+                continue
+            if not _path_resolves_under(run_dir, home):
+                continue
+            manifest_file = run_dir / "manifest.json"
+            if (
+                manifest_file.is_symlink()
+                or not _safe_capped_file(manifest_file, home)
+                or not _exists_strict(manifest_file)
+            ):
+                continue
+            count += 1
+            candidates.append((_safe_mtime(run_dir), run_dir))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    manifests: list[DelegationLiveManifest] = []
+    unparsed = 0
+    for mtime, run_dir in candidates:
+        data = _live_manifest_data(run_dir, home)
+        if data is None:
+            # Counted by the presence-based scan, but no card: over the parse
+            # cap, torn, or not JSON. Reported so the two numbers cannot
+            # silently disagree.
+            unparsed += 1
+        elif len(manifests) < _MAX_LIVE_MANIFESTS:
+            manifests.append(
+                _live_manifest_from_data(
+                    data,
+                    run_dir,
+                    home,
+                    mtime=mtime,
+                    now=now,
+                    log_tail=log_tail,
+                )
+            )
+    return {
+        "delegation_live_manifests": manifests,
+        "delegation_live_manifest_count": count,
+        "delegation_live_unparsed_count": unparsed,
+    }
+
+
+def _live_manifest_data(run_dir: Path, home: Path) -> dict[str, Any] | None:
+    return _json_object_capped(
+        _read_text_capped(run_dir / "manifest.json", home),
+        max_bytes=_LIVE_MANIFEST_MAX_BYTES,
+    )
+
+
+def _live_manifest_from_data(
+    data: dict[str, Any],
+    run_dir: Path,
+    home: Path,
+    *,
+    mtime: float,
+    now: float,
+    log_tail: Callable[[Path, Path], list[str]] = _live_log_tail,
+) -> DelegationLiveManifest:
+    """Materialize one readable manifest as a delegation card."""
+    task_entries = _as_list(data.get("tasks"))
+    # Only the displayed slice is materialised, so the per-task log tails stay
+    # bounded by _MAX_LIVE_TASKS instead of the (unbounded) manifest size; the
+    # counts below are still derived from every raw entry.
+    entries = [_as_dict(entry) for entry in task_entries]
+    tasks = [
+        _live_task_from_entry(entry, run_dir, home, log_tail=log_tail)
+        for entry in entries[:_MAX_LIVE_TASKS]
+    ]
+    # The run dir IS the delegation id upstream (the writer names it so); the
+    # manifest's own field is ignored, so a doctored id cannot mislabel a card.
+    return DelegationLiveManifest(
+        delegation_id=run_dir.name,
+        model=str(data.get("model") or ""),
+        provider=str(data.get("provider") or ""),
+        started=str(data.get("started") or ""),
+        completed=str(data.get("completed") or ""),
+        manifest_present=True,
+        dir_age_seconds=_age_seconds(mtime, now),
+        # The card's total is its own entry list, not the manifest's
+        # self-reported count: upstream writes ``len(task_list)`` there, so a
+        # disagreement means a torn or doctored file, and the list is what the
+        # truncation label compares against.
+        task_count=len(entries),
+        running_task_count=sum(
+            1 for entry in entries if str(entry.get("status") or "") == "running"
+        ),
+        tasks=tasks,
+        tasks_truncated=len(entries) > len(tasks),
+    )
+
+
+def _live_task_from_entry(
+    entry: dict[str, Any],
+    run_dir: Path,
+    home: Path,
+    *,
+    log_tail: Callable[[Path, Path], list[str]] = _live_log_tail,
+) -> DelegationLiveTask:
+    index = _coerce_int(entry.get("index"))
+    log_name = f"task-{index}.log"
+    tail = log_tail(run_dir / log_name, home)
+    return DelegationLiveTask(
+        index=index,
+        goal=_redact_secret_text(_clip_single_line(str(entry.get("goal") or ""))),
+        status=str(entry.get("status") or ""),
+        exit_reason=str(entry.get("exit_reason") or ""),
+        log_name=log_name if tail else "",
+        log_tail=tail,
+    )
 
 
 def _read_process_receipts(receipts_dir: Path, home: Path, *, now: float) -> ProcessReceiptsState:
@@ -610,11 +643,39 @@ def _process_receipt_from_file(
         termination_source=str(data.get("termination_source") or ""),
         started_age_seconds=_age_seconds(started_at if started_at > 0 else None, now),
         finished_age_seconds=_age_seconds(mtime, now),
-        output_tail=_redact_secret_text(output[-_PROCESS_RECEIPT_TAIL_MAX_CHARS:]),
+        # Redact first, then bound: slicing ahead of the redactor can cut the
+        # "Bearer "/"key=" marker off a credential and keep the token itself.
+        output_tail=_redact_secret_text(output)[-_PROCESS_RECEIPT_TAIL_MAX_CHARS:],
     )
 
 
-def _read_checkpoint_prune_marker(marker_path: Path, home: Path, *, now: float) -> dict[str, Any]:
+def _checkpoint_prune_interval_seconds(cfg: Mapping[str, Any]) -> float:
+    """The wrapper's configured cadence in seconds (``min_interval_hours``).
+
+    Upstream reads ``checkpoints.min_interval_hours`` before deciding whether a
+    pass is due (``hermes_cli/cli.py:1133``, ``gateway/run.py:3671``) with a 24h
+    default, so a marker age only means "overdue" relative to that policy. Only
+    a positive real number counts; anything else keeps the default.
+    """
+    raw = _as_dict(cfg.get("checkpoints")).get("min_interval_hours")
+    if isinstance(raw, bool) or not isinstance(raw, int | float) or raw <= 0:
+        return float(CHECKPOINT_PRUNE_INTERVAL_SECONDS)
+    try:
+        interval_seconds = float(raw) * 3600.0
+    except OverflowError:
+        return float(CHECKPOINT_PRUNE_INTERVAL_SECONDS)
+    if not math.isfinite(interval_seconds):
+        return float(CHECKPOINT_PRUNE_INTERVAL_SECONDS)
+    return interval_seconds
+
+
+def _read_checkpoint_prune_marker(
+    marker_path: Path,
+    home: Path,
+    *,
+    now: float,
+    interval_seconds: float = float(CHECKPOINT_PRUNE_INTERVAL_SECONDS),
+) -> dict[str, Any]:
     """The checkpoint auto-prune wrapper's ``.last_prune`` marker.
 
     PROFILE scope: the marker lives in ``checkpoints/``, which upstream resolves
@@ -629,6 +690,7 @@ def _read_checkpoint_prune_marker(marker_path: Path, home: Path, *, now: float) 
     update: dict[str, Any] = {
         "checkpoint_prune_marker_present": False,
         "checkpoint_prune_marker_age_seconds": None,
+        "checkpoint_prune_interval_seconds": interval_seconds,
     }
     if (
         marker_path.is_symlink()
@@ -787,7 +849,10 @@ def _read_project_summaries(
             name=str(row.get("name") or ""),
             board_slug=str(row.get("board_slug") or ""),
             primary_path=str(row.get("primary_path") or ""),
-            archived=bool(row.get("archived")),
+            # Strict, like every other flag read from a DB row: the column's
+            # INTEGER affinity converts a numeric spelling, but a text 'false'
+            # survives as TEXT and bool() would call the project archived.
+            archived=_coerce_bool(row.get("archived")),
             verification_root_count=_project_verification_root_count(
                 str(row.get("primary_path") or ""),
                 verification_roots,
@@ -841,187 +906,29 @@ def _same_path_or_descendant(candidate: str, parent: str) -> bool:
 
 
 def _json_list_count(value: object) -> int:
+    """Length of a JSON array column; 0 for absent, malformed or absurdly nested
+    text, which the decoder refuses with RecursionError rather than a parse error."""
     if not isinstance(value, str) or not value:
         return 0
-    with contextlib.suppress(json.JSONDecodeError):
+    with contextlib.suppress(json.JSONDecodeError, RecursionError):
         decoded = json.loads(value)
         if isinstance(decoded, list):
             return len(decoded)
     return 0
 
 
-def _curator_with_scheduler_state(
-    run: CuratorRun,
-    state: dict[str, Any],
-    curator_cfg: dict[str, Any],
-) -> CuratorRun:
-    if not state and not curator_cfg:
-        return run
-    return run.model_copy(
-        update={
-            "scheduler_state_present": bool(state),
-            "scheduler_paused": bool(state.get("paused")),
-            "scheduler_run_count": _coerce_int(state.get("run_count")),
-            "scheduler_last_run_at": str(state.get("last_run_at") or ""),
-            "scheduler_last_report_path": str(state.get("last_report_path") or ""),
-            "consolidate_enabled": bool(curator_cfg.get("consolidate")),
-        }
-    )
-
-
-# Curator transition thresholds, agent/curator.py:29 — 14 days to stale, 30 to
-# archive — overridable per install via curator.stale_after_days /
-# curator.archive_after_days (resolved by get_stale_after_days /
-# get_archive_after_days, agent/curator.py:115-120).
-_CURATOR_DEFAULT_STALE_AFTER_DAYS = 14
-_CURATOR_DEFAULT_ARCHIVE_AFTER_DAYS = 30
-# Display bound on the per-skill window table; the counts stay complete.
-_SKILL_WINDOW_LIMIT = 20
-_SECONDS_PER_DAY = 86400.0
-
-
-def _curator_threshold_days(cfg: dict[str, Any], key: str, default: int) -> int:
-    """``int(curator.<key>)`` with the default on any cast failure.
-
-    Mirrors ``_config_number`` (``agent/curator.py:96-100``): an uncastable or
-    absent value falls back to the default, while a present numeric value —
-    including ``0`` — is kept exactly as the curator would keep it.
-    """
-    try:
-        return int(cfg.get(key, default))
-    except (TypeError, ValueError):
-        return default
-
-
-def _curator_thresholds(cfg: dict[str, Any]) -> tuple[int, int, bool]:
-    """Effective (stale, archive) day thresholds, and whether config overrode them."""
-    customized = "stale_after_days" in cfg or "archive_after_days" in cfg
-    stale = _curator_threshold_days(cfg, "stale_after_days", _CURATOR_DEFAULT_STALE_AFTER_DAYS)
-    archive = _curator_threshold_days(
-        cfg, "archive_after_days", _CURATOR_DEFAULT_ARCHIVE_AFTER_DAYS
-    )
-    return stale, archive, customized
-
-
-def _usage_last_activity_epoch(record: dict[str, Any]) -> float | None:
-    """Newest use/view/patch stamp as an epoch, or None when the skill never fired.
-
-    ``created_at`` is deliberately left out — upstream excludes it so
-    never-active skills stay distinguishable (``tools/skill_usage.py:106-111``).
-    """
-    stamps = [
-        epoch
-        for key in ("last_used_at", "last_viewed_at", "last_patched_at")
-        if (epoch := _iso_to_epoch(record.get(key))) is not None
-    ]
-    return max(stamps) if stamps else None
-
-
-def _skill_curation_hygiene(
-    usage: dict[str, Any],
-    *,
-    now: float,
-    stale_after_days: int,
-    archive_after_days: int,
-) -> dict[str, Any]:
-    """Patch-reuse, state and threshold-window rollups over ``skills/.usage.json``.
-
-    Records are what ``tools/skill_usage.py:330-340`` writes: ``state`` in
-    {active, stale, archived} with ``pinned`` as a separate flag, and the patch
-    loop tracked as ``patch_generation`` vs ``last_reused_patch_generation`` —
-    a generation gap means the skill was patched but the patched version has
-    not been re-used yet. Any other ``state`` value counts as unknown rather
-    than being folded into a known bucket.
-    """
-    counts = {"active": 0, "stale": 0, "archived": 0}
-    unknown = 0
-    pinned = 0
-    patch_pending = 0
-    windows: list[SkillCurationWindow] = []
-    for name, raw in sorted(usage.items()):
-        record = raw if isinstance(raw, dict) else None
-        if record is None:
-            continue
-        state = str(record.get("state") or "active")
-        if state in counts:
-            counts[state] += 1
-        else:
-            unknown += 1
-        is_pinned = bool(record.get("pinned"))
-        if is_pinned:
-            pinned += 1
-        pending = _coerce_int(record.get("patch_generation")) > _coerce_int(
-            record.get("last_reused_patch_generation")
-        )
-        if pending:
-            patch_pending += 1
-        activity = _usage_last_activity_epoch(record)
-        age = _age_seconds(activity, now)
-        window = SkillCurationWindow(
-            name=str(name),
-            state=state,
-            pinned=is_pinned,
-            patch_pending_reuse=pending,
-            last_activity_age_seconds=age,
-            days_until_stale=_days_remaining(age, stale_after_days),
-            days_until_archive=_days_remaining(age, archive_after_days),
-        )
-        if len(windows) < _SKILL_WINDOW_LIMIT:
-            windows.append(window)
-        else:
-            _replace_soonest_window(windows, window)
-    windows.sort(key=_window_sort_key)
-    return {
-        "managed_skill_count": sum(counts.values()) + unknown,
-        "patch_pending_reuse_count": patch_pending,
-        "state_active_count": counts["active"],
-        "state_stale_count": counts["stale"],
-        "state_archived_count": counts["archived"],
-        "state_unknown_count": unknown,
-        "pinned_count": pinned,
-        "skill_windows": windows,
-    }
-
-
-def _days_remaining(age_seconds: float | None, threshold_days: int) -> float | None:
-    """Days left before a threshold, from the last activity; None with no activity."""
-    if age_seconds is None:
-        return None
-    return threshold_days - age_seconds / _SECONDS_PER_DAY
-
-
-def _window_sort_key(window: SkillCurationWindow) -> tuple[bool, float, str]:
-    days = window.days_until_stale
-    return (days is None, days if days is not None else 0.0, window.name)
-
-
-def _replace_soonest_window(
-    windows: list[SkillCurationWindow], candidate: SkillCurationWindow
-) -> None:
-    """Keep the soonest-deadline window when the display list is already full."""
-    slowest_index = max(range(len(windows)), key=lambda idx: _window_sort_key(windows[idx]))
-    if _window_sort_key(candidate) < _window_sort_key(windows[slowest_index]):
-        windows[slowest_index] = candidate
-
-
-def _state_transition_label(entry: dict[str, Any]) -> str:
-    from_state = str(entry.get("from") or entry.get("from_state") or "")
-    to_state = str(entry.get("to") or entry.get("to_state") or "")
-    at = str(entry.get("at") or entry.get("timestamp") or entry.get("created_at") or "")
-    if from_state or to_state:
-        label = f"{from_state or 'unknown'} -> {to_state or 'unknown'}"
-    else:
-        label = str(entry.get("state") or "")
-    return f"{label} @ {at}" if at and label else label
-
-
 def _moa_latest_record_summary(path: Path, max_bytes: int) -> tuple[str, list[str]]:
+    """Newest parseable JSON record's labels and keys; junk lines are skipped.
+
+    A line nested deeply enough to exhaust the decoder raises RecursionError,
+    which counts as junk here for the same reason a torn line does.
+    """
     with contextlib.suppress(OSError):
         for line in reversed(_read_tail_text(path, max_bytes).splitlines()):
             stripped = line.strip()
             if not stripped:
                 continue
-            with contextlib.suppress(json.JSONDecodeError):
+            with contextlib.suppress(json.JSONDecodeError, RecursionError):
                 data = json.loads(stripped)
                 if isinstance(data, dict):
                     keys = sorted(str(key) for key in data)[:8]

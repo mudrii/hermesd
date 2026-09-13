@@ -13,63 +13,24 @@ concurrency:
 
 jobs:
   # Release eligibility (audit CI-04): agreeing tag/version/changelog is not
-  # enough. The exact commit the tag points to must carry a successful,
-  # completed run of the aggregate CI gate; anything else - missing, failed,
-  # cancelled, stale, or still-running validation - refuses to publish.
+  # enough. The exact tagged commit must belong to protected main history and
+  # the latest attempt of its trusted main-push CI run must have completed the
+  # aggregate gate successfully. Missing or unsuccessful evidence fails closed.
   release-eligibility:
     name: Release eligibility
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
-      checks: read
+      actions: read
     steps:
-      - name: Verify the release commit passed the required CI gate
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Verify protected-main ancestry and trusted CI provenance
         env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_SHA: ${{ github.sha }}
-          REQUIRED_CHECK: CI gate
-        run: |
-          gh api "repos/${{ github.repository }}/commits/${RELEASE_SHA}/check-runs?per_page=100" \
-            --paginate --jq '.check_runs[]' > "$RUNNER_TEMP/check-runs.jsonl"
-          python3 - <<'PY'
-          import json
-          import os
-          import sys
-
-          required = os.environ["REQUIRED_CHECK"]
-          latest: dict[str, dict] = {}
-          with open(os.environ["RUNNER_TEMP"] + "/check-runs.jsonl") as handle:
-              for line in handle:
-                  line = line.strip()
-                  if not line:
-                      continue
-                  run = json.loads(line)
-                  current = latest.get(run["name"])
-                  if current is None or run["id"] > current["id"]:
-                      latest[run["name"]] = run
-
-          gate = latest.get(required)
-          if gate is None:
-              sys.exit(
-                  f"no '{required}' check run exists on the release commit "
-                  f"{os.environ['RELEASE_SHA']} - refusing to publish"
-              )
-          if gate["status"] != "completed":
-              sys.exit(
-                  f"'{required}' on the release commit is still '{gate['status']}' "
-                  "- refusing to publish"
-              )
-          if gate["conclusion"] != "success":
-              sys.exit(
-                  f"'{required}' on the release commit concluded "
-                  f"'{gate['conclusion']}' - refusing to publish"
-              )
-          print(
-              f"release commit {os.environ['RELEASE_SHA']} "
-              f"passed the '{required}' aggregate gate"
-          )
-          PY
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/release_eligibility.py
 
   test:
     runs-on: ubuntu-24.04
@@ -80,16 +41,18 @@ jobs:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
       - uses: ./.github/actions/locked-env
         with:
           python-version: ${{ matrix.python-version }}
-          enable-cache: "true"
+          enable-cache: "false"
       - name: Lint (ruff)
         run: uv run ruff check .
       - name: Format check (ruff)
         run: uv run ruff format --check .
       - name: Type check (mypy)
-        run: uv run mypy hermesd
+        run: uv run mypy hermesd scripts
       - name: Compile check
         run: uv run python -m compileall hermesd
       - name: Test
@@ -114,6 +77,8 @@ jobs:
     needs: [test, release-eligibility]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
       # Release builds keep uv caching disabled (audit CI-16): publication
       # inputs must not acquire a cache trust dependency.
       - uses: ./.github/actions/locked-env

@@ -7,10 +7,60 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ## [Unreleased]
 
+## [2026.9.13] - 2026-09-13
+
+This release includes all changes since the published
+`v2026.7.11`, including the unpublished `2026.9.8` development milestone below.
+See the [consolidated release notes](docs/releases/2026.9.13.md) for the complete
+release scope grouped by dashboard area.
+
+### Fixed
+
+- Gateway restart windows and checkpoint-prune intervals reject non-finite or overflowing configuration values and retain their defaults, so `.nan`, `.inf`, and oversized numbers cannot crash detail panels or text snapshots. Delegation manifest diagnostics count malformed entries across the bounded candidate scan even after five displayed cards are filled, without opening additional task logs.
+- Kanban can read a WAL-mode board with no sidecars through the immutable path, while still refusing an unreadable WAL sidecar instead of silently serving old data.
+- Cron incident copy now describes the detected incident without claiming that its existence proves alert delivery is broken. Fire-claim checks use an explicitly supplied hostname, and execution handoff flags use strict boolean parsing.
+- Delegation receipt tails and Kanban completion contracts are redacted before clipping or entering dashboard state.
+- The Curator panel dropped its whole hygiene rollup whenever a run report existed: `logs/curator/<stamp>/run.json` is read into a fresh `CuratorRun`, and that object carried none of the thresholds or the `skills/.usage.json` counts computed for the same pass. On a home with 20 run reports the panel showed no hygiene section at all — while its usage file manages 72 skills (59 active, 13 stale) — and a configured 7/9 threshold pair rendered as 14/30. Both shapes now apply one shared overlay, so a field cannot land on only one of them.
+- The gateway loop verdict had a 90-300 s band that always answered `stale`, so a gateway whose witness was armed and silent for four minutes still read as a slow heartbeat and a witness-less legacy writer in that band read as one too. Upstream opens the escalation band at its 90 s stale budget (three missed 30 s beats); the band is gone, the three-strike silence guard still stands, and `legacy`/`unknown` now apply from 90 s.
+- The kanban breaker fired on healthy tasks: `breaker_tripped` compared the raw failure counter against the limit, so a task with `max_retries: 0` and no failures rendered `0/0 breaker tripped` in alert style. Upstream increments before every comparison, so the trip test now floors the limit at one failure while still reporting the stored 0.
+- The compact lease row printed `1 expired` in warning style with nothing to distinguish it from the action-worthy orphaned case, although upstream revives an expired lease whose holder still matches. It now reads `1 expired (holder may revive)`, and the lease note states that a compression lock only blocks other compressions, never turns.
+- The Operations compact row called every delegation run directory "live" — nine July delegations whose manifests all carried completion stamps read as `9 live`. Only the parsed cards know whether a batch finished, so the total is now labelled `manifests` and the running sum keeps its `(shown)` marker.
+- The `conversation_generations` shrink warning lasted exactly one refresh: the reader compared against the previous count and then stored it, so the next pass cleared the warning and the operator's only cue was catching the interval that saw the drop. The remembered count is a high-water mark now, and the warning stands until the table recovers to it.
+- The kanban notify read selected every `kanban_notify_subs` row with two correlated `task_events` subqueries each and no `LIMIT` — the only unbounded read in its module, where the panel displays ten rows. The list is the worst ten backlogs now, and the subscription count, platform rollup, backlog total and peak all come from their own aggregates, so the cap cannot change a total.
+- `cron/jobs.json`'s own `enabled` flag was still read truthily while `no_agent` and `preflight_alerted` in the same record were strict: a stringified `"false"` showed a paused job as enabled. It goes through `_coerce_bool` now, with the null/absent fallback to the model default unchanged.
+- Routing `resume_reason` and `auto_reset_reason` were redacted but never clipped, and both render in the routes table and the JSON snapshot: `entry_json` is chat-controlled metadata bounded only by its 64 KiB column cap, so one route could put two multi-thousand-character strings on the panel. Both are clipped like the display name, after redaction so a credential cannot survive as a truncated prefix.
+- The gateway detail view ran five separate liveness facts together on one line (`… witness answered  Starts: … Web client: … Exit diagnostics: …`), and the exit-diag tag was clipped but never redacted. Each fact now gets its own line, the tag goes through the redactor, the value is labelled `last record` (on a healthy boot it is a start record, not an exit), and the unclean-exit flags carry a caveat that a `gateway --replace` takeover that outlived its SIGTERM grace window leaves the same record.
+- A route pointing at a *hidden* session was reported as dangling. Upstream hides a session from the default listing while keeping it resumable (`get_session` does not filter), and canonical bot chats are born hidden; route targets are resolved against the unfiltered id set now, from the same cached state.db pass.
+- Panel-level honesty fixes: the delegation card's task total derives from its own entry list (a torn manifest could render `showing 8 of 3`); a manifest that was counted but could not be parsed is named instead of silently missing; `notify_platform_counts` is rendered in the kanban detail view; a truncated mirror roster says so; future-dated exit-diag stamps no longer count as unclean exits in the last 24 h; and the free-tier badge matches upstream's `is_guest_state` (auth method alone).
+- Config panel (5) had no viewport, so its ~72-line detail could not reach the `backups/config/` section — including the corrupt-snapshot alert — at a default 80x24 terminal. It scrolls now, and the `[g/G]` hint follows the same scrollable flag as `[j/k]` instead of a panel list that could drift.
+- A YAML `.inf` in `curator.stale_after_days` raised `OverflowError` out of the threshold cast and failed the whole curator source — thresholds, usage rollup and run history — over one token; `_coerce_bool` read `NaN`, `inf` and `-inf` as set; a nesting bomb reached the terminal-breadcrumb and file-cache readers as a source failure (and made `file_cache` re-parse the file every refresh); the `archived` columns were read truthily; and kanban's WAL database was copied once per reader instead of once per refresh.
+
+- Boolean flags read from machine-written payloads are now read strictly wherever they feed a panel verdict — not only in the six places the audit batch touched: `gateway_state.json` platform `needs_attention` and config-source `exists`, `channel_aliases.json` staleness, `skills/.usage.json` `pinned` (the learned roll-up, the curator's pinned count and each curation window), `skills/.curator_state` `paused`, the migration manifest's `flag_was` and `service.system`, the update receipt's `restart_requested`, the drain request's `suppress_notification`, `active_sessions.json` `track_liveness`, `processes.json` `notify_on_complete` and `cron/jobs.json` `no_agent`. A stringified `"false"` no longer reads as set. Human-authored settings (`config.yaml`, SKILL.md frontmatter) stay truthy on purpose — upstream reads those truthily when it decides what to do — and INTEGER-affinity SQLite columns need no change.
+
+- Kanban notify backlog counted the *global* `task_events` id gap (`MAX(id) - last_event_id`), so every other task's events inflated it: with one unseen event and 20 foreign ones the panel showed "21 unseen (max 21)" and raised its own "watcher is wedged" alarm. It is now a correlated count of the subscription's own events newer than its cursor (`id > last_event_id`, as upstream's notifier claims them).
+- `delegation_live` tail-read a log file for **every** task in a manifest and only then sliced to the eight it displays — 1 500 manifest entries meant 1 500 opens per card per refresh. Only displayed tasks are tailed now; `running_task_count` and the truncation flag still describe the whole batch.
+- A recursively nested JSON payload (≈6 KB, well under every size cap) raised `RecursionError` out of the JSON helpers, so `delegation_live`, `process_receipts`, `gateway_routes` and the MoA/JSON-count readers reported a *failed source* for data that is merely junk. Deep nesting is now treated as junk, like any other malformed payload.
+- A corrupt `cache/plugin-catalog.json` (or any payload that is not the `{"entries": [...]}` object upstream writes) was read as an empty catalog, so the panel answered "plugins match the catalog" from a file it had not read. It now renders "catalog cache … is unreadable — update/removal checks unavailable"; a cache that parsed and is empty still counts as evidence of no drift.
+- The config-backup group cap could delete the alert it exists to show: groups were sorted by *reason* before the cut, so eight alphabetically earlier reasons dropped the `good` and `corrupt` groups and the panel printed "no good copy" / "Corrupt snapshots: none". Kinds are ranked now, and truncation is flagged in the compact view too.
+- The respawn-storm verdict used a hardcoded 5 starts / 120 s while upstream's effective policy is `gateway.respawn_storm.{max_starts,window_seconds}` from `config.yaml` — a raised cap produced a false "respawn backoff", a lowered one hid a real storm, and a longer window dropped starts from the count. The reader now takes the configured cap and window (defaulting to 5 / 120 s), renders the window label instead of a fixed "2m", and treats `max_starts <= 0` (writer disabled) as no verdict at all. `gateway_starts_2m` is renamed `gateway_starts_window` to match.
+- A task with an explicit `max_retries: 0` was read as "unset" and shown with the config/default breaker limit; upstream honours `0` and trips on the first recorded failure. `NULL` and `0` are now distinguished, and the comment claiming otherwise is corrected.
+- Listener mirror URLs were gated by the *ingress* deny-list, so an adapter in any state but `fatal`/`disconnected`/`stopped` — `paused`, `starting`, or a missing state — still produced a `/p/<profile>/v1` callback URL. The mirror path now uses upstream's serving allow-list (`connected`, `connecting`, `retrying`), leaving the ingress rule untouched.
+- The reset-churn shrink warning was unreachable in its own worst case: the panel gated the whole section on a non-zero chat total, so a *wiped* `conversation_generations` table — the exact invariant break the flag detects — rendered nothing. The warning now renders on the flag alone, with a compact marker.
+- Loop-tick silence strikes were counted in one shared counter across gateway restarts, so two misses from a dead process made the replacement's *first* silent probe the third strike and escalated it to `wedged`. Strikes are keyed to the witness pid now.
+- The checkpoint-prune "overdue" window was hardcoded to 48 h and ignored `checkpoints.min_interval_hours`, so a slower configured cadence (a weekly policy, say) reported a missed pass that had not happened. The window is twice the configured interval (24 h default) and the row states the effective value.
+- A cron fire claim whose same-host owner pid had exited still read `running` for the rest of the 300 s TTL, where upstream releases it immediately; a killed `hermes cron run` therefore looked like a live run here. The owner rule is mirrored, and foreign or unparseable owners stay unverifiable. Same record: `last_fire_error` is cleared only by a *successful* run (not "the next run outcome"), the compact warning carries the newest age, and the `(N unacked)` qualifier is only rendered when it differs from the open count.
+- A bare credential in a chat's `display_name` (or in a route's resume/auto-reset reason) survived redaction, because the shared redactor only rewrites `key = value` shapes; `sk-`, `ghp_`, `xox…-` and JWT-shaped values are now scrubbed from routing free text, and the reasons are redacted at all.
+- The terminal-breadcrumb scan materialised and sorted the whole `terminal-sessions/` directory before applying its 200-entry cap while its docstring claimed the listing was bounded, and a truncated scan reported its partial count as the total. The listing is now sliced before sorting and the panel says "at least N" when the scan was cut.
+- `bool("false")` is `True`, so six flag reads on untrusted payloads (routing `suspended`/`resume_pending`/`was_auto_reset`, a session row's `pinned`, cron's `preflight_alerted`) could flip a warning on from a stringified value. They now go through a strict `_coerce_bool`, which accepts JSON `true`, a non-zero number (integer or real) and the `"1"`/`"true"`/`"yes"`/`"on"` spellings upstream itself accepts.
+- A failed source read could restore only half of a pair: after the new exact totals landed, a failing `gateway_hygiene` read kept its last-good streak rows while `hygiene_total` fell back to zero, rendering "0 hygiene cooldown(s)" above those very rows. The last-good field list now carries the total beside the rows (pinned by a resilience test), and the hygiene effect label reads the model's computed `suspended` flag instead of re-deriving the ladder threshold, with the panel note naming the base as the configurable default it is.
+- A present-but-unparseable `gateway-starts.log` was reported as a *recorded* zero ("2m 0/5 1h 0") although upstream always appends a start before its atomic replace, so such a file was not written by that ledger. It now reads as unrecorded and the line is omitted.
+- Panel copy and counts that overstated what was read: the live-delegation card labelled the run directory's mtime as liveness (it does not advance while a task runs) and is now "Dispatched"; the unredacted task `goal` beside a redacted tail is now redacted too; a duplicated "Tasks" row on a truncated card became "Task List"; the empty Operations state no longer prints both "no receipts yet" and "No operations artifacts found"; the compact live line marks its running sum as "(shown)"; the hygiene/route counts use exact totals (`hygiene_total`, `route_total`) instead of the capped row lists; kanban's compact Text buffers stopped markup-escaping literal brackets; and the hygiene effect label derives from the model's `suspended` flag instead of re-hardcoding the threshold.
+- Documentation: `README.md` now describes the batch's panel content, the ownership table's `gateway_loop_tick` row cites the pins that actually exercise the witness (and the four gateway launch-cluster rows plus delegation-live/plugin-catalog are marked **decided**), `gateway_lifecycle` lists the two OOM fields, the `generation_churn` writer citation points at the increment SQL, the mixed-model register records what panel 12 mixes, and the ownership-doc test now requires an upstream citation on every row and a resolvable `test_*` name in every "pinned by" cell.
+
 ### Added
 
 - Gateway panel (1) now probes the loop-tick witness socket (`state/gateway.loop-tick.<pid>.sock`, or its 127.0.0.1 TCP port on Windows) and shows an authoritative `alive` badge when the gateway's own loop answers — the heartbeat file has been written off-loop since #90502, so freshness alone no longer proves the loop dispatches. Escalation to `wedged` requires silence across consecutive probes plus a stale heartbeat, mirroring upstream's sustained window; a heartbeat that predates the witness key renders as `legacy heartbeat`, where staleness alone is evidence. The detail view explains which witness decided the verdict.
-- Gateway panel (1) shows crash forensics: `previous exit unclean` and `suspected OOM` carry flags from the lifecycle sentinel, the respawn-storm ledger (`gateway-starts.log`) as starts-per-2-minutes against the cap with a `respawn backoff` badge, the tail of the `gateway-exit-diag.log` crash ledger (last exit tag, unclean exits in 24h, size with an oversized warning — upstream never prunes it), and stat-only metadata for the event-only companion logs (`gateway-shutdown-diag.log`, `gateway_faulthandler.log`, `launchd-reload.log`), where growth, not absence, is the signal.
+- Gateway panel (1) shows crash forensics: `previous exit unclean` and `suspected OOM` carry flags from the lifecycle sentinel, the respawn-storm ledger (`gateway-starts.log`) as starts within the *configured* window (`gateway.respawn_storm.window_seconds`, rendered as its own label) against the configured cap, with a `respawn backoff` badge, the tail of the `gateway-exit-diag.log` crash ledger (last exit tag, unclean exits in 24h, size with an oversized warning — upstream never prunes it), and stat-only metadata for the event-only companion logs (`gateway-shutdown-diag.log`, `gateway_faulthandler.log`, `launchd-reload.log`), where growth, not absence, is the signal.
 - Gateway panel (1) shows web-dashboard attachment from the `state/dashboard_clients.heartbeat` marker (mtime only; a `web client` chip when one attached in the last minute), respawn-storm counts, and per-served-profile mirror URLs synthesized from the default profile's `listener_base` (`Inbound callback URLs on the shared listener`), redacted and suppressed exactly like recorded ingress URLs.
 - Skills/Integrations panel: plugin catalog drift is now visible. Each installed
   plugin is compared against the live catalog cache (`cache/plugin-catalog.json`):
@@ -25,17 +75,21 @@ and this project uses date-based versions in `YYYY.M.D` form.
   stamps appear as an audit trail. Stamps are the writer's local time.
 - Curator panel: skill-library hygiene from `skills/.usage.json` — how many skills
   were patched but never re-used (the patch-reuse loop), state counts
-  (active/stale/archived), pinned skills, and each skill's distance to the
+  (active/stale/archived, plus `unknown` for a state outside that vocabulary),
+  pinned skills, and each skill's distance to the
   curator's stale/archive thresholds (14/30 days by default, honoring
   `curator.stale_after_days` / `curator.archive_after_days` overrides). Windows run
   from the last use/view/patch; `created_at` stays excluded upstream.
 - Skills/Integrations panel: a "Nous free tier" badge now marks the free-tier
-  identity (`providers.nous` with `auth_method`/`account_tier` "anonymous" in
-  auth.json), next to the provider list in both views. Key names only — no
-  credential values are read or shown.
+  identity (`providers.nous` with `auth_method` "anonymous" in auth.json — the
+  single condition upstream's `is_guest_state` tests), next to the provider
+  list in both views. Key names only — no credential values are read or shown.
 
 ### CI/CD
 
+- Hosted release validation caught two Nix-specific gaps: Intel macOS now selects an immutable pin from the still-supported Nixpkgs 26.05 Darwin branch, while the other systems retain their validated package set; fake dependency-scanner tests invoke their own interpreter rather than relying on `/usr/bin/env` inside a pure sandbox. Nix jobs stream complete build/test logs and avoid writing a lockfile during either validation command.
+- Follow-up validation binds release eligibility to protected-main ancestry and the latest attempt of the exact-SHA main-push CI workflow, makes dependency review part of the required aggregate gate, and rejects cancelled, missing, or unexpected gate outcomes. Both release test and build caches are disabled. Scanner reports are validated for shape, completeness and exit-code agreement; wheel pins reject duplicate requirements; sdists include their helper scripts, lockfile and policy documents. Nix restores the required Hatchling build tool and installed Git support, with package, CLI and checkpoint checks configured for all four Linux/macOS architecture targets. The publication environment now admits only `v*` tags without administrator bypass; version-tag creation is administrator-only and tag updates/deletion are blocked. Protected-main ancestry is enforced separately by the release workflow.
+- Validated development-tool updates include pytest 9.1.1, Ruff 0.16.6 and types-PyYAML 6.0.12.20260906. Cross-version JSON-error and platform timestamp tests now exercise failures deterministically.
 - Hardened the whole pipeline per the consolidated CI/CD audit. Nix now proves buildability: the flake derives its version from `pyproject.toml` (single source of truth), declares `checks` outputs that build the package, run its pytest suite, and smoke the installed CLI, and CI builds `.#hermesd` on Linux and macOS instead of merely evaluating. Published runtime requirements are exact pins matching `uv.lock` (`rich==14.3.3`, `pyyaml==6.0.3`, `pydantic==2.13.4`), enforced against wheel metadata by `scripts/check_wheel_pins.py`; the pydantic upgrade itself was validated on hermesd's own full Python 3.11–3.14 matrix, mypy, and snapshot/threading surfaces before landing (decision and evidence in `docs/dependency-decisions.md`).
 - CI now separates lint/format/types into a `static` job, dependency auditing into a `security` job (per-interpreter, marker-aware), and keeps the test matrix to behavior; a composite `locked-env` action defines toolchain setup once so CI and the publication workflow cannot drift, with release builds keeping uv caching disabled to preserve the publication trust boundary.
 - Docker and Nix jobs are classified by changed inputs on pull requests — always including application source and package metadata — behind an always-reporting **CI gate** that fails on any non-success outcome of expected work (failure, cancellation, or skipped-but-expected), giving branch protection one stable required check.
@@ -51,9 +105,9 @@ and this project uses date-based versions in `YYYY.M.D` form.
   root-anchored `kanban.db` the board itself comes from — `kanban_home()` = `get_default_hermes_root()`,
   "Shared across profiles BY DESIGN" (`hermes_cli/kanban_db.py:382-401`), so the source stays ROOT-scoped
   under `--profile` — and reports, per subscription, the unseen-event backlog
-  `max(task_events.id) - last_event_id` (upstream's notifier claims events with `id > last_event_id`,
-  `hermes_cli/kanban_db_notify.py:186-232`): a backlog that only grows means the gateway watcher that owns
-  the subscription is wedged or gone. The panel shows subscriber counts rolled up per platform
+  the count of that task's events with `id > last_event_id` (upstream's notifier claims the same events,
+  `hermes_cli/kanban_db_notify.py:186-232`): a backlog that keeps growing is a reason to inspect the gateway watcher that owns
+  the subscription, rather than proof of its liveness state. The panel shows subscriber counts rolled up per platform
   (case-insensitively, matching notifier routing), the total and worst backlog, a bounded table of the
   subscriptions that actually have unseen events (task, platform, delivery mode, owning profile, cursor,
   newest event, backlog), and the subscriptions whose `notifier_profile` names a profile that no longer
@@ -80,11 +134,11 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 - Operations forensics: the [12] panel now accounts for the subagent process handoff feature from durable delegation result payloads. Each delegation row in the detail view gains a `Procs` column summing `handed_off_processes`, `orphaned_processes` (with runtime) and `unread_completions` (with exit code and output tail) across the payload's per-child entries — partial mid-flight rows included — because this is the only durable trace of the handoff; session ids, commands and output tails never leave the payload, so hermesd keeps the counts only.
 
-- The [12] panel now parses live delegation manifests from `cache/delegation/live/<id>/manifest.json` (new `delegation_live` health source). Each newest delegation gets a card — model, provider, task count, per-task status/exit reason and a redacted tail of `task-<n>.log` — with directory-mtime liveness, and the section states explicitly that the live roster (per-task tool counts, steer state, depth) exists only in gateway memory and over RPC.
+- The [12] panel now parses live delegation manifests from `cache/delegation/live/<id>/manifest.json` (new `delegation_live` health source). Each newest delegation gets a card — model, provider, task count, per-task status/exit reason and a redacted tail of `task-<n>.log` — with the run directory's age labelled `Dispatched` (its mtime does not advance while a task runs, so it is not liveness), and the section states explicitly that the live roster (per-task tool counts, steer state, depth) exists only in gateway memory and over RPC.
 
 - The [12] panel now lists recently finished background processes from PROFILE `logs/process-results/` receipts (new `process_receipts` health source): newest-first cards with exit code, completion reason, ages and a doubly-redacted output tail (upstream redacts at write time; hermesd redacts again at the collector boundary). An absent directory renders as "no receipts yet", which the 7-day / 64-file retention makes the normal quiet-machine case.
 
-- The [12] panel flags "Checkpoint prune overdue" when the PROFILE `checkpoints/.last_prune` marker is older than 48h (2x upstream's 24h auto-prune interval), with the caveat kept inline: a fresh marker proves the wrapper ran, not that pruning succeeded.
+- The [12] panel flags "Checkpoint prune overdue" when the PROFILE `checkpoints/.last_prune` marker is older than twice the effective cadence — upstream's 24h default, or `checkpoints.min_interval_hours` when configured — with the caveat kept inline: a fresh marker proves the wrapper ran, not that pruning succeeded.
 
 - The [12] panel raises a red flag with its age when ROOT `spawn-ledger.json.corrupt` exists — the parking bay where upstream moves an unparseable spawn ledger rather than silently treating it as empty.
 - The Sessions panel now surfaces the gateway's cross-process coordination state, read from four
@@ -122,10 +176,11 @@ and this project uses date-based versions in `YYYY.M.D` form.
 - Active-surface lease rows now show a **joinable** chip when the registry entry advertises
   `metadata.shared_runtime_url` — the loopback origin upstream's cooperative attach handshake
   requires (`hermes_cli/shared_session_attach.py:32-47`). Presence is the whole signal: hermesd
-  never probes the handshake, never stores the URL, and never displays more than the chip. The lease
-  surface vocabulary now includes gateway surfaces recorded as `gateway:<platform>`
-  (`gateway/run_busy.py:187`), and bot delivery consumers carry
-  `metadata.bot_live_delivery_consumer` (`tui_gateway/session_lifecycle.py:36`).
+  never probes the handshake, never stores the URL, and never displays more than the chip. The
+  lease's `surface` value is carried verbatim, never allowlisted, so a gateway surface recorded as
+  `gateway:<platform>` (`gateway/run_busy.py:187`) and a bot delivery consumer carrying
+  `metadata.bot_live_delivery_consumer` (`tui_gateway/session_lifecycle.py:36`) both render
+  without a vocabulary change.
 
 - Terminal breadcrumbs under `terminal-sessions/` (PROFILE-scoped, matching upstream's
   `get_hermes_home()` writer, `hermes_cli/terminal_breadcrumbs.py:26-28,85-92`, pruned at 30 days
@@ -165,20 +220,13 @@ and this project uses date-based versions in `YYYY.M.D` form.
   (`cron/jobs.py:1600-1630`), so an operator can see what an unpinned job will actually run instead
   of assuming a pin that is not there.
 
-- The Cron panel's Open Incidents table now labels a `detected` incident **never alerted** and
-  states the acknowledgement semantics beside the table. Upstream moves a row `detected` →
-  `alerted` only when a failure ping actually leaves the process (`cron/scheduler.py:2745-2746`),
-  so a row still `detected` — in particular one whose `last_seen_at` has gone stale — means the
-  alert delivery path itself is broken rather than a merely unacknowledged failure. And because
-  `acked_at` is only ever written together with `closed_at` by the terminal closing transition
-  (`cron/incidents.py:186-195`), an open incident can never be acknowledged away.
+- The Cron panel's Open Incidents table labels a `detected` incident **no delivered failure ping** and explains acknowledgement beside the table. Upstream marks a row `alerted` only when the ping leaves the process; a notice may also be intentionally suppressed or have no route, so a detected record warrants investigation without proving the delivery path is broken. Because `acked_at` is written together with `closed_at` by the terminal closing transition, an open incident cannot be acknowledged independently of closure.
 
 ### Fixed
 
 - Fixed Agent Plugin compatibility: provider-kind auto-detection now runs only when `kind` is absent, while explicit null, blank, non-string, and unknown values remain standalone as upstream treats them. Portable v1 manifests now mirror all upstream load-blocking field validation, including author, project links, licensing, keywords, and extensions.
 - Migration verification now requires the supported version-1 manifest schema, a valid default profile record, and well-shaped secondary profile records. Malformed or unsupported manifests remain visible as intent metadata but can no longer produce a verified migration verdict.
 - Active-session capacity now uses the complete valid-entry count from the bounded registry input, independently of filtering and the 200-row retained display sample. The Sessions panel labels shown versus total entries and reports truncation, so filters no longer suppress a registry-wide at-capacity warning.
-- Gateway, Cron, Skills / Integrations, Sessions, and Operations detail views now share a whole-render viewport, making lower sections reachable with `j`/`k` and `g`/`G` at ordinary terminal heights. Resizing and filtering re-clamp the live position, while copy and snapshot rendering remain non-mutating; direct Skills panel rendering retains its existing 20-row paging API.
 - Unreadable cron catch-up and ticker-error markers now fail the cron source and preserve last-good state instead of clearing observed counters or errors. Read-only SQLite snapshots likewise refuse unsafe, unreadable, symlinked, or dangling `-wal`/`-shm` sidecars before immutable fallback, preventing checkpoint-old false-zero results while still allowing genuinely absent sidecars.
 - Expired API reservation counts are now labelled as rows past their retention deadline. They may include terminal rows awaiting a later request-triggered pruning pass, so the panel no longer invents a missing terminal status.
 
@@ -242,6 +290,9 @@ and this project uses date-based versions in `YYYY.M.D` form.
 - Platform writer-identity stamps (`writer_pid` / `writer_start_time`) are retained in `PlatformStatus` because the ownership verdict is computed from them, but upstream classifies them as private process recon and strips them from its public status endpoint. A parametrized test now pins that neither value reaches a rendered panel in compact or detail view — only the derived verdict does.
 
 ## [2026.9.8] - 2026-09-08
+
+Unpublished development milestone; all changes in this section are included in
+the `2026.9.13` release.
 
 ### Added
 
@@ -501,6 +552,8 @@ and this project uses date-based versions in `YYYY.M.D` form.
 ## [2026.4.9] - 2026-04-09
 
 ### Added
+
+- Gateway, Cron, Skills / Integrations, Sessions, Operations and Config detail views now share a whole-render viewport, making lower sections reachable with `j`/`k` and `g`/`G` at ordinary terminal heights. Resizing and filtering re-clamp the live position, while copy and snapshot rendering remain non-mutating; direct Skills panel rendering retains its existing 20-row paging API.
 
 - Initial release of hermesd TUI monitoring dashboard
 - 8-panel overview with compact and detail views:

@@ -18,6 +18,8 @@ import tomllib
 import zipfile
 from pathlib import Path
 
+from packaging.requirements import InvalidRequirement, Requirement
+
 # Runtime dependency names from [project.dependencies] (PEP 503-normalized).
 RUNTIME_DEPS = ("pydantic", "pyyaml", "rich")
 
@@ -60,14 +62,14 @@ def split_requirement(requirement: str) -> tuple[str, str] | None:
     Entries scoped to an optional extra (``; extra == 'dev'``) describe that
     extra, not the runtime dependency set, so they return ``None``.
     """
-    parts = requirement.split(";", 1)
-    if len(parts) == 2 and re.search(r"\bextra\b", parts[1]):
+    try:
+        parsed = Requirement(requirement)
+    except InvalidRequirement as exc:
+        raise SystemExit(f"unparseable Requires-Dist entry: {requirement!r}") from exc
+    marker = str(parsed.marker) if parsed.marker is not None else ""
+    if re.fullmatch(r'extra == "[^"]+"', marker):
         return None
-    base = parts[0].strip()
-    match = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(\[[^\]]*\])?\s*(.*)$", base)
-    if match is None:
-        raise SystemExit(f"unparseable Requires-Dist entry: {requirement!r}")
-    return normalize(match.group(1)), match.group(3).strip()
+    return normalize(parsed.name), str(parsed.specifier)
 
 
 def main() -> int:
@@ -84,19 +86,23 @@ def main() -> int:
     locked = locked_versions(Path("uv.lock"))
     requirements = wheel_requires_dist(wheels[0])
     parsed = [parsed for requirement in requirements if (parsed := split_requirement(requirement))]
-    actual = dict(parsed)
+    actual: dict[str, list[str]] = {}
+    for name, spec in parsed:
+        actual.setdefault(name, []).append(spec)
 
     problems: list[str] = []
     unexpected = sorted(set(actual) - set(RUNTIME_DEPS))
     if unexpected:
         problems.append(f"undeclared runtime dependencies in wheel: {', '.join(unexpected)}")
     for name in RUNTIME_DEPS:
-        spec = actual.get(name)
+        specs = actual.get(name, [])
         expected = f"=={locked[name]}"
-        if spec is None:
+        if not specs:
             problems.append(f"{name} missing from wheel metadata")
-        elif spec != expected:
-            problems.append(f"{name} pin {spec!r} does not match locked {expected!r}")
+        elif len(specs) > 1:
+            problems.append(f"duplicate runtime dependency in wheel: {name}")
+        elif specs[0] != expected:
+            problems.append(f"{name} pin {specs[0]!r} does not match locked {expected!r}")
 
     if problems:
         for problem in problems:

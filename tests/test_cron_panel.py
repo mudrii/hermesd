@@ -1116,12 +1116,14 @@ def test_cron_detail_shows_model_snapshot_only_when_unpinned() -> None:
     assert pinned.model not in text or "gpt-9 (unpinned" not in text
 
 
-def test_cron_detail_labels_detected_incident_as_never_alerted() -> None:
-    """An open incident still in ``detected`` was never alerted: upstream flips it
-    to ``alerted`` only when a failure ping actually leaves the process
-    (``cron/incidents.py:1-9``, ``cron/scheduler.py:2745-2746``), so a stale
-    ``detected`` row means the alert delivery path itself is broken. ``acked_at``
-    is only ever set together with ``closed_at`` (``cron/incidents.py:186-195``),
+def test_cron_detail_labels_detected_incident_as_no_delivered_failure_ping() -> None:
+    """An open incident still in ``detected`` has no delivered failure ping on
+    record: upstream flips it to ``alerted`` only when a failure ping actually
+    leaves the process (``cron/incidents.py:1-9``, ``cron/scheduler.py:2745-2746``),
+    but it also leaves the row in ``detected`` when the failure notice was only
+    queued (``cron/scheduler.py:2516-2528``), so the label records the missing
+    delivery without claiming the alert path itself is broken. ``acked_at`` is
+    only ever set together with ``closed_at`` (``cron/incidents.py:186-195``),
     so an open incident can never be acknowledged."""
     detected = CronIncident(
         incident_id="i1",
@@ -1141,7 +1143,11 @@ def test_cron_detail_labels_detected_incident_as_never_alerted() -> None:
         )
     )
     text = render_to_str(render_cron(state, Theme(), detail=True), no_color=True)
-    assert "never alerted" in text
+    assert "no delivered failure ping" in text
+    # The softened copy must not regress into absolute claims: a queued notice
+    # leaves the row in detected with no delivery breakage on record.
+    assert "broken alert path" not in text
+    assert "ever reached the operator" not in text
 
 
 def test_cron_detail_incident_note_explains_ack_semantics() -> None:
@@ -1154,6 +1160,9 @@ def test_cron_detail_incident_note_explains_ack_semantics() -> None:
     text = render_to_str(render_cron(state, Theme(), detail=True), no_color=True)
     assert "acked_at" in text
     assert "closed_at" in text
+    # The queued-notice caveat is what keeps a detected row from reading as
+    # proof the delivery path is broken.
+    assert "queued" in text
 
 
 def test_cron_detail_keeps_alerted_incident_label_and_unknown_states_verbatim() -> None:
@@ -1168,6 +1177,43 @@ def test_cron_detail_keeps_alerted_incident_label_and_unknown_states_verbatim() 
     )
     text = render_to_str(render_cron(state, Theme(), detail=True), no_color=True)
     # 'alerted' stays labelled; an unseen state is shown verbatim, never folded
-    # into 'never alerted'.
+    # into 'no delivered failure ping'.
     assert "alerted" in text
     assert "quarantined" in text
+
+
+def test_cron_compact_fire_forward_line_carries_the_newest_age() -> None:
+    """An ageless warning reads as current; the newest miss age bounds it."""
+    state = DashboardState(
+        cron=CronState(
+            jobs=[
+                CronJob(
+                    job_id="j1",
+                    name="old",
+                    last_fire_error="loopback refused",
+                    last_fire_error_age_seconds=86400.0,
+                ),
+                CronJob(
+                    job_id="j2",
+                    name="recent",
+                    last_fire_error="loopback refused",
+                    last_fire_error_age_seconds=120.0,
+                ),
+            ]
+        )
+    )
+    text = render_to_str(render_cron(state, Theme()), width=100, no_color=True)
+    assert "Fire forward failed on 2 job(s)" in text
+    assert "newest 2m ago" in text
+
+
+def test_cron_compact_hides_unacked_when_it_cannot_differ() -> None:
+    """``acked_at`` is written only with ``closed_at``, so open == unacked in this
+    schema (``cron/incidents.py:172-203``); the qualifier is only worth a line
+    when a foreign schema diverges from that."""
+    state = DashboardState(
+        cron_executions=_executions_state(open_incident_count=2, unacked_incident_count=2)
+    )
+    text = render_to_str(render_cron(state, Theme()), width=100, no_color=True)
+    assert "Incidents: 2 open" in text
+    assert "unacked" not in text

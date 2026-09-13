@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import time
 from datetime import UTC, datetime
@@ -18,7 +19,6 @@ import hermesd.collect.cron as cron_module
 from hermesd.collect.common import _EXCERPT_MAX_CHARS
 from hermesd.collect.cron import (
     _EXECUTIONS_RECENT_LIMIT,
-    _FIRE_CLAIM_TTL_SECONDS,
     _INCIDENTS_LIMIT,
 )
 from hermesd.collect.logs import _MAX_LOG_LINE_CHARS
@@ -696,7 +696,7 @@ def test_cron_excerpt_serves_last_good_when_output_file_cannot_be_stat_ed(
         def failing_is_file(self: Path, *args: object, **kwargs: object) -> bool:
             if self == output_file:
                 raise OSError("stat denied")
-            return real_is_file(self, *args, **kwargs)  # type: ignore[arg-type]
+            return real_is_file(self, *args, **kwargs)
 
         monkeypatch.setattr(Path, "stat", failing_stat)
         monkeypatch.setattr(Path, "is_file", failing_is_file)
@@ -964,6 +964,39 @@ def test_unknown_status_is_counted_and_not_folded_into_failed(hermes_home: Path)
     assert stats.completed_24h == 0
     assert stats.failed_24h == 0
     assert stats.running_24h == 0
+
+
+def test_cron_execution_handoff_pending_is_read_strictly(hermes_home: Path):
+    """A text ``'false'`` in the handoff column is not a pending handoff.
+
+    The column has INTEGER affinity, which converts a numeric spelling but
+    leaves ``'false'`` as TEXT — and ``bool('false')`` is True. The delivery
+    column beside it is copied verbatim, so only this flag needed the reader.
+    """
+    db_path = _write_permissive_executions_db(hermes_home, [])
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "INSERT INTO executions (id, job_id, source, process_id, pid, status, claimed_at, "
+        "handoff_pending) VALUES ('e1', 'job-alpha', 'builtin', 'proc', 1, 'completed', ?, ?)",
+        (iso_ago(60), "false"),
+    )
+    conn.execute(
+        "INSERT INTO executions (id, job_id, source, process_id, pid, status, claimed_at, "
+        "handoff_pending) VALUES ('e2', 'job-alpha', 'builtin', 'proc', 1, 'completed', ?, ?)",
+        (iso_ago(120), 1),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    by_id = {run.execution_id: run for run in state.cron_executions.recent}
+    assert by_id["e1"].handoff_pending is False
+    assert by_id["e2"].handoff_pending is True
 
 
 def test_window_counts_reconcile_against_the_total(hermes_home: Path):
@@ -2663,7 +2696,9 @@ def test_collect_cron_fire_claim_ttl_boundary_and_unusable_claims(hermes_home: P
     _write_jobs_json(
         hermes_home,
         [
-            {"id": "job-edge", "fire_claim": {"at": iso_ago(_FIRE_CLAIM_TTL_SECONDS, now=now)}},
+            # Literal 300s: importing the constant under test would move the fixture
+            # with the mutation (upstream FIRE_CLAIM_TTL_SECONDS, cron/jobs.py:889-892).
+            {"id": "job-edge", "fire_claim": {"at": iso_ago(300.0, now=now)}},
             {"id": "job-none", "fire_claim": None},
             {"id": "job-junk", "fire_claim": {"at": "not-a-timestamp"}},
         ],
@@ -2926,3 +2961,163 @@ def test_collect_cron_future_dated_fire_claim_carries_no_state(hermes_home: Path
     job = state.cron.jobs[0]
     assert job.fire_claim_age_seconds == 0.0
     assert job.fire_claim_state is None
+
+
+def test_collect_cron_fire_claim_dead_owner_releases_before_the_ttl(hermes_home: Path):
+    """A same-host owner pid that has exited releases the claim immediately.
+
+    ``_claim_is_live`` (``cron/jobs.py:2087-2098``) returns False when
+    ``_claim_owner_is_dead`` (``:2070-2086``) proves the claim's ``by`` pid is
+    gone on THIS host, so a killed ``hermes cron run`` stops blocking the next
+    manual run instead of holding the lease for the full 300 s TTL. A foreign
+    host, a machine-id override or any unparseable owner stays live — only
+    kernel proof shortens the window.
+
+    The host is a sentinel that cannot be this machine's name, so the
+    ``ABANDONED_RUN`` verdict for ``job-dead`` is only reachable when the reader
+    classifies the claim through the injected ``hostname``: a reader-side
+    ``socket.gethostname()`` fallback would read both ``injected-host`` claims
+    as foreign and leave ``job-dead`` RUNNING — this assert fails on the wrong
+    verdict, not merely on a missing constructor keyword.
+    """
+    now = 1_800_000_000.0
+    host = "injected-host"
+    assert host != socket.gethostname()
+    _write_jobs_json(
+        hermes_home,
+        [
+            {
+                "id": "job-alive",
+                "name": "Owner alive",
+                "fire_claim": {"at": iso_ago(5, now=now), "by": f"{host}:4242:abc"},
+            },
+            {
+                "id": "job-dead",
+                "name": "Owner gone",
+                "fire_claim": {"at": iso_ago(5, now=now), "by": f"{host}:4243:def"},
+            },
+            {
+                "id": "job-foreign",
+                "name": "Foreign host",
+                "fire_claim": {"at": iso_ago(5, now=now), "by": "elsewhere:4243:ghi"},
+            },
+        ],
+    )
+
+    c = Collector(hermes_home, pid_exists=lambda pid: pid == 4242, clock=lambda: now, hostname=host)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    by_id = {job.job_id: job for job in state.cron.jobs}
+    assert by_id["job-alive"].fire_claim_state is CronFireClaimState.RUNNING
+    assert by_id["job-dead"].fire_claim_state is CronFireClaimState.ABANDONED_RUN
+    assert by_id["job-dead"].fire_claim_age_seconds == pytest.approx(5, abs=5)
+    assert by_id["job-foreign"].fire_claim_state is CronFireClaimState.RUNNING
+
+
+def test_cron_fire_claim_reader_takes_no_hostname_of_its_own() -> None:
+    """The fire-claim reader has no hostname of its own to fall back on.
+
+    Only the Collector knows the name a claim writer stamps (injected there),
+    so ``_cron_job_fire_claim`` requires ``hostname``: a reader-side
+    ``socket.gethostname()`` default would silently reclassify same-host owners
+    as foreign on any host whose name the guess misses.
+    """
+    job = {"fire_claim": {"at": iso_ago(5, now=1_800_000_000.0), "by": "h:4242:tok"}}
+    with pytest.raises(TypeError, match="hostname"):
+        cron_module._cron_job_fire_claim(job, now=1_800_000_000.0, pid_exists=lambda pid: False)
+
+
+@pytest.mark.parametrize("owner", ["", "hostonly", "localhost:notdigits", None])
+def test_collect_cron_fire_claim_unverifiable_owner_stays_live(hermes_home: Path, owner: object):
+    """An owner hermesd cannot parse or place is unverifiable, never dead."""
+    now = 1_800_000_000.0
+    _write_jobs_json(
+        hermes_home,
+        [{"id": "job-x", "fire_claim": {"at": iso_ago(5, now=now), "by": owner}}],
+    )
+
+    c = Collector(hermes_home, pid_exists=lambda pid: False, clock=lambda: now)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.cron.jobs[0].fire_claim_state is CronFireClaimState.RUNNING
+
+
+def test_collect_cron_small_future_skew_is_still_no_state(hermes_home: Path):
+    """The skew guard is "any future stamp", not "more than some margin".
+
+    The 600 s case above passes for any guard between 0 and 600 s; ten seconds
+    pins the boundary the reader documents (``age < 0``).
+    """
+    now = 1_800_000_000.0
+    _write_jobs_json(
+        hermes_home,
+        [{"id": "job-slight-skew", "fire_claim": {"at": iso_ago(-10, now=now)}}],
+    )
+
+    c = Collector(hermes_home, clock=lambda: now)
+    try:
+        job = c.collect().cron.jobs[0]
+    finally:
+        c.close()
+
+    assert job.fire_claim_state is None
+
+
+def test_cron_no_agent_flag_is_read_strictly(hermes_home: Path):
+    """``cron/jobs.json`` is machine-written: a stringified ``"false"`` is not set."""
+    _write_jobs_json(
+        hermes_home,
+        [
+            {"id": "job-script", "name": "Scripted", "no_agent": "false"},
+            {"id": "job-agentless", "name": "Agentless", "no_agent": True},
+        ],
+    )
+
+    c = Collector(hermes_home, clock=lambda: 1_800_000_000.0)
+    try:
+        by_id = {job.job_id: job for job in c.collect().cron.jobs}
+    finally:
+        c.close()
+
+    assert by_id["job-script"].no_agent is False
+    assert by_id["job-agentless"].no_agent is True
+
+
+def test_cron_enabled_flag_is_read_strictly(hermes_home: Path):
+    """The job's own ``enabled`` flag is a machine-written boolean.
+
+    ``cron/jobs.py`` stores ``not paused`` and reads it back truthily, so a
+    stringified ``"false"`` beside the real booleans is corruption, not a
+    disabled job: ``bool("false")`` would report every stringified job as
+    enabled, the opposite of what the record says. An omitted or null flag
+    still falls back to the job default (enabled), which is a separate,
+    deliberate reading pinned by ``test_cron_source_survives_null_enabled``.
+    """
+    _write_jobs_json(
+        hermes_home,
+        [
+            {"id": "job-quoted-false", "name": "Quoted false", "enabled": "false"},
+            {"id": "job-quoted-zero", "name": "Quoted zero", "enabled": "0"},
+            {"id": "job-real-false", "name": "Really paused", "enabled": False},
+            {"id": "job-real-true", "name": "Enabled", "enabled": True},
+            {"id": "job-absent", "name": "No flag"},
+        ],
+    )
+
+    c = Collector(hermes_home, clock=lambda: 1_800_000_000.0)
+    try:
+        by_id = {job.job_id: job for job in c.collect().cron.jobs}
+    finally:
+        c.close()
+
+    assert by_id["job-quoted-false"].enabled is False
+    assert by_id["job-quoted-zero"].enabled is False
+    assert by_id["job-real-false"].enabled is False
+    assert by_id["job-real-true"].enabled is True
+    assert by_id["job-absent"].enabled is True

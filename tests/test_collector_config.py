@@ -909,14 +909,23 @@ class TestConfigBackupGroupReader:
             _config_backup_groups,
         )
 
+        # "aaa-*" sorts before "corrupt" and "good", so a plain
+        # reason-ordered cap would evict the two load-bearing groups.
         names = [
-            f"config.yaml.reason-{index:03d}.20260907-1430{index % 60:02d}"
+            f"config.yaml.aaa-{index:03d}.20260907-1430{index % 60:02d}"
             for index in range(_CONFIG_BACKUP_GROUP_LIMIT + 3)
+        ]
+        names += [
+            "config.yaml.good.20260907-143000",
+            "config.yaml.corrupt.20260906-090000",
         ]
         groups, truncated = _config_backup_groups(names, now=1_783_000_000.0)
 
         assert len(groups) == _CONFIG_BACKUP_GROUP_LIMIT
         assert truncated is True
+        # The cap must never silently evict the corrupt alert or the
+        # "last changed" evidence.
+        assert {group.kind for group in groups} >= {"good", "corrupt"}
 
     def test_empty_input_is_empty(self):
         from hermesd.collect.config import _config_backup_groups
@@ -963,6 +972,30 @@ def test_collect_config_backups_groups_by_reason(hermes_home: Path):
     assert "config_backups" not in state.health.failed_sources
 
 
+def test_collect_config_backups_keep_good_and_corrupt_past_the_group_cap(hermes_home: Path):
+    from hermesd.collect.config import _CONFIG_BACKUP_GROUP_LIMIT
+
+    # A hostile/chatty backups dir: the cap is hit by reasons that all sort
+    # before "good"/"corrupt", which must still come back so the panel can
+    # render the "last changed" and corrupt-alert rows.
+    for index in range(_CONFIG_BACKUP_GROUP_LIMIT):
+        _write_config_backup(hermes_home, f"config.yaml.aaa-{index:03d}.20260907-1430{index:02d}")
+    _write_config_backup(hermes_home, "config.yaml.good.20260907-143000")
+    _write_config_backup(hermes_home, "config.yaml.corrupt.20260906-090000")
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    config = state.config
+    assert config.config_backups_present is True
+    assert config.config_backup_groups_truncated is True
+    assert len(config.config_backup_groups) == _CONFIG_BACKUP_GROUP_LIMIT
+    assert {group.kind for group in config.config_backup_groups} >= {"good", "corrupt"}
+
+
 def test_collect_config_backups_absent_dir_is_an_healthy_empty(hermes_home: Path):
     c = Collector(hermes_home)
     try:
@@ -995,23 +1028,23 @@ def test_collect_config_backups_symlinked_dir_is_not_present(hermes_home: Path, 
     assert "config_backups" in state.health.failed_sources
 
 
-def test_collect_config_backups_failure_keeps_last_good_fields(
-    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_collect_config_backups_failure_keeps_last_good_fields(hermes_home: Path):
+    """A failure AFTER a good scan keeps the last-good fields, not zeroes.
+
+    The failure is a real one — the backups directory becomes unreadable — so
+    the pin exercises the reader instead of a patched helper.
+    """
     _write_config_backup(hermes_home, "config.yaml.good.20260907-143000")
+    backups = hermes_home / "backups" / "config"
     c = Collector(hermes_home)
     try:
         first = c.collect()
         assert first.config.config_backups_present is True
 
-        import hermesd.collector as collector_module
-
-        def boom(names, *, now):
-            raise RuntimeError("scan exploded")
-
-        monkeypatch.setattr(collector_module, "_config_backup_groups", boom)
+        backups.chmod(0o000)
         second = c.collect()
     finally:
+        backups.chmod(0o700)
         c.close()
 
     assert "config_backups" in second.health.failed_sources

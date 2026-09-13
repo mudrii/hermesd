@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 import yaml
 
-from hermesd.collect.operations import _SKILL_WINDOW_LIMIT
 from hermesd.collector import (
     Collector,
     _count_skills,
@@ -1131,6 +1130,28 @@ def test_curator_threshold_junk_override_falls_back_to_default(hermes_home: Path
     assert state.curator.thresholds_customized is True
 
 
+def test_curator_threshold_infinite_value_falls_back_to_default(hermes_home: Path):
+    """A YAML ``.inf`` must not take the whole curator source down.
+
+    ``int(float("inf"))`` raises ``OverflowError``, which is not a ``ValueError``
+    or ``TypeError``, so the cast guard let it escape: the source failed, the
+    whole CuratorRun fell back to last good, and the thresholds, the usage
+    rollup and the run history all disappeared for that refresh.
+    """
+    (hermes_home / "config.yaml").write_text(
+        yaml.dump({"curator": {"stale_after_days": float("inf")}})
+    )
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "curator" not in state.health.failed_sources
+    assert state.curator.stale_after_days == 14
+    assert state.curator.archive_after_days == 30
+
+
 def test_curator_usage_hygiene_counts(hermes_home: Path):
     now = time.time()
     _write_usage(
@@ -1197,7 +1218,7 @@ def test_curator_usage_hygiene_counts(hermes_home: Path):
 def test_curator_usage_windows_are_soonest_first_and_bounded(hermes_home: Path):
     now = time.time()
     records = {}
-    for index in range(_SKILL_WINDOW_LIMIT + 5):
+    for index in range(25):  # literal: _SKILL_WINDOW_LIMIT is 20 (bounded windows)
         age_days = index + 1  # later index = older = sooner to go stale
         records[f"skill-{index:02d}"] = {
             "state": "active",
@@ -1212,8 +1233,8 @@ def test_curator_usage_windows_are_soonest_first_and_bounded(hermes_home: Path):
         c.close()
 
     cur = state.curator
-    assert cur.managed_skill_count == _SKILL_WINDOW_LIMIT + 5
-    assert len(cur.skill_windows) == _SKILL_WINDOW_LIMIT
+    assert cur.managed_skill_count == 25
+    assert len(cur.skill_windows) == 20
     stale_days = [window.days_until_stale for window in cur.skill_windows]
     assert stale_days == sorted(stale_days)
     # The soonest skills survive the cap; the youngest are the ones cut.
@@ -1261,3 +1282,93 @@ def test_curator_hygiene_ignores_non_mapping_records(hermes_home: Path):
 
     assert state.curator.managed_skill_count == 1
     assert state.curator.state_stale_count == 1
+
+
+def test_usage_pinned_flag_is_read_strictly(hermes_home: Path):
+    """`skills/.usage.json` is a state payload: `"false"` is not pinned.
+
+    Upstream writes a real boolean (`set_pinned` stores `bool(pinned)`), so a
+    string is corruption; `bool("false")` would report a skill as protected from
+    curation when it is not. The human-authored *frontmatter* flag is left
+    truthy on purpose — that one is a setting, read the way config values are.
+    """
+    _write_usage(
+        hermes_home,
+        {
+            "quoted-false": {"state": "active", "pinned": "false"},
+            "quoted-zero": {"state": "active", "pinned": "0"},
+            "really-pinned": {"state": "active", "pinned": True},
+        },
+    )
+
+    c = Collector(hermes_home)
+    try:
+        cur = c.collect().curator
+    finally:
+        c.close()
+
+    assert cur.managed_skill_count == 3
+    assert cur.pinned_count == 1
+    windows = {window.name: window for window in cur.skill_windows}
+    assert windows["really-pinned"].pinned is True
+    assert windows["quoted-false"].pinned is False
+    assert windows["quoted-zero"].pinned is False
+
+
+def test_curator_run_record_keeps_the_usage_rollup_and_thresholds(hermes_home: Path):
+    """A populated run must not drop the usage rollup or the thresholds.
+
+    Three files describe one curation pass: ``run.json`` holds the transition
+    counts, ``skills/.usage.json`` holds the state and patch-reuse rollup, and
+    ``config.yaml`` holds the thresholds. Building the populated run from a
+    fresh ``CuratorRun`` discarded the last two, so panel 13 showed no hygiene
+    section at all on a home whose usage file manages dozens of skills.
+    """
+    now = time.time()
+    _write_curator_run(hermes_home, "20260610-133539", _LIVE_SHAPE)
+    (hermes_home / "config.yaml").write_text(
+        yaml.dump({"curator": {"stale_after_days": 7, "archive_after_days": 9}})
+    )
+    _write_usage(
+        hermes_home,
+        {
+            "research": {
+                "state": "active",
+                "patch_generation": 3,
+                "last_reused_patch_generation": 1,
+                "last_used_at": iso_ago(86400, now=now),
+                "pinned": True,
+            },
+            "old-habit": {"state": "stale", "last_used_at": iso_ago(8 * 86400, now=now)},
+            "archived-one": {"state": "archived"},
+        },
+    )
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    cur = state.curator
+    # The run report still wins for the fields it owns ...
+    assert cur.run_present is True
+    assert cur.model == "MiniMax-M3"
+    assert cur.count_before == 8
+    # ... and everything the usage file and config own survives it.
+    assert cur.managed_skill_count == 3
+    assert cur.state_active_count == 1
+    assert cur.state_stale_count == 1
+    assert cur.state_archived_count == 1
+    assert cur.patch_pending_reuse_count == 1
+    assert cur.pinned_count == 1
+    assert cur.stale_after_days == 7
+    assert cur.archive_after_days == 9
+    assert cur.thresholds_customized is True
+    windows = {window.name: window for window in cur.skill_windows}
+    assert windows["old-habit"].days_until_stale == pytest.approx(-1.0, abs=0.01)
+
+    text = render_to_str(render_panel(13, state, Theme(), detail=True), width=120, no_color=True)
+    assert re.search(r"Managed\s+3", text)
+    assert "stale after 7d · archive after 9d" in text
+    assert "curator.stale_after_days" in text

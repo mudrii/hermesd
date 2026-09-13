@@ -132,6 +132,41 @@ def test_kanban_compact_omits_notify_lines_without_subscriptions() -> None:
     assert "Orphan Profiles:" not in text
 
 
+def test_kanban_compact_orphan_profile_renders_literal_brackets() -> None:
+    """Orphan profile names are appended to a Text buffer, which never parses
+    Rich markup, so escaping them would leak the escape backslashes."""
+    state = DashboardState(
+        kanban=KanbanState(
+            db_present=True,
+            task_count=1,
+            notify_sub_count=1,
+            notify_orphan_profile_count=1,
+            notify_orphan_profiles=["we[i]rd"],
+        )
+    )
+    text = render_to_str(render_kanban(state, Theme()), width=100, no_color=True)
+
+    assert "Orphan Profiles: we[i]rd" in text
+    assert "\\" not in text
+
+
+def test_kanban_compact_breaker_content_renders_literal_brackets() -> None:
+    """The compact breaker line appends task ids to the same Text buffer and
+    must stay unescaped too."""
+    tripped = KanbanTaskSummary(
+        task_id="we[i]rd",
+        status="blocked",
+        consecutive_failures=1,
+        breaker_limit=0,
+        breaker_tripped=True,
+    )
+    state = DashboardState(kanban=KanbanState(db_present=True, problem_tasks=[tripped]))
+    text = render_to_str(render_kanban(state, Theme()), width=100, no_color=True)
+
+    assert "Breaker Tripped: we[i]rd" in text
+    assert "\\" not in text
+
+
 def test_kanban_compact_warns_when_breaker_tripped() -> None:
     tripped = KanbanTaskSummary(
         task_id="t_trip",
@@ -195,3 +230,80 @@ def test_kanban_detail_notify_backlog_zero_reads_as_none_unseen() -> None:
     text = render_to_str(render_kanban(state, Theme(), detail=True), width=160, no_color=True)
 
     assert "0 unseen" in text
+
+
+def test_kanban_detail_renders_notify_platform_counts() -> None:
+    """The per-platform subscription rollup is collected; the panel must show it.
+
+    It was the one notify field with no consumer outside the JSON snapshot, so
+    "which platform's watchers are subscribed" — the first question when a
+    backlog grows — had no answer in the UI.
+    """
+    state = DashboardState(
+        kanban=KanbanState(
+            db_present=True,
+            notify_sub_count=3,
+            notify_platform_counts={"discord": 2, "slack": 1},
+        )
+    )
+
+    text = render_to_str(render_kanban(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "Notify Platforms" in text
+    assert "discord 2" in text
+    assert "slack 1" in text
+    assert "truncated" not in text
+
+
+def test_kanban_detail_marks_a_truncated_platform_rollup() -> None:
+    """The rollup is capped at the busiest platforms; a cut rollup must not
+    read as every platform there is."""
+    state = DashboardState(
+        kanban=KanbanState(
+            db_present=True,
+            notify_sub_count=75,
+            notify_platform_counts={"discord": 30, "slack": 20},
+            notify_platforms_truncated=True,
+        )
+    )
+
+    text = render_to_str(render_kanban(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "discord 30" in text
+    assert "truncated" in text
+
+
+def test_kanban_detail_labels_a_capped_backlog_list() -> None:
+    """The backlog table shows the worst ten subscriptions; the section must
+    say so instead of reading as the whole backlog."""
+    subs = [KanbanNotifySubSummary(task_id=f"t{index}", backlog=1) for index in range(10)]
+    state = DashboardState(
+        kanban=KanbanState(
+            db_present=True,
+            notify_sub_count=40,
+            notify_backlog_sub_count=40,
+            notify_backlog_subs=subs,
+        )
+    )
+
+    text = render_to_str(render_kanban(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "showing 10 of 40" in text
+
+
+def test_kanban_detail_unlabeled_when_backlog_list_is_complete() -> None:
+    """When every backlogged sub is displayed there is nothing to disclose."""
+    sub = KanbanNotifySubSummary(task_id="t1", backlog=2)
+    state = DashboardState(
+        kanban=KanbanState(
+            db_present=True,
+            notify_sub_count=1,
+            notify_backlog_sub_count=1,
+            notify_backlog_subs=[sub],
+        )
+    )
+
+    text = render_to_str(render_kanban(state, Theme(), detail=True), width=160, no_color=True)
+
+    assert "Notify Backlog" in text
+    assert "showing" not in text

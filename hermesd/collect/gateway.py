@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import re
 import socket
 import sqlite3
@@ -23,6 +24,7 @@ from hermesd.collect.common import (
     _age_seconds,
     _as_dict,
     _as_list,
+    _coerce_bool,
     _coerce_float,
     _coerce_int,
     _file_size,
@@ -32,7 +34,7 @@ from hermesd.collect.common import (
     _read_text_capped,
     _safe_child_path,
 )
-from hermesd.collect.redaction import _redact_secret_url
+from hermesd.collect.redaction import _redact_secret_text, _redact_secret_url
 from hermesd.collect.sqlite_util import (
     _count_by,
     _query_rows,
@@ -50,7 +52,10 @@ from hermesd.models import (
 )
 
 # The gateway watchdog rewrites state/gateway.heartbeat every 30s: three missed
-# writes is stale, ten is a wedged event loop.
+# writes is stale — and, for a witness-less writer, that budget is upstream's
+# decisive cutoff (`DEFAULT_LOOP_LIVENESS_STALE_AFTER_S`, hermes_cli/gateway.py:345).
+# The ten-write figure only survives in the heartbeat-only fallback below, where
+# nothing witnessed the loop and a long-silent file may just be a stopped gateway.
 _HEARTBEAT_TICKING_SECONDS = 90.0
 _HEARTBEAT_STALE_SECONDS = 300.0
 # Loop-tick witness probe (hermes_cli/gateway.py:363-424): one byte, one second.
@@ -121,6 +126,12 @@ _PROFILE_PLATFORM_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}:[a-z0-9][a-z0-
 # (hermes_cli/gateway_multiplex_served.py:66-68): the route belonged to an
 # adapter that is not serving, so the URL is history rather than an endpoint.
 _INGRESS_SUPPRESSED_STATES = frozenset({"fatal", "disconnected", "stopped"})
+# Adapter states the multiplexer will mirror a shared listener for
+# (gateway/status.py:962-966). Upstream asks whether the default's entry is
+# *serving*, not whether it escaped a failure vocabulary: ``paused`` and any
+# unrecognised or missing state are refused, so neither may publish a callback
+# URL hermesd synthesized for a secondary profile.
+_MIRROR_SERVING_STATES = frozenset({"connected", "connecting", "retrying"})
 
 
 def _optional_int(value: object) -> int | None:
@@ -224,12 +235,15 @@ def _listener_mirror_urls(
     Mirrors ``shared_listener_mirror_platforms`` (``gateway/status.py:951-974``):
     the multiplexer never builds api_server/webhook adapters for a secondary, so
     every reader must synthesize ``<listener_base>/p/<profile><mirror_path>``
-    from the default profile's own entry. The same suppression rules as recorded
-    ingress URLs apply — a dead writer, a suppressed state, or a missing base
-    mean the URL is history rather than an endpoint — and the value is redacted
-    at the data boundary. Only a bounded roster of served profiles is synthesized.
+    from the default profile's own entry. Only an entry upstream calls *serving*
+    is mirrored — ``_MIRROR_SERVING_STATES``, the allow-list at
+    ``gateway/status.py:962-966`` — not the ingress deny-list, which answers a
+    different question (a paused or unlabelled adapter is not serving, and
+    upstream refuses to publish its URL). A dead writer or a missing base also
+    mean the URL is history rather than an endpoint, and the value is redacted at
+    the data boundary. Only a bounded roster of served profiles is synthesized.
     """
-    if not record_current or state in _INGRESS_SUPPRESSED_STATES:
+    if not record_current or state not in _MIRROR_SERVING_STATES:
         return {}
     if name not in _SHARED_LISTENER_MIRROR_PLATFORMS:
         return {}
@@ -258,22 +272,27 @@ def _platform_status(
     profile, name = _split_platform_key(key)
     state = str(info.get("state") or "unknown")
     retrying_since = str(info.get("retrying_since") or "")
+    served = served_profiles or []
+    mirrors = _listener_mirror_urls(
+        name,
+        info,
+        state,
+        record_current=record_current,
+        served_profiles=served,
+    )
     return PlatformStatus(
         name=name,
         profile=profile,
-        mirror_urls=_listener_mirror_urls(
-            name,
-            info,
-            state,
-            record_current=record_current,
-            served_profiles=served_profiles or [],
-        ),
+        mirror_urls=mirrors,
+        # Only a built roster can be short: an empty one means nothing was
+        # mirrored, not that the profile list was cut.
+        mirror_urls_truncated=bool(mirrors) and len(served) > _MIRROR_PROFILE_LIMIT,
         ingress_url=_recorded_ingress_url(info, state=state, record_current=record_current),
         state=state,
         updated_at=str(info.get("updated_at") or ""),
         error_code=str(info.get("error_code") or ""),
         error_message=str(info.get("error_message") or ""),
-        needs_attention=bool(info.get("needs_attention")),
+        needs_attention=_coerce_bool(info.get("needs_attention")),
         retrying_since=retrying_since,
         retrying_since_age_seconds=_age_seconds(_iso_to_epoch(retrying_since), now),
         writer_pid=_identity_stamp(info.get("writer_pid")),
@@ -309,7 +328,10 @@ def _heartbeat_liveness(
 # The heartbeat moved off-loop (#90502), so a fresh file no longer proves the loop
 # dispatches. The gateway arms a witness served *by the loop itself*
 # (gateway/shutdown_watchdog.py:288-302) and advertises it on the heartbeat as
-# ``loop_tick_socket`` (POSIX) or ``loop_tick_tcp_port`` (Windows). The protocol is
+# ``loop_tick_socket`` plus, when the loop bound a loopback listener, the
+# ``loop_tick_tcp_port`` to reach it — both derived from the same server, so a
+# port without the flag is not a shape the writer produces (the flag is true on
+# POSIX and Windows alike; an unbound listener nulls both). The protocol is
 # one byte: connect, expect b"1", close — the client sends nothing, so probing is
 # non-mutating and safe for a read-only tool. Verdict vocabulary mirrors
 # ``classify`` in hermes_cli/gateway.py:425-497.
@@ -390,8 +412,11 @@ def _loop_tick_verdict(
         return GatewayLoopHealth.ALIVE
     if age <= _HEARTBEAT_TICKING_SECONDS:
         return GatewayLoopHealth.UNKNOWN if probe_result is False else current
-    if age <= _HEARTBEAT_STALE_SECONDS:
-        return GatewayLoopHealth.STALE if probe_result is False else current
+    # Past the stale budget the witness decides, exactly as upstream escalates
+    # (``:465-497``): there is no milder band between the budget and the
+    # old on-loop 300 s cutoff, because a gateway wedged for four minutes is
+    # not a slow heartbeat. The three-strike guard still stands, so the first
+    # silent probes read STALE rather than WEDGED.
     if plan.armed is None:
         return GatewayLoopHealth.LEGACY
     if plan.armed is False:
@@ -418,7 +443,7 @@ def _default_loop_tick_probe(
         if not 0 < tcp_port <= 65535:
             return None
         family: int = socket.AF_INET
-        address: object = ("127.0.0.1", tcp_port)
+        address: tuple[str, int] | str = ("127.0.0.1", tcp_port)
     else:
         node = home / "state" / f"gateway.loop-tick.{pid}.sock"
         try:
@@ -432,7 +457,7 @@ def _default_loop_tick_probe(
     try:
         sock = socket.socket(family, socket.SOCK_STREAM)
         sock.settimeout(max(float(timeout), 0.0))
-        sock.connect(address)  # type: ignore[arg-type]
+        sock.connect(address)
         return sock.recv(1) == b"1"
     except OSError:
         return False
@@ -497,7 +522,7 @@ def _config_generation(data: JsonMapping) -> _ConfigGeneration:
         ConfigSourceStamp(
             name=str(info.get("name") or ""),
             path=str(info.get("path") or ""),
-            exists=bool(info.get("exists")),
+            exists=_coerce_bool(info.get("exists")),
             mtime_ns=_coerce_int(info.get("mtime_ns")),
             size=_coerce_int(info.get("size")),
         )
@@ -695,31 +720,84 @@ def _fleet_state_counts(fleet: list[object]) -> dict[str, int]:
 
 @dataclass(frozen=True, slots=True)
 class _StartStorm:
-    """Start ledger facts for the dashboard window."""
+    """Start ledger facts for the configured respawn-storm window."""
 
     recorded: bool = False
-    starts_2m: int = 0
+    starts_window: int = 0
     starts_1h: int = 0
     last_start_age_seconds: float | None = None
+    cap: int = _RESTART_STORM_CAP
+    window_seconds: float = _RESTART_STORM_WINDOW_SECONDS
 
-    def model_fields(self, now: float) -> dict[str, Any]:
+    def as_update(self) -> dict[str, Any]:
+        """The model fields this readout owns, ready for ``model_copy(update=...)``.
+
+        Named ``as_update`` rather than ``model_fields``: the latter is a
+        Pydantic accessor, and a same-named method on a plain dataclass reads as
+        one even though this class has no Pydantic base.
+        """
         return {
             "gateway_starts_recorded": self.recorded,
-            "gateway_starts_2m": self.starts_2m,
+            "gateway_starts_window": self.starts_window,
             "gateway_starts_1h": self.starts_1h,
             "seconds_since_last_gateway_start": self.last_start_age_seconds,
-            "restart_storm_cap": _RESTART_STORM_CAP if self.recorded else 0,
-            "in_respawn_backoff": self.recorded and self.starts_2m > _RESTART_STORM_CAP,
+            "restart_storm_cap": self.cap if self.recorded else 0,
+            "restart_storm_window_seconds": self.window_seconds,
+            "in_respawn_backoff": self.recorded and self.starts_window > self.cap,
         }
 
 
-def _read_start_storm(path: Path, root: Path, now: float) -> _StartStorm:
-    """Count recorded gateway starts in the storm-detection windows."""
-    if not path.is_file():
-        return _StartStorm()
+def _respawn_storm_policy(cfg: JsonMapping) -> tuple[int, float]:
+    """``(max_starts, window_seconds)`` as upstream resolves them from config.
+
+    Mirrors ``_respawn_storm_backoff`` (``hermes_cli/gateway.py:4673-4685``):
+    only a real ``int`` counts for ``max_starts`` (a JSON ``true`` is an int in
+    Python but not upstream) and only ``int``/``float`` for ``window_seconds``;
+    anything else keeps ``DEFAULT_CONFIG``'s 5 / 120 s
+    (``hermes_cli/config_defaults.py:1978``). The environment overrides upstream
+    also honours (``HERMES_GATEWAY_MAX_STARTS``, ``HERMES_GATEWAY_START_WINDOW_S``)
+    belong to the gateway's environment and are deliberately not read here — the
+    panel therefore reports the policy *as recorded in config*.
+    """
+    respawn = _as_dict(_as_dict(cfg.get("gateway")).get("respawn_storm"))
+    raw_cap = respawn.get("max_starts")
+    cap = (
+        raw_cap
+        if isinstance(raw_cap, int) and not isinstance(raw_cap, bool)
+        else _RESTART_STORM_CAP
+    )
+    raw_window = respawn.get("window_seconds")
+    window = _RESTART_STORM_WINDOW_SECONDS
+    if isinstance(raw_window, int | float) and not isinstance(raw_window, bool):
+        with contextlib.suppress(OverflowError):
+            configured_window = float(raw_window)
+            if math.isfinite(configured_window) and configured_window > 0.0:
+                window = configured_window
+    return cap, window
+
+
+def _read_start_storm(
+    path: Path,
+    root: Path,
+    now: float,
+    *,
+    cap: int = _RESTART_STORM_CAP,
+    window_seconds: float = _RESTART_STORM_WINDOW_SECONDS,
+) -> _StartStorm:
+    """Count recorded gateway starts in the storm-detection windows.
+
+    ``recorded`` means "a ledger we can read", not "a file exists": upstream
+    appends ``now`` before its atomic ``os.replace`` (``gateway/status.py:64-79``),
+    so a file whose every line fails to parse — empty, whitespace or junk — was
+    not written by the ledger and proves as little as an absent one. A
+    non-positive ``cap`` disables the writer upstream (``max_starts <= 0``), so a
+    leftover file is stale by construction and no verdict is derived from it.
+    """
+    if cap <= 0 or not path.is_file():
+        return _StartStorm(cap=cap, window_seconds=window_seconds)
     text = _read_text_capped(path, root)
     if not text and _file_size(path) > 0:
-        return _StartStorm()
+        return _StartStorm(cap=cap, window_seconds=window_seconds)
     starts: list[float] = []
     for line in text.splitlines():
         try:
@@ -730,12 +808,14 @@ def _read_start_storm(path: Path, root: Path, now: float) -> _StartStorm:
         if 0.0 < epoch <= now:
             starts.append(epoch)
     if not starts:
-        return _StartStorm(recorded=True)
+        return _StartStorm(cap=cap, window_seconds=window_seconds)
     return _StartStorm(
         recorded=True,
-        starts_2m=sum(1 for start in starts if now - start <= _RESTART_STORM_WINDOW_SECONDS),
+        starts_window=sum(1 for start in starts if now - start <= window_seconds),
         starts_1h=sum(1 for start in starts if now - start <= _DAY_SECONDS / 24.0),
         last_start_age_seconds=now - max(starts),
+        cap=cap,
+        window_seconds=window_seconds,
     )
 
 
@@ -749,15 +829,25 @@ def _read_start_storm(path: Path, root: Path, now: float) -> _StartStorm:
 # ---------------------------------------------------------------------------
 
 
-def _dashboard_client_status(path: Path, root: Path, now: float) -> tuple[bool, float | None]:
-    attached = False
-    age: float | None = None
+@dataclass(frozen=True, slots=True)
+class _DashboardClientStatus:
+    """Two related answers about the marker file, named rather than positional."""
+
+    attached: bool = False
+    age_seconds: float | None = None
+
+
+def _dashboard_client_status(path: Path, root: Path, now: float) -> _DashboardClientStatus:
+    status = _DashboardClientStatus()
     if _safe_child_path(path, root):
         stamp = _mtime(path)
         if stamp is not None:
             age = max(0.0, now - stamp)
-            attached = age <= _DASHBOARD_CLIENT_ATTACHED_SECONDS
-    return attached, age
+            status = _DashboardClientStatus(
+                attached=age <= _DASHBOARD_CLIENT_ATTACHED_SECONDS,
+                age_seconds=age,
+            )
+    return status
 
 
 # ---------------------------------------------------------------------------
@@ -778,7 +868,6 @@ class _ExitDiag:
     unclean_24h: int = 0
     size_bytes: int = 0
     oversized: bool = False
-    forensic_files: list[ForensicFile] = field(default_factory=list)
 
 
 def _read_exit_diag(path: Path, root: Path, now: float, tail_bytes: int) -> _ExitDiag:
@@ -804,11 +893,14 @@ def _read_exit_diag(path: Path, root: Path, now: float, tail_bytes: int) -> _Exi
         stamp = _iso_to_epoch(record.get("ts"))
         if stamp is not None:
             last_age = _age_seconds(stamp, now)
-            if tag == _UNCLEAN_EXIT_TAG and now - stamp <= _DAY_SECONDS:
+            if tag == _UNCLEAN_EXIT_TAG and 0 <= now - stamp <= _DAY_SECONDS:
                 unclean_24h += 1
     return _ExitDiag(
         recorded=True,
-        last_tag=last_tag,
+        # The ledger is a log file: upstream writes literal tags, but a foreign
+        # or tampered writer can put credential-shaped text in one, and every
+        # other log-derived string hermesd surfaces goes through the redactor.
+        last_tag=_redact_secret_text(last_tag[:_EXIT_DIAG_TAG_CHARS]),
         last_age_seconds=last_age,
         unclean_24h=unclean_24h,
         size_bytes=size,

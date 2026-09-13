@@ -152,15 +152,23 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         expired = sum(1 for lease in coord.leases if lease.expired)
         orphaned = sum(1 for lease in coord.leases if lease.orphaned)
         if expired:
-            lines.append(f" {expired} expired", style=theme.ui_warn)
+            # Qualified like the detail row: expiry alone is benign upstream.
+            lines.append(f" {expired} expired (holder may revive)", style=theme.ui_warn)
         if orphaned:
             lines.append(f" {orphaned} orphaned", style=f"bold {theme.ui_error}")
     if coord.hygiene:
-        # Per-chat session-hygiene failure streaks: compaction backing off.
-        lines.append(f"  ⚠ {len(coord.hygiene)} hygiene cooldown(s)", style=f"bold {theme.ui_warn}")
+        # Per-chat session-hygiene failure streaks: compaction backing off. The
+        # model's own rule: report the exact total, never the capped row count.
+        lines.append(
+            f"  ⚠ {coord.hygiene_total} hygiene cooldown(s)", style=f"bold {theme.ui_warn}"
+        )
         suspended = sum(1 for row in coord.hygiene if row.suspended)
         if suspended:
             lines.append(f" · {suspended} compaction off", style=f"bold {theme.ui_error}")
+    if coord.generation_count_shrank:
+        # The never-prune invariant broke. Compact has no Reset Churn head, so
+        # the flag rides its own marker rather than staying detail-only.
+        lines.append("  ⚠ reset churn: generations table shrank", style=f"bold {theme.ui_error}")
     if state.terminal_sessions.count:
         lines.append(f"  {state.terminal_sessions.count} cli tty", style=theme.banner_dim)
     lines.append(f"   {total_msgs} msgs  {total_tc} tools\n", style=theme.banner_text)
@@ -876,6 +884,10 @@ def _coordination_sections(state: DashboardState, theme: Theme) -> list[Renderab
         sections.append(Text(f"  {_LEASE_NOTE}", style=theme.banner_dim))
     if coord.hygiene:
         sections.append(section_heading("Hygiene Cooldowns", theme))
+        caption = f"  {coord.hygiene_total} chat(s) with a failure streak"
+        if coord.hygiene_total > len(coord.hygiene):
+            caption += f" — showing the worst {len(coord.hygiene)}"
+        sections.append(Text(caption, style=theme.banner_text))
         sections.append(_hygiene_table(coord.hygiene, theme))
         sections.append(Text(f"  {_HYGIENE_NOTE}", style=theme.banner_dim))
     if coord.routes:
@@ -884,10 +896,17 @@ def _coordination_sections(state: DashboardState, theme: Theme) -> list[Renderab
         waiting = sum(1 for route in coord.routes if route.needs_user_message)
         dangling = sum(1 for route in coord.routes if route.dangling)
         if waiting or dangling:
+            # Only a capped list needs the routing table's exact size beside it.
+            total = coord.route_total if coord.route_total > len(coord.routes) else None
             sections.append(
-                Text(f"  {_route_counts_label(waiting, dangling)}\n", style=theme.banner_text)
+                Text(
+                    f"  {_route_counts_label(waiting, dangling, total)}\n", style=theme.banner_text
+                )
             )
-    if coord.generation_chat_total:
+    # An emptied table is the worst case of the never-prune invariant break:
+    # the chat total is 0 exactly when the shrink flag is set, so gating on the
+    # total alone would hide the warning it exists to raise.
+    if coord.generation_chat_total or coord.generation_count_shrank:
         sections.append(section_heading("Reset Churn", theme))
         sections.append(_reset_churn_section(coord, theme))
     term = state.terminal_sessions
@@ -898,7 +917,9 @@ def _coordination_sections(state: DashboardState, theme: Theme) -> list[Renderab
 
 
 _LEASE_NOTE = (
-    "Turn leases key a conversation lineage; compression locks key one session. "
+    "Turn leases key a conversation lineage; compression locks key one session "
+    "and only block other compressions, never turns "
+    "(hermes_state_compression.py:451-474). "
     "Upstream revives an expired lease whose holder still matches rather than "
     "stealing it, so expiry alone is benign — only expired rows with a dead "
     "holder (orphaned) are stuck. There is no background sweeper; rows clear "
@@ -907,8 +928,9 @@ _LEASE_NOTE = (
 
 _HYGIENE_NOTE = (
     "Failure streaks are per rotation-stable chat key; cooldowns climb x1/x3/x9 "
-    "over the 300s base, clamped at 1h, so streak 3 suspends pre-turn "
-    "compaction. A row clears only when compaction recovers."
+    "over the default 300s base (config `hygiene_failure_cooldown_seconds`), "
+    "clamped at 1h, so streak 3 suspends pre-turn compaction. A row clears only "
+    "when compaction recovers."
 )
 
 
@@ -959,8 +981,15 @@ def _leases_table(leases: list[SessionLease], theme: Theme) -> Table:
     return table
 
 
-def _hygiene_effect_label(streak: int) -> str:
-    if streak >= 3:
+def _hygiene_effect_label(suspended: bool) -> str:
+    """Effect wording from the model's derived flag, not a re-derived threshold.
+
+    ``GatewayHygieneState.suspended`` is the reader's verdict
+    (``failure_streak >= _HYGIENE_SUSPENSION_STREAK``); re-checking the streak
+    here would duplicate the ladder and silently disagree with the model if the
+    suspension point ever moves.
+    """
+    if suspended:
         return "compaction suspended, cooldown up to 1h"
     return "compaction cooldown backoff"
 
@@ -975,7 +1004,7 @@ def _hygiene_table(rows: list[GatewayHygieneState], theme: Theme) -> Table:
         table.add_row(
             escape(row.session_key[-_COORDINATION_KEY_CHARS:]),
             str(row.failure_streak),
-            escape(_hygiene_effect_label(row.failure_streak)),
+            escape(_hygiene_effect_label(row.suspended)),
             escape(_truncate(row.compression_failure_error, _MAX_COORDINATION_ERROR_CHARS))
             if row.compression_failure_error
             else "—",
@@ -1025,14 +1054,18 @@ def _routes_table(routes: list[GatewayRouteState], theme: Theme) -> Table:
     return table
 
 
-def _route_counts_label(waiting: int, dangling: int) -> str:
+def _route_counts_label(waiting: int, dangling: int, total: int | None = None) -> str:
+    """Counts from the retained rows, with the table's exact size when capped.
+
+    ``total`` is only passed when the row list was truncated, so an uncapped
+    panel keeps the plain wording rather than stating the obvious.
+    """
+    scope = f" of {total} routed chats" if total is not None else " chat(s)"
     parts: list[str] = []
     if waiting:
-        parts.append(f"{waiting} chat(s) need a user message to recover")
+        parts.append(f"{waiting}{scope} need a user message to recover")
     if dangling:
-        parts.append(
-            f"{dangling} dangling route(s) — the gateway would resume a nonexistent session"
-        )
+        parts.append(f"{dangling}{scope} dangling — the gateway would resume a nonexistent session")
     return " · ".join(parts)
 
 
@@ -1048,7 +1081,7 @@ def _reset_churn_section(coord: SessionCoordinationState, theme: Theme) -> Rende
     lines.append(f" across {coord.generation_chat_total} chat(s)", style=theme.banner_text)
     if coord.generation_count_shrank:
         lines.append(
-            " · table shrank between refreshes — upstream never prunes it",
+            " · table shrank between refreshes — an invariant break; upstream never prunes it",
             style=f"bold {theme.ui_error}",
         )
     lines.append("\n")
@@ -1076,7 +1109,17 @@ _TERMINAL_NOTE = (
 
 def _terminal_section(term: TerminalSessionReadout, theme: Theme) -> RenderableType:
     lines = Text()
-    lines.append(f"  {term.count} open CLI terminals in the last 24 hours", style=theme.ui_accent)
+    if term.truncated:
+        # The directory exceeded the scan bound, so the figure is a floor.
+        lines.append(
+            f"  at least {term.count} open CLI terminals in the last 24 hours",
+            style=theme.ui_accent,
+        )
+        lines.append(" (directory scan truncated)", style=theme.ui_warn)
+    else:
+        lines.append(
+            f"  {term.count} open CLI terminals in the last 24 hours", style=theme.ui_accent
+        )
     lines.append(f" — {_TERMINAL_NOTE}\n", style=theme.banner_dim)
     if not term.sessions:
         return lines

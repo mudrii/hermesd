@@ -930,3 +930,28 @@ def test_the_verdict_needs_every_clause():
     }
     for clause, refuted in refutations.items():
         assert refuted.migration_verified is False, clause
+
+
+def test_migration_recorded_flags_are_read_strictly(hermes_home: Path):
+    """The manifest is machine-written: `"false"` strings are corruption.
+
+    ``flag_was`` and a profile's ``service.system`` are booleans upstream
+    (``gateway_migrate.py:58,540,582``); reading them truthily would claim the
+    multiplex flag was on before the migration and that a service manager was
+    system-wide.
+    """
+    _write_manifest(
+        hermes_home,
+        {
+            "version": 1,
+            "migrated_at": "2026-09-01T00:00:00Z",
+            "flag_was": "false",
+            "default": {"profile": "default", "service": {"kind": "launchd", "system": "false"}},
+            "secondaries": [],
+        },
+    )
+
+    migration = _collect(hermes_home).migration
+
+    assert migration.flag_was is False
+    assert migration.default_profile.service_system is False

@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 import rich.box
 from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from hermesd.models import ConfigBackupGroup, ConfigSummary, DashboardState
+from hermesd.models import (
+    ConfigBackupGroup,
+    ConfigBackupKind,
+    ConfigSummary,
+    DashboardState,
+)
 from hermesd.panels.formatting import escape_terminal_text as escape
 from hermesd.panels.formatting import fmt_age_seconds, sanitize_terminal_text, section_heading
 from hermesd.theme import Theme
@@ -21,7 +28,7 @@ def render_config(state: DashboardState, theme: Theme, detail: bool = False) -> 
 def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     c = state.config
     gateway_count = sum(1 for route in c.tool_gateway_routes if route.mode == "gateway")
-    corrupt_count = _corrupt_backup_count(c)
+    backups = _backup_index(c)
     lines = Text()
     lines.append("  Model: ", style=theme.ui_label)
     lines.append(f"{sanitize_terminal_text(c.model) or '—'}\n", style=theme.ui_accent)
@@ -45,9 +52,11 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     if not c.config_backups_present:
         lines.append("—", style=theme.banner_dim)
     else:
-        lines.append(_newest_good_backup_stamp(c) or "no good copy", style=theme.banner_text)
-        if corrupt_count:
-            lines.append(f" · corrupt {corrupt_count}", style=theme.ui_error)
+        lines.append(backups.newest_good_stamp or "no good copy", style=theme.banner_text)
+        if backups.corrupt_count:
+            lines.append(f" · corrupt {backups.corrupt_count}", style=theme.ui_error)
+        if c.config_backup_groups_truncated:
+            lines.append(" · truncated", style=theme.banner_dim)
 
     return Panel(
         lines,
@@ -243,20 +252,40 @@ _BACKUP_NOTE_LINES = (
 )
 
 _AUDIT_TRAIL_LIMIT = 4
+# The two kinds the panel answers questions about; everything else is history.
+_LOAD_BEARING_KINDS = frozenset({ConfigBackupKind.GOOD, ConfigBackupKind.CORRUPT})
 
 
-def _corrupt_backup_count(c: ConfigSummary) -> int:
+@dataclass(slots=True)
+class _BackupIndex:
+    """The three backup answers, computed in one traversal.
+
+    Mutable on purpose: the traversal fills it field by field, and it never
+    outlives the render it was built for.
+    """
+
+    newest_good_stamp: str = ""
+    newest_good_age: float | None = None
+    corrupt_count: int = 0
+    audit: list[ConfigBackupGroup] = field(default_factory=list)
+
+
+def _backup_index(c: ConfigSummary) -> _BackupIndex:
+    """One pass over the groups: the good copy, the corrupt count, the audit trail.
+
+    The rows are ranked by kind already, but a single traversal keeps the three
+    answers consistent with each other and with the model's one list.
+    """
+    index = _BackupIndex()
     for group in c.config_backup_groups:
-        if group.kind == "corrupt":
-            return group.count
-    return 0
-
-
-def _newest_good_backup_stamp(c: ConfigSummary) -> str:
-    for group in c.config_backup_groups:
-        if group.kind == "good":
-            return group.newest_stamp
-    return ""
+        if group.kind is ConfigBackupKind.GOOD and index.newest_good_stamp == "":
+            index.newest_good_stamp = group.newest_stamp
+            index.newest_good_age = group.newest_age_seconds
+        elif group.kind is ConfigBackupKind.CORRUPT:
+            index.corrupt_count += group.count
+        elif group.kind not in _LOAD_BEARING_KINDS:
+            index.audit.append(group)
+    return index
 
 
 def _backup_section(c: ConfigSummary, theme: Theme) -> list[RenderableType]:
@@ -268,8 +297,9 @@ def _backup_section(c: ConfigSummary, theme: Theme) -> list[RenderableType]:
     table = Table(box=None, show_header=False, padding=(0, 2))
     table.add_column("Key", style=theme.ui_label)
     table.add_column("Value", style=theme.ui_accent)
-    newest_good = _newest_good_backup_stamp(c)
-    newest_good_age = _newest_good_backup_age(c)
+    index = _backup_index(c)
+    newest_good = index.newest_good_stamp
+    newest_good_age = index.newest_good_age
     if newest_good:
         changed = newest_good
         if newest_good_age is not None:
@@ -277,28 +307,19 @@ def _backup_section(c: ConfigSummary, theme: Theme) -> list[RenderableType]:
         table.add_row("Last changed", escape(changed))
     else:
         table.add_row("Last changed", "no good copy")
-    corrupt_count = _corrupt_backup_count(c)
-    if corrupt_count:
-        table.add_row("Corrupt snapshots", Text(str(corrupt_count), style=theme.ui_error))
+    if index.corrupt_count:
+        table.add_row("Corrupt snapshots", Text(str(index.corrupt_count), style=theme.ui_error))
     else:
         table.add_row("Corrupt snapshots", "none")
-    audit = [group for group in c.config_backup_groups if group.kind not in ("good", "corrupt")]
-    if audit:
+    if index.audit:
         table.add_row(
             "Audit trail",
-            escape(_audit_trail_label(audit[:_AUDIT_TRAIL_LIMIT], len(audit))),
+            escape(_audit_trail_label(index.audit[:_AUDIT_TRAIL_LIMIT], len(index.audit))),
         )
     if c.config_backup_groups_truncated:
         table.add_row("Groups", "truncated — the scan hit its entry budget")
     note = Text("\n".join(f"  {line}" for line in _BACKUP_NOTE_LINES), style=theme.banner_dim)
     return [heading, table, note]
-
-
-def _newest_good_backup_age(c: ConfigSummary) -> float | None:
-    for group in c.config_backup_groups:
-        if group.kind == "good":
-            return group.newest_age_seconds
-    return None
 
 
 def _audit_trail_label(groups: list[ConfigBackupGroup], total: int) -> str:

@@ -16,7 +16,7 @@ uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd -
 uv run pytest tests/ -q --cov=hermesd --cov-report=term-missing  # coverage (CI gate: 96%)
 uv run ruff check .                 # lint
 uv run ruff format --check .        # format check
-uv run mypy hermesd                 # type check
+uv run mypy hermesd scripts         # type check
 uv run python -m compileall hermesd # compile check
 uv run pip-audit                    # dependency audit
 uv lock --check                     # lockfile freshness
@@ -56,8 +56,9 @@ hermesd/
   app.py          Rich TUI: Live context, input thread, adaptive layout
   collector.py    Collector orchestration + public facade over collect/
   collect/        Per-domain readers (sessions, kanban, cron, skills, plugins,
-                  operations, config, gateway, migration, logs, redaction,
-                  sqlite_util, system, common, recovery, hosted_rooms, api_runs)
+                  operations, curator, config, gateway, migration, logs,
+                  redaction, sqlite_util, system, common, recovery,
+                  hosted_rooms, api_runs)
   defaults.py     Shared refresh-rate and log-tail-bytes defaults
   db.py           Read-only SQLite with PRAGMA data_version caching
   file_cache.py   mtime-keyed JSON/YAML cache

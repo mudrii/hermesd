@@ -322,8 +322,11 @@ def test_footer_advertises_top_bottom_only_for_scrollable_detail_panels(
 
     app.handle_key("5")
     config_footer = app._build_footer(state).plain
-    assert "Scroll" not in config_footer
-    assert "Top/bottom" not in config_footer
+    # The Config detail is longer than a default terminal (72 lines against a
+    # 22-line viewport at 80x24), so its corrupt-snapshot alert is only
+    # reachable if the panel scrolls.
+    assert "Scroll" in config_footer
+    assert "Top/bottom" in config_footer
     app.close()
 
 
@@ -1158,12 +1161,50 @@ def test_build_footer_detail_sessions_shows_sort(populated_hermes_home: Path):
 def test_top_bottom_keys_ignore_non_scrollable_detail_panels(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
 
-    app.handle_key("5")
+    # Memory (panel 10, key "0") is a fixed-size detail: no viewport, no scroll.
+    app.handle_key("0")
     app.handle_key("G")
     assert app._view.scroll_offset == 0
 
     app.handle_key("g")
     assert app._view.scroll_offset == 0
+    app.close()
+
+
+def test_config_detail_corrupt_alert_is_reachable_at_80x24(populated_hermes_home: Path):
+    """The corrupt-snapshot alert must not sit below an unscrollable fold.
+
+    The Config detail renders roughly 72 lines while a default terminal shows
+    about 22, and the backups section is appended last — so before the panel had
+    a viewport the alert could not be reached at all, not even by scrolling.
+    """
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    from hermesd.models import ConfigBackupGroup
+
+    config = app._state.config.model_copy(
+        update={
+            "config_backups_present": True,
+            "config_backup_groups": [
+                ConfigBackupGroup(reason="good", kind="good", count=1, newest_stamp="20260907"),
+                ConfigBackupGroup(reason="corrupt", kind="corrupt", count=2),
+            ],
+        }
+    )
+    app._set_state(app._state.model_copy(update={"config": config}))
+    app.handle_key("5")
+    app._console = Console(file=io.StringIO(), width=80, height=24, no_color=True)
+
+    with app._console.capture() as top_capture:
+        app._console.print(app._build_layout())
+    assert "Corrupt snapshots" not in top_capture.get(), "the alert is below the fold at 80x24"
+
+    app.handle_key("G")
+    with app._console.capture() as bottom_capture:
+        app._console.print(app._build_layout())
+    assert app._view.scroll_offset > 0
+    bottom = bottom_capture.get()
+    assert "Corrupt snapshots" in bottom
+    assert "2" in bottom
     app.close()
 
 

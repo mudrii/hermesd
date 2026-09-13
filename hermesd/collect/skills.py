@@ -10,7 +10,13 @@ from typing import Any
 
 import yaml
 
-from hermesd.collect.common import _EXCERPT_MAX_CHARS, _as_dict, _as_list, _read_text_capped
+from hermesd.collect.common import (
+    _EXCERPT_MAX_CHARS,
+    _as_dict,
+    _as_list,
+    _coerce_bool,
+    _read_text_capped,
+)
 from hermesd.models import (
     MCPCacheEntry,
     MCPCacheEntryState,
@@ -206,7 +212,10 @@ def _learning_summary(
     for name, metadata in usage_metadata.items():
         if _usage_indicates_learned(metadata):
             learned.add(name)
-        if bool(metadata.get("pinned")):
+        # ``.usage.json`` is a state payload written with real booleans
+        # (``set_pinned`` stores ``bool(pinned)``), so a stringified flag is
+        # corruption, not truth.
+        if _coerce_bool(metadata.get("pinned")):
             pinned.add(name)
         if str(metadata.get("created_by") or metadata.get("source") or "") == "agent":
             agent_created.add(name)
@@ -219,6 +228,8 @@ def _learning_summary(
             name = skill_dir.name
             metadata = read_frontmatter(skill_dir / "SKILL.md", skills_dir)
             learned.add(name)
+            # Frontmatter is human-authored, like a config value: read the way
+            # upstream reads its own settings, not with the state-payload rule.
             if bool(metadata.get("pinned")):
                 pinned.add(name)
             if str(metadata.get("created_by") or metadata.get("source") or "") == "agent":
@@ -234,10 +245,10 @@ def _learning_summary(
 
 def _usage_indicates_learned(metadata: dict[str, Any]) -> bool:
     return bool(
-        metadata.get("learned")
-        or metadata.get("agent_created")
-        or metadata.get("profile_skill")
-        or metadata.get("pinned")
+        _coerce_bool(metadata.get("learned"))
+        or _coerce_bool(metadata.get("agent_created"))
+        or _coerce_bool(metadata.get("profile_skill"))
+        or _coerce_bool(metadata.get("pinned"))
         or str(metadata.get("created_by") or metadata.get("source") or "") == "agent"
     )
 

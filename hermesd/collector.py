@@ -11,6 +11,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import socket
 import sqlite3
 import subprocess  # noqa: F401  # re-exported: tests patch hermesd.collector.subprocess.run
 import threading
@@ -30,6 +31,7 @@ from hermesd.collect.common import (
     _age_seconds,
     _as_dict,
     _as_list,
+    _coerce_bool,
     _coerce_float,
     _coerce_int,
     _db_source_mtime_ns,
@@ -86,6 +88,12 @@ from hermesd.collect.cron import (
     _read_cron_executions_state,
     _tail_latest_cron_output,
 )
+from hermesd.collect.curator import (
+    _curator_thresholds,
+    _curator_with_scheduler_state,
+    _skill_curation_hygiene,
+    _state_transition_label,
+)
 from hermesd.collect.desktop_plugins import read_desktop_plugins
 from hermesd.collect.gateway import (
     _LOOP_TICK_SILENCE_STRIKES,
@@ -106,6 +114,7 @@ from hermesd.collect.gateway import (
     _read_gateway_ledger_rows,
     _read_start_storm,
     _record_writer,
+    _respawn_storm_policy,
     _update_receipt_status,
 )
 from hermesd.collect.hosted_rooms import _read_hosted_rooms
@@ -129,11 +138,11 @@ from hermesd.collect.migration import (
 )
 from hermesd.collect.operations import (
     StateDbRead,
+    _checkpoint_prune_interval_seconds,
     _count_delegation_live_logs,
-    _curator_thresholds,
-    _curator_with_scheduler_state,
     _is_dashboard_process,
     _iso_age_seconds,
+    _live_log_tail,
     _moa_latest_record_summary,
     _model_cache_counts,
     _read_checkpoint_prune_marker,
@@ -143,9 +152,7 @@ from hermesd.collect.operations import (
     _read_projects_state,
     _read_state_snapshots,
     _read_verification_evidence,
-    _skill_curation_hygiene,
     _state_db_update,
-    _state_transition_label,
 )
 from hermesd.collect.operations import (
     _read_state_db as _read_state_db_tables,
@@ -216,6 +223,7 @@ from hermesd.collect.skills import (
 )
 from hermesd.collect.sqlite_util import (
     _connect_readonly_sqlite,
+    _snapshot_wal_if_present,
     _table_count_or_zero,
 )
 from hermesd.collect.system import (
@@ -344,6 +352,7 @@ _CONFIG_BACKUP_FIELDS = (
 _PLUGIN_CATALOG_FIELDS = (
     "plugins",
     "plugin_catalog_cache_present",
+    "plugin_catalog_cache_usable",
     "plugin_catalog_cache_age_seconds",
     "plugin_catalog_update_count",
     "plugin_catalog_removed_count",
@@ -369,8 +378,10 @@ _API_RUN_FIELDS = ("api_runs",)
 _KANBAN_NOTIFY_FIELDS = (
     "notify_sub_count",
     "notify_platform_counts",
+    "notify_platforms_truncated",
     "notify_backlog_total",
     "notify_max_backlog",
+    "notify_backlog_sub_count",
     "notify_backlog_subs",
     "notify_orphan_profile_count",
     "notify_orphan_profiles",
@@ -378,6 +389,7 @@ _KANBAN_NOTIFY_FIELDS = (
 _DELEGATION_LIVE_FIELDS = (
     "delegation_live_manifests",
     "delegation_live_manifest_count",
+    "delegation_live_unparsed_count",
 )
 _PROCESS_RECEIPT_FIELDS = ("process_receipts",)
 _STATE_SNAPSHOT_FIELDS = ("snapshot_count", "snapshot_total_bytes", "newest_snapshot_age_seconds")
@@ -392,9 +404,10 @@ _LIFECYCLE_FIELDS = (
 # gateway-starts.log: the respawn-storm ledger's fields.
 _RESTART_STORM_FIELDS = (
     "gateway_starts_recorded",
-    "gateway_starts_2m",
+    "gateway_starts_window",
     "gateway_starts_1h",
     "restart_storm_cap",
+    "restart_storm_window_seconds",
     "seconds_since_last_gateway_start",
     "in_respawn_backoff",
 )
@@ -440,7 +453,7 @@ _LEDGER_FIELDS = (
 # SessionCoordinationState, so a corrupt coordination table degrades only its
 # own group instead of blanking the others.
 _SESSION_LEASE_FIELDS = ("leases", "lease_total")
-_HYGIENE_FIELDS = ("hygiene",)
+_HYGIENE_FIELDS = ("hygiene", "hygiene_total")
 _GATEWAY_ROUTE_FIELDS = ("routes", "route_total")
 _GENERATION_FIELDS = (
     "generations",
@@ -658,6 +671,9 @@ class Collector:
         clock: Callable[[], float] = time.time,
         env: Mapping[str, str] | None = None,
         loop_tick_probe: Callable[[int, int | None], bool | None] | None = None,
+        hostname: str | None = None,
+        text_reader: Callable[[Path, Path | None], str] | None = None,
+        live_log_tail: Callable[[Path, Path], list[str]] | None = None,
     ):
         self._root_home = hermes_home
         self._file_cache = file_cache if file_cache is not None else LastGoodFileCache()
@@ -669,6 +685,10 @@ class Collector:
         # never opens real sockets; the default probe is read-only by protocol.
         self._loop_tick_probe = loop_tick_probe or self._probed_loop_tick
         self._loop_tick_silent_strikes = 0
+        # Which witness those strikes belong to. The socket node is named after
+        # the gateway pid, so a restart means a new witness: carrying a dead
+        # life's strikes over would wedge a gateway on its first silent probe.
+        self._loop_tick_strike_pid: int | None = None
         self._log_tail_bytes = max(1, log_tail_bytes)
         self._paths = HermesPaths(hermes_home, profile_name)
         if db_factory is None:
@@ -679,6 +699,17 @@ class Collector:
         self._db = db_factory(self._paths.profile_path("state.db"))
         self._env = env if env is not None else os.environ
         self._clock = clock
+        # This host's name, as the cron fire-claim owner stamps it. Injected so
+        # the claim parser is testable off a fixed host instead of the machine
+        # running the suite.
+        self._hostname = hostname or socket.gethostname()
+        # Capped text reader for untrusted files. Injectable for the same reason
+        # as the clock and pid check: a test that pins "this scanner stopped at
+        # its bound" has to count the reads without patching a module attribute.
+        self._text_reader = text_reader or _read_text_capped
+        # Same reason: a test that pins "tails are read only for the displayed
+        # slice" has to count the reads, and a count is not a fixture.
+        self._live_log_tail = live_log_tail or _live_log_tail
         self._available_tools_cache_key: (
             tuple[
                 tuple[str, int, int] | None,
@@ -700,9 +731,9 @@ class Collector:
         self._last_good_by_source: dict[str, Any] = {}
         self._last_session_rows: list[dict[str, Any]] = []
         # conversation_generations is never pruned upstream, so its row count
-        # must never shrink between refreshes; remembering the last count is
-        # what turns a shrink into a visible warning instead of a silent
-        # "fewer chats than last tick".
+        # must never shrink between refreshes; remembering the high-water count
+        # is what turns a shrink into a visible warning — one that stands until
+        # the table recovers — instead of a silent "fewer chats than last tick".
         self._last_generation_chat_count: int | None = None
         self._log_stream_cache: dict[str, tuple[float | None, int, LogStream]] = {}
         self._cron_excerpt_cache: dict[
@@ -718,6 +749,10 @@ class Collector:
         # state and the gateway ledgers so a pass snapshots the (large, WAL)
         # db only once.
         self._state_db_cache: tuple[int, _StateDbReadout] | None = None
+        # kanban.db's shared WAL snapshots, keyed by source path: each entry is
+        # (source mtime, path to read, temp-dir owner). One per database, so the
+        # boards' own stores do not evict the root one.
+        self._kanban_snapshots: dict[Path, tuple[int | None, Path, Any]] = {}
         self._checkpoint_summary_cache: dict[
             str, tuple[tuple[int, ...], tuple[int, float | None, str]]
         ] = {}
@@ -1070,11 +1105,7 @@ class Collector:
                     "api_runs", results["operations"], _API_RUN_FIELDS
                 ),
             ),
-            # Seventh writer of `operations`: the live delegation manifests are a
-            # ROOT-scoped cache directory (the same open divergence as the
-            # delegation_live_log_count read inside `operations`), and a torn
-            # manifest must keep the last-good cards instead of blanking them.
-            # Eighth writer of `operations`: process receipts live under the
+            # Seventh writer of `operations`: process receipts live under the
             # profile's logs/, upstream's own location, so a vanished receipt
             # (7-day retention) keeps the last-good list instead of a false zero.
             _SourceSpec(
@@ -1086,6 +1117,10 @@ class Collector:
                     "process_receipts", results["operations"], _PROCESS_RECEIPT_FIELDS
                 ),
             ),
+            # Eighth writer of `operations`: the live delegation manifests are a
+            # ROOT-scoped cache directory (the same open divergence as the
+            # delegation_live_log_count read inside `operations`), and a torn
+            # manifest must keep the last-good cards instead of blanking them.
             _SourceSpec(
                 "operations",
                 "delegation_live",
@@ -1176,9 +1211,7 @@ class Collector:
             _SourceSpec(
                 "session_coordination",
                 "gateway_routes",
-                lambda: self._with_gateway_routes(
-                    results["session_coordination"], results["sessions"]
-                ),
+                lambda: self._with_gateway_routes(results["session_coordination"]),
                 lambda: results["session_coordination"],
                 fallback=lambda: self._last_source_fields(
                     "gateway_routes", results["session_coordination"], _GATEWAY_ROUTE_FIELDS
@@ -1517,7 +1550,7 @@ class Collector:
             hermes_version=version,
             updates_behind=behind,
             active_agents=active_agents,
-            restart_requested=bool(data.get("restart_requested")),
+            restart_requested=_coerce_bool(data.get("restart_requested")),
             busy=running and active_agents > 0,
             drainable=running and active_agents == 0,
             drain_active=bool(drain_request),
@@ -1525,7 +1558,7 @@ class Collector:
             drain_principal=str(
                 drain_request.get("principal") or drain_request.get("requested_by") or ""
             ),
-            drain_suppress_notification=bool(drain_request.get("suppress_notification")),
+            drain_suppress_notification=_coerce_bool(drain_request.get("suppress_notification")),
             served_profiles=served_names,
             served_profiles_recorded=served_recorded,
             scale_to_zero_idle_timeout_minutes=_coerce_int(scale_cfg.get("idle_timeout_minutes")),
@@ -1586,7 +1619,8 @@ class Collector:
         (``_LOOP_TICK_SILENCE_STRIKES``): one silent probe is never destructive
         evidence, mirroring upstream's sustained window without sleeping in the
         collector thread. Any answer, ambiguity, or non-probing pass resets the
-        strike count.
+        strike count, and so does a change of witness pid: the node is named after
+        the gateway process, so a restart starts a fresh count.
         """
         path = self._paths.shared_path("state", "gateway.heartbeat")
         heartbeat = (
@@ -1599,7 +1633,11 @@ class Collector:
         )
         if plan is None:
             self._loop_tick_silent_strikes = 0
+            self._loop_tick_strike_pid = None
             return gateway
+        if plan.pid != self._loop_tick_strike_pid:
+            self._loop_tick_strike_pid = plan.pid
+            self._loop_tick_silent_strikes = 0
         probe_result = self._loop_tick_probe(plan.pid, plan.tcp_port)
         if probe_result is False:
             self._loop_tick_silent_strikes += 1
@@ -1615,10 +1653,24 @@ class Collector:
         return gateway.model_copy(update={"loop_health": health, "loop_tick_armed": plan.armed})
 
     def _with_restart_storm(self, gateway: GatewayState) -> GatewayState:
-        """Respawn-storm ledger facts from gateway-starts.log (read-only ring file)."""
+        """Respawn-storm ledger facts from gateway-starts.log (read-only ring file).
+
+        The cap and window are upstream's configurable policy
+        (``gateway.respawn_storm``), read from the same root ``config.yaml`` the
+        config source uses — mtime-cached, so this costs one stat on a steady
+        install. config.yaml here is the ROOT file, like every other gateway
+        launch input.
+        """
+        cap, window_seconds = _respawn_storm_policy(self._read_yaml_cached())
         path = self._paths.shared_path("gateway-starts.log")
-        storm = _read_start_storm(path, self._paths.root_home, self._clock())
-        return gateway.model_copy(update=storm.model_fields(self._clock()))
+        storm = _read_start_storm(
+            path,
+            self._paths.root_home,
+            self._clock(),
+            cap=cap,
+            window_seconds=window_seconds,
+        )
+        return gateway.model_copy(update=storm.as_update())
 
     def _with_exit_diag(self, gateway: GatewayState) -> GatewayState:
         """Crash forensics from the tail of the exit-diag ledger; metadata only.
@@ -1654,11 +1706,11 @@ class Collector:
     def _with_dashboard_client(self, gateway: GatewayState) -> GatewayState:
         """Web dashboard attachment from the marker file's mtime; the socket is never touched."""
         path = self._paths.shared_path("state", "dashboard_clients.heartbeat")
-        attached, age = _dashboard_client_status(path, self._paths.root_home, self._clock())
+        status = _dashboard_client_status(path, self._paths.root_home, self._clock())
         return gateway.model_copy(
             update={
-                "dashboard_client_attached": attached,
-                "dashboard_client_last_frame_age_seconds": age,
+                "dashboard_client_attached": status.attached,
+                "dashboard_client_last_frame_age_seconds": status.age_seconds,
             }
         )
 
@@ -1830,7 +1882,10 @@ class Collector:
                 estimated_cost_usd=_resolved_session_cost(r),
                 api_call_count=r.get("api_call_count") or 0,
                 cwd=r.get("cwd") or "",
-                archived=bool(r.get("archived") or 0),
+                # Strict, like every other flag read from a DB row: INTEGER
+                # affinity converts a numeric spelling, but a text 'false'
+                # survives as TEXT and bool() would call it archived.
+                archived=_coerce_bool(r.get("archived")),
                 rewind_count=r.get("rewind_count") or 0,
                 handoff_state=r.get("handoff_state") or "",
                 handoff_platform=r.get("handoff_platform") or "",
@@ -1840,13 +1895,13 @@ class Collector:
                 started_at=_coerce_float(r.get("started_at")),
                 ended_at=r.get("ended_at"),
                 title=r.get("title"),
-                is_active=r.get("ended_at") is None and not bool(r.get("archived") or 0),
+                is_active=r.get("ended_at") is None and not _coerce_bool(r.get("archived")),
                 git_branch=r.get("git_branch") or "",
                 chat_type=r.get("chat_type") or "",
                 display_name=r.get("display_name") or "",
                 title_source=r.get("title_source") or "",
                 profile_name=r.get("profile_name") or "",
-                pinned=bool(r.get("pinned") or 0),
+                pinned=_coerce_bool(r.get("pinned")),
                 last_activity_at=_coerce_float(r.get("last_activity_at")),
                 last_activity_description=r.get("last_activity_description") or "",
                 actual_cost_usd=_coerce_float(r.get("actual_cost_usd")),
@@ -1935,7 +1990,7 @@ class Collector:
                     lease_id=str(entry.get("lease_id") or ""),
                     started_at_age_seconds=_lease_age_seconds(entry.get("started_at"), now),
                     updated_at_age_seconds=_lease_age_seconds(entry.get("updated_at"), now),
-                    track_liveness=bool(entry.get("track_liveness")),
+                    track_liveness=_coerce_bool(entry.get("track_liveness")),
                     joinable=bool(str(metadata.get("shared_runtime_url") or "")),
                 )
             )
@@ -1974,29 +2029,32 @@ class Collector:
                 raise RuntimeError("state.db gateway hygiene disappeared or became unsafe")
             return coord
         return coord.model_copy(
-            update=_hygiene_fields(readout.coordination.hygiene_rows, session_rows)
+            update=_hygiene_fields(
+                readout.coordination.hygiene_rows,
+                session_rows,
+                readout.coordination.hygiene_total,
+            )
         )
 
-    def _with_gateway_routes(
-        self, coord: SessionCoordinationState, sessions: list[SessionInfo]
-    ) -> SessionCoordinationState:
+    def _with_gateway_routes(self, coord: SessionCoordinationState) -> SessionCoordinationState:
         """Decoded routing entries (PROFILE ``state.db``, table
         ``gateway_routing`` — ``hermes_state.py:160,178``; payload writer
         ``gateway/session.py:535-545``). Dangling routes are those whose
-        session id has no row in the (possibly last-good) session list."""
+        session id has no row at all: the target set is the *unfiltered* id
+        list, because upstream hides a session from the default listing while
+        keeping it resumable (``hermes_state_sessions.py:898-900``)."""
         readout = self._read_state_db()
         if readout is None:
             last = self._last_good_by_source.get("gateway_routes")
             if last is not None and last.route_total:
                 raise RuntimeError("state.db gateway routes disappeared or became unsafe")
             return coord
-        known = frozenset(session.session_id for session in sessions if session.session_id)
         return coord.model_copy(
             update=_gateway_route_fields(
                 readout.coordination.routing_rows,
                 route_total=readout.coordination.routing_total,
                 now=self._clock(),
-                known_session_ids=known,
+                known_session_ids=readout.coordination.session_ids,
             )
         )
 
@@ -2006,7 +2064,13 @@ class Collector:
         garbage-collected upstream (``hermes_state_common.py:460-487``), so the
         row count is remembered across refreshes and a shrink sets the panel's
         invariant-break warning. The remembered count advances only on a
-        successful read; a failed source never invents a shrink."""
+        successful read; a failed source never invents a shrink.
+
+        The remembered count is a *high-water* mark, not last-seen: a shrink is
+        an invariant break, so the warning has to stand until the table
+        recovers to the count seen before it. Comparing against last-seen would
+        clear the warning on the very next refresh, leaving the operator's only
+        cue to the one interval that happened to observe the drop."""
         readout = self._read_state_db()
         if readout is None:
             last = self._last_good_by_source.get("generation_churn")
@@ -2014,11 +2078,9 @@ class Collector:
                 raise RuntimeError("state.db generations disappeared or became unsafe")
             return coord
         rows = readout.coordination
-        shrank = (
-            self._last_generation_chat_count is not None
-            and rows.generation_chat_total < self._last_generation_chat_count
-        )
-        self._last_generation_chat_count = rows.generation_chat_total
+        previous = self._last_generation_chat_count
+        shrank = previous is not None and rows.generation_chat_total < previous
+        self._last_generation_chat_count = max(previous or 0, rows.generation_chat_total)
         return coord.model_copy(
             update={
                 **_generation_fields(rows),
@@ -2047,16 +2109,21 @@ class Collector:
         now = self._clock()
         rows: list[TerminalBreadcrumb] = []
         count = 0
-        for entry in sorted(directory.iterdir(), key=lambda path: path.name)[
-            :_TERMINAL_SESSION_SCAN_LIMIT
-        ]:
+        # Bound the listing before sorting, like the config-backups scan: a
+        # hostile directory must not be materialised whole, and one extra entry
+        # is enough to know the scan was cut.
+        examined = list(islice(directory.iterdir(), _TERMINAL_SESSION_SCAN_LIMIT + 1))
+        truncated = len(examined) > _TERMINAL_SESSION_SCAN_LIMIT
+        for entry in sorted(examined[:_TERMINAL_SESSION_SCAN_LIMIT], key=lambda path: path.name):
             if entry.name.startswith(".") or not entry.is_file():
                 continue
             if entry.is_symlink() or not _path_resolves_under(entry, home):
                 continue
             try:
-                data = json.loads(_read_text_capped(entry, home))
-            except (json.JSONDecodeError, UnicodeError):
+                data = json.loads(self._text_reader(entry, home))
+            except (json.JSONDecodeError, UnicodeError, RecursionError):
+                # RecursionError is the deep-nesting refusal, not a parse error:
+                # a nesting bomb is junk like any other unreadable breadcrumb.
                 continue
             if not isinstance(data, dict):
                 continue
@@ -2074,7 +2141,7 @@ class Collector:
                         age_seconds=age,
                     )
                 )
-        return TerminalSessionReadout(sessions=rows, count=count)
+        return TerminalSessionReadout(sessions=rows, count=count, truncated=truncated)
 
     def _last_model_usage(self) -> _ModelUsageBundle:
         bundle: _ModelUsageBundle = self._last_good_by_source.get(
@@ -2156,7 +2223,7 @@ class Collector:
                 started_at=_coerce_float(entry.get("started_at")),
                 task_id=str(entry.get("task_id") or ""),
                 session_key=str(entry.get("session_key") or ""),
-                notify_on_complete=bool(entry.get("notify_on_complete")),
+                notify_on_complete=_coerce_bool(entry.get("notify_on_complete")),
                 watcher_platform=str(entry.get("watcher_platform") or ""),
                 watcher_chat_id=str(entry.get("watcher_chat_id") or ""),
                 watcher_user_id=str(entry.get("watcher_user_id") or ""),
@@ -2452,13 +2519,18 @@ class Collector:
                     self._log_tail_bytes,
                 )
                 last_status = j.get("last_status")
-                # A raw null must fall back to the model default, not fail the job.
+                # A raw null must fall back to the model default, not fail the
+                # job; anything else is read strictly, like the sibling
+                # no_agent/preflight_alerted flags in the same machine-written
+                # record (`cron/jobs.py` stores `not paused` as a real bool).
                 raw_enabled = j.get("enabled", True)
-                enabled = True if raw_enabled is None else bool(raw_enabled)
+                enabled = True if raw_enabled is None else _coerce_bool(raw_enabled)
                 dispatch_lateness, dispatch_kind = _cron_job_dispatch(j)
                 repeat_times, repeat_completed = _cron_job_repeat(j)
                 paused, paused_reason = _cron_job_paused(j)
-                fire_claim_age, fire_claim_state = _cron_job_fire_claim(j, now=now)
+                fire_claim_age, fire_claim_state = _cron_job_fire_claim(
+                    j, now=now, pid_exists=self._pid_exists, hostname=self._hostname
+                )
                 pending_slot_at, pending_slot_age = _cron_job_pending_slot(j, now=now)
                 fire_error, fire_error_age = _cron_job_fire_error(j, now=now)
                 jobs.append(
@@ -2488,7 +2560,7 @@ class Collector:
                         dispatch_kind=dispatch_kind,
                         repeat_times=repeat_times,
                         repeat_completed=repeat_completed,
-                        no_agent=bool(j.get("no_agent")),
+                        no_agent=_coerce_bool(j.get("no_agent")),
                         model=str(j.get("model") or ""),
                         provider=str(j.get("provider") or ""),
                         fire_claim_age_seconds=fire_claim_age,
@@ -2497,7 +2569,7 @@ class Collector:
                         pending_slot_age_seconds=pending_slot_age,
                         last_fire_error=fire_error,
                         last_fire_error_age_seconds=fire_error_age,
-                        preflight_alerted=bool(j.get("preflight_alerted")),
+                        preflight_alerted=_coerce_bool(j.get("preflight_alerted")),
                         model_snapshot=str(j.get("model_snapshot") or ""),
                         provider_snapshot=str(j.get("provider_snapshot") or ""),
                     )
@@ -2608,6 +2680,42 @@ class Collector:
             platforms=platform_infos,
         )
 
+    def _kanban_read_path(self, db_path: Path) -> tuple[Path, bool]:
+        """A path to read kanban.db from, copying its WAL at most once per change.
+
+        Three readers touch this database in a refresh — the board state, one
+        summary per board, and the notify subscriptions — and each used to
+        snapshot the WAL on its own, copying a multi-megabyte file per reader.
+        The snapshot is keyed by the source's mtime (db plus sidecar) and shared
+        by all of them; without a WAL there is nothing to copy and the real path
+        is returned.
+
+        The second element says whether the first is that shared snapshot. A
+        snapshot may be opened ``mode=ro`` directly (``resolved=True``). A real
+        path must go through the ordinary route (``resolved=False``), whose
+        sidecar check re-runs and whose immutable open neither recreates
+        ``-wal``/``-shm`` beside the monitored database — a write into the
+        Hermes home, and a failure on SQLite builds that refuse read-only WAL
+        opens — nor serves stale data when a WAL appears mid-refresh.
+        """
+        key = _db_source_mtime_ns(db_path)
+        cached = self._kanban_snapshots.get(db_path)
+        if cached is not None and key is not None and cached[0] == key:
+            # owner is a TemporaryDirectory exactly when the path is a snapshot.
+            return cached[1], cached[2] is not None
+        if cached is not None:
+            owner = cached[2]
+            if owner is not None:
+                owner.cleanup()
+            del self._kanban_snapshots[db_path]
+        snapshot = _snapshot_wal_if_present(db_path)
+        if snapshot is None:
+            self._kanban_snapshots[db_path] = (key, db_path, None)
+            return db_path, False
+        snapshot_dir, snapshot_db = snapshot
+        self._kanban_snapshots[db_path] = (key, snapshot_db, snapshot_dir)
+        return snapshot_db, True
+
     def _collect_kanban(self) -> KanbanState:
         cfg = self._read_yaml_reporting_stale()
         kanban_cfg = _as_dict(cfg.get("kanban"))
@@ -2630,7 +2738,15 @@ class Collector:
             if last_kanban is not None and last_kanban.db_present:
                 raise RuntimeError("kanban.db replaced by unsafe path")
             return self._with_kanban_boards(base_state)
-        return self._with_kanban_boards(_read_kanban_state(db_path, base_state, now=self._clock()))
+        read_path, snapshotted = self._kanban_read_path(db_path)
+        return self._with_kanban_boards(
+            _read_kanban_state(
+                read_path,
+                base_state,
+                now=self._clock(),
+                resolved=snapshotted,
+            )
+        )
 
     def _read_current_kanban_board(self) -> str:
         path = self._paths.shared_path("kanban", "current")
@@ -2688,12 +2804,14 @@ class Collector:
                 ):
                     continue
                 try:
+                    read_path, snapshotted = self._kanban_read_path(db_path)
                     summary = _read_kanban_board_summary(
-                        db_path,
+                        read_path,
                         slug=board_dir.name,
                         current=board_dir.name == state.current_board,
                         claim_ttl_seconds=state.claim_ttl_seconds,
                         now=self._clock(),
+                        resolved=snapshotted,
                     )
                 except (sqlite3.Error, OSError) as exc:
                     self._kanban_board_errors.append(
@@ -2727,9 +2845,12 @@ class Collector:
             or not _path_resolves_under(db_path, self._paths.root_home)
         ):
             return state
+        read_path, snapshotted = self._kanban_read_path(db_path)
         return state.model_copy(
             update=_read_kanban_notify(
-                db_path, known_profiles=self._kanban_notifier_profile_names()
+                read_path,
+                known_profiles=self._kanban_notifier_profile_names(),
+                resolved=snapshotted,
             )
         )
 
@@ -2796,6 +2917,7 @@ class Collector:
                     self._paths.profile_path("checkpoints", ".last_prune"),
                     self._paths.profile_home,
                     now=self._clock(),
+                    interval_seconds=_checkpoint_prune_interval_seconds(self._read_yaml_cached()),
                 ),
                 **_read_corrupt_ledger_marker(
                     self._paths.shared_path("spawn-ledger.json.corrupt"),
@@ -3102,6 +3224,7 @@ class Collector:
                 live_root,
                 self._paths.root_home,
                 now=self._clock(),
+                log_tail=self._live_log_tail,
             )
         )
 
@@ -3148,16 +3271,19 @@ class Collector:
             stale_after_days=stale_days,
             archive_after_days=archive_days,
         )
+        # One overlay for both shapes: the thresholds and the usage rollup come
+        # from files the run report does not contain, so a populated run must
+        # keep them exactly like the empty one does. Applied through a single
+        # dict so a new field cannot land on only one branch.
+        overlay = {
+            "stale_after_days": stale_days,
+            "archive_after_days": archive_days,
+            "thresholds_customized": thresholds_customized,
+            **hygiene,
+        }
         base_run = _curator_with_scheduler_state(
             CuratorRun(), scheduler_state, curator_cfg
-        ).model_copy(
-            update={
-                "stale_after_days": stale_days,
-                "archive_after_days": archive_days,
-                "thresholds_customized": thresholds_customized,
-                **hygiene,
-            }
-        )
+        ).model_copy(update=overlay)
         curator_dir = self._paths.shared_path("logs", "curator")
         if (
             curator_dir.is_symlink()
@@ -3220,7 +3346,7 @@ class Collector:
             ),
             scheduler_state,
             curator_cfg,
-        )
+        ).model_copy(update=overlay)
 
     def _collect_model_caches(self) -> list[ModelCacheSummary]:
         cache_names = [
@@ -3482,13 +3608,18 @@ class Collector:
         comparison describe one home (see .codex/rules/source-ownership.md).
 
         No cache means no claims: update/removal flags stay False and the panel
-        says the checks are unavailable, never "everything is current".
+        says the checks are unavailable, never "everything is current". The same
+        rule applies to a cache that is present but unreadable: upstream refuses
+        any payload that is not ``{"entries": [...], ...}``
+        (``plugin_catalog.py:238-239``), so ``parse_catalog_cache`` returns None
+        and the panel reports the cache as unreadable rather than as agreement.
         """
         cache_path = self._paths.shared_path("cache", "plugin-catalog.json")
         if not _exists_strict(cache_path) or not cache_path.is_file():
             return current.model_copy(
                 update={
                     "plugin_catalog_cache_present": False,
+                    "plugin_catalog_cache_usable": False,
                     "plugin_catalog_cache_age_seconds": None,
                     "plugin_catalog_update_count": 0,
                     "plugin_catalog_removed_count": 0,
@@ -3496,7 +3627,20 @@ class Collector:
             )
         if cache_path.is_symlink() or not _path_resolves_under(cache_path, self._paths.root_home):
             raise RuntimeError(f"unsafe plugin catalog cache: {cache_path.name}")
-        entries, removed = parse_catalog_cache(self._read_json_cached(cache_path))
+        parsed = parse_catalog_cache(self._read_json_cached(cache_path))
+        if parsed is None:
+            # Present but unusable: keep the discovered plugins unevaluated and
+            # make the panel say so instead of claiming a match.
+            return current.model_copy(
+                update={
+                    "plugin_catalog_cache_present": True,
+                    "plugin_catalog_cache_usable": False,
+                    "plugin_catalog_cache_age_seconds": self._file_age_seconds(cache_path),
+                    "plugin_catalog_update_count": 0,
+                    "plugin_catalog_removed_count": 0,
+                }
+            )
+        entries, removed = parsed
         plugins = [
             self._flag_plugin_with_catalog(plugin, entries, removed) for plugin in current.plugins
         ]
@@ -3504,6 +3648,7 @@ class Collector:
             update={
                 "plugins": plugins,
                 "plugin_catalog_cache_present": True,
+                "plugin_catalog_cache_usable": True,
                 "plugin_catalog_cache_age_seconds": self._file_age_seconds(cache_path),
                 "plugin_catalog_update_count": sum(
                     1 for plugin in plugins if plugin.catalog_update_available
@@ -4145,4 +4290,8 @@ class Collector:
         self._closing.set()
         with self._lock:
             self._closed = True
+            for _source, snapshot in self._kanban_snapshots.items():
+                if snapshot[2] is not None:
+                    snapshot[2].cleanup()
+            self._kanban_snapshots.clear()
             self._db.close()

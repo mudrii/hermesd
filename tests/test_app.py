@@ -606,8 +606,8 @@ def test_close_interrupts_and_joins_message_search_thread(populated_hermes_home)
         calls.append("close")
         real_close()
 
-    app._collector.interrupt_searches = fake_interrupt  # type: ignore[attr-defined]
-    app._collector.close = fake_close  # type: ignore[assignment]
+    app._collector.interrupt_searches = fake_interrupt
+    app._collector.close = fake_close
 
     def worker() -> None:
         unblock.wait(10)

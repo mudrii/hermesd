@@ -12,8 +12,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from hermesd.collect.plugins import (
     RemovedCatalogEntry,
     normalize_repo,
@@ -93,10 +91,27 @@ def test_parse_catalog_cache_reads_entries_and_removed():
     ]
 
 
-def test_parse_catalog_cache_tolerates_wrong_shapes():
-    assert parse_catalog_cache({}) == ({}, [])
-    assert parse_catalog_cache({"entries": "junk", "removed": 4}) == ({}, [])
-    assert parse_catalog_cache("junk") == ({}, [])
+def test_parse_catalog_cache_rejects_payloads_upstream_would_refuse():
+    """No usable catalog is None, never an empty one.
+
+    Upstream validates the live payload with
+    ``isinstance(data, dict) and isinstance(data.get("entries"), list)``
+    (``hermes_cli/plugin_catalog.py:238-239``), so anything else is an
+    unreadable cache whose absence of drift findings means "unavailable",
+    not "everything matches".
+    """
+    assert parse_catalog_cache({}) is None
+    assert parse_catalog_cache({"entries": "junk", "removed": 4}) is None
+    assert parse_catalog_cache("junk") is None
+    assert parse_catalog_cache([]) is None
+    assert parse_catalog_cache({"removed": []}) is None
+    assert parse_catalog_cache(None) is None
+
+
+def test_parse_catalog_cache_tolerates_junk_rows_inside_a_valid_payload():
+    """A valid payload stays usable; malformed rows are skipped, not fatal."""
+    assert parse_catalog_cache({"entries": [], "removed": None}) == ({}, [])
+    assert parse_catalog_cache({"entries": [1, "junk", {"name": 5}], "removed": 4}) == ({}, [])
 
 
 def test_normalize_repo_is_git_and_slash_insensitive():
@@ -216,30 +231,34 @@ def test_collector_catalog_cache_symlink_fails_its_own_source(hermes_home: Path,
     assert state.skills_memory.plugin_catalog_cache_present is False
 
 
-def test_collector_catalog_drift_failure_keeps_last_good_flags(
-    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_collector_catalog_drift_failure_keeps_last_good_flags(hermes_home: Path, tmp_path: Path):
+    """A failure AFTER a good read keeps the last-good flags, not just zeroes.
+
+    The failure is a real one — the catalog cache is replaced by a symlink
+    pointing outside the home, which the reader refuses — rather than a patched
+    method, so the property is pinned against the code path that actually runs.
+    """
     _write_plugin(
         hermes_home,
         "weather",
         sidecar={"catalog_name": "weather", "sha": _SHA_OLD},
     )
-    _write_catalog_cache(
+    cache_path = _write_catalog_cache(
         hermes_home,
         entries=[{"name": "weather", "sha": _SHA_NEW}],
         removed=[],
     )
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "plugin-catalog.json").write_text("{}")
+
     c = Collector(hermes_home)
     try:
         first = c.collect()
         assert first.skills_memory.plugin_catalog_update_count == 1
 
-        import hermesd.collector as collector_module
-
-        def boom(current):
-            raise RuntimeError("scan exploded")
-
-        monkeypatch.setattr(collector_module.Collector, "_with_plugin_catalog", boom)
+        cache_path.unlink()
+        cache_path.symlink_to(outside / "plugin-catalog.json")
         second = c.collect()
     finally:
         c.close()
@@ -266,8 +285,31 @@ def test_collector_junk_cache_payload_makes_no_update_claims(hermes_home: Path):
 
     sm = state.skills_memory
     assert sm.plugin_catalog_cache_present is True
+    assert sm.plugin_catalog_cache_usable is False
     assert sm.plugin_catalog_update_count == 0
     assert "plugin_catalog" not in state.health.failed_sources
+
+    # The panel must not answer "everything matches" from a cache it could not read.
+    rendered = render_to_str(render_panel(7, state, Theme(), detail=True))
+    assert "unreadable" in rendered
+    assert "plugins match the catalog" not in rendered
+
+
+def test_panel_still_reports_a_readable_empty_cache_as_a_match(hermes_home: Path):
+    """A cache that parsed and holds nothing is real evidence of no drift."""
+    _write_plugin(hermes_home, "weather", sidecar={"catalog_name": "weather", "sha": _SHA_OLD})
+    _write_catalog_cache(hermes_home, entries=[], removed=[])
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.skills_memory.plugin_catalog_cache_usable is True
+    rendered = render_to_str(render_panel(7, state, Theme(), detail=True))
+    assert "plugins match the catalog" in rendered
+    assert "unreadable" not in rendered
 
 
 def test_panel_shows_catalog_state_column_and_notes(hermes_home: Path):
@@ -323,11 +365,13 @@ def test_panel_notes_absent_catalog_cache(hermes_home: Path):
 
 
 def test_collect_free_tier_provider_marker(hermes_home: Path):
-    """providers.nous with auth_method/account_tier "anonymous" is the free tier.
+    """providers.nous with ``auth_method`` "anonymous" is the free tier.
 
-    Mirrors ``is_guest_state`` + ``ANON_ACCOUNT_TIER``
-    (``hermes_cli/anon_auth.py:39-41,88-89,271-272``). Key names only: the
-    state's token fields are never read.
+    Mirrors ``is_guest_state`` (``hermes_cli/anon_auth.py:88-89``), which keys
+    on the auth method alone; the tier is a *consequence* of an anonymous
+    credential (``ANON_AUTH_METHOD``, ``:39-41``), not a second condition, and
+    an upgrade rewrites ``auth_method`` in place. Key names only: the state's
+    token fields are never read.
     """
     (hermes_home / "auth.json").write_text(
         json.dumps(
@@ -340,7 +384,11 @@ def test_collect_free_tier_provider_marker(hermes_home: Path):
                         "access_token": "jwt-value-never-read",
                     },
                     "openai-codex": {"auth_method": "api_key", "account_tier": "paid"},
-                    "half-anon": {"auth_method": "anonymous"},
+                    # Upstream keys on the auth method alone, so an anonymous
+                    # credential with no stamped tier is still a guest — while
+                    # a stamped tier without the method is not.
+                    "anon-no-tier": {"auth_method": "anonymous"},
+                    "tier-only": {"account_tier": "anonymous"},
                 },
                 "active_provider": "nous",
             }
@@ -357,7 +405,8 @@ def test_collect_free_tier_provider_marker(hermes_home: Path):
     assert providers["nous"].free_tier is True
     assert providers["nous"].is_active is True
     assert providers["openai-codex"].free_tier is False
-    assert providers["half-anon"].free_tier is False
+    assert providers["anon-no-tier"].free_tier is True
+    assert providers["tier-only"].free_tier is False
     # Key names only: no token value may surface anywhere in the state.
     assert "anon-secret-value-never-read" not in state.model_dump_json()
     assert "jwt-value-never-read" not in state.model_dump_json()

@@ -264,7 +264,7 @@ def _recovery_state(**overrides: object) -> DashboardState:
     """A state whose single session carries the given compression-recovery row."""
     return DashboardState(
         collected_at=_NOW,
-        sessions=[_session(**overrides)],  # type: ignore[arg-type]
+        sessions=[_session(**overrides)],
     )
 
 
@@ -671,6 +671,44 @@ def test_detail_lease_note_explains_revivable_expiry() -> None:
     assert "revive" in rendered
 
 
+def test_lease_note_says_a_compression_lock_only_blocks_compressions() -> None:
+    """The two lease kinds do different things; the note must not merge them.
+
+    A turn lease serializes turns across processes, while a compression lock is
+    keyed by session id and only blocks other compressions — a distinction the
+    model docstring carries (``SessionLeaseKind``) and the panel note did not.
+    """
+    rendered = render_to_str(
+        render_sessions(
+            _coordination_state(
+                session_coordination=SessionCoordinationState(
+                    leases=[_lease(expired=True, expires_in_seconds=-30)], lease_total=1
+                )
+            ),
+            Theme(),
+            detail=True,
+        )
+    )
+    assert "only block other compressions" in rendered
+
+
+def test_compact_expiry_line_names_the_revive_semantics() -> None:
+    """A bare "1 expired" in warn style reads as a fault, but upstream revives.
+
+    The detail row already says "expired — holder may revive"; the compact line
+    is the only place the count appears, so it carries the same qualifier.
+    """
+    coord = SessionCoordinationState(
+        leases=[_lease(expired=True, expires_in_seconds=-120)],
+        lease_total=1,
+    )
+    rendered = render_to_str(
+        render_sessions(_coordination_state(session_coordination=coord), Theme())
+    )
+    assert "1 expired" in rendered
+    assert "revive" in rendered
+
+
 def test_compact_counts_leases_and_flags() -> None:
     coord = SessionCoordinationState(
         leases=[
@@ -765,6 +803,49 @@ def test_detail_reset_churn_totals_and_shrink_warning() -> None:
     assert "16" in rendered
     assert "3" in rendered
     assert "never prunes" in rendered or "never pruned" in rendered
+
+
+def test_detail_reset_churn_shrink_warning_survives_emptied_table() -> None:
+    """An emptied table is the worst case of the never-prune invariant break:
+    the row count is 0, so gating the section on the total would hide the flag
+    exactly when it matters most."""
+    coord = SessionCoordinationState(
+        generations=[],
+        generation_chat_total=0,
+        generation_reset_total=0,
+        generation_count_shrank=True,
+    )
+    rendered = render_to_str(
+        render_sessions(_coordination_state(session_coordination=coord), Theme(), detail=True)
+    )
+    assert "Reset Churn" in rendered
+    assert "table shrank between refreshes — an invariant break" in rendered
+
+
+def test_compact_reset_churn_shrink_marker() -> None:
+    coord = SessionCoordinationState(
+        generations=[],
+        generation_chat_total=0,
+        generation_reset_total=0,
+        generation_count_shrank=True,
+    )
+    rendered = render_to_str(
+        render_sessions(_coordination_state(session_coordination=coord), Theme())
+    )
+    assert "⚠ reset churn: generations table shrank" in rendered
+
+
+def test_reset_churn_shrink_warning_absent_when_healthy() -> None:
+    coord = SessionCoordinationState(
+        generations=[ConversationGeneration(source="cli", session_key="k2", generation=9)],
+        generation_chat_total=3,
+        generation_reset_total=16,
+        generation_count_shrank=False,
+    )
+    state = _coordination_state(session_coordination=coord)
+    for detail in (True, False):
+        rendered = render_to_str(render_sessions(state, Theme(), detail=detail))
+        assert "shrank" not in rendered
 
 
 def test_detail_terminal_copy_says_upper_bound() -> None:
@@ -901,3 +982,117 @@ def test_reset_churn_and_terminals_render_heads_without_rows() -> None:
     assert "lifetime resets 21" in rendered
     assert "across 5 chat(s)" in rendered
     assert "2 open CLI terminals in the last 24 hours" in rendered
+
+
+def test_terminal_section_labels_a_truncated_scan_as_a_floor() -> None:
+    """A cut listing must not present its partial count as the total."""
+    term = TerminalSessionReadout(
+        sessions=[
+            TerminalBreadcrumb(terminal="tty-001", session_id="s1", cwd="/tmp", age_seconds=60.0)
+        ],
+        count=200,
+        truncated=True,
+    )
+    text = render_to_str(
+        render_sessions(DashboardState(terminal_sessions=term), Theme(), detail=True)
+    )
+    assert "at least 200 open CLI terminals" in text
+    assert "truncated" in text
+
+    complete = TerminalSessionReadout(sessions=term.sessions, count=1, truncated=False)
+    text = render_to_str(
+        render_sessions(DashboardState(terminal_sessions=complete), Theme(), detail=True)
+    )
+    assert "1 open CLI terminals in the last 24 hours" in text
+    assert "at least" not in text
+
+
+def test_hygiene_counts_use_the_exact_total_not_the_capped_list() -> None:
+    """60 chats with streaks must not render as the 3 retained rows."""
+    coord = SessionCoordinationState(
+        hygiene=[
+            GatewayHygieneState(session_key=f"chat-{index}", failure_streak=4, suspended=True)
+            for index in range(3)
+        ],
+        hygiene_total=60,
+    )
+    compact = render_to_str(
+        render_sessions(DashboardState(session_coordination=coord), Theme()),
+        width=110,
+        no_color=True,
+    )
+    assert "60 hygiene cooldown(s)" in compact
+
+    detail = render_to_str(
+        render_sessions(DashboardState(session_coordination=coord), Theme(), detail=True),
+        width=140,
+        no_color=True,
+    )
+    assert "60 chat(s) with a failure streak" in detail
+    assert "showing the worst 3" in detail
+
+
+def test_route_counts_carry_the_exact_denominator_when_the_list_is_capped() -> None:
+    """A capped route list must not imply it is the whole routing table."""
+    routes = [
+        GatewayRouteState(session_key=f"chat-{index}", platform="telegram", suspended=True)
+        for index in range(50)
+    ]
+    coord = SessionCoordinationState(routes=routes, route_total=500)
+    detail = render_to_str(
+        render_sessions(DashboardState(session_coordination=coord), Theme(), detail=True),
+        width=140,
+        no_color=True,
+    )
+    assert "50 of 500 routed chats need a user message to recover" in detail
+
+    uncapped = SessionCoordinationState(
+        routes=[GatewayRouteState(session_key="chat-1", suspended=True)], route_total=1
+    )
+    detail = render_to_str(
+        render_sessions(DashboardState(session_coordination=uncapped), Theme(), detail=True),
+        width=140,
+        no_color=True,
+    )
+    assert "1 chat(s) need a user message to recover" in detail
+    assert "of 1 routed chats" not in detail
+
+
+def test_hygiene_effect_label_follows_the_models_derived_flag() -> None:
+    """The panel must not re-derive the suspension threshold from the streak.
+
+    ``GatewayHygieneState.suspended`` is the reader's verdict (streak >= the
+    ladder's suspension point); a panel that re-checked ``streak >= 3`` would
+    silently disagree with the model the moment that ladder changes.
+    """
+    coord = SessionCoordinationState(
+        hygiene=[
+            GatewayHygieneState(session_key="chat-low", failure_streak=5, suspended=False),
+            GatewayHygieneState(session_key="chat-flagged", failure_streak=1, suspended=True),
+        ],
+        hygiene_total=2,
+    )
+    detail = render_to_str(
+        render_sessions(DashboardState(session_coordination=coord), Theme(), detail=True),
+        width=160,
+        no_color=True,
+    )
+    low_row = next(line for line in detail.splitlines() if "chat-low" in line)
+    flagged_row = next(line for line in detail.splitlines() if "chat-flagged" in line)
+    assert "compaction cooldown backoff" in low_row
+    assert "compaction suspended" in flagged_row
+
+
+def test_hygiene_note_names_the_configurable_default_base() -> None:
+    """The 300 s base is a *default*: the ladder's base is configurable upstream."""
+    coord = SessionCoordinationState(
+        hygiene=[GatewayHygieneState(session_key="chat-1", failure_streak=1)],
+        hygiene_total=1,
+    )
+    detail = render_to_str(
+        render_sessions(DashboardState(session_coordination=coord), Theme(), detail=True),
+        width=160,
+        no_color=True,
+    )
+    assert "default 300s base" in detail
+    assert "hygiene_failure_cooldown_seconds" in detail

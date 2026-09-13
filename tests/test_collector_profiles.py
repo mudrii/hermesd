@@ -6,8 +6,10 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import sqlite3
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -16,7 +18,7 @@ from hermesd.collector import (
     Collector,
     _read_soul_excerpt,
 )
-from hermesd.models import LogStream, OperationsState, SourceScope
+from hermesd.models import GatewayLoopHealth, LogStream, OperationsState, SourceScope
 from hermesd.paths import HermesPaths
 from tests.conftest import (
     _assert_cached_until_changed,
@@ -1326,13 +1328,14 @@ def test_source_ownership_doc_covers_every_process_env_read():
 def test_gateway_launch_files_are_root_scoped_under_a_profile(
     profiled_hermes_home: Path,
 ):
-    """gateway-starts.log and the dashboard-client marker join the root launch files.
+    """gateway-starts.log, the lifecycle sentinel and the dashboard marker are root.
 
-    Upstream resolves all three through ``get_hermes_home()`` (PROFILE), but they
-    describe the ROOT gateway's launch, the same process whose heartbeat and
-    lifecycle sentinel hermesd already reads from the root. The storm ledger sits
-    beside them so the restart count and the liveness clock describe one process;
-    the dashboard-client marker belongs to the web dashboard that gateway serves.
+    Upstream resolves all of them through ``get_hermes_home()`` (PROFILE), but
+    they describe the ROOT gateway's launch, the same process whose heartbeat
+    hermesd already reads from the root. The storm ledger sits beside them so the
+    restart count and the liveness clock describe one process; the lifecycle
+    sentinel is that process's own exit record; the dashboard-client marker
+    belongs to the web dashboard that gateway serves.
     """
     home = profiled_hermes_home
     profile_home = home / "profiles" / "coding"
@@ -1359,6 +1362,13 @@ def test_gateway_launch_files_are_root_scoped_under_a_profile(
     profile_state.mkdir(parents=True)
     (profile_home / "gateway-starts.log").write_text(f"{now - 30.0!r}\n" * 9)
     (profile_state / "dashboard_clients.heartbeat").touch()
+    # Lifecycle sentinels on both sides, distinguishable by their exit code.
+    (root_state / "gateway.lifecycle.json").write_text(
+        json.dumps({"phase": "exited", "exit_code": 3, "exit_reason": "root_sentinel"})
+    )
+    (profile_state / "gateway.lifecycle.json").write_text(
+        json.dumps({"phase": "exited", "exit_code": 9, "exit_reason": "profile_sentinel"})
+    )
 
     c = Collector(home, profile_name="coding")
     try:
@@ -1369,11 +1379,18 @@ def test_gateway_launch_files_are_root_scoped_under_a_profile(
     # The root copy: one start, marker mtime at 2027-01-15. The nine profile
     # entries (which would trip the storm cap) and the profile marker are ignored.
     assert gateway.gateway_starts_recorded is True
-    assert gateway.gateway_starts_2m == 0
+    assert gateway.gateway_starts_window == 0
     assert gateway.gateway_starts_1h == 1
+    # The root marker was aged 120 s and the profile marker touched now: only a
+    # root read can call this detached (the age alone is non-None either way).
     assert gateway.dashboard_client_last_frame_age_seconds is not None
+    assert gateway.dashboard_client_attached is False
     assert gateway.exit_diag_recorded is True
     assert gateway.exit_diag_last_tag == "gateway.asyncio_main_return"
+    # The lifecycle sentinel is the root gateway's too: the profile copy beside
+    # it records a different exit code and reason.
+    assert gateway.last_exit_code == 3
+    assert gateway.last_exit_reason == "root_sentinel"
 
 
 def test_profiled_collector_reads_session_coordination_from_the_profile_db(
@@ -1430,3 +1447,152 @@ def test_profiled_collector_reads_session_coordination_from_the_profile_db(
     root.close()
     assert [lease.key for lease in state.session_coordination.leases] == ["profile-conv"]
     assert [row.cwd for row in state.terminal_sessions.sessions] == ["/root"]
+
+
+def _iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=UTC).isoformat()
+
+
+def test_loop_tick_witness_is_probed_from_the_root_home_under_a_profile(
+    profiled_hermes_home: Path,
+):
+    """The witness belongs to the root gateway, node and heartbeat alike.
+
+    Upstream arms the witness on the heartbeat the gateway writes
+    (``gateway/shutdown_watchdog.py:169``) and a served profile owns no gateway
+    of its own, so under ``--profile`` the plan must come from the root
+    heartbeat and the node must resolve under the root home. A profile read would
+    silently interrogate a node nobody writes and report "no witness" forever.
+    """
+    home = profiled_hermes_home
+    profile_home = home / "profiles" / "coding"
+    now = time.time()
+
+    root_state = home / "state"
+    root_state.mkdir(exist_ok=True)
+    (root_state / "gateway.heartbeat").write_text(
+        json.dumps(
+            {
+                "pid": 4242,
+                "updated_at": _iso(now - 400),
+                "loop_tick_socket": True,
+                "loop_tick_tcp_port": None,
+            }
+        )
+    )
+    # A conflicting profile-local heartbeat: fresh, and owned by a different pid
+    # so a profile read would answer "not my witness" instead.
+    profile_state = profile_home / "state"
+    profile_state.mkdir(parents=True, exist_ok=True)
+    (profile_state / "gateway.heartbeat").write_text(
+        json.dumps(
+            {
+                "pid": 9999,
+                "updated_at": _iso(now),
+                "loop_tick_socket": True,
+                "loop_tick_tcp_port": None,
+            }
+        )
+    )
+    (home / "gateway_state.json").write_text(
+        json.dumps(
+            {
+                "pid": 4242,
+                "start_time": now - 5000,
+                "kind": "hermes-gateway",
+                "gateway_state": "running",
+                "platforms": {},
+            }
+        )
+    )
+
+    probed: list[tuple[int, int | None]] = []
+
+    def probe(pid: int, tcp_port: int | None) -> bool:
+        probed.append((pid, tcp_port))
+        return True
+
+    c = Collector(
+        home,
+        profile_name="coding",
+        pid_exists=lambda pid: pid == 4242,
+        loop_tick_probe=probe,
+    )
+    try:
+        gateway = c.collect().gateway
+    finally:
+        c.close()
+
+    assert probed == [(4242, None)]
+    assert gateway.loop_tick_armed is True
+    assert gateway.loop_health is GatewayLoopHealth.ALIVE
+
+
+def test_probed_loop_tick_resolves_the_node_under_the_root_home(
+    profiled_hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The AF_UNIX node path is built from the root home, not the profile's.
+
+    ``_default_loop_tick_probe`` derives ``state/gateway.loop-tick.<pid>.sock``
+    from the home it is handed; upstream arms it under the *root* gateway's home
+    (``gateway/shutdown_watchdog.py:169``), so under ``--profile`` a profile home
+    here would interrogate a node nobody writes.
+    """
+    import hermesd.collector as collector_module
+
+    home = profiled_hermes_home
+    seen: list[Path] = []
+
+    def fake_probe(pid: int, tcp_port: int | None, probe_home: Path, **kwargs: object) -> bool:
+        seen.append(probe_home)
+        return True
+
+    monkeypatch.setattr(collector_module, "_default_loop_tick_probe", fake_probe)
+    c = Collector(home, profile_name="coding")
+    try:
+        assert c._probed_loop_tick(4242, None) is True
+    finally:
+        c.close()
+
+    assert seen == [home]
+    assert seen[0] != home / "profiles" / "coding"
+
+
+def _defined_test_names() -> set[str]:
+    root = Path(__file__).resolve().parent
+    names: set[str] = set()
+    for path in root.glob("test_*.py"):
+        names.update(
+            re.findall(r"^def (test_[A-Za-z0-9_]+)", path.read_text(encoding="utf-8"), re.M)
+        )
+    return names
+
+
+def test_source_ownership_rows_cite_upstream_and_resolve_their_pins():
+    """Rule 3 and the pin column are enforced, not just documented.
+
+    ``_documented_scopes`` only reads the scope cell, so a row could cite no
+    upstream file at all, and a "pinned by" cell could name a test that does not
+    exist — which is exactly how the `gateway_loop_tick` row came to credit a
+    test that never armed a witness. Divergence rows are exempt only from having
+    a pin at all (many pre-existing rows are explicitly `UNPINNED`); any name
+    they *do* cite has to exist.
+    """
+    defined = _defined_test_names()
+    problems: list[str] = []
+    for cells in _table_rows(_RULE_FILE.read_text()):
+        if len(cells) < 8:
+            continue
+        name = cells[0].strip("`")
+        if not name or not name.replace("_", "").isalnum() or not name.islower():
+            continue
+        scope_cell = cells[1]
+        scope = scope_cell.split()[0].strip("`") if scope_cell.split() else ""
+        if scope not in _SCOPES:
+            continue
+        if not cells[5].strip():
+            problems.append(f"{name}: no upstream citation")
+        for cited in re.findall(r"`(test_[A-Za-z0-9_]+)`", cells[7]):
+            if cited not in defined:
+                problems.append(f"{name}: pin {cited} is not defined in tests/")
+    assert problems == [], "source-ownership.md rows are incomplete:\n" + "\n".join(problems)

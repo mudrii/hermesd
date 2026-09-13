@@ -14,12 +14,17 @@ from urllib.parse import urlsplit
 from hermesd.collect.common import (
     _age_seconds,
     _as_list,
+    _coerce_bool,
     _coerce_float,
     _coerce_int,
     _iso_to_epoch,
+    _json_object_capped,
 )
-from hermesd.collect.operations import _json_object_capped
-from hermesd.collect.redaction import _redact_secret_url, _redact_text_fields
+from hermesd.collect.redaction import (
+    _redact_bare_credentials,
+    _redact_secret_url,
+    _redact_text_fields,
+)
 from hermesd.collect.sqlite_util import (
     _count_rows,
     _query_rows,
@@ -325,9 +330,12 @@ def _holder_pid(holder: str) -> int:
 
 
 def _holder_liveness(pid: int, pid_exists: Callable[[int], bool]) -> ProcessLiveness:
-    """Upstream's reclaim conservatism, mirrored: only kernel proof the pid is
-    gone marks a holder dead; a reused pid reads as alive (the wrong-alive
-    answer self-heals at TTL, the wrong-dead answer would fork a lineage)."""
+    """Whether a lease holder's pid is provably gone, upstream's conservative way.
+
+    Only kernel proof the pid is gone marks a holder dead; a reused pid reads as
+    alive, because the wrong-alive answer self-heals at the TTL while the
+    wrong-dead answer would fork a lineage.
+    """
     if pid <= 0:
         return ProcessLiveness.UNVERIFIABLE
     return ProcessLiveness.LIVE if pid_exists(pid) else ProcessLiveness.DEAD
@@ -346,15 +354,29 @@ class _SessionCoordinationRows:
     lock_rows: tuple[dict[str, Any], ...] = ()
     lease_total: int = 0
     hygiene_rows: tuple[dict[str, Any], ...] = ()
+    hygiene_total: int = 0
     routing_rows: tuple[dict[str, Any], ...] = ()
     routing_total: int = 0
     generation_rows: tuple[dict[str, Any], ...] = ()
     generation_chat_total: int = 0
     generation_reset_total: int = 0
+    # Every session id in the store, *including* hidden ones. Route targets are
+    # resolved against this set, not against the visible listing.
+    session_ids: frozenset[str] = frozenset()
 
 
 def _read_session_coordination_rows(conn: Any) -> _SessionCoordinationRows:
     """Every coordination table hermesd reads from state.db, absent-tolerant.
+
+    The shapes mirror upstream ``hermes_state_common.py``: ``session_turn_leases``
+    / ``compression_locks`` (``:506-518``, writers
+    ``hermes_state_compression.py:433-605``), ``gateway_routing`` (``:447-457``,
+    payload written by ``gateway/session.py:535-545``), ``gateway_hygiene_state``
+    (``:459-465``, writer ``hermes_state_gateway.py:513-535``) and
+    ``conversation_generations`` (``:482-487``, bumped by
+    ``hermes_state_messages.py:30-34``) — all through
+    ``get_hermes_home()/"state.db"`` (``hermes_state.py:160,178``), i.e. the
+    selected profile's store.
 
     Tables predate nothing: agents older than the lease/hygiene/routing
     features simply have no table, which reads as empty — the same contract as
@@ -384,9 +406,12 @@ def _read_session_coordination_rows(conn: Any) -> _SessionCoordinationRows:
         )
         lease_total += _table_count_or_zero(conn, "compression_locks")
     hygiene_rows: tuple[dict[str, Any], ...] = ()
+    hygiene_total = 0
     if _table_exists(conn, "gateway_hygiene_state"):
         # A 0-streak row is cleared state upstream keeps only transiently; it is
-        # not a warning and never reaches the panel.
+        # not a warning and never reaches the panel. The total counts exactly the
+        # rows the list is filtered to, so a capped list can never be mistaken
+        # for the count.
         hygiene_rows = tuple(
             _query_rows(
                 conn,
@@ -394,6 +419,10 @@ def _read_session_coordination_rows(conn: Any) -> _SessionCoordinationRows:
                 "WHERE COALESCE(failure_streak, 0) > 0 "
                 f"ORDER BY COALESCE(failure_streak, 0) DESC LIMIT {_HYGIENE_ROW_LIMIT}",
             )
+        )
+        hygiene_total = _count_rows(
+            conn,
+            "SELECT COUNT(*) FROM gateway_hygiene_state WHERE COALESCE(failure_streak, 0) > 0",
         )
     routing_rows: tuple[dict[str, Any], ...] = ()
     routing_total = 0
@@ -421,16 +450,31 @@ def _read_session_coordination_rows(conn: Any) -> _SessionCoordinationRows:
         generation_reset_total = _count_rows(
             conn, "SELECT COALESCE(SUM(COALESCE(generation, 0)), 0) FROM conversation_generations"
         )
+    # Route targets: the *unfiltered* id set. Upstream hides a session from the
+    # default listing while keeping it resumable (``hermes_state_sessions.py:898-900``;
+    # ``get_session`` ``:737-746`` selects by id with no hidden filter), and
+    # canonical bot chats are born hidden — so a route to a hidden session is a
+    # live route, not a dangling one. Only ids are read: 64-bit integers plus the
+    # id string, one indexed column scan on the same cached connection.
+    session_ids: frozenset[str] = frozenset()
+    if _table_exists(conn, "sessions"):
+        session_ids = frozenset(
+            str(row.get("id"))
+            for row in _query_rows(conn, "SELECT id FROM sessions")
+            if row.get("id")
+        )
     return _SessionCoordinationRows(
         lease_rows=lease_rows,
         lock_rows=lock_rows,
         lease_total=lease_total,
         hygiene_rows=hygiene_rows,
+        hygiene_total=hygiene_total,
         routing_rows=routing_rows,
         routing_total=routing_total,
         generation_rows=generation_rows,
         generation_chat_total=generation_chat_total,
         generation_reset_total=generation_reset_total,
+        session_ids=session_ids,
     )
 
 
@@ -483,7 +527,8 @@ def _session_lease_fields(
     return {"leases": leases, "lease_total": rows.lease_total}
 
 
-# The hygiene cooldown ladder: multipliers over the 300s base cooldown, clamped
+# The hygiene cooldown ladder: multipliers over the default 300s base cooldown
+# (``hygiene_failure_cooldown_seconds``), clamped
 # at one hour (gateway/run.py:101-103,147-149). Streak 3+ is effectively
 # "pre-turn compaction off" for that chat.
 _HYGIENE_SUSPENSION_STREAK = 3
@@ -492,6 +537,7 @@ _HYGIENE_SUSPENSION_STREAK = 3
 def _hygiene_fields(
     rows: tuple[dict[str, Any], ...],
     session_rows: list[dict[str, Any]],
+    total: int = 0,
 ) -> dict[str, Any]:
     """Pair each streak with the chat's recorded compression failure, if any.
 
@@ -514,7 +560,28 @@ def _hygiene_fields(
         )
         for row in rows
     ]
-    return {"hygiene": hygiene}
+    return {"hygiene": hygiene, "hygiene_total": total}
+
+
+def _route_free_text(value: object) -> str:
+    """Redact one remote-controlled ``entry_json`` string.
+
+    Bare credential shapes are scrubbed first (a chat display name carries no
+    ``key = value`` label), then the field-oriented pass runs so multi-word
+    values under a secret key still collapse.
+    """
+    return _redact_text_fields(_redact_bare_credentials(str(value or "")))
+
+
+# Chat-controlled free text from ``entry_json``: redacted *and* clipped, because
+# the 64 KiB column cap leaves room for a display name or a reason long enough to
+# swamp the panel's cell and the JSON snapshot. Redaction runs first, so a
+# credential can never survive as a truncated prefix.
+_ROUTE_TEXT_CHARS = 40
+
+
+def _route_text(value: object) -> str:
+    return _route_free_text(value)[:_ROUTE_TEXT_CHARS]
 
 
 def _gateway_route(
@@ -545,13 +612,13 @@ def _gateway_route(
         session_id=session_id,
         platform=str(entry.get("platform") or ""),
         chat_type=str(entry.get("chat_type") or ""),
-        display_name=_redact_text_fields(str(entry.get("display_name") or ""))[:40],
+        display_name=_route_text(entry.get("display_name")),
         updated_at_age_seconds=_age_seconds(updated_at, now),
-        suspended=bool(entry.get("suspended")),
-        resume_pending=bool(entry.get("resume_pending")),
-        resume_reason=str(entry.get("resume_reason") or ""),
-        was_auto_reset=bool(entry.get("was_auto_reset")),
-        auto_reset_reason=str(entry.get("auto_reset_reason") or ""),
+        suspended=_coerce_bool(entry.get("suspended")),
+        resume_pending=_coerce_bool(entry.get("resume_pending")),
+        resume_reason=_route_text(entry.get("resume_reason")),
+        was_auto_reset=_coerce_bool(entry.get("was_auto_reset")),
+        auto_reset_reason=_route_text(entry.get("auto_reset_reason")),
         # The durable executing-turn marker: its start age is only meaningful
         # while a token exists (gateway/session.py:515-518).
         turn_age_seconds=_age_seconds(turn_started, now) if turn_token else None,

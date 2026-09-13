@@ -9,12 +9,15 @@ import shutil
 import sqlite3
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+import hermesd.collector as collector_module
 from hermesd.collector import (
     Collector,
+    _coerce_bool,
     _coerce_float,
     _coerce_int,
     _CollectionHealth,
@@ -26,7 +29,7 @@ from hermesd.collector import (
     _redact_secret_url,
     _safe_exception_text,
 )
-from hermesd.models import DashboardState
+from hermesd.models import DashboardState, GatewayLoopHealth
 from tests.conftest import create_kanban_db_tables, create_state_db_tables
 
 
@@ -323,6 +326,37 @@ def test_collect_sessions_reads_newer_runtime_columns(hermes_home: Path):
     assert session.handoff_platform == "telegram"
     assert session.handoff_error == "delivery failed"
     c.close()
+
+
+def test_sessions_archived_text_false_is_not_archived(hermes_home: Path):
+    """A text ``'false'`` in the archived column is not "archived".
+
+    The column has INTEGER affinity, which converts a well-formed integer
+    spelling but leaves anything else as TEXT — ``bool('false')`` is True, so a
+    hand-edited or foreign row would report the session as archived and drop it
+    from the active list. Reading it strictly costs nothing on real data, where
+    the value is already 0 or 1.
+    """
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn)
+    conn.execute("ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, archived) VALUES (?, ?, ?, ?)",
+        ("sess_text", "cli", time.time(), "false"),
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    session = state.sessions[0]
+    assert session.archived is False
+    assert session.is_active is True
 
 
 def test_collect_kanban_state(populated_hermes_home: Path):
@@ -1953,7 +1987,7 @@ def test_last_good_fallback_does_not_regress_across_alternating_failures(
         assert [job.name for job in second.cron.jobs] == ["Nightly digest"]
         assert second.config.model == "gpt-6"
 
-        del c._collect_cron  # type: ignore[attr-defined]
+        del c._collect_cron
         c._collect_config = config_boom  # type: ignore[method-assign]
         jobs_path.write_text(json.dumps({"jobs": [{"id": "weekly", "name": "Weekly digest"}]}))
         third = c.collect()
@@ -2082,3 +2116,227 @@ def test_shared_field_enrichment_keeps_latest_successful_contribution(
         assert third.gateway.last_exit_code == 3
     finally:
         c.close()
+
+
+def _write_running_gateway(home: Path, *, pid: int, heartbeat_age: float, now: float) -> None:
+    """A running gateway record plus an armed, stale heartbeat for ``pid``."""
+    (home / "gateway_state.json").write_text(
+        json.dumps(
+            {
+                "pid": pid,
+                "start_time": now - 5000,
+                "kind": "hermes-gateway",
+                "gateway_state": "running",
+                "platforms": {},
+            }
+        )
+    )
+    state_dir = home / "state"
+    state_dir.mkdir(exist_ok=True)
+    (state_dir / "gateway.heartbeat").write_text(
+        json.dumps(
+            {
+                "pid": pid,
+                "updated_at": datetime.fromtimestamp(now - heartbeat_age, tz=UTC).isoformat(),
+                "monotonic": 1234.5,
+                "start_time": now - 5000,
+                "loop_tick_socket": True,
+                "loop_tick_tcp_port": None,
+            }
+        )
+    )
+
+
+def test_loop_tick_silence_strikes_are_keyed_to_the_witness_pid(hermes_home: Path):
+    """A restarted gateway inherits no strikes: silence is counted per witness pid.
+
+    One shared counter let a dead life's two silent probes make a new gateway's
+    *first* miss the third strike, so the panel escalated to ``wedged`` on a
+    process that had only been silent once.
+    """
+    now = 1_800_000_000.0
+    stale_age = 400.0  # past the stale budget, so escalation is reachable
+    _write_running_gateway(hermes_home, pid=4242, heartbeat_age=stale_age, now=now)
+    c = Collector(
+        hermes_home,
+        pid_exists=lambda pid: pid in (4242, 5150),
+        clock=lambda: now,
+        loop_tick_probe=lambda pid, tcp_port: False,
+    )
+    try:
+        assert c.collect().gateway.loop_health is GatewayLoopHealth.STALE
+        assert c.collect().gateway.loop_health is GatewayLoopHealth.STALE
+
+        # Same stale ledger, new gateway life: strike one for pid 5150.
+        _write_running_gateway(hermes_home, pid=5150, heartbeat_age=stale_age, now=now)
+        assert c.collect().gateway.loop_health is GatewayLoopHealth.STALE
+        assert c.collect().gateway.loop_health is GatewayLoopHealth.STALE
+        assert c.collect().gateway.loop_health is GatewayLoopHealth.WEDGED
+    finally:
+        c.close()
+
+
+def test_terminal_breadcrumb_scan_is_bounded_and_flags_truncation(hermes_home: Path):
+    """A hostile breadcrumb directory must not be listed whole.
+
+    The sibling config-backups scan slices with ``islice`` *before* sorting for
+    exactly this reason; the terminal scan materialised and sorted the whole
+    directory first while its docstring claimed the listing was bounded, and a
+    truncated scan then reported its partial count as if it were complete.
+    """
+    directory = hermes_home / "terminal-sessions"
+    directory.mkdir()
+    for index in range(205):
+        (directory / f"tty-{index:03d}").write_text(
+            json.dumps({"session_id": f"s{index}", "cwd": "/tmp", "ts": time.time()})
+        )
+
+    reads = 0
+    real_read = collector_module._read_text_capped
+
+    def counting_read(path: Path, root: Path | None = None) -> str:
+        nonlocal reads
+        if Path(path).parent == directory:
+            reads += 1
+        return real_read(path, root)
+
+    # The reader is injected rather than patched onto the module: the property
+    # is a read *count*, which no fixture can observe from the outside.
+    c = Collector(hermes_home, text_reader=counting_read)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    term = state.terminal_sessions
+    assert reads <= 200, "the scanner read more files than its bound allows"
+    assert len(term.sessions) == 12
+    assert term.count == 200
+    assert term.truncated is True
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (True, True),
+        (1, True),
+        (1.0, True),
+        (0.0, False),
+        ("1", True),
+        ("true", True),
+        ("on", True),
+        (False, False),
+        (0, False),
+        ("false", False),
+        ("0", False),
+        ("off", False),
+        (None, False),
+        ("junk", False),
+        ([], False),
+        ({}, False),
+    ],
+)
+def test_coerce_bool_never_reads_a_stringified_false_as_truth(value: object, expected: bool):
+    """`bool("false")` is True; an untrusted flag must never flip a warning on."""
+    assert _coerce_bool(value) is expected
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_coerce_bool_rejects_non_finite_numbers(value: float):
+    """A non-finite float is not a boolean the writers can produce.
+
+    ``nan != 0`` and ``inf != 0`` are both True, so a JSON ``NaN`` (which
+    ``json.loads`` accepts by default) or a YAML ``.inf`` read as a set flag.
+    Only finite numbers count, mirroring ``_coerce_float``'s isfinite guard.
+    """
+    assert _coerce_bool(value) is False
+
+
+def test_collect_cron_stringified_preflight_flag_is_not_truthy(hermes_home: Path):
+    """A corrupted ``"preflight_alerted": "false"`` must not claim an alert was sent."""
+    cron_dir = hermes_home / "cron"
+    cron_dir.mkdir(exist_ok=True)
+    (cron_dir / "jobs.json").write_text(
+        json.dumps({"jobs": [{"id": "job-x", "name": "Job X", "preflight_alerted": "false"}]})
+    )
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+    assert state.cron.jobs[0].preflight_alerted is False
+
+
+def test_loop_tick_strikes_reset_when_the_gateway_stops_being_probed(hermes_home: Path):
+    """A non-probing pass clears the strikes instead of banking them."""
+    now = 1_800_000_000.0
+    _write_running_gateway(hermes_home, pid=4242, heartbeat_age=400.0, now=now)
+    c = Collector(
+        hermes_home,
+        pid_exists=lambda pid: pid == 4242,
+        clock=lambda: now,
+        loop_tick_probe=lambda pid, tcp_port: False,
+    )
+    try:
+        assert c.collect().gateway.loop_health is GatewayLoopHealth.STALE
+        assert c.collect().gateway.loop_health is GatewayLoopHealth.STALE
+
+        # The gateway stops: its witness is history, not a wedge, and the two
+        # banked strikes must not survive into the next life's first probe.
+        (hermes_home / "gateway_state.json").write_text(
+            json.dumps({"pid": 0, "gateway_state": "stopped", "platforms": {}})
+        )
+        c.collect()
+
+        _write_running_gateway(hermes_home, pid=4242, heartbeat_age=400.0, now=now)
+        assert c.collect().gateway.loop_health is GatewayLoopHealth.STALE
+    finally:
+        c.close()
+
+
+def test_terminal_breadcrumbs_outside_the_window_are_not_counted(hermes_home: Path):
+    """A 30-hour-old breadcrumb is not an open terminal; the window is 24h."""
+    directory = hermes_home / "terminal-sessions"
+    directory.mkdir()
+    stale = directory / "tty-old"
+    stale.write_text(json.dumps({"session_id": "s1", "cwd": "/tmp", "ts": time.time() - 30 * 3600}))
+    fresh = directory / "tty-new"
+    fresh.write_text(json.dumps({"session_id": "s2", "cwd": "/tmp", "ts": time.time() - 600}))
+
+    c = Collector(hermes_home)
+    try:
+        term = c.collect().terminal_sessions
+    finally:
+        c.close()
+
+    assert term.count == 1
+    assert [row.terminal for row in term.sessions] == ["tty-new"]
+
+
+def test_notify_on_complete_stringified_flag_is_not_truthy(hermes_home: Path):
+    """``processes.json`` is machine-written: `"false"` must not request a ping."""
+    (hermes_home / "processes.json").write_text(
+        json.dumps(
+            [
+                {
+                    "session_id": "proc_x",
+                    "command": "pytest -q",
+                    "pid": 4242,
+                    "pid_scope": "host",
+                    "cwd": "/tmp",
+                    "started_at": time.time() - 60,
+                    "notify_on_complete": "false",
+                    "watch_patterns": [],
+                }
+            ]
+        )
+    )
+
+    c = Collector(hermes_home, pid_exists=lambda pid: pid == 4242)
+    try:
+        processes = c.collect().background_processes
+    finally:
+        c.close()
+
+    assert len(processes) == 1
+    assert processes[0].notify_on_complete is False

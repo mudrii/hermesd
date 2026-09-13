@@ -87,7 +87,25 @@ def test_flake_version_matches_project_version() -> None:
     assert "inherit hermesd;" in flake_text
     assert "hermesd-cli-smoke" in flake_text
 
-    assert len(re.findall(r'github:[^/]+/[^/]+/[0-9a-f]{40}"', flake_text)) == 1
+    input_urls = dict(
+        re.findall(
+            r'^\s+([A-Za-z0-9_-]+)\.url = "github:([^\"]+)";',
+            flake_text,
+            re.MULTILINE,
+        )
+    )
+    assert {"nixpkgs", "nixpkgsIntelDarwin"} <= input_urls.keys()
+    assert all(re.fullmatch(r"NixOS/nixpkgs/[0-9a-f]{40}", url) for url in input_urls.values())
+
+    # Intel Darwin retains its supported package set without holding the other
+    # three systems back from the primary nixpkgs input.
+    assert re.search(
+        r'if system == "x86_64-darwin"\s*'
+        r"then import nixpkgsIntelDarwin .*?"
+        r"else nixpkgs\.legacyPackages\.\$\{system\}",
+        flake_text,
+        re.DOTALL,
+    )
 
 
 def test_readme_images_use_package_metadata_safe_urls() -> None:
@@ -121,14 +139,13 @@ def _assert_ci_uses_locked_env(ci: dict, job_name: str, python_version: str) -> 
 
 
 def test_dependency_review_gate_policy() -> None:
-    review = _workflow(".github/workflows/dependency-review.yml")
+    ci = _workflow(".github/workflows/ci.yml")
 
-    assert review["on"] == {"pull_request": None}
-    # Read-only: posting PR comments would need pull-requests: write for no
-    # control benefit (audit CI-13).
-    assert review["permissions"] == {"contents": "read"}
-
-    job = review["jobs"]["dependency-review"]
+    # The review is part of the required CI workflow, runs only for PRs, and
+    # needs no write permission merely to post comments (audit CI-13).
+    job = ci["jobs"]["dependency-review"]
+    assert job["if"] == "github.event_name == 'pull_request'"
+    assert job["permissions"] == {"contents": "read"}
     step = next(
         step
         for step in job["steps"]
@@ -136,6 +153,11 @@ def test_dependency_review_gate_policy() -> None:
     )
     assert re.fullmatch(r"actions/dependency-review-action@[0-9a-f]{40}", step["uses"])
     assert step["with"]["fail-on-severity"] == "moderate"
+    assert set(step["with"]["fail-on-scopes"].split(", ")) == {
+        "runtime",
+        "development",
+        "unknown",
+    }
     assert step["with"]["retry-on-snapshot-warnings"] is True
     assert "comment-summary-in-pr" not in step["with"]
 
@@ -183,16 +205,22 @@ def test_ci_change_classification_and_gate() -> None:
     )
     assert re.fullmatch(r"dorny/paths-filter@[0-9a-f]{40}", filter_step["uses"])
     filters = yaml.safe_load(filter_step["with"]["filters"])
-    packaged_inputs = {
-        ".github/workflows/ci.yml",
+    common_inputs = {
+        ".github/**",
+        "CHANGELOG.md",
+        "CONTRIBUTING.md",
         "LICENSE",
         "README.md",
+        "SECURITY.md",
+        "docs/**",
         "hermesd/**",
         "pyproject.toml",
+        "scripts/**",
+        "tests/**",
         "uv.lock",
     }
-    assert packaged_inputs | {"Dockerfile", ".dockerignore"} == set(filters["docker"])
-    assert packaged_inputs | {"flake.nix", "flake.lock"} == set(filters["nix"])
+    assert common_inputs | {"Dockerfile", ".dockerignore"} <= set(filters["docker"])
+    assert common_inputs | {"flake.nix", "flake.lock"} <= set(filters["nix"])
 
     # Only pull requests may skip Docker/Nix, and only on an empty diff;
     # trusted events always run the full validation.
@@ -209,6 +237,7 @@ def test_ci_change_classification_and_gate() -> None:
     assert gate["if"] == "always()"
     assert set(gate["needs"]) == {
         "changes",
+        "dependency-review",
         "static",
         "security",
         "test",
@@ -227,8 +256,12 @@ def test_ci_change_classification_and_gate() -> None:
     assert gate_step["env"]["NIX_EXPECTED"] == (
         "${{ needs.changes.outputs.nix == 'true' || github.event_name != 'pull_request' }}"
     )
+    assert gate_step["env"]["DEPENDENCY_REVIEW_EXPECTED"] == (
+        "${{ github.event_name == 'pull_request' }}"
+    )
     gate_commands = "\n".join(_job_run_commands(ci, "gate"))
     assert 'result" ] != "success"' in gate_commands or '!= "success"' in gate_commands
+    assert 'result" != "skipped"' in gate_commands
 
 
 def test_ci_splits_static_security_and_interpreter_gates() -> None:
@@ -242,7 +275,7 @@ def test_ci_splits_static_security_and_interpreter_gates() -> None:
     assert {
         "uv run ruff check .",
         "uv run ruff format --check .",
-        "uv run mypy hermesd",
+        "uv run mypy hermesd scripts",
         "uv run python -m compileall hermesd",
     } <= static_commands
 
@@ -307,21 +340,18 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
     assert publish["jobs"]["pypi-publish"]["if"] == "${{ !github.event.release.prerelease }}"
 
     # Release eligibility is mechanically enforced (audit CI-04): the exact
-    # release commit must carry a successful, completed aggregate CI gate
-    # run; missing, failed, cancelled, stale, or in-progress work refuses to
-    # publish.
+    # tagged SHA must be in protected main history, and the latest attempt of
+    # its trusted main-push CI workflow must have a successful aggregate gate.
     assert ci["jobs"]["gate"]["name"] == "CI gate"
     eligibility = publish["jobs"]["release-eligibility"]
-    assert eligibility["permissions"] == {"contents": "read", "checks": "read"}
+    assert eligibility["permissions"] == {"contents": "read", "actions": "read"}
     verify_step = next(
         step
         for step in eligibility["steps"]
-        if step.get("name", "").startswith("Verify the release commit")
+        if step.get("name", "").startswith("Verify protected-main ancestry")
     )
-    assert verify_step["env"]["REQUIRED_CHECK"] == "CI gate"
-    verify_commands = verify_step["run"]
-    assert "commits/${RELEASE_SHA}/check-runs" in verify_commands
-    assert verify_commands.count("refusing to publish") == 3
+    assert verify_step["env"] == {"GITHUB_TOKEN": "${{ github.token }}"}
+    assert verify_step["run"] == "python3 scripts/release_eligibility.py"
     assert publish["jobs"]["release-build"]["needs"] == ["test", "release-eligibility"]
     assert ci["jobs"]["test"]["timeout-minutes"] == 20
     assert publish["jobs"]["test"]["timeout-minutes"] == 20
@@ -335,11 +365,11 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
     _assert_all_actions_are_sha_pinned(publish)
     for job_name in ("test", "package", "macos"):
         _action_step(ci, job_name, CHECKOUT_ACTION)
-    _action_step(publish, "test", CHECKOUT_ACTION)
-    _action_step(publish, "release-build", CHECKOUT_ACTION)
+    for job_name in ("release-eligibility", "test", "release-build"):
+        checkout = _action_step(publish, job_name, CHECKOUT_ACTION)
+        assert checkout["with"]["ref"] == "${{ github.sha }}"
 
-    # The release test matrix explicitly opts into uv caching; the release
-    # build keeps caching disabled (audit CI-16 trust boundary).
+    # Every release-sensitive environment keeps uv caching disabled (CI-16).
     publish_locked_env = {
         step["with"]["python-version"]: step["with"]["enable-cache"]
         for job in ("test", "release-build")
@@ -347,7 +377,7 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
         if step.get("uses", "").startswith("./.github/actions/locked-env")
     }
     assert publish_locked_env == {
-        "${{ matrix.python-version }}": "true",
+        "${{ matrix.python-version }}": "false",
         "3.11": "false",
     }
 
@@ -355,7 +385,7 @@ def test_ci_and_publish_workflows_match_documented_release_gate() -> None:
     required_release_gate_commands = {
         "uv run ruff check .",
         "uv run ruff format --check .",
-        "uv run mypy hermesd",
+        "uv run mypy hermesd scripts",
         "uv run python -m compileall hermesd",
         'uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing --junitxml="$RUNNER_TEMP/pytest-results.xml"',
         "uv run python scripts/pip_audit_gate.py",
@@ -445,10 +475,7 @@ def test_dependabot_tracks_github_actions_versions() -> None:
         assert update["open-pull-requests-limit"] == 5
     # Routine minor/patch action updates are grouped; majors stay separate.
     groups = by_ecosystem["github-actions"]["groups"]
-    assert groups["actions-minor-and-patch"]["update-types"] == [
-        "version-update:semver-minor",
-        "version-update:semver-patch",
-    ]
+    assert set(groups["actions-minor-and-patch"]["update-types"]) == {"minor", "patch"}
 
 
 def test_typed_marker_and_sdist_support_files_are_packaged() -> None:

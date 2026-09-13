@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from hermesd.collect.common import _coerce_int, _path_resolves_under
+from hermesd.collect.redaction import _redact_secret_url
 from hermesd.collect.sqlite_util import (
     _column_exists,
     _connect_readonly_sqlite,
@@ -36,8 +37,14 @@ _DEFAULT_CLAIM_TTL_SECONDS = 300
 # Failure circuit breaker: the trip threshold order is per-task max_retries >
 # the dispatcher's kanban.failure_limit config > DEFAULT_FAILURE_LIMIT = 2
 # (hermes_cli/kanban_db_dispatch.py:33 and _record_task_failure :986-1013,
-# recompute_ready hermes_cli/kanban_db.py:2012-2050). max_retries <= 0 reads
-# as unset here: upstream stores NULL, and coercion cannot tell 0 from NULL.
+# recompute_ready hermes_cli/kanban_db.py:2012-2050). A task's max_retries is
+# an explicit override whenever the column is NOT NULL — upstream passes 0
+# through its int coercion (hermes_cli/kanban_db.py:1892-1894) and switches on
+# ``task_override is not None`` (kanban_db_dispatch.py:1027-1032), so a stored
+# 0 is "trip on the first failure" rather than NULL's "fall through to the
+# config value". The CLI itself refuses ``--max-retries 0``
+# (hermes_cli/kanban.py:359-361), so such a row is a legacy or direct-DB
+# write; it is still read as the override it says it is.
 _DEFAULT_FAILURE_LIMIT = 2
 
 
@@ -49,8 +56,16 @@ def _kanban_claim_ttl_seconds(cfg: dict[str, Any]) -> int:
     return _DEFAULT_CLAIM_TTL_SECONDS
 
 
-def _read_kanban_state(db_path: Path, base_state: KanbanState, *, now: float) -> KanbanState:
-    with _connect_readonly_sqlite(db_path) as conn:
+def _read_kanban_state(
+    db_path: Path, base_state: KanbanState, *, now: float, resolved: bool = False
+) -> KanbanState:
+    """Board state from kanban.db.
+
+    ``resolved`` means the path is already a shared snapshot of the WAL
+    database (the collector copies it once per refresh and points every reader
+    at the same file), so the sidecar check must not run again.
+    """
+    with _connect_readonly_sqlite(db_path, resolved=resolved) as conn:
         conn.row_factory = sqlite3.Row
         status_counts = _count_by(conn, "SELECT status, COUNT(*) FROM tasks GROUP BY status")
         assignee_counts = _count_by(
@@ -118,8 +133,9 @@ def _read_kanban_board_summary(
     current: bool,
     claim_ttl_seconds: int,
     now: float,
+    resolved: bool = False,
 ) -> KanbanBoardSummary:
-    with _connect_readonly_sqlite(db_path) as conn:
+    with _connect_readonly_sqlite(db_path, resolved=resolved) as conn:
         conn.row_factory = sqlite3.Row
         return KanbanBoardSummary(
             slug=slug,
@@ -196,10 +212,21 @@ _ENRICHED_TASK_TEXT_COLUMNS = (
 )
 
 
-def _breaker_limit(max_retries: int, failure_limit: int) -> int:
-    """Upstream trip threshold: task override, then config, then the default."""
-    if max_retries > 0:
-        return max_retries
+def _optional_int(value: object) -> int | None:
+    """Coerce to int, preserving a genuine null (an unset max_retries column)."""
+    return None if value is None else _coerce_int(value)
+
+
+def _breaker_limit(max_retries: int | None, failure_limit: int) -> int:
+    """Upstream trip threshold: task override, then config, then the default.
+
+    ``max_retries`` is the raw column, so 0 survives as an immediate-trip
+    override instead of being mistaken for NULL. The threshold is only ever
+    reached *after* a failure, so the trip test below floors it at one
+    (``kanban_db_dispatch.py:1025-1033`` increments before comparing).
+    """
+    if max_retries is not None:
+        return max(0, max_retries)
     if failure_limit > 0:
         return failure_limit
     return _DEFAULT_FAILURE_LIMIT
@@ -236,7 +263,7 @@ def _read_recent_enriched_tasks(conn: sqlite3.Connection) -> list[dict[str, Any]
 
 def _kanban_task_from_row(row: dict[str, Any], *, failure_limit: int = 0) -> KanbanTaskSummary:
     consecutive_failures = _coerce_int(row.get("consecutive_failures"))
-    max_retries = _coerce_int(row.get("max_retries"))
+    max_retries = _optional_int(row.get("max_retries"))
     breaker_limit = _breaker_limit(max_retries, failure_limit)
     return KanbanTaskSummary(
         task_id=str(row.get("id") or ""),
@@ -258,10 +285,15 @@ def _kanban_task_from_row(row: dict[str, Any], *, failure_limit: int = 0) -> Kan
         workspace_path=str(row.get("workspace_path") or ""),
         goal_mode=str(row.get("goal_mode") or ""),
         current_step_key=str(row.get("current_step_key") or ""),
-        completion_contract=str(row.get("completion_contract") or ""),
+        # The contract may be a PR URL, so it goes through the same URL
+        # redactor as every other URL hermesd surfaces; a plain ``OWNER/REPO``
+        # has no credential shape and passes through unchanged.
+        completion_contract=_redact_secret_url(str(row.get("completion_contract") or "")),
         max_retries=max_retries,
         breaker_limit=breaker_limit,
-        breaker_tripped=consecutive_failures >= breaker_limit,
+        # A breaker trips on failures: upstream increments the counter before it
+        # compares, so a fresh task under a 0 limit is not "0/0 tripped".
+        breaker_tripped=consecutive_failures >= max(breaker_limit, 1),
     )
 
 
@@ -294,17 +326,20 @@ def _kanban_board_present(paths: HermesPaths, board_slug: str) -> bool:
 
 # --- Notify subscriptions ---------------------------------------------------
 #
-# kanban_notify_subs is written by add_notify_sub and its unseen-event cursor
-# is claimed/advanced/rewound by claim/advance/rewind_notify_cursor
-# (hermes_cli/kanban_db_notify.py:78-130, :186-232); the gateway
-# kanban-notifier is the consumer (gateway/kanban_watchers_notifier.py). The
-# table lives in the same root-anchored kanban.db as the board itself —
+# kanban_notify_subs is written by add_notify_sub (:67-131) and its
+# unseen-event cursor is claimed/advanced/rewound by
+# claim/advance/rewind_notify_cursor (:340-371, :380-395, :409-429); the
+# gateway kanban-notifier is the consumer (gateway/kanban_watchers_notifier.py).
+# The table lives in the same root-anchored kanban.db as the board itself —
 # kanban_home() = get_default_hermes_root(), "Shared across profiles BY
 # DESIGN" (hermes_cli/kanban_db.py:382-401) — so this reader is ROOT-scoped
 # like the kanban source it complements.
 
 _NOTIFY_BACKLOG_SUB_LIMIT = 10
 _NOTIFY_ORPHAN_PROFILE_LIMIT = 5
+# Bound on the per-platform rollup: the detail row joins every key, so a board
+# watched over many distinct platforms must not grow that row without end.
+_NOTIFY_PLATFORM_LIMIT = 6
 
 # "default" is what upstream get_active_profile_name() reports for the root
 # home (hermes_cli/profiles.py:1368-1382); it owns no profiles/ directory, so
@@ -323,7 +358,7 @@ def _kanban_notify_from_row(row: dict[str, Any]) -> KanbanNotifySubSummary:
         delivery_mode=str(row.get("delivery_mode") or ""),
         last_event_id=last_event_id,
         max_event_id=max_event_id,
-        backlog=max(0, max_event_id - last_event_id),
+        backlog=max(0, _coerce_int(row.get("unseen_event_count"))),
     )
 
 
@@ -335,6 +370,12 @@ def _read_kanban_notify_fields(
     ``known_profiles`` is the set of profile names under the root ``profiles/``
     store, or None when that store could not be read safely and orphan
     detection must stay silent rather than report every stamped sub orphaned.
+
+    The table is unbounded (one row per watcher), so the row list is capped
+    like every sibling query in this module and nothing that claims to be a
+    total is derived from it: the counts, the platform rollup, the backlog sum
+    and peak, the sub-with-backlog count, and the distinct notifier profiles
+    all come from their own aggregates over the whole table.
     """
     if not _table_exists(conn, "kanban_notify_subs"):
         return {}
@@ -347,49 +388,94 @@ def _read_kanban_notify_fields(
     # Column order is not stable across migrated databases, so the select list
     # is built from confirmed names only (see sqlite_util._table_columns).
     select_list = ", ".join(f"s.{name} AS {name}" for name in wanted)
-    newest = (
-        ", COALESCE("
-        "(SELECT MAX(e.id) FROM task_events e WHERE e.task_id = s.task_id), 0"
-        ") AS max_event_id"
-        if _table_exists(conn, "task_events")
-        else ", 0 AS max_event_id"
+    # max_event_id is the newest event id of THIS task (the panel's "Newest"
+    # column); unseen_event_count is the subscription's own backlog. task_events.id
+    # is a global autoincrement, so the gap between the two is not the backlog:
+    # upstream selects this task's rows with id > cursor
+    # (kanban_db_notify.py:310-337).
+    has_events = _table_exists(conn, "task_events")
+    max_event_expr = (
+        "COALESCE((SELECT MAX(e.id) FROM task_events e WHERE e.task_id = s.task_id), 0)"
+        if has_events
+        else "0"
     )
-    subs = [
-        _kanban_notify_from_row(row)
-        for row in _query_rows(conn, f"SELECT {select_list}{newest} FROM kanban_notify_subs s")
-    ]
+    unseen_expr = (
+        "COALESCE((SELECT COUNT(*) FROM task_events e WHERE e.task_id = s.task_id "
+        "AND e.id > s.last_event_id), 0)"
+        if has_events
+        else "0"
+    )
+    # Totals first, from aggregates over the whole table.
+    sub_count = _count_rows(conn, "SELECT COUNT(*) FROM kanban_notify_subs")
     platform_counts: dict[str, int] = {}
-    backlog_subs: list[KanbanNotifySubSummary] = []
+    for row in _query_rows(
+        conn, "SELECT platform, COUNT(*) AS subs FROM kanban_notify_subs GROUP BY platform"
+    ):
+        # Rolled up in Python so a non-ASCII platform lowercases the way
+        # Python does, not the way SQLite's ASCII-only LOWER does.
+        platform = str(row.get("platform") or "")
+        key = platform.lower() if platform else "unknown"
+        platform_counts[key] = platform_counts.get(key, 0) + _coerce_int(row.get("subs"))
+    # The detail row joins every key, so the rollup keeps only the busiest
+    # platforms and flags the cut rather than growing without end.
+    platforms_truncated = len(platform_counts) > _NOTIFY_PLATFORM_LIMIT
+    platform_counts = dict(
+        sorted(platform_counts.items(), key=lambda item: (-item[1], item[0]))[
+            :_NOTIFY_PLATFORM_LIMIT
+        ]
+    )
+    backlog_totals = (
+        _query_rows(
+            conn,
+            "SELECT COALESCE(SUM(u), 0) AS total, COALESCE(MAX(u), 0) AS peak "
+            f"FROM (SELECT {unseen_expr} AS u FROM kanban_notify_subs s)",
+        )
+        or [{}]
+    )[0]
+    # The count behind the worst-ten list's "showing 10 of N" label: subs with
+    # an unseen event, aggregated over the whole table like the other totals.
+    backlog_sub_count = _count_rows(
+        conn, f"SELECT COUNT(*) FROM kanban_notify_subs s WHERE {unseen_expr} > 0"
+    )
     orphan_names: set[str] = set()
-    for sub in subs:
-        platform_key = sub.platform.lower() if sub.platform else "unknown"
-        platform_counts[platform_key] = platform_counts.get(platform_key, 0) + 1
-        if sub.backlog > 0:
-            backlog_subs.append(sub)
-        profile = sub.notifier_profile.strip()
-        if (
-            known_profiles is not None
-            and profile
-            and profile != _DEFAULT_PROFILE_NAME
-            and profile not in known_profiles
-        ):
-            orphan_names.add(profile)
-    backlog_subs.sort(key=lambda sub: (-sub.backlog, sub.task_id, sub.platform))
+    if known_profiles is not None:
+        # Distinct stamps only: profile names are a handful, not one per sub.
+        for row in _query_rows(conn, "SELECT DISTINCT notifier_profile FROM kanban_notify_subs"):
+            profile = str(row.get("notifier_profile") or "").strip()
+            if profile and profile != _DEFAULT_PROFILE_NAME and profile not in known_profiles:
+                orphan_names.add(profile)
+    # The displayed slice: the worst backlogs, capped. Only these rows carry the
+    # per-row correlated reads, so the cost is bounded by the cap, not the table.
+    backlog_subs = [
+        _kanban_notify_from_row(row)
+        for row in _query_rows(
+            conn,
+            f"SELECT {select_list}, {max_event_expr} AS max_event_id, "
+            f"{unseen_expr} AS unseen_event_count "
+            f"FROM kanban_notify_subs s WHERE {unseen_expr} > 0 "
+            f"ORDER BY unseen_event_count DESC, s.task_id, s.platform "
+            f"LIMIT {_NOTIFY_BACKLOG_SUB_LIMIT}",
+        )
+    ]
     orphans = sorted(orphan_names)
     return {
-        "notify_sub_count": len(subs),
+        "notify_sub_count": sub_count,
         "notify_platform_counts": platform_counts,
-        "notify_backlog_total": sum(sub.backlog for sub in subs),
-        "notify_max_backlog": max((sub.backlog for sub in subs), default=0),
-        "notify_backlog_subs": backlog_subs[:_NOTIFY_BACKLOG_SUB_LIMIT],
+        "notify_platforms_truncated": platforms_truncated,
+        "notify_backlog_total": _coerce_int(backlog_totals.get("total")),
+        "notify_max_backlog": _coerce_int(backlog_totals.get("peak")),
+        "notify_backlog_sub_count": backlog_sub_count,
+        "notify_backlog_subs": backlog_subs,
         "notify_orphan_profile_count": len(orphans),
         "notify_orphan_profiles": orphans[:_NOTIFY_ORPHAN_PROFILE_LIMIT],
     }
 
 
-def _read_kanban_notify(db_path: Path, *, known_profiles: frozenset[str] | None) -> dict[str, Any]:
+def _read_kanban_notify(
+    db_path: Path, *, known_profiles: frozenset[str] | None, resolved: bool = False
+) -> dict[str, Any]:
     """kanban_notify_subs reads; {} on a pre-subs schema, errors propagate so
     the kanban_notify source fails to its last-good value."""
-    with _connect_readonly_sqlite(db_path) as conn:
+    with _connect_readonly_sqlite(db_path, resolved=resolved) as conn:
         conn.row_factory = sqlite3.Row
         return _read_kanban_notify_fields(conn, known_profiles=known_profiles)

@@ -356,16 +356,20 @@ def normalize_repo(value: object) -> str:
 
 def parse_catalog_cache(
     data: object,
-) -> tuple[dict[str, CatalogCacheEntry], list[RemovedCatalogEntry]]:
+) -> tuple[dict[str, CatalogCacheEntry], list[RemovedCatalogEntry]] | None:
     """Entries and kill-list rows from ``cache/plugin-catalog.json``.
 
     The cache is what ``fetch_live_catalog`` writes
     (``plugin_catalog.py:221-248``): ``{"entries": [...], "removed": [...]}``.
-    Any other shape is an empty cache, never an error — an absent or corrupt
-    cache only means the drift/removal checks are unavailable this pass.
+    Upstream validates the payload with ``isinstance(data, dict) and
+    isinstance(data.get("entries"), list)`` before it is ever written
+    (``:238-239``), so anything else is *unreadable*, not empty: None is
+    returned and the caller must report the checks as unavailable instead of
+    claiming the plugins match. Rows inside a valid payload stay tolerant — a
+    malformed row is skipped, not fatal.
     """
-    if not isinstance(data, dict):
-        return {}, []
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+        return None
     entries: dict[str, CatalogCacheEntry] = {}
     for raw in _as_list(data.get("entries")):
         if not isinstance(raw, dict):

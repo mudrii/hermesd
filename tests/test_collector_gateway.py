@@ -20,13 +20,14 @@ import yaml
 from hermesd.collect.gateway import (
     _INCARNATION_SCAN_LIMIT,
     _OPEN_DELIVERY_LIMIT,
+    _listener_mirror_urls,
 )
 from hermesd.collector import (
     Collector,
     _is_dashboard_process,
     _pid_exists,
 )
-from hermesd.models import GatewayLoopHealth, PlatformOwnership, PlatformStatus
+from hermesd.models import DashboardState, GatewayLoopHealth, PlatformOwnership, PlatformStatus
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
 from tests.conftest import create_state_db_tables, render_to_str
@@ -825,6 +826,10 @@ def _collect(home: Path, *, live_pid: int = 4242):
         collector.close()
 
 
+def _gateway_detail(state: DashboardState) -> str:
+    return render_to_str(render_panel(1, state, Theme(), detail=True), width=200, no_color=True)
+
+
 # --------------------------------------------------------------------------
 # A. heartbeat liveness
 # --------------------------------------------------------------------------
@@ -866,8 +871,10 @@ def test_heartbeat_garbage_timestamp_falls_back_to_file_mtime(hermes_home: Path)
 
     gateway = _collect(hermes_home).gateway
 
+    # The age comes from the file mtime; the verdict is the witness's call,
+    # and this payload is armed with no node to probe in a bare fixture home.
     assert gateway.heartbeat_age_seconds == pytest.approx(120.0)
-    assert gateway.loop_health is GatewayLoopHealth.STALE
+    assert gateway.loop_health is GatewayLoopHealth.UNKNOWN
 
 
 def test_heartbeat_wrong_types_do_not_crash(hermes_home: Path):
@@ -895,12 +902,15 @@ def test_heartbeat_future_timestamp_clamps_to_zero(hermes_home: Path):
     ("age", "gateway_state", "expected"),
     [
         (90.0, "running", GatewayLoopHealth.TICKING),
-        (91.0, "running", GatewayLoopHealth.STALE),
-        (300.0, "running", GatewayLoopHealth.STALE),
-        # Armed witness but no node to probe (the default probe finds none in a
-        # bare fixture home): upstream's classify calls that ambiguity, and a
-        # WEDGED verdict now requires sustained witness silence instead.
+        # Past the 90 s stale budget the witness decides — upstream escalates
+        # there, not at 300 s. This payload is armed but its node cannot be
+        # probed in a bare fixture home, which upstream classifies as
+        # ambiguity; a WEDGED verdict requires sustained witness silence.
+        (91.0, "running", GatewayLoopHealth.UNKNOWN),
+        (300.0, "running", GatewayLoopHealth.UNKNOWN),
         (301.0, "running", GatewayLoopHealth.UNKNOWN),
+        # A stopped gateway has no witness to consult: the heartbeat-only
+        # fallback keeps its ten-write cutoff.
         (301.0, "stopped", GatewayLoopHealth.STALE),
     ],
 )
@@ -2495,7 +2505,7 @@ def test_loop_tick_sustained_silence_escalates_to_wedged(hermes_home: Path):
         hermes_home,
         pid_exists=lambda pid: pid == 4242,
         clock=_clock,
-        loop_tick_probe=lambda pid, tcp_port: False,  # type: ignore[arg-type,return-value]
+        loop_tick_probe=lambda pid, tcp_port: False,
     )
     try:
         first = collector.collect().gateway
@@ -2507,6 +2517,62 @@ def test_loop_tick_sustained_silence_escalates_to_wedged(hermes_home: Path):
     assert first.loop_health is GatewayLoopHealth.STALE
     assert second.loop_health is GatewayLoopHealth.STALE
     assert third.loop_health is GatewayLoopHealth.WEDGED
+
+
+def test_loop_tick_escalation_band_starts_at_the_stale_budget(hermes_home: Path):
+    """The 90 s stale budget opens upstream's escalation band, not 300 s.
+
+    ``probe_gateway_loop_liveness`` (hermes_cli/gateway.py:345,465-497) calls
+    anything older than ``DEFAULT_LOOP_LIVENESS_STALE_AFTER_S`` (three missed
+    30 s beats) decisive: with the witness armed and silent across strikes the
+    verdict is wedged, and with no witness key it is the legacy on-loop writer.
+    hermesd kept a 90-300 s "stale" band that no witness evidence could
+    escalate out of, so a gateway wedged for four minutes still read as a slow
+    heartbeat — the exact verdict upstream exists to avoid.
+    """
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(hermes_home, _armed_heartbeat(120.0))
+
+    collector = Collector(
+        hermes_home,
+        pid_exists=lambda pid: pid == 4242,
+        clock=_clock,
+        loop_tick_probe=lambda pid, tcp_port: False,
+    )
+    try:
+        first = collector.collect().gateway
+        second = collector.collect().gateway
+        third = collector.collect().gateway
+    finally:
+        collector.close()
+
+    # The three-strike guard still stands inside the early band.
+    assert first.loop_health is GatewayLoopHealth.STALE
+    assert second.loop_health is GatewayLoopHealth.STALE
+    assert third.loop_health is GatewayLoopHealth.WEDGED
+
+
+def test_loop_tick_legacy_heartbeat_escalates_at_the_stale_budget(hermes_home: Path):
+    """A witness-less payload past 90 s is the legacy writer's absence of proof."""
+    legacy = {
+        key: value for key, value in _armed_heartbeat(120.0).items() if key != "loop_tick_socket"
+    }
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(hermes_home, legacy)
+
+    gateway = _collect_probed(hermes_home, lambda pid, tcp_port: None).gateway  # type: ignore[attr-defined]
+
+    assert gateway.loop_health is GatewayLoopHealth.LEGACY
+
+
+def test_loop_tick_disarmed_witness_past_the_budget_is_ambiguity(hermes_home: Path):
+    """An armed-failed witness past 90 s is ambiguity, never a wedge."""
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(hermes_home, _armed_heartbeat(120.0, loop_tick_socket=False))
+
+    gateway = _collect_probed(hermes_home, lambda pid, tcp_port: False).gateway  # type: ignore[attr-defined]
+
+    assert gateway.loop_health is GatewayLoopHealth.UNKNOWN
 
 
 def test_loop_tick_legacy_heartbeat_staleness_alone_is_proof(hermes_home: Path):
@@ -2531,7 +2597,7 @@ def test_loop_tick_witness_absent_node_is_ambiguity_never_a_wedge(hermes_home: P
         hermes_home,
         pid_exists=lambda pid: pid == 4242,
         clock=_clock,
-        loop_tick_probe=lambda pid, tcp_port: None,  # type: ignore[arg-type,return-value]
+        loop_tick_probe=lambda pid, tcp_port: None,
     )
     try:
         for _ in range(5):
@@ -2551,7 +2617,7 @@ def test_loop_tick_disarmed_witness_never_escalates(hermes_home: Path):
         hermes_home,
         pid_exists=lambda pid: pid == 4242,
         clock=_clock,
-        loop_tick_probe=lambda pid, tcp_port: False,  # type: ignore[arg-type,return-value]
+        loop_tick_probe=lambda pid, tcp_port: False,
     )
     try:
         for _ in range(5):
@@ -2619,7 +2685,7 @@ def test_loop_tick_strikes_reset_after_a_witness_answer(hermes_home: Path):
         hermes_home,
         pid_exists=lambda pid: pid == 4242,
         clock=_clock,
-        loop_tick_probe=probe,  # type: ignore[arg-type]
+        loop_tick_probe=probe,
     )
     try:
         first = collector.collect().gateway
@@ -2791,7 +2857,7 @@ def test_restart_storm_counts_window_and_cap(hermes_home: Path):
     gateway = _collect(hermes_home).gateway
 
     assert gateway.gateway_starts_recorded is True
-    assert gateway.gateway_starts_2m == 2
+    assert gateway.gateway_starts_window == 2
     assert gateway.gateway_starts_1h == 4
     assert gateway.seconds_since_last_gateway_start == pytest.approx(30.0)
     assert gateway.in_respawn_backoff is False
@@ -2804,7 +2870,7 @@ def test_restart_storm_backoff_when_cap_is_exceeded(hermes_home: Path):
 
     gateway = _collect(hermes_home).gateway
 
-    assert gateway.gateway_starts_2m == 6
+    assert gateway.gateway_starts_window == 6
     assert gateway.in_respawn_backoff is True
 
 
@@ -2814,7 +2880,7 @@ def test_restart_storm_absent_file_is_not_evidence_of_zero_restarts(hermes_home:
     gateway = _collect(hermes_home).gateway
 
     assert gateway.gateway_starts_recorded is False
-    assert gateway.gateway_starts_2m == 0
+    assert gateway.gateway_starts_window == 0
     assert gateway.in_respawn_backoff is False
 
 
@@ -2826,19 +2892,48 @@ def test_restart_storm_garbage_and_future_lines_are_ignored(hermes_home: Path):
     gateway = _collect(hermes_home).gateway
 
     assert gateway.gateway_starts_recorded is True
-    assert gateway.gateway_starts_2m == 2
+    assert gateway.gateway_starts_window == 2
     assert gateway.seconds_since_last_gateway_start == pytest.approx(30.0)
 
 
 def test_restart_storm_empty_file_records_nothing(hermes_home: Path):
+    """Upstream appends ``now`` before its atomic replace, so an empty ledger is not a ledger."""
     _write_gateway_state(hermes_home)
     (hermes_home / "gateway-starts.log").write_text("")
 
-    gateway = _collect(hermes_home).gateway
+    state = _collect(hermes_home)
 
-    assert gateway.gateway_starts_recorded is True
-    assert gateway.gateway_starts_2m == 0
-    assert gateway.seconds_since_last_gateway_start is None
+    assert state.gateway.gateway_starts_recorded is False
+    assert state.gateway.gateway_starts_window == 0
+    assert state.gateway.seconds_since_last_gateway_start is None
+    assert "Starts:" not in _gateway_detail(state)
+
+
+@pytest.mark.parametrize("content", ["   \n\n", "not-a-float\n# junk\n\n"])
+def test_restart_storm_unparseable_file_records_nothing(hermes_home: Path, content: str):
+    _write_gateway_state(hermes_home)
+    (hermes_home / "gateway-starts.log").write_text(content)
+
+    state = _collect(hermes_home)
+
+    assert state.gateway.gateway_starts_recorded is False
+    assert state.gateway.gateway_starts_window == 0
+    assert state.gateway.in_respawn_backoff is False
+    assert "Starts:" not in _gateway_detail(state)
+
+
+def test_restart_storm_one_valid_epoch_beside_junk_still_records(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    (hermes_home / "gateway-starts.log").write_text(f"not-a-float\n{NOW - 30!r}\n\n")
+
+    state = _collect(hermes_home)
+
+    assert state.gateway.gateway_starts_recorded is True
+    assert state.gateway.gateway_starts_window == 1
+    assert state.gateway.gateway_starts_1h == 1
+    assert state.gateway.seconds_since_last_gateway_start == pytest.approx(30.0)
+    assert state.gateway.restart_storm_cap == 5
+    assert "Starts:" in _gateway_detail(state)
 
 
 # --------------------------------------------------------------------------
@@ -2998,6 +3093,26 @@ def test_exit_diag_junk_lines_are_ignored(hermes_home: Path):
     assert "secret" not in json.dumps(gateway.model_dump(mode="json"))
 
 
+def test_exit_diag_tag_is_redacted(hermes_home: Path):
+    """The ledger is a log file, so its tag is redacted like every other one.
+
+    Upstream writes literal tags, but the file lives in a directory a tampered
+    or foreign writer can reach, and hermesd redacts log-derived text
+    everywhere else (``tests/test_collector_logs.py``).
+    """
+    _write_gateway_state(hermes_home)
+    logs = hermes_home / "logs"
+    logs.mkdir(exist_ok=True)
+    (logs / "gateway-exit-diag.log").write_text(
+        json.dumps({"ts": _iso(NOW - 45), "tag": "https://user:tok@example.com/pull/7"}) + "\n"
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.exit_diag_last_tag == "https://[REDACTED]@example.com/pull/7"
+    assert "tok" not in json.dumps(gateway.model_dump(mode="json"))
+
+
 def test_forensic_companion_files_reported_when_present(hermes_home: Path):
     _write_gateway_state(hermes_home)
     logs = hermes_home / "logs"
@@ -3090,3 +3205,468 @@ def test_listener_base_mirrors_are_redacted(hermes_home: Path):
 
     assert "hunter2" not in json.dumps(platform.model_dump(mode="json"))
     assert platform.mirror_urls["dev"].startswith("http://[REDACTED]@127.0.0.1:8088/p/dev/v1")
+
+
+@pytest.mark.parametrize("state", ["starting", "paused", "unknown"])
+def test_listener_base_mirrors_require_a_serving_state(hermes_home: Path, state: str):
+    """Upstream mirrors only a serving default entry (gateway/status.py:962-966)."""
+    _write_gateway_state(
+        hermes_home,
+        served_profiles=["dev"],
+        platforms={
+            "api_server": {"state": state, "listener_base": "http://127.0.0.1:8088"},
+        },
+    )
+
+    assert _collect(hermes_home).gateway.platforms[0].mirror_urls == {}
+
+
+def test_listener_base_mirrors_absent_when_state_is_missing(hermes_home: Path):
+    _write_gateway_state(
+        hermes_home,
+        served_profiles=["dev"],
+        platforms={"api_server": {"listener_base": "http://127.0.0.1:8088"}},
+    )
+
+    platform = _collect(hermes_home).gateway.platforms[0]
+
+    assert platform.state == "unknown"
+    assert platform.mirror_urls == {}
+
+
+@pytest.mark.parametrize("state", ["connected", "connecting", "retrying"])
+def test_listener_base_mirrors_are_synthesized_for_every_serving_state(
+    hermes_home: Path, state: str
+):
+    _write_gateway_state(
+        hermes_home,
+        served_profiles=["dev"],
+        platforms={
+            "api_server": {"state": state, "listener_base": "http://127.0.0.1:8088"},
+        },
+    )
+
+    assert _collect(hermes_home).gateway.platforms[0].mirror_urls == {
+        "dev": "http://127.0.0.1:8088/p/dev/v1"
+    }
+
+
+def test_listener_mirror_urls_need_a_live_writer():
+    assert (
+        _listener_mirror_urls(
+            "api_server",
+            {"listener_base": "https://x.test"},
+            "connected",
+            record_current=False,
+            served_profiles=["coding"],
+        )
+        == {}
+    )
+
+
+def test_listener_mirror_urls_skip_the_default_profile():
+    assert _listener_mirror_urls(
+        "api_server",
+        {"listener_base": "https://x.test"},
+        "connected",
+        record_current=True,
+        served_profiles=["default", "coding"],
+    ) == {"coding": "https://x.test/p/coding/v1"}
+
+
+def _write_respawn_config(home: Path, **respawn: object) -> None:
+    body = ["gateway:", "  respawn_storm:"]
+    for key, value in respawn.items():
+        body.append(f"    {key}: {value!r}" if isinstance(value, str) else f"    {key}: {value}")
+    (home / "config.yaml").write_text("\n".join(body) + "\n")
+
+
+def test_restart_storm_uses_the_configured_cap(hermes_home: Path):
+    """Upstream's effective cap is ``gateway.respawn_storm.max_starts``, not 5.
+
+    ``_respawn_storm_backoff`` reads the value from ``load_config()``
+    (``hermes_cli/gateway.py:4673-4685``), so a raised cap means no backoff
+    where the hardcoded default would have cried storm — and a lowered one means
+    a real storm the default would have missed.
+    """
+    _write_gateway_state(hermes_home)
+    _write_respawn_config(hermes_home, max_starts=10)
+    _write_starts_log(hermes_home, [NOW - 10 * i for i in range(1, 7)])
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.gateway_starts_window == 6
+    assert gateway.restart_storm_cap == 10
+    assert gateway.in_respawn_backoff is False
+
+    _write_respawn_config(hermes_home, max_starts=2)
+    gateway = _collect(hermes_home).gateway
+    assert gateway.restart_storm_cap == 2
+    assert gateway.in_respawn_backoff is True
+
+
+def test_restart_storm_uses_the_configured_window(hermes_home: Path):
+    """A 300 s window counts starts the hardcoded 120 s window would drop."""
+    _write_gateway_state(hermes_home)
+    _write_respawn_config(hermes_home, window_seconds=300)
+    _write_starts_log(hermes_home, [NOW - 60, NOW - 150, NOW - 290, NOW - 400])
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.restart_storm_window_seconds == pytest.approx(300.0)
+    assert gateway.gateway_starts_window == 3
+    assert gateway.gateway_starts_1h == 4
+    assert gateway.in_respawn_backoff is False
+
+
+@pytest.mark.parametrize(
+    "window_yaml",
+    [
+        pytest.param(".nan", id="nan"),
+        pytest.param(".inf", id="positive-infinity"),
+        pytest.param("-.inf", id="negative-infinity"),
+        pytest.param(str(10**400), id="integer-overflow"),
+        pytest.param("0", id="zero"),
+        pytest.param("-1", id="negative"),
+    ],
+)
+def test_restart_storm_invalid_window_falls_back_and_detail_snapshot_renders(
+    hermes_home: Path, window_yaml: str
+):
+    _write_gateway_state(hermes_home)
+    (hermes_home / "config.yaml").write_text(
+        f"gateway:\n  respawn_storm:\n    max_starts: 9\n    window_seconds: {window_yaml}\n"
+    )
+    _write_starts_log(hermes_home, [NOW - 60, NOW - 150])
+
+    state = _collect(hermes_home)
+    detail = _gateway_detail(state)
+
+    assert state.gateway.restart_storm_cap == 9
+    assert state.gateway.restart_storm_window_seconds == pytest.approx(120.0)
+    assert state.gateway.gateway_starts_window == 1
+    assert "2m 1/9" in detail
+
+
+def test_restart_storm_disabled_writer_makes_no_claims(hermes_home: Path):
+    """``max_starts <= 0`` disables the writer upstream, so the ledger is stale
+    by construction and hermesd must not report a storm verdict from it."""
+    _write_gateway_state(hermes_home)
+    _write_respawn_config(hermes_home, max_starts=0)
+    _write_starts_log(hermes_home, [NOW - 10 for _ in range(9)])
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.gateway_starts_recorded is False
+    assert gateway.in_respawn_backoff is False
+
+
+def test_respawn_storm_policy_reads_only_upstream_shapes():
+    """booleans and junk are not ints upstream: mirror the isinstance guards."""
+    from hermesd.collect.gateway import _respawn_storm_policy
+
+    assert _respawn_storm_policy({}) == (5, 120.0)
+    assert _respawn_storm_policy({"gateway": {"respawn_storm": {"max_starts": 8}}}) == (8, 120.0)
+    assert _respawn_storm_policy(
+        {"gateway": {"respawn_storm": {"max_starts": True, "window_seconds": "300"}}}
+    ) == (5, 120.0)
+    assert _respawn_storm_policy({"gateway": {"respawn_storm": {"window_seconds": 300.5}}}) == (
+        5,
+        300.5,
+    )
+
+
+# --------------------------------------------------------------------------
+# O. regression pins for review-reported mutation survivors
+# --------------------------------------------------------------------------
+
+
+def test_loop_tick_probe_uses_only_the_first_byte(hermes_home: Path):
+    """The protocol is one byte: a witness that appends anything still answers.
+
+    Pins ``recv(1)`` (``hermes_cli/gateway.py:363-376``): a probe that drained
+    the socket would misread a well-behaved handler that writes ``b"1\\n"``.
+    """
+    import socket
+    import threading
+
+    from hermesd.collect.gateway import _default_loop_tick_probe
+
+    home = _short_socket_dir()
+    (home / "state").mkdir()
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(home / "state" / "gateway.loop-tick.4242.sock"))
+    listener.listen(1)
+
+    def serve() -> None:
+        conn, _ = listener.accept()
+        with conn:
+            conn.sendall(b"1\n")
+
+    watcher = threading.Thread(target=serve, daemon=True)
+    watcher.start()
+    try:
+        assert _default_loop_tick_probe(4242, None, home) is True
+        watcher.join(timeout=5)
+    finally:
+        listener.close()
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_exit_diag_size_warning_boundary(hermes_home: Path):
+    """Oversized is False below the 2 MiB cap and True above it."""
+    from hermesd.collect.gateway import _EXIT_DIAG_SIZE_WARN_BYTES
+
+    _write_gateway_state(hermes_home)
+    logs = hermes_home / "logs"
+    logs.mkdir(exist_ok=True)
+    ledger = logs / "gateway-exit-diag.log"
+
+    padding = '{"tag": "padding"}\n'
+    one_mib = padding * (1024 * 1024 // len(padding))
+    ledger.write_text(one_mib)
+    gateway = _collect(hermes_home).gateway
+    assert gateway.exit_diag_size_bytes == len(one_mib)
+    assert gateway.exit_diag_oversized is False
+
+    over = one_mib + "x" * (_EXIT_DIAG_SIZE_WARN_BYTES - len(one_mib) + 1)
+    ledger.write_text(over)
+    gateway = _collect(hermes_home).gateway
+    assert gateway.exit_diag_oversized is True
+
+
+def test_exit_diag_unclean_count_window_is_24h(hermes_home: Path):
+    """An unclean exit older than a day is history, not a current signal."""
+    _write_gateway_state(hermes_home)
+    _write_exit_diag(
+        hermes_home,
+        [
+            {"ts": _iso(NOW - 30 * 3600), "tag": "gateway.previous_unclean_exit", "pid": 9},
+            {"ts": _iso(NOW - 2 * 3600), "tag": "gateway.previous_unclean_exit", "pid": 10},
+            {"ts": _iso(NOW - 3600), "tag": "gateway.previous_unclean_exit", "pid": 11},
+        ],
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.exit_diag_unclean_24h == 2
+
+
+def test_exit_diag_future_stamp_is_not_counted_as_unclean(hermes_home: Path):
+    """A stamp in the future is clock skew, not an unclean exit yet.
+
+    The window is ``0 <= now - stamp <= day``: admitting a negative delta
+    counted a record that has not happened as a current unclean exit, and the
+    sibling starts reader already rejects future stamps for the same reason.
+    """
+    _write_gateway_state(hermes_home)
+    _write_exit_diag(
+        hermes_home,
+        [
+            {"ts": _iso(NOW + 600), "tag": "gateway.previous_unclean_exit", "pid": 9},
+            {"ts": _iso(NOW - 3600), "tag": "gateway.previous_unclean_exit", "pid": 10},
+        ],
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.exit_diag_unclean_24h == 1
+
+
+def test_forensic_companions_are_stat_only(hermes_home: Path):
+    """Companion logs are reported by size alone; their contents are never read.
+
+    The files are made unreadable, which is the strongest fixture available: the
+    rows are still reported with their sizes, so nothing opened them — either
+    reader would have failed on the permission bits.
+    """
+    _write_gateway_state(hermes_home)
+    logs = hermes_home / "logs"
+    logs.mkdir(exist_ok=True)
+    companions = ("gateway-shutdown-diag.log", "gateway_faulthandler.log", "launchd-reload.log")
+    paths = [logs / name for name in companions]
+    for path in paths:
+        path.write_text("SECRET-COMPANION-BODY")
+        path.chmod(0o000)
+
+    try:
+        gateway = _collect(hermes_home).gateway
+    finally:
+        for path in paths:
+            path.chmod(0o600)
+
+    assert {f.name for f in gateway.forensic_files} == set(companions)
+    assert all(size > 0 for size in (f.size_bytes for f in gateway.forensic_files))
+
+
+def test_restart_storm_exactly_at_the_cap_is_not_backoff(hermes_home: Path):
+    """Upstream backs off only *past* the cap (``len(recent) <= max_starts``)."""
+    _write_gateway_state(hermes_home)
+    _write_starts_log(hermes_home, [NOW - 10 * index for index in range(1, 6)])
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.gateway_starts_window == 5
+    assert gateway.in_respawn_backoff is False
+
+
+def test_mirror_roster_is_bounded(hermes_home: Path):
+    """The synthesized mirror list honors its profile bound.
+
+    The bound is asserted as a literal: importing the constant under test into
+    the expectation would make the assertion move with the mutation.
+    """
+    _write_gateway_state(hermes_home)
+    profiles = [f"p{index:02d}" for index in range(20)]
+    state_path = hermes_home / "gateway_state.json"
+    payload = json.loads(state_path.read_text())
+    payload["served_profiles"] = profiles
+    payload["platforms"] = {
+        "api_server": {"state": "connected", "listener_base": "http://127.0.0.1:8088"}
+    }
+    state_path.write_text(json.dumps(payload))
+
+    gateway = _collect(hermes_home).gateway
+
+    platform = next(p for p in gateway.platforms if p.name == "api_server")
+    assert len(platform.mirror_urls) == 16
+    assert "p00" in platform.mirror_urls
+    assert "p15" in platform.mirror_urls
+    assert "p16" not in platform.mirror_urls
+    # A sliced roster must not read as the complete set of served profiles.
+    assert platform.mirror_urls_truncated is True
+
+
+def test_mirror_roster_below_the_bound_is_not_flagged(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    state_path = hermes_home / "gateway_state.json"
+    payload = json.loads(state_path.read_text())
+    payload["served_profiles"] = ["default", "dev", "coding"]
+    payload["platforms"] = {
+        "api_server": {"state": "connected", "listener_base": "http://127.0.0.1:8088"}
+    }
+    state_path.write_text(json.dumps(payload))
+
+    gateway = _collect(hermes_home).gateway
+
+    platform = next(p for p in gateway.platforms if p.name == "api_server")
+    assert sorted(platform.mirror_urls) == ["coding", "dev"]
+    assert platform.mirror_urls_truncated is False
+
+
+def test_restart_storm_keeps_defaults_when_config_is_unreadable(hermes_home: Path):
+    """A torn config.yaml must not take the storm verdict down with it.
+
+    The policy read is an enrichment of the ledger read: with no usable config
+    the upstream defaults apply and the source stays healthy, rather than the
+    whole restart-storm source failing over an unrelated file.
+    """
+    _write_gateway_state(hermes_home)
+    _write_starts_log(hermes_home, [NOW - 10 * index for index in range(1, 7)])
+    (hermes_home / "config.yaml").write_text("[1, 2, 3]")
+
+    state = _collect(hermes_home)
+
+    assert "gateway_restart_storm" not in state.health.failed_sources
+    gateway = state.gateway
+    assert gateway.restart_storm_cap == 5
+    assert gateway.restart_storm_window_seconds == pytest.approx(120.0)
+    assert gateway.gateway_starts_window == 6
+    assert gateway.in_respawn_backoff is True
+
+
+def test_gateway_reads_stringified_state_flags_strictly(hermes_home: Path):
+    """A stringified ``"false"`` in gateway_state.json is not truth.
+
+    The record is written by the live gateway, so a string where a boolean
+    belongs is corruption; reading it truthily would raise a "needs attention"
+    flag on a healthy platform and claim a config file exists that does not.
+    """
+    (hermes_home / "gateway_state.json").write_text(
+        json.dumps(
+            {
+                "pid": 4242,
+                "start_time": NOW - 5000,
+                "kind": "hermes-gateway",
+                "gateway_state": "running",
+                "platforms": {
+                    "telegram": {"state": "connected", "needs_attention": "false"},
+                },
+                "config_generation": {
+                    "fingerprint": "fp",
+                    "short": "abc123",
+                    "sources": [
+                        {
+                            "name": "config.yaml",
+                            "path": "/tmp/config.yaml",
+                            "exists": "false",
+                            "mtime_ns": 1,
+                            "size": 2,
+                        }
+                    ],
+                },
+            }
+        )
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    platform = next(p for p in gateway.platforms if p.name == "telegram")
+    assert platform.needs_attention is False
+    assert gateway.config_sources[0].exists is False
+
+
+def test_stale_alias_count_ignores_stringified_flags(hermes_home: Path):
+    """`channel_aliases.json` is a state payload: `"false"` is not stale.
+
+    Each alias entry carries real JSON booleans upstream; a stringified flag is
+    corruption, and `bool("false")` would count a live alias as stale.
+    """
+    (hermes_home / "channel_aliases.json").write_text(
+        json.dumps(
+            {
+                "telegram": {
+                    "1": {"label": "Live", "stale": "false"},
+                    "2": {"label": "Also live", "is_stale": "0"},
+                    "3": {"label": "Really stale", "stale": True},
+                }
+            }
+        )
+    )
+
+    state = _collect(hermes_home)
+
+    assert state.channels.alias_count == 3
+    assert state.channels.stale_alias_count == 1
+
+
+def test_gateway_stringified_request_flags_are_read_strictly(hermes_home: Path):
+    """Update receipts and drain requests are machine-written booleans.
+
+    ``logs/update_receipts/latest.json`` records ``restart_requested`` and
+    ``.drain_request.json`` records ``suppress_notification`` as real JSON
+    booleans; a stringified ``"false"`` would claim a restart is pending and that
+    the drain notification was suppressed.
+    """
+    receipts = hermes_home / "logs" / "update_receipts"
+    receipts.mkdir(parents=True)
+    (receipts / "latest.json").write_text(
+        json.dumps({"outcome": "success", "restart_requested": "false"})
+    )
+    (hermes_home / ".drain_request.json").write_text(
+        json.dumps(
+            {
+                "requested_at": "2026-07-10T10:00:00Z",
+                "principal": "nas",
+                "suppress_notification": "false",
+            }
+        )
+    )
+    (hermes_home / "gateway_state.json").write_text(
+        json.dumps({"pid": 0, "gateway_state": "stopped", "platforms": {}})
+    )
+
+    gw = _collect(hermes_home).gateway
+
+    assert gw.restart_requested is False
+    assert gw.drain_suppress_notification is False

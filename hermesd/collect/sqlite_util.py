@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import sqlite3
+import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -12,17 +13,67 @@ from hermesd.collect.common import _exists_strict, _optional_epoch
 from hermesd.db import _SQLITE_TIMEOUT_SECONDS, snapshot_wal_database
 
 
-@contextlib.contextmanager
-def _connect_readonly_sqlite(db_path: Path) -> Iterator[sqlite3.Connection]:
-    conn: sqlite3.Connection | None = None
+def _snapshot_wal_if_present(
+    db_path: Path,
+) -> tuple[tempfile.TemporaryDirectory[str], Path] | None:
+    """Copy db+sidecars into a temp dir when a WAL exists, else None.
+
+    Separated from the connection so callers that read the same database
+    several times in one refresh can share a single copy: kanban.db is read by
+    the board, per-board and notify readers, and each used to snapshot the WAL
+    on its own. The caller owns cleanup.
+    """
     wal_path = db_path.with_name(f"{db_path.name}-wal")
     if wal_path.is_symlink():
         raise OSError(f"Refusing to open database with unsafe SQLite WAL sidecar: {wal_path}")
     # Strict, not Path.exists(): from Python 3.14 exists() also swallows EACCES, so
     # an unreadable sidecar would read as absent and this would silently fall
     # through to immutable=1 — serving checkpoint-lagging data as current.
-    if _exists_strict(wal_path):
-        snapshot_dir, snapshot_db = snapshot_wal_database(db_path, prefix="hermesd-kanban-")
+    if not _exists_strict(wal_path):
+        return None
+    return snapshot_wal_database(db_path, prefix="hermesd-kanban-")
+
+
+@contextlib.contextmanager
+def _connect_resolved_sqlite(read_path: Path, *, immutable: bool) -> Iterator[sqlite3.Connection]:
+    """Open a database path that is already resolved for reading.
+
+    ``_snapshot_wal_if_present`` copies the ``-wal`` sidecar into the snapshot
+    directory, so a snapshot still looks like a WAL database; running the
+    snapshot check on it again would copy it a second time. Callers that hold
+    the shared snapshot (one copy per refresh, several readers) open it here.
+    """
+    suffix = "?mode=ro&immutable=1" if immutable else "?mode=ro"
+    conn = sqlite3.connect(
+        f"{read_path.resolve().as_uri()}{suffix}",
+        uri=True,
+        timeout=_SQLITE_TIMEOUT_SECONDS,
+    )
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+@contextlib.contextmanager
+def _connect_readonly_sqlite(
+    db_path: Path, *, resolved: bool = False
+) -> Iterator[sqlite3.Connection]:
+    """A read-only connection to ``db_path``, snapshotting its WAL when needed.
+
+    ``resolved`` means the caller already holds a snapshot of the WAL database
+    (``_snapshot_wal_if_present``) and several readers share it: the copy
+    deliberately includes the ``-wal`` sidecar, so re-running the snapshot check
+    on it would copy it again.
+    """
+    if resolved:
+        with _connect_resolved_sqlite(db_path, immutable=False) as resolved_conn:
+            yield resolved_conn
+        return
+    snapshot = _snapshot_wal_if_present(db_path)
+    if snapshot is not None:
+        snapshot_dir, snapshot_db = snapshot
+        conn: sqlite3.Connection | None = None
         try:
             conn = sqlite3.connect(
                 f"{snapshot_db.resolve().as_uri()}?mode=ro",
@@ -30,13 +81,13 @@ def _connect_readonly_sqlite(db_path: Path) -> Iterator[sqlite3.Connection]:
                 timeout=_SQLITE_TIMEOUT_SECONDS,
             )
             yield conn
-            return
         finally:
             try:
                 if conn is not None:
                     conn.close()
             finally:
                 snapshot_dir.cleanup()
+        return
     conn = sqlite3.connect(
         f"{db_path.resolve().as_uri()}?mode=ro&immutable=1",
         uri=True,
@@ -169,8 +220,13 @@ def _select_columns(columns: frozenset[str], wanted: tuple[str, ...]) -> tuple[s
 
 
 def _count_rows(conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = ()) -> int:
-    """Count from a query over a table the caller has already confirmed to
-    exist; read errors propagate so the source fails to its last-good value."""
+    """One integer from a single-value query over a table the caller confirmed exists.
+
+    Named for its common case (``COUNT(*)``) but deliberately not restricted to
+    it: it reads any single-column, single-row scalar, which is why the session
+    coordination reader uses it for ``SUM(...)`` as well. Read errors propagate
+    so the source fails to its last-good value.
+    """
     cur = conn.execute(sql, params)
     row = cur.fetchone()
     return int(row[0] or 0) if row is not None else 0

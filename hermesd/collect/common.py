@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import math
 import time
 from datetime import UTC, datetime
@@ -215,6 +217,36 @@ def _coerce_int(value: object) -> int:
     return 0
 
 
+_TRUTHY_STATE_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def _coerce_bool(value: object) -> bool:
+    """Boolean read for untrusted state, where ``bool()`` is wrong.
+
+    ``bool("false")`` is True, so a corrupted or foreign payload could flip a
+    warning on with a stringified flag. Only the shapes the writers actually
+    produce count as truth: JSON ``true``, SQLite ``1`` (or a float), and the
+    ``"1"`` / ``"true"`` / ``"yes"`` / ``"on"`` spellings upstream itself accepts
+    (``gateway/scale_to_zero.py:38``). Everything else — including ``"false"``,
+    ``"0"``, ``None`` and junk — is False.
+
+    Use it for values read out of *state payloads and database rows* — files and
+    tables a program writes, where a string in a boolean slot is corruption. Do
+    **not** use it for settings a human authored (``config.yaml``, SKILL.md
+    frontmatter): upstream reads those truthily when it decides what to do, so a
+    strict read here would describe a policy the agent does not actually apply.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        # NaN and the infinities are not booleans any writer produces, and both
+        # compare unequal to zero: a JSON ``NaN`` would otherwise read as set.
+        return math.isfinite(value) and value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in _TRUTHY_STATE_VALUES
+    return False
+
+
 def _coerce_float(value: object) -> float:
     if isinstance(value, bool):
         return float(value)
@@ -241,3 +273,31 @@ def _optional_epoch(value: object) -> float | None:
     """
     coerced = _coerce_float(value)
     return coerced if coerced > 0.0 else None
+
+
+# Bound on a JSON column read out of a database. The column itself can hold
+# megabytes (SQLite does not enforce a length), and the payload is rendered, so
+# anything past this reads as absent rather than being parsed. A 64 KiB cap
+# comfortably holds a real goal's full contract and subgoal list.
+_JSON_COLUMN_MAX_BYTES = 64 * 1024
+
+
+def _json_object_capped(
+    raw: object, max_bytes: int = _JSON_COLUMN_MAX_BYTES
+) -> dict[str, Any] | None:
+    """Decode a JSON object column, refusing payloads over ``max_bytes``.
+
+    None means "no usable object" — absent, over the cap, malformed, or not a
+    JSON object — which lets callers distinguish that from a genuine ``{}``.
+    ``RecursionError`` joins the suppressed set because nesting deep enough to
+    exhaust the decoder is just more junk: it must not fail the source.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    if len(raw.encode("utf-8", errors="replace")) > max_bytes:
+        return None
+    with contextlib.suppress(json.JSONDecodeError, ValueError, RecursionError):
+        decoded = json.loads(raw)
+        if isinstance(decoded, dict):
+            return decoded
+    return None

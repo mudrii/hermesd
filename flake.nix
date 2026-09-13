@@ -3,9 +3,10 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/c043004d1c6985732bcc1cbc5a9c9aecbbb4e0f0";
+    nixpkgsIntelDarwin.url = "github:NixOS/nixpkgs/8029b6c369415ee1ef02a86f352806348f104db9";
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, nixpkgsIntelDarwin }:
     let
       systems = [
         "aarch64-darwin"
@@ -13,17 +14,24 @@
         "x86_64-darwin"
         "x86_64-linux"
       ];
-      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      pkgsFor = system:
+        if system == "x86_64-darwin"
+        then import nixpkgsIntelDarwin {
+          inherit system;
+          # The supported 26.05 Darwin package set still marks Intel deprecated,
+          # so opt in explicitly for its remaining support window.
+          config.allowDeprecatedx86_64Darwin = true;
+        }
+        else nixpkgs.legacyPackages.${system};
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f (pkgsFor system));
 
       # Single source of truth for the package version: the flake always reads
       # it from pyproject.toml, so the two cannot drift apart.
       hermesdVersion = pkgs: (pkgs.lib.importTOML ./pyproject.toml).project.version;
 
-      # hermesd's build-system requires hatchling>=1.32,<2 (Core Metadata 2.5;
-      # see pyproject.toml), but the pinned nixpkgs rev tops out at 1.31.0 and
-      # nixos-unstable had not moved past it either. Take hatchling from PyPI
-      # directly, hash-validated, so the Nix build satisfies the same floor as
-      # the locked environments.
+      # The pinned nixpkgs revision provides hatchling 1.31, while the package
+      # requires hatchling>=1.32 for current core metadata. Supply that build
+      # dependency from its hash-verified PyPI wheel.
       mkHatchling = pkgs:
         pkgs.python312.pkgs.buildPythonPackage rec {
           pname = "hatchling";
@@ -56,13 +64,9 @@
 
           build-system = [ (mkHatchling pkgs) ];
 
-          # The published wheel pins its runtime requirements exactly (audit
-          # CI-06); this Nix derivation deliberately satisfies them from
-          # nixpkgs instead, whose in-tree versions (e.g. rich 15) can run
-          # ahead of the locked baseline. The build-time pytest suite and the
-          # installed-CLI smoke are what validate those nixpkgs versions here,
-          # so the wheel-metadata runtime-deps check, which would demand the
-          # uv.lock pins verbatim, does not apply to this channel.
+          # PyPI installs use the exact runtime pins in pyproject.toml. Nix
+          # supplies its own package-set versions and validates that set with
+          # the build-time test suite and installed CLI smoke below.
           dontCheckRuntimeDeps = true;
 
           dependencies = with python.pkgs; [
@@ -74,13 +78,16 @@
           # The package build itself executes the pytest suite (checkPhase),
           # so `nix build .#hermesd` and `nix flake check` both prove that the
           # packaged code passes its tests — not merely that it evaluates.
-          # git is a hermesd runtime dependency (checkpoint summaries) and the
-          # test fixtures build bare checkpoint repos, so it must be on PATH
-          # in the sandbox.
           nativeCheckInputs = [
             python.pkgs.pytestCheckHook
+            python.pkgs.packaging
             pkgs.git
           ];
+          pytestFlags = [ "tests" ];
+
+          # Checkpoint collection invokes git after installation, so keep it
+          # on PATH for consumers of the Nix application as well as tests.
+          makeWrapperArgs = [ "--prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git ]}" ];
 
           meta = with pkgs.lib; {
             description = "TUI monitoring dashboard for Hermes AI agent";
@@ -143,6 +150,37 @@
                 echo "installed hermesd does not report version $expectedVersion" >&2
                 exit 1
               }
+              touch "$out"
+            '';
+
+          # Set up the fixture with an absolute git path, then rely on the
+          # installed hermesd wrapper to provide git to checkpoint collection.
+          hermesd-checkpoint-smoke = pkgs.runCommand "hermesd-checkpoint-smoke"
+            {
+              nativeBuildInputs = [ hermesd ];
+              meta.timeout = 300;
+            }
+            ''
+              home="$TMPDIR/.hermes"
+              workdir="$TMPDIR/workspaces/project-alpha"
+              repo="$home/checkpoints/smoke000000000000"
+              mkdir -p "$home"/{logs,sessions,skills,memories,cron} "$workdir" "$repo"
+              echo "$workdir" > "$repo/HERMES_WORKDIR"
+
+              git_bin=${pkgs.git}/bin/git
+              "$git_bin" init --quiet --bare "$repo"
+              "$git_bin" --git-dir "$repo" --work-tree "$workdir" config user.email smoke@example.invalid
+              "$git_bin" --git-dir "$repo" --work-tree "$workdir" config user.name "Smoke Test"
+              echo "checkpoint smoke" > "$workdir/notes.txt"
+              "$git_bin" --git-dir "$repo" --work-tree "$workdir" add -A
+              "$git_bin" --git-dir "$repo" --work-tree "$workdir" commit --quiet -m "checkpoint 0"
+              echo "checkpoint smoke v1" > "$workdir/notes.txt"
+              "$git_bin" --git-dir "$repo" --work-tree "$workdir" add -A
+              "$git_bin" --git-dir "$repo" --work-tree "$workdir" commit --quiet -m "checkpoint 1"
+
+              hermesd --hermes-home "$home" --snapshot-panel 4 --no-color > snapshot.txt
+              grep -F "Checkpoints (1)" snapshot.txt > /dev/null
+              grep -F "checkpoint 1" snapshot.txt > /dev/null
               touch "$out"
             '';
         });

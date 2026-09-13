@@ -58,7 +58,9 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             )
             suffix = f" (+{extra} more)" if extra > 0 else ""
             lines.append("  Orphan Profiles: ", style=theme.ui_label)
-            lines.append(f"{escape(orphans)}{suffix}\n", style=theme.ui_warn)
+            # Text.append never parses Rich markup, so only terminal controls
+            # are stripped here; escaping would show literal backslashes.
+            lines.append(f"{sanitize_terminal_text(orphans)}{suffix}\n", style=theme.ui_warn)
         tripped_ids = [
             task.task_id
             for task in (
@@ -73,7 +75,9 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             extra = len(tripped_ids) - len(shown)
             suffix = f" (+{extra} more)" if extra > 0 else ""
             lines.append("  Breaker Tripped: ", style=theme.ui_label)
-            lines.append(f"{escape(', '.join(shown))}{suffix}\n", style=theme.ui_error)
+            lines.append(
+                f"{sanitize_terminal_text(', '.join(shown))}{suffix}\n", style=theme.ui_error
+            )
         lines.append("  Dispatch: ", style=theme.ui_label)
         lines.append(
             "gateway" if kanban.dispatch_in_gateway else "disabled",
@@ -128,6 +132,16 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
 
     if kanban.notify_backlog_subs:
         sections.append(section_heading("Notify Backlog", theme))
+        if kanban.notify_backlog_sub_count > len(kanban.notify_backlog_subs):
+            # Same disclosure rule as every bounded list: a cap must not read
+            # as the whole backlog.
+            sections.append(
+                Text(
+                    f"  showing {len(kanban.notify_backlog_subs)} of "
+                    f"{kanban.notify_backlog_sub_count} subscriptions with a backlog",
+                    style=theme.banner_text,
+                )
+            )
         sections.append(_notify_backlog_table(kanban, theme))
 
     if kanban.recent_runs:
@@ -180,6 +194,15 @@ def _summary_table(kanban: KanbanState, theme: Theme) -> Table:
             else "0 unseen"
         )
         summary.add_row("Notify Backlog", backlog)
+    if kanban.notify_platform_counts:
+        # Named platforms only reach the panel here: the backlog table lists the
+        # worst subscriptions, which says nothing about who is watching at all.
+        platforms = " · ".join(
+            f"{name} {count}" for name, count in sorted(kanban.notify_platform_counts.items())
+        )
+        if kanban.notify_platforms_truncated:
+            platforms += " · truncated"
+        summary.add_row("Notify Platforms", escape(platforms))
     if kanban.notify_orphan_profile_count:
         summary.add_row(
             "Orphan Profiles",

@@ -6,9 +6,9 @@ from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 
-from hermesd.collect.common import _age_seconds, _as_dict, _as_list, _coerce_int
+from hermesd.collect.common import _age_seconds, _as_dict, _as_list, _coerce_bool, _coerce_int
 from hermesd.collect.redaction import _API_KEY_FIELD_NAMES, _OAUTH_FIELD_NAMES
-from hermesd.models import ConfigBackupGroup, PlatformStatus
+from hermesd.models import ConfigBackupGroup, ConfigBackupKind, PlatformStatus
 
 # Upper bound on name lists surfaced from config/cache mappings.
 _MAX_LISTED_NAMES = 20
@@ -160,18 +160,30 @@ _CONFIG_BACKUP_ENTRY_LIMIT = 512
 _GOOD_REASON = "good"
 _CORRUPT_REASON = "corrupt"
 
+# Display ranking for the group cap. "good" and "corrupt" are single reasons,
+# so ranking them first means the cap can never evict the "last changed" stamp
+# or the corrupt alert; the bulk audit trail (setup/migration/other) absorbs
+# the truncation instead.
+_KIND_RANK = {
+    ConfigBackupKind.GOOD: 0,
+    ConfigBackupKind.CORRUPT: 1,
+    ConfigBackupKind.SETUP: 2,
+    ConfigBackupKind.MIGRATION: 3,
+    ConfigBackupKind.OTHER: 4,
+}
 
-def _backup_reason_kind(reason: str) -> str:
+
+def _backup_reason_kind(reason: str) -> ConfigBackupKind:
     """Coarse bucket for the audit trail: setup/migration stamps vs the rest."""
     if reason == _GOOD_REASON:
-        return _GOOD_REASON
+        return ConfigBackupKind.GOOD
     if reason == _CORRUPT_REASON:
-        return _CORRUPT_REASON
+        return ConfigBackupKind.CORRUPT
     if reason.startswith("pre-setup"):
-        return "setup"
+        return ConfigBackupKind.SETUP
     if "migrate" in reason:
-        return "migration"
-    return "other"
+        return ConfigBackupKind.MIGRATION
+    return ConfigBackupKind.OTHER
 
 
 def _config_backup_stamp_epoch(stamp: str) -> float | None:
@@ -198,20 +210,15 @@ def _config_backup_groups(
     Names are what the backups directory listed (any order); each group keeps
     its full count and its newest stamp. Junk and hand-named copies
     (``config.yaml.bak-my-note``) are skipped — only the writer's own naming
-    scheme carries a reason. Both caps are display hygiene for a hostile
-    directory: the entry cap bounds the scan, the group cap bounds the model,
-    and either firing marks the result truncated.
+    scheme carries a reason. The entry cap bounds the *caller's* directory scan
+    (the collector slices before calling), so this function only applies the
+    display cap on the number of groups and marks the result truncated when it
+    fires. Groups come back ranked by kind (``_KIND_RANK``) so that cap always
+    keeps the load-bearing ``good`` and ``corrupt`` rows and drops audit-trail
+    bulk instead.
     """
-    kept: list[str] = []
-    scan_truncated = False
-    for name in names:
-        if len(kept) >= _CONFIG_BACKUP_ENTRY_LIMIT:
-            scan_truncated = True
-            break
-        kept.append(name)
-
     stamps_by_reason: dict[str, list[tuple[str, float]]] = {}
-    for name in kept:
+    for name in names:
         if not name.startswith(_BACKUP_CONFIG_PREFIX):
             continue
         reason, separator, stamp = name[len(_BACKUP_CONFIG_PREFIX) :].rpartition(".")
@@ -222,8 +229,8 @@ def _config_backup_groups(
             continue
         stamps_by_reason.setdefault(reason, []).append((stamp, epoch))
 
-    groups = []
-    for reason, stamps in sorted(stamps_by_reason.items()):
+    groups: list[ConfigBackupGroup] = []
+    for reason, stamps in stamps_by_reason.items():
         stamps.sort()
         newest_stamp, newest_epoch = stamps[-1]
         groups.append(
@@ -235,18 +242,22 @@ def _config_backup_groups(
                 newest_age_seconds=_age_seconds(newest_epoch, now),
             )
         )
-    truncated = scan_truncated or len(groups) > _CONFIG_BACKUP_GROUP_LIMIT
+    groups.sort(key=lambda group: (_KIND_RANK[group.kind], group.reason))
+    truncated = len(groups) > _CONFIG_BACKUP_GROUP_LIMIT
     return groups[:_CONFIG_BACKUP_GROUP_LIMIT], truncated
 
 
 def _provider_free_tier(entry: dict[str, Any]) -> bool:
-    """The Nous free-tier identity: ``auth_method`` and ``account_tier`` both
-    "anonymous" (``hermes_cli/anon_auth.py:39-41``, ``is_guest_state`` at
-    ``:88-89``, minted state at ``:271-272``). Key names only — the entry's
-    token values are never read, and a dead guest credential is removed rather
-    than marked, so the tier simply disappears when it lapses.
+    """The Nous free-tier identity: an anonymous credential.
+
+    Mirrors ``is_guest_state`` (``hermes_cli/anon_auth.py:88-89``), which keys
+    on ``auth_method == ANON_AUTH_METHOD`` alone — the tier is a consequence of
+    the credential, not a second condition, and an upgrade rewrites
+    ``auth_method`` in place (``:647,756``). Key names only — the entry's token
+    values are never read, and a dead guest credential is removed rather than
+    marked, so the tier simply disappears when it lapses.
     """
-    return entry.get("auth_method") == "anonymous" and entry.get("account_tier") == "anonymous"
+    return entry.get("auth_method") == "anonymous"
 
 
 def _provider_model_label(cfg: dict[str, Any]) -> str:
@@ -354,7 +365,13 @@ def _stale_alias_count(aliases: dict[str, Any]) -> int:
     for entries in aliases.values():
         for value in _as_dict(entries).values():
             entry = _as_dict(value)
-            if entry and bool(entry.get("stale") or entry.get("is_stale") or entry.get("expired")):
+            # State payload written by the gateway: a stringified flag is
+            # corruption, never truth (``bool("false")`` is True).
+            if entry and (
+                _coerce_bool(entry.get("stale"))
+                or _coerce_bool(entry.get("is_stale"))
+                or _coerce_bool(entry.get("expired"))
+            ):
                 count += 1
     return count
 

@@ -139,6 +139,9 @@ class PlatformStatus(BaseModel):
     # gateway/status.py:951-974), where a client reaches the profile on the
     # default listener. Empty unless the writer is live and the adapter serves.
     mirror_urls: dict[str, str] = Field(default_factory=dict)
+    # The synthesized roster is sliced to a display bound, so a short list must
+    # not read as the complete set of served profiles.
+    mirror_urls_truncated: bool = False
     # Per-entry writer provenance. Absent on a gateway that predates the stamps,
     # which is why ownership defaults to unverifiable rather than current.
     writer_pid: int | None = None
@@ -225,11 +228,14 @@ class GatewayState(BaseModel):
     prior_suspected_oom: bool = False
     # Respawn-storm ledger (gateway-starts.log). The file records one epoch per
     # start; an absent file is NOT evidence of zero restarts, because
-    # HERMES_GATEWAY_MAX_STARTS<=0 disables the writer.
+    # HERMES_GATEWAY_MAX_STARTS<=0 disables the writer. ``window`` counts starts
+    # inside the configured ``gateway.respawn_storm.window_seconds`` (120 s by
+    # default), which is also what ``in_respawn_backoff`` compares against the cap.
     gateway_starts_recorded: bool = False
-    gateway_starts_2m: int = 0
+    gateway_starts_window: int = 0
     gateway_starts_1h: int = 0
     restart_storm_cap: int = 0
+    restart_storm_window_seconds: float = 0.0
     seconds_since_last_gateway_start: float | None = None
     in_respawn_backoff: bool = False
     # Exit diagnostics ledger (logs/gateway-exit-diag.log): one JSON object per
@@ -586,7 +592,8 @@ class GatewayHygieneState(BaseModel):
 
     Writers increment the streak per failed hygiene run
     (``hermes_state_gateway.py:513-529``); the consumer escalates a cooldown
-    ladder x1/x3/x9 over the 300s base, clamped at 3600s
+    ladder x1/x3/x9 over the default 300s base (``hygiene_failure_cooldown_seconds``),
+    clamped at 3600s
     (``gateway/run.py:101-149``), so a streak of 3+ effectively disables
     pre-turn compaction for up to an hour. Rows are deleted only when a
     compression actually recovers the chat (``gateway/run.py:152-167``).
@@ -680,11 +687,14 @@ class TerminalSessionReadout(BaseModel):
     """Bounded recent terminal breadcrumbs plus the 24h file count.
 
     ``count`` covers every breadcrumb within the 24-hour window even when
-    ``sessions`` is truncated to the newest rows.
+    ``sessions`` is truncated to the newest rows. When the directory itself
+    exceeded the scan bound, ``truncated`` marks ``count`` as a lower bound and
+    the panel says so rather than presenting a partial scan as the total.
     """
 
     sessions: list[TerminalBreadcrumb] = Field(default_factory=list)
     count: int = 0
+    truncated: bool = False
 
 
 class SessionCoordinationState(BaseModel):
@@ -701,6 +711,8 @@ class SessionCoordinationState(BaseModel):
     leases: list[SessionLease] = Field(default_factory=list)
     lease_total: int = 0
     hygiene: list[GatewayHygieneState] = Field(default_factory=list)
+    # Exact count of chats with a non-zero failure streak; ``hygiene`` is capped.
+    hygiene_total: int = 0
     routes: list[GatewayRouteState] = Field(default_factory=list)
     route_total: int = 0
     generations: list[ConversationGeneration] = Field(default_factory=list)
@@ -759,10 +771,11 @@ class ActiveSurface(BaseModel):
     # present (``hermes_cli/shared_session_attach.py:32-47`` — presence is the
     # whole signal; the handshake is HTTP and hermesd never probes it). The URL
     # itself is deliberately not stored: only gateway surfaces that advertise it
-    # show the joinable chip. Gateway leases record surface "gateway:<platform>"
-    # (``gateway/run_busy.py:187``) and bot delivery consumers carry
-    # metadata.bot_live_delivery_consumer
-    # (``tui_gateway/session_lifecycle.py:36``).
+    # show the joinable chip. ``surface`` is carried verbatim, never
+    # allowlisted, so gateway leases recording "gateway:<platform>"
+    # (``gateway/run_busy.py:187``) and bot delivery consumers carrying
+    # metadata.bot_live_delivery_consumer (``tui_gateway/session_lifecycle.py:36``)
+    # both render as written.
     joinable: bool = False
 
     @computed_field  # type: ignore[prop-decorator]
@@ -1123,6 +1136,21 @@ class ToolGatewayRoute(BaseModel):
     token_present: bool = False
 
 
+class ConfigBackupKind(StrEnum):
+    """Fixed vocabulary for a backup group's coarse bucket.
+
+    Derived from the writer's reason word (``hermes_cli/config_backups.py:29-69``):
+    ``good``/``corrupt`` are the load-bearing states, ``setup`` and ``migration``
+    are the audit trail, and anything else the naming scheme allows is ``other``.
+    """
+
+    GOOD = "good"
+    CORRUPT = "corrupt"
+    SETUP = "setup"
+    MIGRATION = "migration"
+    OTHER = "other"
+
+
 class ConfigBackupGroup(BaseModel):
     """One backup-reason group inside ``backups/config/``.
 
@@ -1134,7 +1162,7 @@ class ConfigBackupGroup(BaseModel):
     """
 
     reason: str
-    kind: str = ""
+    kind: ConfigBackupKind = ConfigBackupKind.OTHER
     count: int = 0
     newest_stamp: str = ""
     newest_age_seconds: float | None = None
@@ -1256,9 +1284,10 @@ class ProviderInfo(BaseModel):
     name: str
     is_active: bool = False
     # The Nous free-tier identity marker: providers.<name> with
-    # auth_method == "anonymous" and account_tier == "anonymous"
-    # (hermes_cli/anon_auth.py:39-41,88-89). Presence of the marker only — the
-    # state's token values are never read, and quota state never reaches disk.
+    # auth_method == "anonymous" (hermes_cli/anon_auth.py:39-41,88-89), which
+    # is the single condition upstream's is_guest_state tests. Presence of the
+    # marker only — the state's token values are never read, and quota state
+    # never reaches disk.
     free_tier: bool = False
 
 
@@ -1461,8 +1490,11 @@ class SkillsMemory(BaseModel):
     skills: list[SkillInfo] = Field(default_factory=list)
     # cache/plugin-catalog.json — the live catalog's view of the installed
     # plugins above. Absent cache means the drift/removal checks made no
-    # claims this pass, which must not read as "everything is current".
+    # claims this pass, which must not read as "everything is current" — and
+    # neither may a present-but-unreadable one (`usable` False: the payload is
+    # not the ``{"entries": [...]}`` object upstream writes).
     plugin_catalog_cache_present: bool = False
+    plugin_catalog_cache_usable: bool = False
     plugin_catalog_cache_age_seconds: float | None = None
     plugin_catalog_update_count: int = 0
     plugin_catalog_removed_count: int = 0
@@ -1689,10 +1721,11 @@ class KanbanTaskSummary(BaseModel):
     # (tools/kanban_tools_schemas.py:461-464), so a done-looking review card
     # may be waiting on CI rather than finished.
     completion_contract: str = ""
-    # Per-task breaker trip count (NULL upstream -> 0 here). This is the
+    # Per-task breaker trip threshold: the raw column, so NULL ("no override")
+    # stays distinct from a stored 0 ("trip on the first failure"). This is the
     # failure count at which the breaker trips, not a retry budget
     # (hermes_cli/kanban_db.py:908-914).
-    max_retries: int = 0
+    max_retries: int | None = None
     # Effective trip threshold and verdict for this task, computed against the
     # configured kanban.failure_limit at collect time.
     breaker_limit: int = 0
@@ -1720,10 +1753,11 @@ class KanbanTaskLink(BaseModel):
 class KanbanNotifySubSummary(BaseModel):
     """One task notification subscription and its unseen-event backlog.
 
-    The gateway kanban-notifier claims task_events with ``id > last_event_id``
-    per subscription (``hermes_cli/kanban_db_notify.py:186-232``); ``backlog``
-    is ``max(task_events.id) - last_event_id``, so a backlog that only grows
-    means the watcher that owns the sub is wedged or gone.
+    The gateway kanban-notifier claims *this task's* task_events with
+    ``task_id = ? AND id > last_event_id`` (``hermes_cli/kanban_db_notify.py:310-337``);
+    ``backlog`` counts those rows, so a backlog that only grows means the
+    watcher that owns the sub is wedged or gone. ``max_event_id`` is the task's
+    newest event id, not the backlog source.
     """
 
     task_id: str = ""
@@ -1772,8 +1806,13 @@ class KanbanState(BaseModel):
     # Notify subscriptions (kanban_notify source over kanban_notify_subs).
     notify_sub_count: int = 0
     notify_platform_counts: dict[str, int] = Field(default_factory=dict)
+    # True when notify_platform_counts was cut to its busiest entries.
+    notify_platforms_truncated: bool = False
     notify_backlog_total: int = 0
     notify_max_backlog: int = 0
+    # Subscriptions holding any unseen event: the exact count behind the
+    # capped worst-ten notify_backlog_subs list.
+    notify_backlog_sub_count: int = 0
     notify_backlog_subs: list[KanbanNotifySubSummary] = Field(default_factory=list)
     notify_orphan_profile_count: int = 0
     notify_orphan_profiles: list[str] = Field(default_factory=list)
@@ -1900,7 +1939,9 @@ class DelegationLiveManifest(BaseModel):
     per-task status. This is the *manifest*, not the live roster — tool counts,
     steer state and depth exist only in gateway memory and over RPC, so nothing
     here claims to show them. ``dir_age_seconds`` comes from the directory
-    mtime, which is the only liveness signal hermesd has.
+    mtime, which is the dispatch write time; appending a ``task-<index>.log`` or
+    rewriting the manifest does not advance it, so this is a *dispatched* age,
+    not a liveness signal.
     """
 
     delegation_id: str = ""
@@ -2311,7 +2352,17 @@ PROCESS_RECEIPT_MAX_FILES: int = 64
 # overdue at 2x the interval — a stale marker is a missed wrapper run, not proof
 # of anything about the store itself.
 CHECKPOINT_PRUNE_INTERVAL_SECONDS: int = 24 * 60 * 60
-CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS: int = 2 * CHECKPOINT_PRUNE_INTERVAL_SECONDS
+
+
+def checkpoint_prune_overdue_after(interval_seconds: float) -> float:
+    """When a prune marker counts as missed: twice the *effective* cadence.
+
+    The wrapper short-circuits within ``min_interval_hours`` of the marker, so
+    the overdue window follows ``checkpoints.min_interval_hours`` when it is set
+    (``tools/checkpoint_manager.py:1094``) instead of a hardcoded default. One
+    helper so the verdict and the bound the panel prints cannot disagree.
+    """
+    return 2 * interval_seconds
 
 
 class ProcessReceipt(BaseModel):
@@ -2394,6 +2445,10 @@ class OperationsState(BaseModel):
     # the last-good card list instead of blanking the panel.
     delegation_live_manifests: list[DelegationLiveManifest] = Field(default_factory=list)
     delegation_live_manifest_count: int = 0
+    # Counted run dirs whose manifest could not be read into a card (over the
+    # parse cap, torn, or not JSON). The count above is presence-based, so
+    # without this the difference is invisible.
+    delegation_live_unparsed_count: int = 0
     state_db_schema_version: int = 0
     state_db_size_bytes: int = 0
     state_db_wal_size_bytes: int = 0
@@ -2426,6 +2481,10 @@ class OperationsState(BaseModel):
     # (``tools/checkpoint_manager.py:1094-1130``).
     checkpoint_prune_marker_present: bool = False
     checkpoint_prune_marker_age_seconds: float | None = None
+    # The effective wrapper cadence: ``checkpoints.min_interval_hours`` from
+    # config.yaml, defaulting to upstream's 24h. The overdue window is 2x this,
+    # so a deliberately slower policy is never reported as a missed pass.
+    checkpoint_prune_interval_seconds: float = float(CHECKPOINT_PRUNE_INTERVAL_SECONDS)
     # ROOT parking bay for an unparseable spawn ledger
     # (``hermes_cli/process_identity.py:160-171``).
     spawn_ledger_corrupt_present: bool = False
@@ -2434,18 +2493,15 @@ class OperationsState(BaseModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def checkpoint_prune_overdue(self) -> bool:
-        """True when a marker exists and is older than the 48h overdue window.
+        """True when a marker exists and is older than twice the configured interval.
 
         Caveat kept with the render copy: a fresh marker proves the wrapper RAN,
         not that pruning succeeded — per-repo failures land in the prune result,
         not in the marker — so this flag is never a store-health verdict.
         """
         age = self.checkpoint_prune_marker_age_seconds
-        return (
-            self.checkpoint_prune_marker_present
-            and age is not None
-            and age > CHECKPOINT_PRUNE_OVERDUE_AFTER_SECONDS
-        )
+        overdue_after = checkpoint_prune_overdue_after(self.checkpoint_prune_interval_seconds)
+        return self.checkpoint_prune_marker_present and age is not None and age > overdue_after
 
 
 class SkillCurationWindow(BaseModel):
