@@ -117,6 +117,7 @@ Upstream paths are relative to `/Users/mudrii/.hermes/hermes-agent/`.
 | `tokens_today` | PROFILE (derived) | `tokens_today` | (session rows) | none | `hermes_state.py:160,178` | agrees | UNPINNED |
 | `tokens_total` | PROFILE (derived) | `tokens_total` | (session rows) | none | `hermes_state.py:160,178` | agrees | UNPINNED |
 | `token_analytics` | PROFILE (derived) | `token_analytics` | (session rows) | none | `hermes_state.py:160,178` | agrees | UNPINNED |
+| `usage_analytics` | PROFILE (derived) | `usage_analytics` | (session rows, incl. `git_repo_root` `hermes_state_common.py:366`) | none | `hermes_state.py:160,178`; semantics mirror `agent/insights.py:378-421,441-453` (platforms, local-time activity, top sessions) and `hermes_cli/web_routers/analytics.py:79-97` (daily series) | agrees | UNPINNED |
 | `tool_stats` | PROFILE (derived) | `tool_stats` | (session rows) | none | `hermes_state.py:160,178` | agrees | UNPINNED |
 | `tool_call_total` | PROFILE (derived) | `total_tool_calls` | (session rows) | none | `hermes_state.py:160,178` | agrees | UNPINNED |
 | `model_usage` | PROFILE (derived) | `token_analytics.usage_source`, `token_analytics.model_usage_*` | (session rows: `session_model_usage`) | none | `hermes_state.py:160,178` | agrees | UNPINNED |

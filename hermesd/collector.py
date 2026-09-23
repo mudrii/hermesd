@@ -213,6 +213,7 @@ from hermesd.collect.sessions import (
     _summarize_tokens,
     _summarize_window,
     _tool_names_from_entries,
+    _usage_analytics,
 )
 from hermesd.collect.skills import (
     _count_skills,
@@ -297,6 +298,7 @@ from hermesd.models import (
     ToolGatewayRoute,
     ToolsetAvailability,
     ToolStats,
+    UsageAnalytics,
 )
 from hermesd.paths import HermesPaths
 from hermesd.theme import normalize_skin_name
@@ -1046,6 +1048,16 @@ class Collector:
                     deps=self._window_time_bucket,
                 ),
                 TokenAnalytics,
+            ),
+            _SourceSpec(
+                "usage_analytics",
+                "usage_analytics",
+                derived(
+                    "usage_analytics",
+                    self._collect_usage_analytics,
+                    deps=self._window_time_bucket,
+                ),
+                UsageAnalytics,
             ),
             _SourceSpec(
                 "tool_stats",
@@ -1991,6 +2003,7 @@ class Collector:
                 last_activity_description=r.get("last_activity_description") or "",
                 actual_cost_usd=_coerce_float(r.get("actual_cost_usd")),
                 cost_source=r.get("cost_source") or "",
+                transport_profile=r.get("transport_profile") or "",
                 compression_failure_error=r.get("compression_failure_error") or "",
                 # 0 and NULL both mean "no deadline" — see _optional_epoch.
                 compression_failure_cooldown_until=_optional_epoch(
@@ -2266,6 +2279,9 @@ class Collector:
             by_endpoint=_summarize_breakdown(rows, key_name="billing_base_url"),
             cost_status_counts=_count_cost_statuses(rows),
         )
+
+    def _collect_usage_analytics(self, rows: list[dict[str, Any]]) -> UsageAnalytics:
+        return _usage_analytics(rows, now=self._clock())
 
     def _collect_tool_stats(
         self,

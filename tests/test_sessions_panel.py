@@ -12,12 +12,14 @@ from hermesd.models import (
     GatewayHygieneState,
     GatewayRouteState,
     ProcessLiveness,
+    RepoActivity,
     SessionCoordinationState,
     SessionInfo,
     SessionLease,
     SessionLeaseKind,
     TerminalBreadcrumb,
     TerminalSessionReadout,
+    UsageAnalytics,
 )
 from hermesd.panels.sessions import render_sessions
 from hermesd.theme import Theme
@@ -1115,3 +1117,66 @@ def test_empty_message_filter_does_not_hide_sessions(query: str) -> None:
     sessions = [_session(session_id="sess_one", started_at=_NOW - 60)]
 
     assert sessions_module._filter_sessions(sessions, query, set()) == sessions
+
+
+def test_sessions_detail_lists_repositories_by_escaped_basename() -> None:
+    state = DashboardState(
+        usage_analytics=UsageAnalytics(
+            repos=[
+                RepoActivity(repo_root="/Users/me/src/hermesd", sessions_7d=3, sessions_30d=9),
+                RepoActivity(repo_root="/tmp/[b]evil[x]\x1b[2J/", sessions_7d=0, sessions_30d=1),
+            ]
+        )
+    )
+
+    rendered = render_to_str(render_sessions(state, Theme(), detail=True), width=140)
+
+    assert "Repositories" in rendered
+    repo_line = next(line for line in rendered.splitlines() if "hermesd" in line)
+    assert "3" in repo_line
+    assert "9" in repo_line
+    assert "/Users/me/src" not in rendered
+    assert "[b]evil[x]" in rendered
+    assert "\x1b[2J" not in rendered
+
+
+def test_sessions_detail_omits_repositories_without_data() -> None:
+    rendered = render_to_str(render_sessions(DashboardState(), Theme(), detail=True), width=140)
+    assert "Repositories" not in rendered
+    assert "Activity by Hour" not in rendered
+
+
+def test_sessions_detail_shows_hour_of_day_sparkline_and_peak() -> None:
+    hourly = [0] * 24
+    hourly[14] = 8
+    hourly[9] = 2
+    state = DashboardState(usage_analytics=UsageAnalytics(hourly_sessions_7d=hourly))
+
+    rendered = render_to_str(render_sessions(state, Theme(), detail=True), width=140)
+
+    assert "Activity by Hour (7d, local)" in rendered
+    assert "▁" * 9 + "▃" + "▁" * 4 + "█" + "▁" * 9 in rendered
+    assert "peak 14:00 (8)" in rendered
+
+
+def test_sessions_detail_shows_transport_profile_when_set() -> None:
+    sessions = [
+        SessionInfo(session_id="sess_bot_0001", transport_profile="[b]work-bot[/b]"),
+        SessionInfo(session_id="sess_cli_0002", display_name="plain"),
+    ]
+
+    rendered = render_to_str(
+        render_sessions(DashboardState(sessions=sessions), Theme(), detail=True), width=160
+    )
+
+    assert "Via" in rendered
+    bot_line = next(line for line in rendered.splitlines() if "ot_0001" in line)
+    assert "[b]work-bot[/b]" in bot_line
+
+
+def test_sessions_detail_hides_via_column_when_no_transport_profile() -> None:
+    sessions = [SessionInfo(session_id="sess_cli_0002", display_name="plain")]
+    rendered = render_to_str(
+        render_sessions(DashboardState(sessions=sessions), Theme(), detail=True), width=160
+    )
+    assert "Via" not in rendered

@@ -362,6 +362,10 @@ class HermesDB:
             "compression_fallback_streak",
             "compression_ineffective_count",
             "compression_recovery_deadline",
+            # Analytics columns (hermes_state_common.py:366,391); absent on
+            # databases written before they landed.
+            "git_repo_root",
+            "transport_profile",
         ]
         available = self._session_column_set(conn)
         return [column for column in wanted_columns if column in available]
