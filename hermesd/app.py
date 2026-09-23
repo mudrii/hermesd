@@ -395,9 +395,6 @@ class DashboardApp:
     def render_current_view_text(self) -> str:
         return self._capture_layout_text(refresh=False)
 
-    def render_snapshot(self, panel_num: int | None = None) -> None:
-        self._console.print(self.render_snapshot_text(panel_num=panel_num), end="")
-
     def copy_current_view(self) -> str:
         copied_text = _truncate_for_osc52(self.render_current_view_text())
         sequence = _osc52_sequence(copied_text)

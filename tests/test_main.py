@@ -197,9 +197,6 @@ def test_main_snapshot_stdout_renders_once(populated_hermes_home: Path, capsys, 
         def render_snapshot_json(self, panel_num=None):
             raise AssertionError("json renderer should not be used")
 
-        def render_snapshot(self, panel_num=None):
-            raise AssertionError("stdout path should print the captured snapshot text")
-
         def close(self):
             nonlocal closed
             closed = True

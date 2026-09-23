@@ -1575,17 +1575,6 @@ def test_jump_bottom_clamps_to_first_stream_when_sub_view_missing(populated_herm
     app.close()
 
 
-def test_render_snapshot_prints_to_console(populated_hermes_home: Path):
-    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
-    buffer = io.StringIO()
-    app._console = Console(file=buffer, width=120, height=48, force_terminal=True, no_color=True)
-    app.render_snapshot()
-    out = buffer.getvalue()
-    assert "Gateway & Platforms" in out
-    assert "Memory" in out
-    app.close()
-
-
 def test_collector_loop_updates_state_on_successful_collect(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     real_collector = app._collector
