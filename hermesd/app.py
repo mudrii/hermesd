@@ -26,6 +26,7 @@ from hermesd.collector import Collector
 from hermesd.defaults import DEFAULT_LOG_TAIL_BYTES, DEFAULT_REFRESH_RATE
 from hermesd.models import DashboardState
 from hermesd.panels import PANEL_NAMES, render_panel
+from hermesd.panels.operations import estop_banner
 from hermesd.theme import Theme, load_theme
 
 _LOG_VIEWS = ("agent", "gateway", "errors", "cron")
@@ -858,6 +859,11 @@ class DashboardApp:
         now = datetime.now().strftime("%H:%M:%S")
         t = Text(style=f"on {bg}")
         t.append(f" ⚕ hermesd {__version__}", style=f"bold {active_theme.banner_title} on {bg}")
+        if state.runtime.estop_engaged:
+            t.append(
+                f"  {estop_banner(state.runtime)}",
+                style=f"bold {active_theme.ui_error} on {bg}",
+            )
         if state.runtime.banner:
             t.append(
                 f"  {state.runtime.banner}",

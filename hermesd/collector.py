@@ -242,6 +242,7 @@ from hermesd.collect.system import (
     _lease_age_seconds,
     _observed_process_start_times,
     _pid_exists,
+    _read_estop,
     _surface_liveness,
 )
 from hermesd.db import HermesDB
@@ -442,6 +443,7 @@ _DELEGATION_LIVE_FIELDS = (
     "delegation_live_unparsed_count",
 )
 _PROCESS_RECEIPT_FIELDS = ("process_receipts",)
+_ESTOP_FIELDS = ("estop_engaged", "estop_reason", "estop_age_seconds", "estop_scope")
 _STATE_SNAPSHOT_FIELDS = (
     "snapshot_count",
     "snapshot_total_bytes",
@@ -1314,6 +1316,18 @@ class Collector:
                 "runtime",
                 lambda: self._collect_runtime_status(results["gateway"], results["sessions"]),
                 RuntimeStatus,
+            ),
+            # Second writer of `runtime`: the ESTOP sentinel is a separate file
+            # read on its own source, so a stat failure keeps the last-good pause
+            # state instead of silently reporting "not paused".
+            _SourceSpec(
+                "runtime",
+                "estop",
+                lambda: self._with_estop(results["runtime"]),
+                lambda: results["runtime"],
+                fallback=lambda: self._last_source_fields(
+                    "estop", results["runtime"], _ESTOP_FIELDS
+                ),
             ),
         )
 
@@ -4342,6 +4356,10 @@ class Collector:
             last_activity_age_seconds=last_activity_age,
             banner=banner,
         )
+
+    def _with_estop(self, runtime: RuntimeStatus) -> RuntimeStatus:
+        """Merge the ESTOP sentinel (``agent/estop.py``) into the runtime status."""
+        return runtime.model_copy(update=_read_estop(self._paths, self._clock()))
 
     def _summarize_profile(self, name: str, profile_home: Path) -> ProfileSummary:
         db_path = profile_home / "state.db"

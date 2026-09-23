@@ -2609,6 +2609,15 @@ class RuntimeStatus(BaseModel):
     agent_running: bool = False
     last_activity_age_seconds: float | None = None
     banner: str = ""
+    # Global emergency stop (``hermes pause``): the ``ESTOP`` sentinel pauses
+    # NEW cron, kanban and gateway work; in-flight work keeps running
+    # (``agent/estop.py:1-8``). Written by its own ``estop`` source. A profile
+    # process honours its own home first, then the fleet root (``:33-50``);
+    # ``estop_scope`` says which sentinel was found.
+    estop_engaged: bool = False
+    estop_reason: str = ""
+    estop_age_seconds: float | None = None
+    estop_scope: str = ""
 
 
 class DashboardState(BaseModel):

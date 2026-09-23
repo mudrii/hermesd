@@ -25,6 +25,7 @@ from hermesd.models import (
     HostedRoomSummary,
     OperationsState,
     ProcessReceiptsState,
+    RuntimeStatus,
     StateSnapshotSummary,
     checkpoint_prune_overdue_after,
 )
@@ -98,9 +99,25 @@ _LIVE_MANIFEST_NOTE_LINES = (
     "leaves tasks marked running. Tails are redacted again before rendering.",
 )
 
+# Rendered under the ESTOP banner: what a pause does and does not stop.
+_ESTOP_NOTE_LINES = (
+    "hermes pause: cron, the kanban dispatcher and new gateway turns skip new work;",
+    "in-flight work is never killed. `hermes resume` removes the sentinel.",
+)
+
 # Rendered whenever a bounded list was cut short, so a display cap can never be
 # mistaken for the size of the table it came from.
 _TRUNCATION_LABEL = "showing {shown} of {total} — the counts above cover the whole table"
+
+
+def estop_banner(runtime: RuntimeStatus) -> str:
+    """One-line ESTOP banner, terminal-sanitized (plain text, never markup)."""
+    label = "⏸ PAUSED (ESTOP)"
+    if runtime.estop_reason:
+        label = f"{label}: {sanitize_terminal_text(runtime.estop_reason)}"
+    if runtime.estop_age_seconds is not None:
+        label = f"{label}, since {fmt_age_seconds(runtime.estop_age_seconds)} ago"
+    return label
 
 
 def render_operations(state: DashboardState, theme: Theme, detail: bool = False) -> Panel:
@@ -113,6 +130,8 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     ops = state.operations
     model_count = sum(cache.model_count for cache in ops.model_caches)
     lines = Text()
+    if state.runtime.estop_engaged:
+        lines.append(f"  {estop_banner(state.runtime)}\n", style=f"bold {theme.ui_error}")
     lines.append("  Dashboard: ", style=theme.ui_label)
     lines.append(f"{ops.dashboard_process_count} proc\n", style=theme.banner_text)
     lines.append("  Model Caches: ", style=theme.ui_label)
@@ -195,7 +214,11 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
 def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     ops = state.operations
     no_artifacts = _has_no_artifacts(ops)
-    sections: list[RenderableType] = [_summary_table(ops, theme)]
+    sections: list[RenderableType] = []
+    if state.runtime.estop_engaged:
+        sections.append(Text(f"  {estop_banner(state.runtime)}", style=f"bold {theme.ui_error}"))
+        sections.append(_note(_ESTOP_NOTE_LINES, theme))
+    sections.append(_summary_table(ops, theme))
 
     if ops.model_caches:
         sections.append(_heading("Model Caches", theme))

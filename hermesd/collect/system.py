@@ -18,9 +18,13 @@ from hermesd.collect.common import (
     _age_seconds,
     _coerce_float,
     _coerce_int,
+    _excerpt,
+    _iso_to_epoch,
+    _json_object_capped,
     _mtime,
     _mtime_ns,
     _optional_epoch,
+    _read_text_capped,
 )
 from hermesd.models import ProcessLiveness
 from hermesd.paths import HermesPaths
@@ -317,3 +321,49 @@ def _latest_runtime_activity_age(paths: HermesPaths, now: float) -> float | None
     if latest <= 0.0:
         return None
     return max(0.0, now - latest)
+
+
+_ESTOP_SENTINEL_NAME = "ESTOP"
+_ESTOP_REASON_MAX_CHARS = 120
+_ESTOP_MAX_BYTES = 16 * 1024
+
+
+def _read_estop(paths: HermesPaths, now: float) -> dict[str, object]:
+    """The ``ESTOP`` sentinel as RuntimeStatus fields.
+
+    ``hermes pause`` writes ``<home>/ESTOP`` with optional JSON
+    ``{"reason", "engaged_at"}``; any existing file is engaged, including an
+    empty or corrupt one (``agent/estop.py:1-8,64-73``). A profile process
+    checks its own home first, then the fleet root (``:33-50``), so hermesd
+    checks ``profile_path`` then ``shared_path``. Presence is an ``lstat``: a
+    symlinked sentinel still counts, but its target is never read. A stat error
+    other than absence propagates, so the ``estop`` source keeps its last-good
+    value instead of reporting "not paused".
+    """
+    profile_sentinel = paths.profile_path(_ESTOP_SENTINEL_NAME)
+    root_sentinel = paths.shared_path(_ESTOP_SENTINEL_NAME)
+    candidates = [("root", root_sentinel)]
+    if profile_sentinel != root_sentinel:
+        candidates.insert(0, ("profile", profile_sentinel))
+    for scope, path in candidates:
+        try:
+            stat = path.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        home = paths.profile_home if scope == "profile" else paths.root_home
+        data = _json_object_capped(_read_text_capped(path, home), max_bytes=_ESTOP_MAX_BYTES) or {}
+        engaged_at = _iso_to_epoch(data.get("engaged_at"))
+        return {
+            "estop_engaged": True,
+            "estop_reason": _excerpt(data.get("reason") or "", _ESTOP_REASON_MAX_CHARS),
+            "estop_age_seconds": _age_seconds(
+                engaged_at if engaged_at is not None else stat.st_mtime, now
+            ),
+            "estop_scope": scope,
+        }
+    return {
+        "estop_engaged": False,
+        "estop_reason": "",
+        "estop_age_seconds": None,
+        "estop_scope": "",
+    }
