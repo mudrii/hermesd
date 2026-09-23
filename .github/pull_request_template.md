@@ -12,7 +12,7 @@ Brief description of the change.
       `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy hermesd scripts`,
       `uv run python -m compileall hermesd`,
       `uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing`,
-      `uv run pip-audit`, `uv lock --check`, `uv build`, wheel/sdist smoke install,
+      `uv run python scripts/pip_audit_gate.py`, `uv lock --check`, `uv build`, wheel/sdist smoke install,
       `uv run twine check dist/*`
 - [ ] New tests added for new functionality
 - [ ] Tested manually with `hermesd` against a live `~/.hermes/`

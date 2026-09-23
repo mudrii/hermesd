@@ -17,8 +17,12 @@ def test_default_theme_colors():
     assert t.ui_error == "#ef5350"
 
 
-def test_load_theme_default(hermes_home, sample_config):
+def test_load_theme_explicit_default_skin(hermes_home, sample_config):
+    import yaml
+
+    assert yaml.safe_load(sample_config.read_text())["display"]["skin"] == "default"
     t = load_theme(hermes_home)
+    assert t.skin_name == "default"
     assert t.banner_title == "#FFD700"
 
 
