@@ -501,12 +501,12 @@ def _read_session_coordination_rows(
 
     The shapes mirror upstream ``hermes_state_common.py``: ``session_turn_leases``
     / ``compression_locks`` (``:506-518``, writers
-    ``hermes_state_compression.py:433-605``), ``gateway_routing`` (``:447-457``,
-    payload written by ``gateway/session.py:535-545``), ``gateway_hygiene_state``
-    (``:459-465``, writer ``hermes_state_gateway.py:513-535``) and
+    ``hermes_state_compression.py:437-609``), ``gateway_routing`` (``:447-457``,
+    payload written by ``gateway/session.py:540-552``), ``gateway_hygiene_state``
+    (``:459-465``, writer ``hermes_state_gateway.py:559-581``) and
     ``conversation_generations`` (``:482-487``, bumped by
-    ``hermes_state_messages.py:30-34``) — all through
-    ``get_hermes_home()/"state.db"`` (``hermes_state.py:160,178``), i.e. the
+    ``hermes_state_messages.py:38-43``) — all through
+    ``get_hermes_home()/"state.db"`` (``hermes_state.py:165,183``), i.e. the
     selected profile's store.
 
     Tables predate nothing: agents older than the lease/hygiene/routing
@@ -771,7 +771,7 @@ def _gateway_route(
 ) -> GatewayRouteState:
     """Decode one routing row's ``entry_json`` into display state.
 
-    The payload is ``SessionEntry.to_dict()`` (``gateway/session.py:535-545``):
+    The payload is ``SessionEntry.to_dict()`` (``gateway/session.py:540-552``):
     an unbounded free-text map that also carries token counters and Slack
     watermarks. It is decoded through the bounded JSON reader and only the
     state flags below survive; ``display_name`` — attacker-controlled chat

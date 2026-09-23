@@ -341,7 +341,7 @@ def _kanban_board_present(paths: HermesPaths, board_slug: str) -> bool:
 # gateway kanban-notifier is the consumer (gateway/kanban_watchers_notifier.py).
 # The table lives in the same root-anchored kanban.db as the board itself —
 # kanban_home() = get_default_hermes_root(), "Shared across profiles BY
-# DESIGN" (hermes_cli/kanban_db.py:382-401) — so this reader is ROOT-scoped
+# DESIGN" (hermes_cli/kanban_db.py:399-407) — so this reader is ROOT-scoped
 # like the kanban source it complements.
 
 _NOTIFY_BACKLOG_SUB_LIMIT = 10
@@ -351,7 +351,7 @@ _NOTIFY_ORPHAN_PROFILE_LIMIT = 5
 _NOTIFY_PLATFORM_LIMIT = 6
 
 # "default" is what upstream get_active_profile_name() reports for the root
-# home (hermes_cli/profiles.py:1368-1382); it owns no profiles/ directory, so
+# home (hermes_cli/profiles.py:358-366); it owns no profiles/ directory, so
 # a sub stamped with it is not orphaned. ""/NULL stamps are legacy unowned
 # rows that the dispatch owner covers (include_unowned, :119-146).
 _DEFAULT_PROFILE_NAME = "default"

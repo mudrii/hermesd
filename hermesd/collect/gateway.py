@@ -115,7 +115,7 @@ _RESTART_STORM_CAP = 5
 _DASHBOARD_CLIENT_ATTACHED_SECONDS = 60.0
 # logs/gateway-exit-diag.log grows forever upstream (one JSON object per
 # asyncio.run() return path plus one gateway.previous_unclean_exit per unclean
-# boot; writer hermes_cli/gateway.py:4643-4665, HERMES_GATEWAY_EXIT_DIAG=0 opts
+# boot; writer hermes_cli/gateway.py:4016-4028, HERMES_GATEWAY_EXIT_DIAG=0 opts
 # out). Warn once the file is past a couple of megabytes; read only the tail.
 _EXIT_DIAG_SIZE_WARN_BYTES = 2 * 1024 * 1024
 _EXIT_DIAG_TAG_CHARS = 120
@@ -332,7 +332,7 @@ def _listener_mirror_urls(
 ) -> dict[str, str]:
     """Mirror URLs a served profile reaches through this default-listener binder.
 
-    Mirrors ``shared_listener_mirror_platforms`` (``gateway/status.py:951-974``):
+    Mirrors ``shared_listener_mirror_platforms`` (``gateway/status.py:1289-1312``):
     the multiplexer never builds api_server/webhook adapters for a secondary, so
     every reader must synthesize ``<listener_base>/p/<profile><mirror_path>``
     from the default profile's own entry. Only an entry upstream calls *serving*
@@ -599,7 +599,7 @@ def _default_loop_tick_probe(
 ) -> bool | None:
     """One witness probe: True answered, False silent, None no node to ask.
 
-    Mirrors ``_ping_loop_tick_witness`` (hermes_cli/gateway.py:363-376): the
+    Mirrors ``_ping_loop_tick_witness`` (hermes_cli/gateway.py:385-396): the
     handler swallows its own errors, so refusal and timeout are both just
     "silent". Sends nothing and reads at most one byte.
     """
@@ -975,7 +975,7 @@ def _fleet_state_counts(fleet: list[object]) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
-# Respawn-storm ledger (gateway-starts.log, gateway/status.py:57-83)
+# Respawn-storm ledger (gateway-starts.log, gateway/status.py:197-203)
 #
 # One repr(float) UTC epoch per line, rewritten atomically as a ring of
 # max(max_starts*4, 40) entries. An absent file is NOT evidence of zero
@@ -1016,7 +1016,7 @@ class _StartStorm:
 def _respawn_storm_policy(cfg: JsonMapping) -> tuple[int, float]:
     """``(max_starts, window_seconds)`` as upstream resolves them from config.
 
-    Mirrors ``_respawn_storm_backoff`` (``hermes_cli/gateway.py:4673-4685``):
+    Mirrors ``_respawn_storm_backoff`` (``hermes_cli/gateway.py:4035-4053``):
     only a real ``int`` counts for ``max_starts`` (a JSON ``true`` is an int in
     Python but not upstream) and only ``int``/``float`` for ``window_seconds``;
     anything else keeps ``DEFAULT_CONFIG``'s 5 / 120 s

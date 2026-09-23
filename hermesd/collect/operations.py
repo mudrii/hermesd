@@ -696,7 +696,7 @@ def _read_checkpoint_prune_marker(
     """The checkpoint auto-prune wrapper's ``.last_prune`` marker.
 
     PROFILE scope: the marker lives in ``checkpoints/``, which upstream resolves
-    through ``get_hermes_home()`` (``tools/checkpoint_manager.py:33,37-42``), and
+    through ``get_hermes_home()`` (``tools/checkpoint_manager.py:34,38-42``), and
     is written as a bare epoch after each wrapper pass (``:1106-1116``) with a
     default interval of 24h (``:1094``). A fresh marker proves the wrapper ran,
     not that pruning succeeded — per-repo failures are swallowed into the prune

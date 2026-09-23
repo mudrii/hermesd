@@ -2234,7 +2234,7 @@ class Collector:
         """The auto-resume restart-loop breaker's boot chain, evaluated at now.
 
         PROFILE-scoped: ``get_hermes_home()/"gateway"/"restart_loop.json"``
-        (``gateway/restart_loop_guard.py:36-37``). The policy is
+        (``gateway/restart_loop_guard.py:37-38``). The policy is
         ``gateway.restart_loop_guard`` from the root ``config.yaml``, like the other
         gateway launch inputs (``gateway/run_shutdown.py:344-363``).
         """
@@ -2292,7 +2292,7 @@ class Collector:
         ROOT-scoped beside ``latest.json`` (the ``update_receipt`` source), so the
         history and the latest run always describe the same home; upstream writes
         both under ``get_hermes_home()/"logs"/"update_receipts"``
-        (``hermes_cli/update_receipt.py:120-122``). Memoized by the directory's
+        (``hermes_cli/update_receipt.py:119-125``). Memoized by the directory's
         signature: archived receipts are never rewritten, only added and pruned.
         """
         directory = self._paths.shared_path("logs", "update_receipts")
@@ -2498,7 +2498,7 @@ class Collector:
 
         Scope note (``.codex/rules/source-ownership.md``): this reads the selected
         profile's registry via ``profile_path``, matching upstream's
-        ``_state_path`` (``hermes_cli/active_sessions.py:164-168``). Upstream's
+        ``_state_path`` (``hermes_cli/active_sessions.py:175-176``). Upstream's
         orphan reclamation sweeps the root home *and every profile home*
         (``release_orphaned_leases``, ``:660-687``), so the occupancy hermesd
         reports is one registry's — leases held under other profiles are invisible
@@ -2549,8 +2549,8 @@ class Collector:
         """Turn leases and compression locks from the profile's ``state.db``.
 
         PROFILE-scoped: upstream opens ``get_hermes_home()/"state.db"`` for
-        both tables (``hermes_state.py:160,178``; writers
-        ``hermes_state_compression.py:433-605``). See
+        both tables (``hermes_state.py:165,183``; writers
+        ``hermes_state_compression.py:437-609``). See
         ``.codex/rules/source-ownership.md`` (``session_leases``).
         """
         last = self._last_good_by_source.get("session_leases")
@@ -2569,7 +2569,7 @@ class Collector:
 
     def _with_gateway_hygiene(self, coord: SessionCoordinationState) -> SessionCoordinationState:
         """Per-chat hygiene failure streaks (PROFILE ``state.db``, table
-        ``gateway_hygiene_state`` — ``hermes_state.py:160,178``). The unfiltered
+        ``gateway_hygiene_state`` — ``hermes_state.py:165,183``). The unfiltered
         sessions table joins the recorded compression failure to each streak."""
         last = self._last_good_by_source.get("gateway_hygiene")
         readout = self._state_db_for(
@@ -2589,8 +2589,8 @@ class Collector:
 
     def _with_gateway_routes(self, coord: SessionCoordinationState) -> SessionCoordinationState:
         """Decoded routing entries (PROFILE ``state.db``, table
-        ``gateway_routing`` — ``hermes_state.py:160,178``; payload writer
-        ``gateway/session.py:535-545``). Dangling routes are those whose
+        ``gateway_routing`` — ``hermes_state.py:165,183``; payload writer
+        ``gateway/session.py:540-552``). Dangling routes are those whose
         session id has no row at all: the target set is the *unfiltered* id
         list, because upstream hides a session from the default listing while
         keeping it resumable (``hermes_state_sessions.py:898-900``)."""
@@ -2613,7 +2613,7 @@ class Collector:
 
     def _with_generation_churn(self, coord: SessionCoordinationState) -> SessionCoordinationState:
         """Conversation generations (PROFILE ``state.db`` —
-        ``hermes_state.py:160,178``). The table is deliberately never
+        ``hermes_state.py:165,183``). The table is deliberately never
         garbage-collected upstream (``hermes_state_common.py:460-487``), so the
         row count is remembered across refreshes and a shrink sets the panel's
         invariant-break warning. The remembered count advances only on a
@@ -3068,7 +3068,7 @@ class Collector:
         ``<config dir>/backups/config`` (``hermes_cli/config_backups.py:29-69``),
         keeping the newest five per reason and skipping byte-identical repeats.
         The config path upstream copies is ``get_config_path()`` —
-        ``hermes_constants.py:1132-1135`` — so the directory inherits whatever
+        ``hermes_constants.py:1430-1432`` — so the directory inherits whatever
         home that resolves to; hermesd keeps the ROOT copy on purpose, the same
         decision as the ``config`` source (see .codex/rules/source-ownership.md).
 
@@ -3560,7 +3560,7 @@ class Collector:
 
         Both the store and the profile names live at the root: kanban.db is
         root-anchored upstream ("Shared across profiles BY DESIGN",
-        ``hermes_cli/kanban_db.py:382-401``) and ``profiles/`` is the root
+        ``hermes_cli/kanban_db.py:399-407``) and ``profiles/`` is the root
         profile store. An absent or unsafe kanban.db reads as no
         subscriptions; the kanban source itself reports path problems.
         """
@@ -4012,7 +4012,7 @@ class Collector:
         """Recovery artifacts beside the profile-scoped ``state.db``.
 
         PROFILE-scoped, and it agrees with upstream: the database hermes-agent
-        repairs is ``get_hermes_home()/"state.db"`` (``hermes_state.py:160``,
+        repairs is ``get_hermes_home()/"state.db"`` (``hermes_state.py:165``,
         repair invoked at ``:535``), and every artifact is written as a sibling of
         it (``hermes_state_repair.py:317``, ``hermes_state_dbfile.py:228``). The
         scan is therefore confined to ``profile_home``, not ``root_home``: a
@@ -4149,7 +4149,7 @@ class Collector:
         ``tools/process_registry_results.py:30,58`` resolves
         ``get_hermes_home()/"logs"/"process-results"`` — the same
         ``get_hermes_home()`` anchor as the registry checkpoint at
-        ``tools/process_registry.py:41,45-50`` that the ownership table already
+        ``tools/process_registry.py:42,46-51`` that the ownership table already
         records. That is the opposite of the ROOT ``spawn-ledger.json``: the two
         registries are deliberately not the same scope.
 
@@ -4275,7 +4275,7 @@ class Collector:
         All three resolve through ``get_hermes_home()/"skills"`` upstream —
         ``tools/skill_usage.py:194-207`` (``.curator_suppressed``),
         ``tools/skill_ledger.py:79-84`` (``.curator_ledger.jsonl``) and
-        ``agent/curator.py:1119-1141`` (``.locks/curator-run``, the pid of an
+        ``agent/curator.py:1121-1141`` (``.locks/curator-run``, the pid of an
         ``O_EXCL`` claim taken over after an hour) — so they are PROFILE-scoped.
         """
         skills = self._paths.profile_path("skills")
@@ -4660,7 +4660,7 @@ class Collector:
         """Counts over ``telemetry/shared_metrics/metrics.sqlite3`` (PROFILE).
 
         ``SharedMetricsStore`` roots at ``get_hermes_home()/"telemetry"/
-        "shared_metrics"`` (``hermes_cli/observability/shared_metrics.py:171-176``).
+        "shared_metrics"`` (``hermes_cli/observability/shared_metrics.py:179``).
         The readout is reused until the db or its WAL changes.
         """
         path = self._paths.profile_path("telemetry", "shared_metrics", "metrics.sqlite3")

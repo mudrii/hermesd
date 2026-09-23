@@ -136,7 +136,7 @@ class PlatformStatus(BaseModel):
     retrying_since_age_seconds: float | None = None
     # Per-served-profile mirror URLs synthesized from this port-binder's
     # listener_base (``<listener_base>/p/<profile><mirror_path>``,
-    # gateway/status.py:951-974), where a client reaches the profile on the
+    # gateway/status.py:1289-1312), where a client reaches the profile on the
     # default listener. Empty unless the writer is live and the adapter serves.
     mirror_urls: dict[str, str] = Field(default_factory=dict)
     # The synthesized roster is sliced to a display bound, so a short list must
@@ -735,7 +735,7 @@ class GatewayHygieneState(BaseModel):
 
 class GatewayRouteState(BaseModel):
     """Decoded ``gateway_routing.entry_json`` (one ``SessionEntry.to_dict()``,
-    ``gateway/session.py:535-545``) for one routed chat.
+    ``gateway/session.py:540-552``) for one routed chat.
 
     ``entry_json`` also carries token counters and Slack watermarks; only the
     state flags below are extracted, and ``display_name`` is redacted before it
@@ -2534,7 +2534,7 @@ class DbRecoveryState(BaseModel):
     """
 
     # ``state.db.repair-attempts.json`` — ``_repair_ledger_path``,
-    # ``hermes_state_repair.py:317-318``.
+    # ``hermes_state_repair.py:318-319``.
     repair_ledger_present: bool = False
     failed_attempts: int = 0
     # ``datetime.now().isoformat(timespec="seconds")``: naive local time.
@@ -2824,7 +2824,7 @@ class ApiRunReservationsState(BaseModel):
     """Retained API run reservations, read from ``runs_idempotency.db``.
 
     **An empty store is not an idle API.** ``_prune_stale_terminal_locked``
-    (``api_server_run_idempotency.py:168-186``) runs inside every ``reserve`` and
+    (``api_server_run_idempotency.py:169-187``) runs inside every ``reserve`` and
     ``lookup`` and deletes an aged row only once its stored status is terminal,
     and long room runs push ``retention_until`` out
     (``api_server_runs.py:56-61,222-232``). On top of that, when the file cannot

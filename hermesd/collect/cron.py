@@ -1355,7 +1355,7 @@ def _read_cron_bot_chat(
 
 
 # Fire-path recovery telemetry, appended best effort and never pruned upstream:
-# ``_append_telemetry_record`` (``cron/jobs.py:1011-1023``) for the first two,
+# ``_append_telemetry_record`` (``cron/jobs.py:1010-1022``) for the first two,
 # ``_record_forced_release`` (``cron/scheduler.py:868-884``) for the third.
 # (file name, label, timestamp key) per ledger.
 _RECOVERY_LEDGERS = (
