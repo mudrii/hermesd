@@ -24,23 +24,39 @@ _SECRET_KEY_NAMES = {
     "authorization",
     "bearer",
     "client-secret",
+    "cookie",
     "credential",
+    "credentials",
     "id-token",
     "key",
     "pass",
+    "passphrase",
     "passwd",
     "password",
     "pin",
     "pwd",
     "refresh-token",
     "secret",
+    "set-cookie",
     "token",
     "x-api-key",
     "user-token",
 }
 
 
-_SECRET_KEY_SUFFIXES = ("token", "key", "secret")
+_SECRET_KEY_SUFFIXES = (
+    "token",
+    "key",
+    "secret",
+    "password",
+    "passwd",
+    "pwd",
+    "passphrase",
+    "credential",
+    "credentials",
+    "cookie",
+    "signature",
+)
 
 
 _SECRET_KEY_FUSED = {"apikey", "sessionid"}
@@ -101,6 +117,24 @@ def _is_secret_option(option: str) -> bool:
     return normalized in _SECRET_OPTION_NAMES or _is_secret_key(normalized)
 
 
+# Tokens carried in the URL path rather than userinfo or query: Telegram's
+# /bot<id>:<token>/, Discord's /webhooks/<id>/<token>, and Slack incoming
+# webhooks (hooks.slack.com/services/<team>/<bot>/<secret>).
+_SECRET_URL_PATH_RES = (
+    re.compile(r"(/bot)\d+:[^/?#]+"),
+    re.compile(r"(/webhooks/\d+/)[^/?#]+"),
+)
+_SLACK_HOOK_PATH_RE = re.compile(r"(/services/[^/]+/[^/]+/)[^/?#]+")
+
+
+def _redact_secret_url_path(host: str, path: str) -> str:
+    for pattern in _SECRET_URL_PATH_RES:
+        path = pattern.sub(r"\1[REDACTED]", path)
+    if host == "hooks.slack.com":
+        path = _SLACK_HOOK_PATH_RE.sub(r"\1[REDACTED]", path)
+    return path
+
+
 def _redact_secret_url(value: str) -> str:
     if not value:
         return ""
@@ -110,6 +144,7 @@ def _redact_secret_url(value: str) -> str:
         return _redact_malformed_url(value)
     if not parts.scheme or not parts.netloc:
         return value
+    parts = parts._replace(path=_redact_secret_url_path(parts.hostname or "", parts.path))
     netloc = parts.netloc
     if parts.username or parts.password:
         host = parts.hostname or ""
@@ -298,7 +333,7 @@ def _redact_text_fields(text: str) -> str:
 # in a dotted-JWT-only shape, would backtrack per `eyJ` occurrence instead.)
 # The `eyJ` branch therefore covers a JWT's dotted base64url runs in one class
 # rather than pinned segment by segment.
-_BARE_CREDENTIAL_RE = re.compile(
+_BARE_CREDENTIAL_PATTERN = (
     r"sk-[A-Za-z0-9_-]{12,}"
     r"|pk-[A-Za-z0-9_-]{12,}"
     r"|rk-[A-Za-z0-9_-]{12,}"
@@ -307,9 +342,14 @@ _BARE_CREDENTIAL_RE = re.compile(
     r"|xox[baprs]-[A-Za-z0-9-]{12,}"
     r"|eyJ[A-Za-z0-9_.-]{12,}"
 )
+_BARE_CREDENTIAL_RE = re.compile(_BARE_CREDENTIAL_PATTERN)
+# General text (log lines, exception messages) is full of kebab-case words, so
+# there the prefix must open a token: the fixed-width lookbehind keeps words
+# that merely contain a prefix (task-..., work-...) visible.
+_BOUNDED_BARE_CREDENTIAL_RE = re.compile(rf"(?<![A-Za-z0-9_-])(?:{_BARE_CREDENTIAL_PATTERN})")
 
 
-def _redact_bare_credentials(value: str) -> str:
+def _redact_bare_credentials(value: str, *, token_start: bool = False) -> str:
     """Scrub bare well-known credential shapes anywhere in ``value``.
 
     The field-oriented redactor above only rewrites ``key = value`` shapes, so
@@ -318,7 +358,8 @@ def _redact_bare_credentials(value: str) -> str:
     """
     if not value:
         return ""
-    return _BARE_CREDENTIAL_RE.sub("[REDACTED]", value)
+    pattern = _BOUNDED_BARE_CREDENTIAL_RE if token_start else _BARE_CREDENTIAL_RE
+    return pattern.sub("[REDACTED]", value)
 
 
 def _redact_secret_text(value: str) -> str:
@@ -341,7 +382,7 @@ def _redact_secret_text(value: str) -> str:
         value,
     )
     redacted = re.sub(r"(?i)(bearer)\s+[^,\s]+", r"\1 [REDACTED]", redacted)
-    return _redact_text_fields(redacted)
+    return _redact_text_fields(_redact_bare_credentials(redacted, token_start=True))
 
 
 def _safe_exception_text(exc: Exception) -> str:
