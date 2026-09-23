@@ -204,6 +204,90 @@ def test_derived_cache_never_serves_a_value_for_a_freed_rows_list(hermes_home: P
     assert (first, second) == ("a", "b")
 
 
+def test_cron_excerpt_cache_survives_a_job_id_containing_a_colon(hermes_home: Path) -> None:
+    """The excerpt cache must key (output root, job id) without re-splitting a
+    joined string: a ``:`` in the id made pruning evict the entry every pass."""
+    (hermes_home / "cron" / "jobs.json").write_text(
+        json.dumps({"jobs": [{"id": "team:nightly", "name": "Nightly"}]})
+    )
+    output_dir = hermes_home / "cron" / "output" / "team:nightly"
+    output_dir.mkdir(parents=True)
+    output_file = output_dir / "latest.md"
+    output_file.write_text("digest sent\n")
+
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        assert first.cron.jobs[0].latest_output_excerpt == "digest sent"
+        output_file.unlink()
+        second = c.collect()
+    finally:
+        c.close()
+
+    assert second.cron.jobs[0].latest_output_excerpt == "digest sent"
+
+
+def test_cron_job_errors_are_redacted(hermes_home: Path) -> None:
+    (hermes_home / "cron" / "jobs.json").write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "job-1",
+                        "name": "Job 1",
+                        "last_error": "HTTP 401 with api_key=sk-live-cron-secret",
+                        "last_delivery_error": "POST https://user:hunter2@hooks.example/x failed",
+                    }
+                ]
+            }
+        )
+    )
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    (job,) = state.cron.jobs
+    assert "sk-live-cron-secret" not in job.last_error
+    assert "hunter2" not in job.last_delivery_error
+    assert "[REDACTED]" in job.last_error
+
+
+@pytest.mark.parametrize(
+    ("relpath", "good", "source"),
+    [
+        ("cron/jobs.json", {"jobs": [{"id": "job-1", "name": "Job 1"}]}, "cron"),
+        ("channel_directory.json", {"platforms": {"telegram": []}}, "channels"),
+        ("spawn-ledger.json", [{"pid": 4242, "session_id": "s1", "command": "x"}], None),
+    ],
+    ids=["jobs", "channel-directory", "spawn-ledger"],
+)
+def test_corrupt_json_after_a_good_read_is_reported_stale(
+    hermes_home: Path, relpath: str, good: object, source: str | None
+) -> None:
+    """A corrupt file served from the last-good cache must name its source."""
+    path = hermes_home / relpath
+    path.write_text(json.dumps(good))
+    c = Collector(hermes_home, pid_exists=lambda pid: True)
+    try:
+        first = c.collect()
+        path.write_text("{ torn write")
+        second = c.collect()
+    finally:
+        c.close()
+
+    name = source or "background_processes"
+    assert name not in first.health.failed_sources
+    assert name in second.health.failed_sources
+    if name == "cron":
+        assert [job.name for job in second.cron.jobs] == ["Job 1"]
+    elif name == "channels":
+        assert second.channels.platform_count == first.channels.platform_count
+    else:
+        assert second.background_processes == first.background_processes
+
+
 def test_gateway_pid_file_names_the_live_replacement(hermes_home: Path) -> None:
     (hermes_home / "gateway_state.json").write_text(
         json.dumps({"pid": 4242, "gateway_state": "running", "platforms": {}})

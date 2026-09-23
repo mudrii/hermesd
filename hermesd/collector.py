@@ -783,8 +783,9 @@ class Collector:
         # the table recovers — instead of a silent "fewer chats than last tick".
         self._last_generation_chat_count: int | None = None
         self._log_stream_cache: dict[str, tuple[float | None, int, LogStream]] = {}
+        # Keyed by (output root, job id): a job id may itself contain ':'.
         self._cron_excerpt_cache: dict[
-            str,
+            tuple[Path, str],
             tuple[
                 tuple[str, int, int] | tuple[str, float | None],
                 tuple[str, bool, str, float | None],
@@ -864,7 +865,7 @@ class Collector:
         self._cron_excerpt_cache = {
             key: entry
             for key, entry in self._cron_excerpt_cache.items()
-            if not _path_confirmed_gone(Path(key.rsplit(":", 1)[0]) / key.rsplit(":", 1)[1])
+            if not _path_confirmed_gone(key[0] / key[1])
         }
 
     def _build_dashboard_state(
@@ -2293,7 +2294,10 @@ class Collector:
     def _collect_background_processes(self) -> list[BackgroundProcessInfo]:
         # hermes-agent >= 0.21 registers live processes in spawn-ledger.json;
         # processes.json is the legacy (now usually empty) registry.
-        ledger = self._read_json_list_cached(self._paths.shared_path("spawn-ledger.json"))
+        ledger_path = self._paths.shared_path("spawn-ledger.json")
+        ledger = self._read_json_list_cached(ledger_path)
+        if self._file_cache.last_read_was_stale(ledger_path):
+            raise RuntimeError(f"{ledger_path.name} is unreadable; keeping last-good values")
         if ledger:
             return [
                 _background_process_from_ledger(entry, self._pid_exists)
@@ -2587,7 +2591,7 @@ class Collector:
         jobs: list[CronJob] = []
         error_count = 0
         now = self._clock()
-        data = self._read_json_cached(self._paths.shared_path("cron", "jobs.json"))
+        data = self._read_json_reporting_stale(self._paths.shared_path("cron", "jobs.json"))
         if data:
             directory = self._read_json_cached(self._paths.shared_path("channel_directory.json"))
             for j in _as_list(data.get("jobs")):
@@ -2639,11 +2643,13 @@ class Collector:
                         silent_run=silent_run,
                         next_run_at=str(j.get("next_run_at") or ""),
                         last_status=str(last_status) if last_status is not None else None,
-                        last_error=str(j.get("last_error") or ""),
+                        last_error=_redact_secret_text(str(j.get("last_error") or "")),
                         failure_streak=_coerce_int(j.get("failure_streak")),
                         paused=paused,
                         paused_reason=paused_reason,
-                        last_delivery_error=str(j.get("last_delivery_error") or ""),
+                        last_delivery_error=_redact_secret_text(
+                            str(j.get("last_delivery_error") or "")
+                        ),
                         dispatch_lateness_seconds=dispatch_lateness,
                         dispatch_kind=dispatch_kind,
                         repeat_times=repeat_times,
@@ -2719,7 +2725,9 @@ class Collector:
         )
 
     def _collect_channels(self, gateway: GatewayState) -> ChannelDirectoryState:
-        directory = self._read_json_cached(self._paths.shared_path("channel_directory.json"))
+        directory = self._read_json_reporting_stale(
+            self._paths.shared_path("channel_directory.json")
+        )
         aliases = _as_dict(self._read_json_cached(self._paths.shared_path("channel_aliases.json")))
         platforms = _as_dict(directory.get("platforms"))
         gateway_states = {platform.name: platform.state for platform in gateway.platforms}
@@ -4396,7 +4404,7 @@ class Collector:
         job_id: str,
         max_bytes: int,
     ) -> tuple[str, bool, str, float | None]:
-        cache_key = f"{output_root}:{job_id}"
+        cache_key = (output_root, job_id)
         cached = self._cron_excerpt_cache.get(cache_key)
         latest = _latest_cron_output_file(output_root, job_id, stop_at=self._paths.root_home)
         if latest is None:

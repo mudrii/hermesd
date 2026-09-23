@@ -92,7 +92,7 @@ def test_stale_path_caches_are_evicted_when_targets_disappear(hermes_home: Path)
     try:
         c.collect()
         assert "alpha" in c._kanban_board_cache
-        assert any(key.endswith(":job-1") for key in c._cron_excerpt_cache)
+        assert any(key[1] == "job-1" for key in c._cron_excerpt_cache)
         assert any(str(memory_md) in key for key in c._derived_file_cache)
 
         shutil.rmtree(board_dir)
@@ -101,7 +101,7 @@ def test_stale_path_caches_are_evicted_when_targets_disappear(hermes_home: Path)
         c.collect()
 
         assert "alpha" not in c._kanban_board_cache
-        assert not any(key.endswith(":job-1") for key in c._cron_excerpt_cache)
+        assert not any(key[1] == "job-1" for key in c._cron_excerpt_cache)
         assert not any(str(memory_md) in key for key in c._derived_file_cache)
     finally:
         c.close()
