@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,13 @@ _MAX_CACHE_ENTRIES = 20
 _FINGERPRINT_PREFIX_CHARS = 8
 _NOT_A_MAPPING = "entry is not a mapping"
 _NO_FINGERPRINT = "no usable fingerprint recorded"
+# Directories upstream never scans for skills (``EXCLUDED_SKILL_DIRS`` and
+# ``SKILL_SUPPORT_DIRS``, ``agent/skill_utils.py:27-50``), copied, never imported.
+# Dot-dirs are skipped wholesale, so only the undotted names are listed.
+_SKILL_EXCLUDED_DIRS = frozenset({"venv", "node_modules", "site-packages", "__pycache__"})
+_SKILL_SUPPORT_DIRS = frozenset({"references", "templates", "assets", "scripts"})
+# Bound on directories visited per skills walk: ~/.hermes is untrusted input.
+_MAX_SKILL_SCAN_DIRS = 5000
 
 
 def _toolset_availability(data: dict[str, Any]) -> ToolsetAvailability:
@@ -163,17 +172,71 @@ def _skills_prompt_summary(data: dict[str, Any], age_seconds: float | None) -> S
     )
 
 
-def _count_skills(skills_dir: Path) -> int:
+@dataclass(frozen=True, slots=True)
+class _SkillEntry:
+    """One skill directory: a directory holding ``SKILL.md``, at any depth."""
+
+    name: str
+    # Upstream's category: the top-level directory, "" for a flat skill
+    # (``_get_category_from_path``, ``tools/skills_tool.py:562-585``).
+    category: str
+    # Path of the skill's parent relative to the skills root ("" when flat).
+    parent: str
+
+
+def _skill_entries(skills_dir: Path) -> list[_SkillEntry]:
+    """Every skill under ``skills_dir``, sorted by relative path.
+
+    Mirrors upstream's ``iter_skill_index_files`` (``agent/skill_utils.py:785-809``):
+    a skill is any directory holding ``SKILL.md``, so flat skills and nested
+    ``<category>/<group>/<name>`` skills both count, while dependency/VCS dirs
+    and a skill's own support dirs are pruned. Unlike upstream, dot-dirs are all
+    skipped, symlinked dirs are never descended, and the walk is bounded. An
+    unreadable skills root raises so the source fails to last-good; an unreadable
+    nested directory is skipped.
+    """
     if not skills_dir.is_dir():
-        return 0
-    count = 0
-    for category_dir in skills_dir.iterdir():
-        if not category_dir.is_dir() or category_dir.name.startswith("."):
+        return []
+    entries: list[tuple[tuple[str, ...], _SkillEntry]] = []
+    pending = [skills_dir]
+    visited = 0
+    while pending and visited < _MAX_SKILL_SCAN_DIRS:
+        directory = pending.pop()
+        visited += 1
+        try:
+            with os.scandir(directory) as scan:
+                children = list(scan)
+        except OSError:
+            if directory == skills_dir:
+                raise
             continue
-        for skill_dir in category_dir.iterdir():
-            if skill_dir.is_dir():
-                count += 1
-    return count
+        is_skill = directory != skills_dir and any(c.name == "SKILL.md" for c in children)
+        if is_skill:
+            parts = directory.relative_to(skills_dir).parts
+            entries.append(
+                (
+                    parts,
+                    _SkillEntry(
+                        name=parts[-1],
+                        category=parts[0] if len(parts) > 1 else "",
+                        parent="/".join(parts[:-1]),
+                    ),
+                )
+            )
+        for child in children:
+            if (
+                child.name.startswith(".")
+                or child.name in _SKILL_EXCLUDED_DIRS
+                or (is_skill and child.name in _SKILL_SUPPORT_DIRS)
+            ):
+                continue
+            if child.is_dir(follow_symlinks=False):
+                pending.append(Path(child.path))
+    return [entry for _, entry in sorted(entries, key=lambda item: item[0])]
+
+
+def _count_skills(skills_dir: Path) -> int:
+    return len(_skill_entries(skills_dir))
 
 
 def _word_count(path: Path, root: Path | None = None) -> int:
