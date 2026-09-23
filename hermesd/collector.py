@@ -101,6 +101,7 @@ from hermesd.collect.curator import (
 from hermesd.collect.desktop_plugins import read_desktop_plugins
 from hermesd.collect.gateway import (
     _LOOP_TICK_SILENCE_STRIKES,
+    _claims_serving,
     _config_generation,
     _config_stale,
     _dashboard_client_status,
@@ -120,6 +121,7 @@ from hermesd.collect.gateway import (
     _record_writer,
     _respawn_storm_policy,
     _update_receipt_status,
+    _watchdog_exit_reason,
 )
 from hermesd.collect.hosted_rooms import _read_hosted_rooms
 from hermesd.collect.kanban import (
@@ -1563,7 +1565,8 @@ class Collector:
         # would signal a process group or every process the user owns.
         recorded_pid = writer.pid or 0
         pid = recorded_pid
-        running = data.get("gateway_state") == "running"
+        recorded_state = str(data.get("gateway_state") or "unknown")
+        running = _claims_serving(recorded_state)
         recorded_writer_live = False
         # The PID in gateway_state.json can be stale if launchd restarted
         # the gateway. A replacement PID proves a process is running, but it does
@@ -1630,7 +1633,8 @@ class Collector:
             exit_reason=str(data.get("exit_reason") or ""),
             pid=pid,
             running=running,
-            state=str(data.get("gateway_state") or "unknown"),
+            state=recorded_state,
+            watchdog_exit_reason=_watchdog_exit_reason(data, running=running),
             platforms=platforms,
             hermes_version=version,
             updates_behind=behind,
@@ -1688,7 +1692,7 @@ class Collector:
             data,
             file_mtime,
             self._clock(),
-            running=gateway.state == "running",
+            running=_claims_serving(gateway.state),
         )
         return gateway.model_copy(update={"heartbeat_age_seconds": age, "loop_health": health})
 
@@ -1714,7 +1718,7 @@ class Collector:
         plan = _loop_tick_probe_plan(
             heartbeat,
             gateway.pid,
-            running=gateway.state == "running",
+            running=_claims_serving(gateway.state),
         )
         if plan is None:
             self._loop_tick_silent_strikes = 0

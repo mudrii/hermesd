@@ -184,8 +184,18 @@ class DeliveryObligationSummary(BaseModel):
 
 class GatewayState(BaseModel):
     pid: int = 0
+    # Live and serving: the recorded ``gateway_state`` is ``running`` or ``degraded``
+    # (upstream's ``_DRAINABLE_GATEWAY_STATES``, gateway/status.py:1207-1209) and the
+    # recorded or launchd PID is alive.
     running: bool = False
+    # The recorded ``gateway_state`` verbatim. ``degraded`` is a serving gateway with a
+    # parked platform (gateway/run_startup.py:56-59), not a stopped one.
     state: str = "unknown"
+    # A dead gateway whose last record is the watchdog's ``degraded`` stamp with an
+    # ``exit_reason`` in upstream's ``WATCHDOG_EXIT_REASONS`` (gateway/status.py:362-385):
+    # the loop stopped dispatching and the watchdog hard-exited it. Empty otherwise,
+    # including once the operator recorded ``desired_state: stopped``.
+    watchdog_exit_reason: str = ""
     platforms: list[PlatformStatus] = Field(default_factory=list)
     hermes_version: str = ""
     updates_behind: int = 0
@@ -285,6 +295,12 @@ class GatewayState(BaseModel):
     pending_delivery_count: int = 0
     failed_delivery_count: int = 0
     pending_deliveries: list[DeliveryObligationSummary] = Field(default_factory=list)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def degraded(self) -> bool:
+        """Serving, but a configured platform is parked or retrying."""
+        return self.running and self.state == "degraded"
 
 
 class MigrationVerificationGap(StrEnum):

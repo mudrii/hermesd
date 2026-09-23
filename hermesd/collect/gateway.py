@@ -136,6 +136,34 @@ _INGRESS_SUPPRESSED_STATES = frozenset({"fatal", "disconnected", "stopped"})
 # unrecognised or missing state are refused, so neither may publish a callback
 # URL hermesd synthesized for a secondary profile.
 _MIRROR_SERVING_STATES = frozenset({"connected", "connecting", "retrying"})
+# Recorded gateway states that mean "live and serving" once the PID is alive:
+# upstream's ``_DRAINABLE_GATEWAY_STATES`` (gateway/status.py:1207-1209).
+# ``degraded`` is stamped by ``_serving_state`` when a platform is parked
+# (gateway/run_startup.py:56-59) and by the out-of-loop watchdogs right before
+# they hard-exit (gateway/shutdown_watchdog.py:148-163).
+_SERVING_GATEWAY_STATES = frozenset({"running", "degraded"})
+# ``exit_reason`` values the watchdogs stamp beside ``degraded``
+# (``WATCHDOG_EXIT_REASONS``, gateway/status.py:362-364).
+_WATCHDOG_EXIT_REASONS = frozenset({"loop_liveness_watchdog", "shutdown_watchdog"})
+
+
+def _claims_serving(state: str) -> bool:
+    """Whether the recorded ``gateway_state`` claims a serving gateway (PID not checked)."""
+    return state in _SERVING_GATEWAY_STATES
+
+
+def _watchdog_exit_reason(data: JsonMapping, *, running: bool) -> str:
+    """The watchdog's exit reason for a dead degraded record, else ``""``.
+
+    Mirrors ``retained_gateway_state`` (gateway/status.py:367-385): only while the
+    operator has not recorded ``desired_state: stopped``.
+    """
+    if running or data.get("gateway_state") != "degraded":
+        return ""
+    if data.get("desired_state") == "stopped":
+        return ""
+    reason = data.get("exit_reason")
+    return reason if isinstance(reason, str) and reason in _WATCHDOG_EXIT_REASONS else ""
 
 
 @dataclass(frozen=True, slots=True)

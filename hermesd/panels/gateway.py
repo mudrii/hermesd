@@ -40,13 +40,16 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines = Text()
 
     if gw.running:
-        lines.append("  ● ", style=f"bold {theme.ui_ok}")
-        lines.append("Running", style=theme.banner_text)
+        dot, label = _serving_badge(gw, theme)
+        lines.append("  ● ", style=f"bold {dot}")
+        lines.append(label, style=theme.ui_warn if gw.degraded else theme.banner_text)
         lines.append("  PID:", style=theme.ui_label)
         lines.append(f"{gw.pid}", style=theme.ui_accent)
     else:
         lines.append("  ● ", style=f"bold {theme.ui_error}")
         lines.append("Stopped", style=theme.banner_text)
+        if gw.watchdog_exit_reason:
+            lines.append("  ⚠ watchdog exit", style=theme.ui_error)
     lines.append("  loop:", style=theme.ui_label)
     lines.append(gw.loop_health.value, style=_loop_style(gw.loop_health, theme))
     if gw.dashboard_client_attached:
@@ -110,6 +113,24 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         box=rich.box.HORIZONTALS,
         padding=(1, 2),
     )
+
+
+# Operator wording for the watchdog exit reasons, after upstream's own
+# ``_WATCHDOG_EXIT_REASONS`` table (hermes_cli/gateway.py:4207-4214).
+_WATCHDOG_EXIT_WORDING = {
+    "loop_liveness_watchdog": (
+        "event loop stopped dispatching; the liveness watchdog exited it for the supervisor"
+        " to restart"
+    ),
+    "shutdown_watchdog": "shutdown drain wedged; the shutdown watchdog forced the exit",
+}
+
+
+def _serving_badge(gw: GatewayState, theme: Theme) -> tuple[str, str]:
+    """Dot colour and label for a live gateway: ``degraded`` is serving, but a warning."""
+    if gw.degraded:
+        return theme.ui_warn, "Degraded"
+    return theme.ui_ok, "Running"
 
 
 def _platform_label(platform: PlatformStatus) -> str:
@@ -247,11 +268,27 @@ def _status_header(state: DashboardState, theme: Theme) -> Text:
     gw = state.gateway
     header = Text()
     if gw.running:
-        header.append("● ", style=f"bold {theme.ui_ok}")
-        header.append(f"Running  PID:{gw.pid}", style=theme.banner_text)
+        dot, label = _serving_badge(gw, theme)
+        header.append("● ", style=f"bold {dot}")
+        header.append(
+            f"{label}  PID:{gw.pid}", style=theme.ui_warn if gw.degraded else theme.banner_text
+        )
+        if gw.degraded:
+            header.append(
+                "  serving; a configured platform is parked or retrying", style=theme.ui_warn
+            )
     else:
         header.append("● ", style=f"bold {theme.ui_error}")
         header.append("Stopped", style=theme.banner_text)
+        if gw.watchdog_exit_reason:
+            header.append(
+                f"  ⚠ watchdog exit: {sanitize_terminal_text(gw.watchdog_exit_reason)}",
+                style=theme.ui_error,
+            )
+            header.append(
+                f"\n    {_WATCHDOG_EXIT_WORDING.get(gw.watchdog_exit_reason, '')}",
+                style=theme.banner_dim,
+            )
     if gw.hermes_version:
         header.append(
             f"\n  Hermes v{sanitize_terminal_text(gw.hermes_version)}",
