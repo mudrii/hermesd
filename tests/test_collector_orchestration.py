@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from hermesd.collect.operations import _BOUNDED_SCAN_LIMIT
 from hermesd.collector import _STATE_DB_SOURCES, Collector, _state_db_readout
 
 _SHA_NEW = "a" * 40
@@ -286,6 +287,47 @@ def test_corrupt_json_after_a_good_read_is_reported_stale(
         assert second.channels.platform_count == first.channels.platform_count
     else:
         assert second.background_processes == first.background_processes
+
+
+def test_moa_trace_scan_is_bounded(hermes_home: Path) -> None:
+    traces = hermes_home / "moa-traces"
+    traces.mkdir()
+    for i in range(_BOUNDED_SCAN_LIMIT + 5):
+        (traces / f"sess_{i:03d}.jsonl").write_text("{}\n")
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.operations.moa_trace_count == _BOUNDED_SCAN_LIMIT
+
+
+def test_moa_trace_vanishing_mid_scan_does_not_fail_operations(
+    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A trace deleted between the listing and the newest-file stat is skipped."""
+    traces = hermes_home / "moa-traces"
+    traces.mkdir()
+    (traces / "sess_real.jsonl").write_text('{"event": "aggregate"}\n')
+    (traces / "sess_ghost.jsonl").write_text("{}\n")
+    real_is_file = Path.is_file
+
+    def racing_is_file(self: Path) -> bool:
+        present = real_is_file(self)
+        if self.name == "sess_ghost.jsonl" and present:
+            self.unlink()
+        return present
+
+    monkeypatch.setattr(Path, "is_file", racing_is_file)
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "operations" not in state.health.failed_sources
+    assert state.operations.moa_trace_newest_session_id == "sess_real"
 
 
 def test_gateway_pid_file_names_the_live_replacement(hermes_home: Path) -> None:

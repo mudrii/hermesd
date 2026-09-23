@@ -48,6 +48,7 @@ from hermesd.collect.common import (
     _read_text_capped,
     _safe_capped_file,
     _safe_child_path,
+    _safe_mtime,
     _safe_or_absent_child_path,
     _today_epoch,
 )
@@ -137,6 +138,7 @@ from hermesd.collect.migration import (
     _migration_state,
 )
 from hermesd.collect.operations import (
+    _BOUNDED_SCAN_LIMIT,
     StateDbRead,
     _checkpoint_prune_interval_seconds,
     _count_delegation_live_logs,
@@ -3100,16 +3102,19 @@ class Collector:
             if had_last_good:
                 raise RuntimeError("MoA trace directory became unsafe")
             return operations
+        # Bounded like the sibling cache scans: the directory is untrusted and
+        # listed every refresh.
         traces = [
             path
-            for path in trace_dir.glob("*.jsonl")
+            for path in islice(trace_dir.glob("*.jsonl"), _BOUNDED_SCAN_LIMIT)
             if path.is_file()
             and not path.is_symlink()
             and _path_resolves_under(path, self._paths.root_home)
         ]
         if not traces:
             return operations
-        newest = max(traces, key=lambda path: path.stat().st_mtime)
+        # A trace deleted after the listing stats as mtime 0 rather than raising.
+        newest = max(traces, key=_safe_mtime)
         latest_record = _moa_latest_record_summary(newest, self._log_tail_bytes)
         return operations.model_copy(
             update={
