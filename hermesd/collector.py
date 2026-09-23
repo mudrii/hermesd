@@ -1879,10 +1879,10 @@ class Collector:
                 content = _read_text_capped(pid_file, self._paths.root_home).strip()
                 if content:
                     data = json.loads(content)
-                    if isinstance(data, dict):
-                        lpid = int(data.get("pid", 0) or 0)
-                    else:
-                        lpid = int(content)
+                    raw_pid = data.get("pid") if isinstance(data, dict) else data
+                    # A JSON true is not pid 1, and an overflowing or non-scalar
+                    # value is no pid at all.
+                    lpid = 0 if isinstance(raw_pid, bool) else _coerce_int(raw_pid)
                     if lpid > 0 and self._pid_exists(lpid):
                         return lpid
             except (ValueError, json.JSONDecodeError, ProcessLookupError, PermissionError, OSError):

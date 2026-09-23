@@ -162,3 +162,42 @@ def test_a_failed_state_db_readout_is_attempted_once_per_pass(
     assert set(second.health.failed_sources) >= _STATE_DB_SOURCES
     assert set(third.health.failed_sources) >= _STATE_DB_SOURCES
     assert len(attempts) == 2
+
+
+@pytest.mark.parametrize(
+    "content",
+    ['{"pid": true}', '{"pid": [4243]}', '{"pid": 1e400}', "[4243]", "1e400", "true"],
+    ids=["bool", "list", "overflow", "bare-list", "bare-overflow", "bare-bool"],
+)
+def test_malformed_gateway_pid_file_reads_as_no_launchd_gateway(
+    hermes_home: Path, content: str
+) -> None:
+    """A junk gateway.pid is no replacement pid: never pid 1, never a crash."""
+    (hermes_home / "gateway_state.json").write_text(
+        json.dumps({"pid": 4242, "gateway_state": "running", "platforms": {}})
+    )
+    (hermes_home / "gateway.pid").write_text(content)
+    c = Collector(hermes_home, pid_exists=lambda pid: pid != 4242)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "gateway" not in state.health.failed_sources
+    assert state.gateway.running is False
+    assert state.gateway.pid == 4242
+
+
+def test_gateway_pid_file_names_the_live_replacement(hermes_home: Path) -> None:
+    (hermes_home / "gateway_state.json").write_text(
+        json.dumps({"pid": 4242, "gateway_state": "running", "platforms": {}})
+    )
+    (hermes_home / "gateway.pid").write_text('{"pid": 4243}')
+    c = Collector(hermes_home, pid_exists=lambda pid: pid == 4243)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.gateway.running is True
+    assert state.gateway.pid == 4243
