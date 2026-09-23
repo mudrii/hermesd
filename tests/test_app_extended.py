@@ -1195,17 +1195,54 @@ def test_build_footer_detail_sessions_shows_sort(populated_hermes_home: Path):
     app.close()
 
 
-def test_top_bottom_keys_ignore_non_scrollable_detail_panels(populated_hermes_home: Path):
+def test_top_bottom_keys_ignore_overview(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
 
-    # Memory (panel 10, key "0") is a fixed-size detail: no viewport, no scroll.
-    app.handle_key("0")
     app.handle_key("G")
     assert app._view.scroll_offset == 0
 
     app.handle_key("g")
     assert app._view.scroll_offset == 0
     app.close()
+
+
+@pytest.mark.parametrize("panel_num", [n for n in sorted(PANEL_NAMES) if n != _LOG_PANEL_NUM])
+def test_every_non_logs_detail_scrolls_through_rendered_viewport(
+    populated_hermes_home: Path, panel_num: int
+):
+    """A detail taller than the terminal must be reachable with j/k/G, never clipped."""
+    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    try:
+        app._console = Console(file=io.StringIO(), width=100, height=5, no_color=True)
+        app._view.enter_detail(panel_num)
+        with app._console.capture() as top_capture:
+            app._console.print(app._build_layout())
+
+        app.handle_key("G")
+        with app._console.capture() as bottom_capture:
+            app._console.print(app._build_layout())
+        bottom = app._view.scroll_offset
+
+        assert 0 < bottom < 999_999
+        assert bottom_capture.get() != top_capture.get()
+        app.handle_key("k")
+        assert app._view.scroll_offset == bottom - 1
+        footer = app._build_footer(app._state).plain
+        assert "[j/k]" in footer
+    finally:
+        app.close()
+
+
+def test_short_viewport_detail_clamps_bottom_to_zero(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    try:
+        app._console = Console(file=io.StringIO(), width=100, height=200, no_color=True)
+        app.handle_key("0")
+        app.handle_key("G")
+        app._build_layout()
+        assert app._view.scroll_offset == 0
+    finally:
+        app.close()
 
 
 def test_config_detail_corrupt_alert_is_reachable_at_80x24(populated_hermes_home: Path):

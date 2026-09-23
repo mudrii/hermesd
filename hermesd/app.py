@@ -51,27 +51,13 @@ def _panel_num_by_name(name: str) -> int:
 
 
 _LOG_PANEL_NUM = _panel_num_by_name("Logs")
-_GATEWAY_PANEL_NUM = _panel_num_by_name("Gateway & Platforms")
 _SESSIONS_PANEL_NUM = _panel_num_by_name("Sessions")
-_CRON_PANEL_NUM = _panel_num_by_name("Cron")
 _SKILLS_PANEL_NUM = _panel_num_by_name("Skills / Integrations")
 _PROFILES_PANEL_NUM = _panel_num_by_name("Profiles")
-_OPERATIONS_PANEL_NUM = _panel_num_by_name("Operations")
-_CONFIG_PANEL_NUM = _panel_num_by_name("Config")
-_RENDERED_VIEWPORT_PANEL_NUMS = frozenset(
-    {
-        _GATEWAY_PANEL_NUM,
-        _SESSIONS_PANEL_NUM,
-        _CRON_PANEL_NUM,
-        # Config renders ~72 lines at a default terminal (settings, session
-        # capacity, agent limits, integrations, backups, tool gateway), so the
-        # sections it appends last — including the corrupt-snapshot alert — are
-        # only reachable through the viewport.
-        _CONFIG_PANEL_NUM,
-        _SKILLS_PANEL_NUM,
-        _OPERATIONS_PANEL_NUM,
-    }
-)
+# Every detail except Logs scrolls its complete rendered output: any detail can
+# outgrow the terminal, and without the viewport its tail is clipped with no
+# way to reach it. Logs keeps its own line window so its tab bar stays visible.
+_RENDERED_VIEWPORT_PANEL_NUMS = frozenset(set(_PANEL_NUMBERS) - {_LOG_PANEL_NUM})
 _WIDE_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
     ("row1", 4, (1,)),
     ("row2", None, (2, 3)),
@@ -1160,8 +1146,8 @@ def _detail_max_scroll_offset(
 ) -> int | None:
     """Effective max scroll offset for scrollable detail panels, else None.
 
-    Logs delegates to its panel's own clamp. Gateway, Sessions, Cron, Skills
-    and Operations use a rendered-line viewport instead.
+    Logs delegates to its panel's own clamp. Every other detail uses the
+    rendered-line viewport instead.
     """
     if panel_num == _LOG_PANEL_NUM:
         from hermesd.panels.logs import max_detail_scroll_offset
