@@ -497,6 +497,7 @@ def _executions_sections(executions: CronExecutionsState, theme: Theme) -> list[
     """Recent-execution and open-incident tables, or a single 'no data' line."""
     if (
         not executions.recent
+        and not executions.recent_failures
         and not executions.open_incidents
         and not executions.resolved_incident_count
     ):
@@ -508,6 +509,9 @@ def _executions_sections(executions: CronExecutionsState, theme: Theme) -> list[
     if executions.recent:
         sections.append(section_heading("Recent Executions", theme))
         sections.append(_recent_executions_table(executions, theme))
+    if executions.recent_failures:
+        sections.append(section_heading("Recent Failures", theme))
+        sections.extend(_failure_line(run, theme) for run in executions.recent_failures)
     if executions.open_incidents:
         sections.append(
             section_heading(
@@ -588,6 +592,17 @@ def _recent_executions_table(executions: CronExecutionsState, theme: Theme) -> T
             escape(run.error_excerpt) if run.error_excerpt else "—",
         )
     return table
+
+
+def _failure_line(run: CronExecution, theme: Theme) -> Text:
+    """One failed run: job, age, and its error excerpt (redacted in the collector)."""
+    line = Text()
+    line.append(
+        f"  {sanitize_terminal_text(run.job_name or run.job_id or '—')} ", style=theme.ui_label
+    )
+    line.append(f"{_fmt_error_age(run.started_age_seconds)}: ", style=theme.banner_dim)
+    line.append(f"{sanitize_terminal_text(run.error_excerpt) or '—'}\n", style=theme.ui_error)
+    return line
 
 
 def _delivery_cell(run: CronExecution, theme: Theme) -> Text:

@@ -1282,3 +1282,21 @@ def test_cron_panel_labels_a_quota_held_job() -> None:
     assert "(provider usage window)" in detail
     compact = render_to_str(render_cron(state, Theme()), no_color=True)
     assert "held" in compact
+
+
+def test_cron_detail_lists_recent_failures_with_their_errors() -> None:
+    failure = CronExecution(
+        execution_id="e1",
+        job_id="j1",
+        job_name="nightly",
+        status="failed",
+        started_age_seconds=7200.0,
+        error_excerpt="Script execution failed: [Errno 2] missing",
+    )
+    state = DashboardState(
+        cron_executions=CronExecutionsState(db_present=True, recent_failures=[failure])
+    )
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=200, no_color=True)
+    assert "Recent Failures" in text
+    assert "Script execution failed: [Errno 2] missing" in text
+    assert "2h ago" in text

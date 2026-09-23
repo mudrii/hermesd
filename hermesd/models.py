@@ -1065,6 +1065,9 @@ class CronExecutionsState(BaseModel):
     db_present: bool = False
     job_stats: list[CronJobExecutionStats] = Field(default_factory=list)
     recent: list[CronExecution] = Field(default_factory=list)
+    # The newest failed runs regardless of age, so a failure pushed out of
+    # ``recent`` by later successes still shows its (redacted) error.
+    recent_failures: list[CronExecution] = Field(default_factory=list)
     open_incident_count: int = 0
     unacked_incident_count: int = 0
     open_incidents: list[CronIncident] = Field(default_factory=list)

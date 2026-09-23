@@ -58,6 +58,7 @@ from hermesd.models import (
 _EXECUTIONS_RECENT_LIMIT = 10
 _EXECUTIONS_WINDOW_SECONDS = 24 * 60 * 60.0
 _INCIDENTS_LIMIT = 5
+_RECENT_FAILURES_LIMIT = 5
 
 # The ticker fires every 60s. Two missed beats means stale; a heartbeat that
 # keeps arriving while last_success falls ten beats behind means failing.
@@ -468,6 +469,19 @@ def _recent_execution_rows(conn: sqlite3.Connection, *, columns: set[str]) -> li
     )
 
 
+def _recent_failure_rows(conn: sqlite3.Connection, *, columns: set[str]) -> list[dict[str, Any]]:
+    """The newest _RECENT_FAILURES_LIMIT failed executions, newest claim first."""
+    # The LIMIT is a module-level int constant, never caller-supplied text.
+    return _execution_rows(
+        conn,
+        f"SELECT {_execution_select_columns(columns)} "
+        "FROM executions WHERE status = 'failed' "
+        "ORDER BY hermes_epoch(claimed_at) DESC, id DESC "
+        f"LIMIT {_RECENT_FAILURES_LIMIT}",
+        columns=columns,
+    )
+
+
 def _execution_window_rows(
     conn: sqlite3.Connection, *, now: float, columns: set[str]
 ) -> list[dict[str, Any]]:
@@ -667,6 +681,7 @@ def _read_cron_executions_state(
         conn.row_factory = sqlite3.Row
         columns = _executions_columns(conn)
         recent_rows = _recent_execution_rows(conn, columns=columns)
+        failure_rows = _recent_failure_rows(conn, columns=columns)
         window_rows = _execution_window_rows(conn, now=now, columns=columns)
         delivery_rows = _execution_delivery_rows(conn, now=now, columns=columns)
         last_rows = _last_execution_rows(conn, columns=columns)
@@ -680,6 +695,7 @@ def _read_cron_executions_state(
                 delivery_tracked="delivery_outcome" in columns,
             ),
             recent=[_execution_from_row(row, job_names, now=now) for row in recent_rows],
+            recent_failures=[_execution_from_row(row, job_names, now=now) for row in failure_rows],
             **incidents,
             **_execution_retention_fields(conn, now=now, columns=columns),
         )

@@ -3401,3 +3401,43 @@ def test_collect_cron_reports_only_an_active_quota_hold(hermes_home: Path):
     assert by_id["job-expired"].quota_hold_until == ""
     assert by_id["job-garbage"].quota_hold_until == ""
     assert by_id["job-free"].quota_hold_until == ""
+
+
+def test_collect_cron_recent_failures_survive_a_run_of_newer_successes(hermes_home: Path):
+    """A failure older than the newest ten runs still has its redacted error
+    shown (executions ``error``, ``cron/executions.py``), newest first, capped."""
+    conn = sqlite3.connect(str(hermes_home / "cron" / "executions.db"))
+    create_cron_executions_tables(conn)
+    for index in range(cron_module._RECENT_FAILURES_LIMIT + 2):
+        insert_cron_execution(
+            conn,
+            f"fail_{index:02d}",
+            "job-1",
+            "failed",
+            claimed_at=iso_ago(86400 + index * 60),
+            error=f"boom {index} api_key=sk-abcdef1234567890abcdef\nsecond line",
+        )
+    for index in range(_EXECUTIONS_RECENT_LIMIT + 2):
+        insert_cron_execution(
+            conn, f"ok_{index:02d}", "job-1", "completed", claimed_at=iso_ago(index * 60)
+        )
+    conn.commit()
+    conn.close()
+    _write_jobs_json(hermes_home, [{"id": "job-1", "name": "Nightly"}])
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    executions = state.cron_executions
+    assert all(run.status == "completed" for run in executions.recent)
+    failures = executions.recent_failures
+    assert [run.execution_id for run in failures] == [
+        f"fail_{index:02d}" for index in range(cron_module._RECENT_FAILURES_LIMIT)
+    ]
+    assert failures[0].job_name == "Nightly"
+    assert failures[0].error_excerpt.startswith("boom 0")
+    assert "sk-abcdef" not in failures[0].error_excerpt
+    assert "second line" not in failures[0].error_excerpt
