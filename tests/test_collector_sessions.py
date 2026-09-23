@@ -41,10 +41,26 @@ from tests.conftest import (
 )
 
 
-def test_today_epoch_is_midnight():
+@pytest.fixture
+def fixed_utc_plus_8(monkeypatch: pytest.MonkeyPatch):
+    """Pin local time to a tzdata-free POSIX zone (UTC+8) and restore it afterwards."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset is unavailable on this platform")
+    monkeypatch.setenv("TZ", "XXX-08")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+def test_today_epoch_is_midnight(fixed_utc_plus_8: None):
     import datetime
 
-    epoch = _today_epoch(time.time())
+    # 2026-09-23 18:30:45 UTC is 2026-09-24 02:30:45 in UTC+8, so local midnight
+    # (2026-09-24 00:00 +08 == 2026-09-23 16:00 UTC) differs from UTC midnight.
+    now = datetime.datetime(2026, 9, 23, 18, 30, 45, tzinfo=UTC).timestamp()
+    epoch = _today_epoch(now)
+    assert epoch == datetime.datetime(2026, 9, 23, 16, 0, 0, tzinfo=UTC).timestamp()
     dt = datetime.datetime.fromtimestamp(epoch)
     assert dt.hour == 0
     assert dt.minute == 0
