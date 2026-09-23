@@ -161,13 +161,13 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         age = ops.checkpoint_prune_marker_age_seconds
         lines.append("  ⚠ Checkpoint prune overdue ", style=theme.ui_warn)
         lines.append(
-            f"({_age_span_label(age)} since last pass)\n",
+            f"({fmt_age_seconds(age)} since last pass)\n",
             style=theme.ui_warn,
         )
     if ops.spawn_ledger_corrupt_present:
         lines.append("  ⚠ spawn-ledger corrupt ", style=theme.ui_warn)
         lines.append(
-            f"(parked {_age_span_label(ops.spawn_ledger_corrupt_age_seconds)} ago)\n",
+            f"(parked {fmt_age_seconds(ops.spawn_ledger_corrupt_age_seconds)} ago)\n",
             style=theme.ui_warn,
         )
     lines.append("  Verify: ", style=theme.ui_label)
@@ -339,7 +339,7 @@ def _hosted_room_summary_table(hosted: HostedRoomState, theme: Theme) -> Table:
     table.add_row(
         "Events",
         f"{hosted.event_count} · {_size_label(hosted.accounted_event_bytes)} accounted · "
-        f"newest {_age_span_label(hosted.newest_event_age_seconds)} ago",
+        f"newest {fmt_age_seconds(hosted.newest_event_age_seconds)} ago",
     )
     kinds = _hosted_event_kind_label(hosted)
     if kinds:
@@ -348,7 +348,7 @@ def _hosted_room_summary_table(hosted: HostedRoomState, theme: Theme) -> Table:
         table.add_row(
             "Retired IDs",
             f"{hosted.retired_id_count} · newest "
-            f"{_age_span_label(hosted.newest_retired_id_age_seconds)} ago",
+            f"{fmt_age_seconds(hosted.newest_retired_id_age_seconds)} ago",
         )
     if hosted.link_count:
         # A count only: every other column of that table is a credential-bearing
@@ -358,7 +358,7 @@ def _hosted_room_summary_table(hosted: HostedRoomState, theme: Theme) -> Table:
         table.add_row(
             "Remote Runs",
             f"{hosted.remote_run_count} · newest "
-            f"{_age_span_label(hosted.newest_remote_run_age_seconds)} ago",
+            f"{fmt_age_seconds(hosted.newest_remote_run_age_seconds)} ago",
         )
     if hosted.revoked_grant_count:
         table.add_row("Revoked Grants", f"{hosted.revoked_grant_count} (scope keys never read)")
@@ -403,7 +403,7 @@ def _hosted_rooms_table(hosted: HostedRoomState, theme: Theme) -> Table:
             str(room.revision),
             str(room.latest_seq),
             _size_label(room.event_bytes),
-            _age_span_label(room.updated_at_age_seconds),
+            fmt_age_seconds(room.updated_at_age_seconds),
             _hosted_room_state_label(room),
         )
     return table
@@ -412,7 +412,7 @@ def _hosted_rooms_table(hosted: HostedRoomState, theme: Theme) -> Table:
 def _hosted_room_state_label(room: HostedRoomSummary) -> str:
     if not room.disbanded:
         return "active"
-    return f"disbanded {_age_span_label(room.disbanded_at_age_seconds)} ago"
+    return f"disbanded {fmt_age_seconds(room.disbanded_at_age_seconds)} ago"
 
 
 def _api_run_sections(api_runs: ApiRunReservationsState, theme: Theme) -> list[RenderableType]:
@@ -446,8 +446,8 @@ def _api_run_summary_table(api_runs: ApiRunReservationsState, theme: Theme) -> T
     )
     table.add_row(
         "Ages",
-        f"newest {_age_span_label(api_runs.newest_age_seconds)} · "
-        f"oldest {_age_span_label(api_runs.oldest_age_seconds)}",
+        f"newest {fmt_age_seconds(api_runs.newest_age_seconds)} · "
+        f"oldest {fmt_age_seconds(api_runs.oldest_age_seconds)}",
     )
     if api_runs.acknowledged_count:
         table.add_row("Acknowledged", str(api_runs.acknowledged_count))
@@ -478,8 +478,8 @@ def _api_runs_table(api_runs: ApiRunReservationsState, theme: Theme) -> Table:
         table.add_row(
             escape(item.run_id) or "—",
             escape(item.status.value),
-            _age_span_label(item.created_at_age_seconds),
-            _age_span_label(item.updated_at_age_seconds),
+            fmt_age_seconds(item.created_at_age_seconds),
+            fmt_age_seconds(item.updated_at_age_seconds),
             _retention_label(item.retention_remaining_seconds),
             _run_owner_label(item),
         )
@@ -491,8 +491,8 @@ def _retention_label(seconds: float | None) -> str:
     if seconds is None:
         return "—"
     if seconds < 0:
-        return f"{_duration_label(-seconds)} overdue"
-    return f"{_duration_label(seconds)} left"
+        return f"{fmt_age_seconds(-seconds)} overdue"
+    return f"{fmt_age_seconds(seconds)} left"
 
 
 def _run_owner_label(item: ApiRunReservation) -> str:
@@ -552,13 +552,13 @@ def _summary_table(ops: OperationsState, theme: Theme) -> Table:
         summary.add_row(
             "Web UI Build",
             f"{escape(ops.web_ui_build_hash) or '—'}  "
-            f"built {_age_span_label(ops.web_ui_built_age_seconds)} ago",
+            f"built {fmt_age_seconds(ops.web_ui_built_age_seconds)} ago",
         )
     if ops.snapshot_count:
         summary.add_row(
             "Snapshots",
             f"{ops.snapshot_count} · {_size_label(ops.snapshot_total_bytes)} · "
-            f"newest {_age_span_label(ops.newest_snapshot_age_seconds)} ago",
+            f"newest {fmt_age_seconds(ops.newest_snapshot_age_seconds)} ago",
         )
     if ops.blocked_script_count:
         summary.add_row("Blocked scripts", _blocked_scripts_label(ops))
@@ -577,12 +577,12 @@ def _checkpoint_prune_label(ops: OperationsState) -> str:
     is part of the row: a fresh marker proves the wrapper ran, not that pruning
     succeeded.
     """
-    age = _age_span_label(ops.checkpoint_prune_marker_age_seconds)
+    age = fmt_age_seconds(ops.checkpoint_prune_marker_age_seconds)
     interval = ops.checkpoint_prune_interval_seconds
     verdict = (
-        f"OVERDUE (> {_age_span_label(checkpoint_prune_overdue_after(interval))})"
+        f"OVERDUE (> {fmt_age_seconds(checkpoint_prune_overdue_after(interval))})"
         if ops.checkpoint_prune_overdue
-        else f"interval {_age_span_label(interval)}"
+        else f"interval {fmt_age_seconds(interval)}"
     )
     return f"last pass {age} ago · {verdict} · a fresh marker proves the wrapper ran, not that pruning succeeded"
 
@@ -590,7 +590,7 @@ def _checkpoint_prune_label(ops: OperationsState) -> str:
 def _spawn_ledger_corrupt_label(ops: OperationsState) -> str:
     """The parked corrupt ledger: presence and age, contents never read."""
     return (
-        f"⚠ corrupt ledger parked {_age_span_label(ops.spawn_ledger_corrupt_age_seconds)} ago "
+        f"⚠ corrupt ledger parked {fmt_age_seconds(ops.spawn_ledger_corrupt_age_seconds)} ago "
         "(read-only viewer; contents never parsed)"
     )
 
@@ -600,7 +600,7 @@ def _blocked_scripts_label(ops: OperationsState) -> str:
     names = ", ".join(escape(name) for name in ops.blocked_script_names)
     label = (
         f"{ops.blocked_script_count} "
-        f"(newest {_age_span_label(ops.newest_blocked_script_age_seconds)} ago)"
+        f"(newest {fmt_age_seconds(ops.newest_blocked_script_age_seconds)} ago)"
     )
     return f"{label}: {names}" if names else label
 
@@ -639,7 +639,7 @@ def _repair_ledger_label(recovery: DbRecoveryState) -> str:
         budget = f"budget exhausted (max {MAX_PERSISTENT_REPAIR_ATTEMPTS})"
     else:
         budget = f"budget {recovery.failed_attempts}/{MAX_PERSISTENT_REPAIR_ATTEMPTS}"
-    last = _age_span_label(recovery.last_attempt_age_seconds)
+    last = fmt_age_seconds(recovery.last_attempt_age_seconds)
     return f"{recovery.failed_attempts} failed · {budget} · last {last} ago"
 
 
@@ -647,7 +647,7 @@ def _malformed_backup_label(recovery: DbRecoveryState) -> str:
     """Settled forensic copies only; staging is its own row."""
     return (
         f"{recovery.malformed_backup_count} · {_size_label(recovery.malformed_backup_bytes)} · "
-        f"newest {_age_span_label(recovery.newest_malformed_backup_age_seconds)} ago"
+        f"newest {fmt_age_seconds(recovery.newest_malformed_backup_age_seconds)} ago"
     )
 
 
@@ -658,7 +658,7 @@ def _retired_wal_label(recovery: DbRecoveryState) -> str:
     if not newest.manifest_present:
         parts.append("newest has no readable manifest.json")
         return " · ".join(parts)
-    age = _age_span_label(newest.captured_at_age_seconds)
+    age = fmt_age_seconds(newest.captured_at_age_seconds)
     parts.append(f"newest {escape(newest.captured_at) or '—'} ({age} ago)")
     parts.append(f"trigger={escape(newest.trigger) or '—'}")
     parts.append(f"wal {_size_label(newest.wal_bytes)}")
@@ -714,7 +714,7 @@ def _delegations_table(ops: OperationsState, theme: Theme) -> Table:
             escape(delegation.state) or "—",
             delivery,
             "alive" if delegation.owner_alive else "—",
-            _duration_label(delegation.duration_seconds),
+            fmt_age_seconds(delegation.duration_seconds),
             escape(delegation.goal) or "—",
             escape(delegation.error_excerpt) or escape(delegation.result_status) or "—",
             _delegation_procs_label(delegation),
@@ -741,7 +741,7 @@ def _live_manifest_sections(ops: OperationsState, theme: Theme) -> list[Renderab
             table.add_row("Started", escape(manifest.started))
         if manifest.completed:
             table.add_row("Completed", escape(manifest.completed))
-        table.add_row("Dispatched", _age_span_label(manifest.dir_age_seconds))
+        table.add_row("Dispatched", fmt_age_seconds(manifest.dir_age_seconds))
         if manifest.tasks_truncated:
             table.add_row("Task List", _truncation_label(len(manifest.tasks), manifest.task_count))
         parts.append(table)
@@ -831,7 +831,7 @@ def _receipts_table(receipts: ProcessReceiptsState, theme: Theme) -> Table:
             escape(receipt.process_id) or "—",
             "—" if receipt.exit_code is None else str(receipt.exit_code),
             escape(receipt.completion_reason) or escape(receipt.termination_source) or "—",
-            _age_span_label(receipt.finished_age_seconds),
+            fmt_age_seconds(receipt.finished_age_seconds),
             escape(receipt.command) or "—",
             escape(_single_line(receipt.output_tail)) or "—",
         )
@@ -867,8 +867,8 @@ def _state_db_table(ops: OperationsState, theme: Theme) -> Table:
         f"{_size_label(ops.state_db_size_bytes)} db · "
         f"{_size_label(ops.state_db_wal_size_bytes)} wal",
     )
-    table.add_row("Last Auto Prune", _age_span_label(ops.last_auto_prune_age_seconds))
-    table.add_row("Last Auto Archive", _age_span_label(ops.last_auto_archive_age_seconds))
+    table.add_row("Last Auto Prune", fmt_age_seconds(ops.last_auto_prune_age_seconds))
+    table.add_row("Last Auto Archive", fmt_age_seconds(ops.last_auto_archive_age_seconds))
     table.add_row("File Generation", escape(ops.state_db_file_generation) or "—")
     table.add_row("FTS Storage", escape(ops.state_db_fts_storage_version) or "—")
     return table
@@ -1060,21 +1060,6 @@ def _discovered_repos_table(ops: OperationsState, theme: Theme) -> Table:
     return repo_table
 
 
-def _duration_label(seconds: float | None) -> str:
-    if seconds is None:
-        return "—"
-    return fmt_age_seconds(max(0, int(seconds)))
-
-
-def _age_span_label(seconds: float | None) -> str:
-    """Compact age label with a day tier for prune/archive/snapshot ages."""
-    if seconds is None:
-        return "—"
-    if seconds < 86400:
-        return _duration_label(seconds)
-    return f"{int(seconds // 86400)}d"
-
-
 def _size_label(size_bytes: int) -> str:
     if size_bytes >= 1_000_000_000:
         return f"{size_bytes / 1_000_000_000:.1f}G"
@@ -1088,11 +1073,7 @@ def _size_label(size_bytes: int) -> str:
 def _age_label(timestamp: float | None, now: float) -> str:
     if timestamp is None:
         return "—"
-    try:
-        age = max(0, int(now - timestamp))
-    except (OverflowError, OSError, ValueError):
-        return "—"
-    return fmt_age_seconds(age)
+    return fmt_age_seconds(now - timestamp)
 
 
 def _goal_waiting_label(waiting_on_pid: int, waiting_on_session: str) -> str:

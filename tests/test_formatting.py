@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import math
+
+import pytest
+
 from hermesd.panels.formatting import (
     IdentityMemo,
+    fmt_age_seconds,
+    fmt_bytes,
     fmt_iso_timestamp,
     fmt_tokens,
     fmt_usd,
@@ -107,3 +113,41 @@ def test_identity_memo_recomputes_for_equal_but_distinct_objects():
     assert memo.get(([1],), lambda: 1) == 1
     assert memo.get(([1],), lambda: 2) == 2
     assert memo.get(([1], "a"), lambda: 3) == 3
+
+
+@pytest.mark.parametrize(
+    ("age", "expected"),
+    [
+        (0, "0s"),
+        (59.9, "59s"),
+        (60, "1m"),
+        (3599, "59m"),
+        (3600, "1h"),
+        (86399, "23h"),
+        (86400, "1d"),
+        (3 * 86400 + 5, "3d"),
+        (-5, "0s"),
+        (None, "—"),
+        (math.inf, "—"),
+        (-math.inf, "—"),
+        (math.nan, "—"),
+    ],
+)
+def test_fmt_age_seconds_tiers_and_non_finite_guard(age: float | None, expected: str):
+    assert fmt_age_seconds(age) == expected
+
+
+@pytest.mark.parametrize(
+    ("size", "expected"),
+    [
+        (0, "0 B"),
+        (1023, "1023 B"),
+        (1024, "1.0 KB"),
+        (1536, "1.5 KB"),
+        (5 * 1024 * 1024, "5.0 MB"),
+        (3 * 1024**3, "3.0 GB"),
+        (2 * 1024**4, "2.0 TB"),
+    ],
+)
+def test_fmt_bytes_uses_binary_units(size: int, expected: str):
+    assert fmt_bytes(size) == expected

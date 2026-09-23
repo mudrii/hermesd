@@ -20,6 +20,8 @@ from hermesd.panels.formatting import (
     escape_terminal_text as escape,
 )
 from hermesd.panels.formatting import (
+    fmt_age_seconds,
+    fmt_bytes,
     fmt_iso_timestamp,
     sanitize_terminal_text,
     section_heading,
@@ -146,7 +148,7 @@ def _platforms_table(gw: GatewayState, theme: Theme) -> Table:
             status,
             _ownership_label(p.ownership, theme),
             escape(fmt_iso_timestamp(p.updated_at)),
-            _duration_label(p.retrying_since_age_seconds),
+            fmt_age_seconds(p.retrying_since_age_seconds),
             error,
         )
     return table
@@ -353,14 +355,14 @@ def _restart_storm_text(gw: GatewayState, theme: Theme) -> Text:
     """
     text = Text()
     text.append("\n  Starts: ", style=theme.ui_label)
-    window = _duration_label(gw.restart_storm_window_seconds)
+    window = fmt_age_seconds(gw.restart_storm_window_seconds)
     text.append(
         f"{window} {gw.gateway_starts_window}/{gw.restart_storm_cap}  1h {gw.gateway_starts_1h}",
         style=theme.banner_text,
     )
     last = gw.seconds_since_last_gateway_start
     if last is not None:
-        text.append(f"  last start {_duration_label(last)} ago", style=theme.banner_dim)
+        text.append(f"  last start {fmt_age_seconds(last)} ago", style=theme.banner_dim)
     if gw.in_respawn_backoff:
         text.append(
             "  ⚠ respawn backoff (the supervisor pauses between restarts)",
@@ -376,28 +378,15 @@ def _dashboard_client_text(gw: GatewayState, theme: Theme) -> Text:
     if gw.dashboard_client_attached:
         text.append("web dashboard client attached", style=theme.ui_ok)
         if age is not None:
-            text.append(f"  last frame {_duration_label(age)} ago", style=theme.banner_dim)
+            text.append(f"  last frame {fmt_age_seconds(age)} ago", style=theme.banner_dim)
     elif age is not None:
         text.append(
-            f"no client attached (last frame {_duration_label(age)} ago)",
+            f"no client attached (last frame {fmt_age_seconds(age)} ago)",
             style=theme.banner_dim,
         )
     else:
         text.append("no dashboard client marker (never attached)", style=theme.banner_dim)
     return text
-
-
-def _duration_label(seconds: float | None) -> str:
-    if seconds is None:
-        return "—"
-    total = max(0, int(seconds))
-    if total < 60:
-        return f"{total}s"
-    if total < 3600:
-        return f"{total // 60}m"
-    if total < 86400:
-        return f"{total // 3600}h"
-    return f"{total // 86400}d"
 
 
 def _or_dash(value: str) -> str:
@@ -448,10 +437,10 @@ def _liveness_text(gw: GatewayState, theme: Theme) -> Text:
     text.append("  Loop: ", style=theme.ui_label)
     text.append(gw.loop_health.value, style=_loop_style(gw.loop_health, theme))
     text.append(
-        f"  heartbeat {_duration_label(gw.heartbeat_age_seconds)} ago"
+        f"  heartbeat {fmt_age_seconds(gw.heartbeat_age_seconds)} ago"
         f"  incarnations {gw.gateway_incarnation_count}"
         f"  restarts 24h {gw.gateway_restarts_24h}"
-        f"  uptime {_duration_label(gw.current_incarnation_uptime_seconds)}",
+        f"  uptime {fmt_age_seconds(gw.current_incarnation_uptime_seconds)}",
         style=theme.banner_dim,
     )
     text.append_text(_witness_label(gw, theme))
@@ -508,14 +497,6 @@ def _append_lifecycle(text: Text, gw: GatewayState, theme: Theme) -> None:
         text.append("\n  ⚠ suspected OOM", style=theme.ui_warn)
 
 
-def _size_label(size_bytes: int) -> str:
-    if size_bytes >= 1024 * 1024:
-        return f"{size_bytes / (1024 * 1024):.1f} MB"
-    if size_bytes >= 1024:
-        return f"{size_bytes / 1024:.0f} KB"
-    return f"{size_bytes} B"
-
-
 def _exit_diag_text(gw: GatewayState, theme: Theme) -> Text:
     """Crash forensics from the exit-diag ledger: tags and counts only.
 
@@ -535,11 +516,11 @@ def _exit_diag_text(gw: GatewayState, theme: Theme) -> Text:
     text.append(_text_or_dash(gw.exit_diag_last_tag), style=theme.banner_text)
     if gw.exit_diag_last_age_seconds is not None:
         text.append(
-            f"  {_duration_label(gw.exit_diag_last_age_seconds)} ago",
+            f"  {fmt_age_seconds(gw.exit_diag_last_age_seconds)} ago",
             style=theme.banner_dim,
         )
     text.append(f"  unclean exits 24h: {gw.exit_diag_unclean_24h}", style=theme.banner_dim)
-    text.append(f"  ledger {_size_label(gw.exit_diag_size_bytes)}", style=theme.banner_dim)
+    text.append(f"  ledger {fmt_bytes(gw.exit_diag_size_bytes)}", style=theme.banner_dim)
     if gw.exit_diag_oversized:
         text.append(
             "  ⚠ past a few MB and nothing prunes it",
@@ -554,10 +535,10 @@ def _forensic_files_text(gw: GatewayState, theme: Theme) -> Text:
         return Text()
     text = Text("\n  Event logs: ", style=theme.ui_label)
     parts = [
-        f"{sanitize_terminal_text(file.name)} ({_size_label(file.size_bytes)}, "
-        f"{_duration_label(file.age_seconds)} ago)"
+        f"{sanitize_terminal_text(file.name)} ({fmt_bytes(file.size_bytes)}, "
+        f"{fmt_age_seconds(file.age_seconds)} ago)"
         if file.age_seconds is not None
-        else f"{sanitize_terminal_text(file.name)} ({_size_label(file.size_bytes)})"
+        else f"{sanitize_terminal_text(file.name)} ({fmt_bytes(file.size_bytes)})"
         for file in gw.forensic_files
     ]
     text.append("; ".join(parts), style=theme.banner_dim)
@@ -579,7 +560,7 @@ def _updates_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
         style=theme.ui_warn if gw.update_receipt_unfinished else theme.ui_ok,
     )
     text.append(
-        f"  finished {_duration_label(gw.last_update_finished_age_seconds)} ago",
+        f"  finished {fmt_age_seconds(gw.last_update_finished_age_seconds)} ago",
         style=theme.banner_dim,
     )
     text.append("\n  Version: ", style=theme.ui_label)
@@ -721,7 +702,7 @@ def _append_migration_intent(text: Text, mig: MigrationState, theme: Theme) -> N
         suffix = (
             " (local time; the recorded stamp could not be parsed)"
             if mig.migrated_at_age_seconds is None
-            else f" (local time, {_duration_label(mig.migrated_at_age_seconds)} ago)"
+            else f" (local time, {fmt_age_seconds(mig.migrated_at_age_seconds)} ago)"
         )
         text.append(suffix, style=theme.banner_dim)
     text.append("\n  Config flag: ", style=theme.ui_label)
@@ -812,7 +793,7 @@ def _deliveries_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
             _or_dash(entry.platform),
             _or_dash(entry.state),
             str(entry.attempts),
-            _duration_label(entry.age_seconds),
+            fmt_age_seconds(entry.age_seconds),
             _or_dash(entry.last_error),
         )
     return [header, table]

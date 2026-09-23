@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable
 from datetime import datetime
@@ -84,13 +85,33 @@ def escape_terminal_text(value: str) -> str:
     return escape(sanitize_terminal_text(value))
 
 
-def fmt_age_seconds(age: int) -> str:
-    """Render a non-negative age in seconds as a compact s/m/h label."""
-    if age < 60:
-        return f"{age}s"
-    if age < 3600:
-        return f"{age // 60}m"
-    return f"{age // 3600}h"
+def fmt_age_seconds(age: float | None) -> str:
+    """Compact s/m/h/d label for an age in seconds; "—" when unknown or not finite.
+
+    Negative ages (clock skew) clamp to "0s".
+    """
+    if age is None or not math.isfinite(age):
+        return "—"
+    seconds = max(0, int(age))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def fmt_bytes(size_bytes: int) -> str:
+    """Binary-unit size label: B, then KB/MB/GB/TB with one decimal."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    value = float(size_bytes)
+    for unit in ("KB", "MB", "GB"):
+        value /= 1024
+        if value < 1024:
+            return f"{value:.1f} {unit}"
+    return f"{value / 1024:.1f} TB"
 
 
 def section_heading(label: str, theme: Theme, *, leading_blank: bool = True) -> Text:

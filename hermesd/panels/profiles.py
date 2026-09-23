@@ -11,7 +11,7 @@ from rich.text import Text
 
 from hermesd.models import DashboardState
 from hermesd.panels.formatting import escape_terminal_text as escape
-from hermesd.panels.formatting import sanitize_terminal_text
+from hermesd.panels.formatting import fmt_bytes, sanitize_terminal_text
 from hermesd.theme import Theme
 
 
@@ -81,7 +81,7 @@ def _render_detail(state: DashboardState, theme: Theme, profile_view_index: int)
             escape(profile.name),
             str(profile.session_count),
             str(profile.skill_count),
-            _format_size(profile.db_size_bytes),
+            fmt_bytes(profile.db_size_bytes),
             _format_timestamp(profile.latest_log_mtime),
         )
 
@@ -116,15 +116,3 @@ def _format_timestamp(value: float | None) -> str:
     if value > time.time() + 60:
         return f"{formatted} (future)"
     return formatted
-
-
-def _format_size(size_bytes: int) -> str:
-    if size_bytes < 1024:
-        return f"{size_bytes} B"
-    if size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.1f} KB"
-    if size_bytes < 1024 * 1024 * 1024:
-        return f"{size_bytes / (1024 * 1024):.1f} MB"
-    if size_bytes < 1024 * 1024 * 1024 * 1024:
-        return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
-    return f"{size_bytes / (1024 * 1024 * 1024 * 1024):.1f} TB"

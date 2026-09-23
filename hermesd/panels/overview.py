@@ -157,7 +157,7 @@ def _mcp_cache_section(state: DashboardState, theme: Theme) -> list[RenderableTy
         "Cached servers",
         escape(f"{cache.mcp_cached_server_count} ({names})") if names else "—",
     )
-    table.add_row("Cache age", _age_label(cache.mcp_schema_cache_age_seconds))
+    table.add_row("Cache age", fmt_age_seconds(cache.mcp_schema_cache_age_seconds))
     table.add_row("Entry validity", _validity_summary(cache))
     # An absent entry says nothing about whether the server ever connected: the
     # cache can be cleared, invalidated, or written under another profile.
@@ -243,7 +243,7 @@ def _entry_detail(entry: MCPCacheEntry) -> str:
     ttl = _duration_label(entry.ttl_ms / 1000.0) if entry.ttl_ms is not None else ""
     if entry.state is MCPCacheEntryState.EXPIRED:
         head = f"{ttl} ttl elapsed" if ttl else "ttl elapsed"
-        elapsed = _age_label(entry.age_seconds) if entry.age_seconds is not None else ""
+        elapsed = fmt_age_seconds(entry.age_seconds) if entry.age_seconds is not None else ""
         return f"{head} {elapsed} ago" if elapsed else head
     if not ttl:
         return "no ttl recorded — never expires"
@@ -256,7 +256,7 @@ def _duration_label(seconds: float) -> str:
     """A TTL or a remaining window; sub-second values keep their milliseconds."""
     if seconds < 1.0:
         return f"{seconds * 1000:.0f}ms"
-    return fmt_age_seconds(int(seconds))
+    return fmt_age_seconds(seconds)
 
 
 def _bounded_name_list(count: int, names: list[str]) -> str:
@@ -273,16 +273,10 @@ def _prompted_skills_text(state: DashboardState, theme: Theme) -> Text:
     text = Text()
     text.append(
         f"\nPrompted skills: {prompt.prompted_skill_count} "
-        f"(snapshot {_age_label(prompt.prompt_snapshot_age_seconds)} ago)",
+        f"(snapshot {fmt_age_seconds(prompt.prompt_snapshot_age_seconds)} ago)",
         style=theme.banner_text,
     )
     return text
-
-
-def _age_label(age_seconds: float | None) -> str:
-    if age_seconds is None:
-        return "—"
-    return fmt_age_seconds(max(0, int(age_seconds)))
 
 
 def _providers_table(sm: SkillsMemory, theme: Theme) -> Table:
@@ -544,14 +538,16 @@ def _append_catalog_note(sm: SkillsMemory, note: Text, theme: Theme) -> None:
         return
     if not sm.plugin_catalog_cache_usable:
         age = sm.plugin_catalog_cache_age_seconds
-        cache_line = "catalog cache" if age is None else f"catalog cache {_age_label(age)} old"
+        cache_line = "catalog cache" if age is None else f"catalog cache {fmt_age_seconds(age)} old"
         note.append(
             f"  {cache_line} is unreadable — update/removal checks unavailable\n",
             style=theme.banner_dim,
         )
         return
     age = sm.plugin_catalog_cache_age_seconds
-    cache_line = "catalog cache observed" if age is None else f"catalog cache {_age_label(age)} old"
+    cache_line = (
+        "catalog cache observed" if age is None else f"catalog cache {fmt_age_seconds(age)} old"
+    )
     note.append(f"  {cache_line}: ", style=theme.banner_dim)
     parts = []
     if sm.plugin_catalog_update_count:

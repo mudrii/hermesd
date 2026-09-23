@@ -527,14 +527,7 @@ def _activity_at(session: SessionInfo) -> float:
 def _age_label(timestamp: float, now: float) -> str:
     if timestamp <= 0:
         return "—"
-    age = max(0, int(now - timestamp))
-    if age < 60:
-        return f"{age}s"
-    if age < 3600:
-        return f"{age // 60}m"
-    if age < 86400:
-        return f"{age // 3600}h"
-    return f"{age // 86400}d"
+    return fmt_age_seconds(now - timestamp)
 
 
 def _truncate(value: str, limit: int) -> str:
@@ -654,17 +647,10 @@ def _surfaces_table(surfaces: list[ActiveSurface], theme: Theme) -> Table | None
             escape(surface.surface) if surface.surface else "—",
             str(surface.pid),
             escape(surface.lease_id[:_LEASE_ID_CHARS]) if surface.lease_id else "—",
-            _lease_age_label(surface.started_at_age_seconds),
+            fmt_age_seconds(surface.started_at_age_seconds),
             _surface_state_label(surface, theme),
         )
     return table
-
-
-def _lease_age_label(seconds: float | None) -> str:
-    """A lease's age; "—" when the registry recorded no usable epoch stamp."""
-    if seconds is None:
-        return "—"
-    return fmt_age_seconds(max(0, int(seconds)))
 
 
 def _surface_state_label(surface: ActiveSurface, theme: Theme) -> Text:
@@ -679,7 +665,7 @@ def _surface_state_label(surface: ActiveSurface, theme: Theme) -> Text:
     label = _liveness_label(surface.liveness, theme)
     if surface.lease_renewed:
         label.append(" moved ", style=theme.banner_dim)
-        label.append(_lease_age_label(surface.updated_at_age_seconds), style=theme.ui_accent)
+        label.append(fmt_age_seconds(surface.updated_at_age_seconds), style=theme.ui_accent)
     if surface.track_liveness:
         label.append(" tracked", style=theme.banner_dim)
     if surface.joinable:
@@ -763,7 +749,7 @@ def _duration_label(seconds: float) -> str:
     """A countdown window; sub-second values keep one decimal place."""
     if seconds < 1.0:
         return f"{seconds:.1f}s"
-    return fmt_age_seconds(int(seconds))
+    return fmt_age_seconds(seconds)
 
 
 def _runtime_table(sessions: list[SessionInfo], theme: Theme) -> Table | None:
@@ -923,19 +909,13 @@ _HYGIENE_NOTE = (
 )
 
 
-def _duration_or_dash(seconds: float | None) -> str:
-    if seconds is None:
-        return "—"
-    return fmt_age_seconds(max(0, int(seconds)))
-
-
 def _ttl_label(lease: SessionLease) -> str:
     expires_in = lease.expires_in_seconds
     if expires_in is None:
         return "—"
     if expires_in >= 0:
-        return f"{fmt_age_seconds(int(expires_in))} left"
-    return f"expired {fmt_age_seconds(int(-expires_in))} ago"
+        return f"{fmt_age_seconds(expires_in)} left"
+    return f"expired {fmt_age_seconds(-expires_in)} ago"
 
 
 def _lease_state_label(lease: SessionLease, theme: Theme) -> Text:
@@ -963,7 +943,7 @@ def _leases_table(leases: list[SessionLease], theme: Theme) -> Table:
             "turn lease" if lease.kind is SessionLeaseKind.TURN_LEASE else "compress lock",
             escape(lease.key[-_COORDINATION_KEY_CHARS:]),
             str(lease.pid) if lease.pid else "—",
-            _duration_or_dash(lease.held_seconds),
+            fmt_age_seconds(lease.held_seconds),
             _ttl_label(lease),
             _lease_state_label(lease, theme),
         )
@@ -1036,7 +1016,7 @@ def _routes_table(routes: list[GatewayRouteState], theme: Theme) -> Table:
             escape(route.session_key[-_COORDINATION_KEY_CHARS:]),
             escape(route.platform) if route.platform else "—",
             escape(route.chat_type) if route.chat_type else "—",
-            _lease_age_label(route.turn_age_seconds),
+            fmt_age_seconds(route.turn_age_seconds),
             escape(route.display_name) if route.display_name else "—",
             escape(_route_flags(route)),
         )
@@ -1122,6 +1102,6 @@ def _terminal_section(term: TerminalSessionReadout, theme: Theme) -> RenderableT
             escape(row.terminal),
             escape(row.session_id[-8:]) if row.session_id else "—",
             escape(_cwd_label(row.cwd)) if row.cwd else "—",
-            _duration_or_dash(row.age_seconds),
+            fmt_age_seconds(row.age_seconds),
         )
     return Group(lines, table)

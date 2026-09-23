@@ -252,7 +252,7 @@ def _window_table(cur: CuratorRun, theme: Theme) -> Table:
 def _activity_label(age_seconds: float | None) -> str:
     if age_seconds is None:
         return "never"
-    return fmt_age_seconds(max(0, int(age_seconds))) + " ago"
+    return fmt_age_seconds(age_seconds) + " ago"
 
 
 def _days_label(days: float | None) -> str:
