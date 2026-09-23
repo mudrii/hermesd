@@ -1612,7 +1612,7 @@ class Collector:
         gateway_cfg = _as_dict(cfg.get("gateway"))
         scale_cfg = _as_dict(cfg.get("scale_to_zero")) or _as_dict(gateway_cfg.get("scale_to_zero"))
         active_agents = _coerce_int(data.get("active_agents"))
-        drain_request = self._read_json_cached(self._paths.shared_path(".drain_request.json"))
+        drain_request = self._read_json_confined(self._paths.shared_path(".drain_request.json"))
         config_generation = _config_generation(data)
         return GatewayState(
             code_sha=str(data.get("code_sha") or ""),
@@ -3690,7 +3690,9 @@ class Collector:
 
     def _collect_hooks(self) -> list[HookInfo]:
         hooks_dir = self._paths.shared_path("hooks")
-        if not hooks_dir.is_dir():
+        # The per-hook reads are confined to hooks_dir, so hooks_dir itself must
+        # be a real directory under the home or those checks confine nothing.
+        if not _safe_child_path(hooks_dir, self._paths.root_home) or not hooks_dir.is_dir():
             return []
 
         hooks: list[HookInfo] = []
@@ -3968,7 +3970,12 @@ class Collector:
         gate = gate_plugin(key=key, name=name, kind=kind, enabled=enabled, disabled=disabled)
         install = install_provenance(install_metadata.get(name))
         catalog = self._read_catalog_sidecar(plugin_dir, base)
-        dashboard_manifest = self._read_json_cached(plugin_dir / "dashboard" / "manifest.json")
+        dashboard_path = plugin_dir / "dashboard" / "manifest.json"
+        dashboard_manifest = (
+            self._read_json_confined(dashboard_path)
+            if _safe_capped_file(dashboard_path, base)
+            else {}
+        )
         return PluginInfo(
             name=name,
             version=version,
@@ -4076,7 +4083,12 @@ class Collector:
 
     def _collect_checkpoints(self) -> list[CheckpointInfo]:
         checkpoints_dir = self._paths.profile_path("checkpoints")
-        if not checkpoints_dir.is_dir():
+        # Each entry is summarised by subprocesses run inside it, so a
+        # checkpoints/ link out of the profile home must not be followed.
+        if (
+            not _safe_child_path(checkpoints_dir, self._paths.profile_home)
+            or not checkpoints_dir.is_dir()
+        ):
             return []
 
         checkpoints: list[CheckpointInfo] = []
@@ -4335,7 +4347,10 @@ class Collector:
         self, name: str, path: Path, max_lines: int, scope: SourceScope
     ) -> LogStream:
         key = str(path)
-        if not _path_resolves_under(path, self._paths.root_home) or not path.exists():
+        # Each stream is confined to the home that owns it: a profile log that
+        # resolves elsewhere under the root is outside the profile's scope.
+        home = self._paths.profile_home if scope is SourceScope.PROFILE else self._paths.root_home
+        if not _path_resolves_under(path, home) or not path.exists():
             return LogStream(
                 name=name, path=path.name, scope=scope, lines=self._log_cache.get(key, [])
             )

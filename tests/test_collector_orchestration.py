@@ -330,6 +330,81 @@ def test_moa_trace_vanishing_mid_scan_does_not_fail_operations(
     assert state.operations.moa_trace_newest_session_id == "sess_real"
 
 
+def test_symlinked_hooks_directory_is_never_read(hermes_home: Path, tmp_path: Path) -> None:
+    outside = tmp_path / "outside-hooks"
+    hook = outside / "evil"
+    hook.mkdir(parents=True)
+    (hook / "HOOK.yaml").write_text("name: SENTINEL_OUTSIDE\nevents: [agent:start]\n")
+    (hook / "handler.py").write_text("def handle(event): pass\n")
+    (hermes_home / "hooks").symlink_to(outside, target_is_directory=True)
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.skills_memory.hooks == []
+    assert "SENTINEL_OUTSIDE" not in state.model_dump_json()
+
+
+def test_symlinked_checkpoints_directory_is_never_read(hermes_home: Path, tmp_path: Path) -> None:
+    """Checkpoint entries run git; a checkpoints/ link out of the home must not
+    steer those subprocesses (or the HERMES_WORKDIR read) outside it."""
+    outside = tmp_path / "outside-checkpoints"
+    repo = outside / "repo1"
+    repo.mkdir(parents=True)
+    (repo / "HERMES_WORKDIR").write_text("/SENTINEL_OUTSIDE\n")
+    (hermes_home / "checkpoints").symlink_to(outside, target_is_directory=True)
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.checkpoints == []
+    assert "SENTINEL_OUTSIDE" not in state.model_dump_json()
+
+
+def test_symlinked_drain_request_is_never_read(hermes_home: Path, tmp_path: Path) -> None:
+    (hermes_home / "gateway_state.json").write_text(
+        json.dumps({"pid": 4242, "gateway_state": "running", "platforms": {}})
+    )
+    outside = tmp_path / "drain.json"
+    outside.write_text(json.dumps({"requested_at": "SENTINEL_OUTSIDE", "principal": "x"}))
+    (hermes_home / ".drain_request.json").symlink_to(outside)
+
+    c = Collector(hermes_home, pid_exists=lambda pid: pid == 4242)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.gateway.drain_active is False
+    assert state.gateway.drain_requested_at == ""
+
+
+def test_symlinked_plugin_dashboard_manifest_is_never_read(
+    hermes_home: Path, tmp_path: Path
+) -> None:
+    outside = tmp_path / "manifest.json"
+    outside.write_text(json.dumps({"name": "SENTINEL_OUTSIDE"}))
+    _write_plugin(hermes_home, "evil")
+    dashboard = hermes_home / "plugins" / "evil" / "dashboard"
+    dashboard.mkdir()
+    (dashboard / "manifest.json").symlink_to(outside)
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    (evil,) = state.skills_memory.plugins
+    assert evil.dashboard_enabled is False
+
+
 def test_gateway_pid_file_names_the_live_replacement(hermes_home: Path) -> None:
     (hermes_home / "gateway_state.json").write_text(
         json.dumps({"pid": 4242, "gateway_state": "running", "platforms": {}})
