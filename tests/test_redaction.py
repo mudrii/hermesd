@@ -102,3 +102,15 @@ def test_malformed_url_keeps_non_secret_query_pair() -> None:
     assert "page=2" in redacted
     assert "token=[REDACTED]" in redacted
     assert "u:p" not in redacted
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Authorization: Bearer abc", "Authorization: [REDACTED]"),
+        ("authorization=Bearer abc, x=1", "authorization=[REDACTED], x=1"),
+        ("token: Bearer abc [REDACTED] tail", "token: [REDACTED]"),
+    ],
+)
+def test_bearer_value_under_secret_key_leaves_no_stray_bracket(text: str, expected: str) -> None:
+    assert _redact_secret_text(text) == expected

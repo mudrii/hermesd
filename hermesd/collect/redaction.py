@@ -284,11 +284,14 @@ _SECRET_TEXT_FIELD_RE = re.compile(
     re.IGNORECASE,
 )
 # Bare (unquoted) values consume to a top-level `,`, `}`, `]`, or end-of-line
-# so multi-word secrets cannot leak their tail. A redacted URL that follows the
-# value stays visible: URLs are sanitized by the pre-pass in _redact_secret_text
-# before field redaction runs.
+# so multi-word secrets cannot leak their tail. A `[REDACTED]` marker left by an
+# earlier pass (`Bearer [REDACTED]`) is consumed whole so its `]` does not end
+# the value early and survive as a stray bracket. A redacted URL that follows
+# the value stays visible: URLs are sanitized by the pre-pass in
+# _redact_secret_text before field redaction runs.
 _SECRET_TEXT_VALUE_RE = re.compile(
-    r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:(?!\s+(?i:[a-z][a-z0-9+.-]{0,31})://)[^,}\]\r\n])+"""
+    r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'"""
+    r"""|(?:\[REDACTED\]|(?!\s+(?i:[a-z][a-z0-9+.-]{0,31})://)[^,}\]\r\n])+"""
 )
 
 
