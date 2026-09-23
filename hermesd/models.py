@@ -482,6 +482,9 @@ class SessionInfo(BaseModel):
     last_activity_description: str = ""
     actual_cost_usd: float = 0.0
     cost_source: str = ""
+    # Which bot/transport profile a conversation arrived through
+    # (hermes_state_common.py:391); absent on older databases.
+    transport_profile: str = ""
     compression_failure_error: str = ""
     # The durable half of the compressor's anti-thrash guard
     # (hermes_state_common.py:375-379). Counters and timestamps only: nothing
@@ -872,6 +875,48 @@ class TokenAnalytics(BaseModel):
     model_usage_all: list[ModelUsage] = Field(default_factory=list)
     model_usage_24h: list[ModelUsage] = Field(default_factory=list)
     model_usage_7d: list[ModelUsage] = Field(default_factory=list)
+
+
+class DailyUsage(BaseModel):
+    """One local calendar day of session usage, bucketed by session start."""
+
+    day: str
+    sessions: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    api_calls: int = 0
+    total_cost_usd: float = 0.0
+    cost_is_estimated: bool = True
+
+
+class TopSession(BaseModel):
+    session_id: str
+    title: str = ""
+    source: str = ""
+    model: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_cost_usd: float = 0.0
+    cost_is_estimated: bool = True
+    started_at: float = 0.0
+
+
+class RepoActivity(BaseModel):
+    repo_root: str
+    sessions_7d: int = 0
+    sessions_30d: int = 0
+
+
+class UsageAnalytics(BaseModel):
+    """Upstream insights/analytics views, derived from the visible session rows."""
+
+    daily: list[DailyUsage] = Field(default_factory=list)
+    by_source_24h: list[TokenBreakdown] = Field(default_factory=list)
+    by_source_7d: list[TokenBreakdown] = Field(default_factory=list)
+    top_sessions_7d: list[TopSession] = Field(default_factory=list)
+    # Sessions started per local hour of day (index 0-23) over the last 7 days.
+    hourly_sessions_7d: list[int] = Field(default_factory=list)
+    repos: list[RepoActivity] = Field(default_factory=list)
 
 
 class ToolStats(BaseModel):
@@ -2603,6 +2648,7 @@ class DashboardState(BaseModel):
     tokens_today: TokenSummary = Field(default_factory=TokenSummary)
     tokens_total: TokenSummary = Field(default_factory=TokenSummary)
     token_analytics: TokenAnalytics = Field(default_factory=TokenAnalytics)
+    usage_analytics: UsageAnalytics = Field(default_factory=UsageAnalytics)
     tool_stats: list[ToolStats] = Field(default_factory=list)
     total_tool_calls: int = 0
     available_tools: int = 0

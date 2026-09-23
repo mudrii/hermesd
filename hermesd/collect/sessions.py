@@ -6,8 +6,9 @@ import json
 import re
 import sqlite3
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -37,14 +38,18 @@ from hermesd.models import (
     AUTHORITATIVE_COST_STATUSES,
     BackgroundProcessInfo,
     ConversationGeneration,
+    DailyUsage,
     GatewayHygieneState,
     GatewayRouteState,
     ProcessLiveness,
+    RepoActivity,
     SessionLease,
     SessionLeaseKind,
     TokenBreakdown,
     TokenSummary,
     TokenWindowSummary,
+    TopSession,
+    UsageAnalytics,
 )
 
 
@@ -141,6 +146,127 @@ def _summarize_breakdown(rows: list[dict[str, Any]], key_name: str) -> list[Toke
         summaries,
         key=lambda summary: (-summary.total_cost_usd, -summary.input_tokens, summary.label),
     )
+
+
+_DAILY_USAGE_DAYS = 14
+_TOP_SESSION_LIMIT = 5
+_REPO_ROW_LIMIT = 10
+_DAY_SECONDS = 86400.0
+
+
+def _usage_analytics(rows: list[dict[str, Any]], *, now: float) -> UsageAnalytics:
+    """Upstream's insights/analytics views over the visible session rows.
+
+    Every view keys a session by ``started_at``, like upstream: the daily
+    series and hour-of-day activity bucket it by *local* start time
+    (``agent/insights.py:413-421``), the rolling windows use ``now - days``
+    cutoffs. Cost is the per-session display cost (provider-billed when known,
+    else the estimate), so the figures agree with the rest of the panel.
+    """
+    started = [(_coerce_float(row.get("started_at")), row) for row in rows]
+    week_cutoff = now - 7 * _DAY_SECONDS
+    week = [row for started_at, row in started if started_at >= week_cutoff]
+    day = [row for started_at, row in started if started_at >= now - _DAY_SECONDS]
+    return UsageAnalytics(
+        daily=_daily_usage(started, now),
+        by_source_24h=_summarize_breakdown(day, key_name="source"),
+        by_source_7d=_summarize_breakdown(week, key_name="source"),
+        top_sessions_7d=_top_sessions(week),
+        hourly_sessions_7d=_hourly_sessions(
+            started_at for started_at, _ in started if started_at >= week_cutoff
+        ),
+        repos=_repo_activity(started, now),
+    )
+
+
+def _daily_usage(started: list[tuple[float, dict[str, Any]]], now: float) -> list[DailyUsage]:
+    today = date.fromtimestamp(now)
+    days = [today - timedelta(days=offset) for offset in range(_DAILY_USAGE_DAYS - 1, -1, -1)]
+    first_midnight = datetime.combine(days[0], datetime.min.time()).timestamp()
+    grouped: dict[date, list[dict[str, Any]]] = {day: [] for day in days}
+    for started_at, row in started:
+        if started_at < first_midnight:
+            continue
+        moment = _local_datetime(started_at)
+        bucket = grouped.get(moment.date()) if moment is not None else None
+        if bucket is not None:
+            bucket.append(row)
+    daily = []
+    for day, day_rows in grouped.items():
+        totals = _summarize_tokens(day_rows)
+        daily.append(
+            DailyUsage(
+                day=day.isoformat(),
+                sessions=len(day_rows),
+                input_tokens=totals.input_tokens,
+                output_tokens=totals.output_tokens,
+                api_calls=sum(_coerce_int(row.get("api_call_count")) for row in day_rows),
+                total_cost_usd=totals.total_cost_usd,
+                cost_is_estimated=totals.cost_is_estimated,
+            )
+        )
+    return daily
+
+
+def _top_sessions(rows: list[dict[str, Any]]) -> list[TopSession]:
+    ranked = sorted(
+        rows,
+        key=lambda row: (
+            -_resolved_session_cost(row),
+            -(_coerce_int(row.get("input_tokens")) + _coerce_int(row.get("output_tokens"))),
+            str(row.get("id") or ""),
+        ),
+    )
+    return [
+        TopSession(
+            session_id=str(row.get("id") or ""),
+            title=str(row.get("display_name") or row.get("title") or ""),
+            source=str(row.get("source") or ""),
+            model=str(row.get("model") or ""),
+            input_tokens=_coerce_int(row.get("input_tokens")),
+            output_tokens=_coerce_int(row.get("output_tokens")),
+            total_cost_usd=_resolved_session_cost(row),
+            cost_is_estimated=not _session_cost_is_reported(row),
+            started_at=_coerce_float(row.get("started_at")),
+        )
+        for row in ranked[:_TOP_SESSION_LIMIT]
+    ]
+
+
+def _hourly_sessions(started_ats: Iterable[float]) -> list[int]:
+    hours = [0] * 24
+    for started_at in started_ats:
+        moment = _local_datetime(started_at)
+        if moment is not None:
+            hours[moment.hour] += 1
+    return hours
+
+
+def _local_datetime(epoch: float) -> datetime | None:
+    """Local time of ``epoch``; None for a value outside the platform's range."""
+    try:
+        return datetime.fromtimestamp(epoch)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _repo_activity(started: list[tuple[float, dict[str, Any]]], now: float) -> list[RepoActivity]:
+    week_cutoff = now - 7 * _DAY_SECONDS
+    month_cutoff = now - 30 * _DAY_SECONDS
+    counts: dict[str, list[int]] = {}
+    for started_at, row in started:
+        repo = str(row.get("git_repo_root") or "")
+        if not repo or started_at < month_cutoff:
+            continue
+        pair = counts.setdefault(repo, [0, 0])
+        pair[1] += 1
+        if started_at >= week_cutoff:
+            pair[0] += 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1][1], -item[1][0], item[0]))
+    return [
+        RepoActivity(repo_root=repo, sessions_7d=week, sessions_30d=month)
+        for repo, (week, month) in ranked[:_REPO_ROW_LIMIT]
+    ]
 
 
 # Approximate fallback cost per 1M tokens (USD), used only when a session row
