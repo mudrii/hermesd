@@ -1509,6 +1509,12 @@ class SkillsMemory(BaseModel):
     plugin_catalog_cache_age_seconds: float | None = None
     plugin_catalog_update_count: int = 0
     plugin_catalog_removed_count: int = 0
+    # `skills_hub` source: skills/.hub/lock.json installed entries and
+    # skills/.hub/quarantine/ directories (tools/skills_hub.py:59-62,295-344;
+    # the counts `hermes doctor` reports, hermes_cli/doctor_state.py:452-464).
+    hub_lock_present: bool = False
+    hub_installed_count: int = 0
+    hub_quarantine_count: int = 0
 
 
 class ToolsetAvailability(BaseModel):
@@ -2533,6 +2539,15 @@ class SkillCurationWindow(BaseModel):
     days_until_archive: float | None = None
 
 
+class CuratorLedgerAction(BaseModel):
+    """One skills/.curator_ledger.jsonl row, without its file manifests."""
+
+    ts: str = ""
+    actor: str = ""
+    action: str = ""
+    skill: str = ""
+
+
 class CuratorRun(BaseModel):
     run_present: bool = False
     stamp: str = ""
@@ -2575,6 +2590,21 @@ class CuratorRun(BaseModel):
     # Display-bounded slice of the per-skill windows, soonest deadline first;
     # managed_skill_count is the complete number.
     skill_windows: list[SkillCurationWindow] = Field(default_factory=list)
+    # skills/.curator_state last_run_duration_seconds (agent/curator.py:45,949).
+    last_run_duration_seconds: float | None = None
+    # `curator_activity` source: skills/.curator_suppressed (built-ins the
+    # curator pruned), the tail of skills/.curator_ledger.jsonl, and the
+    # skills/.locks/curator-run claim (agent/curator.py:1116-1141).
+    suppressed_count: int = 0
+    ledger_present: bool = False
+    # Newest first, display-bounded; actor/action/skill/timestamp only.
+    ledger_recent: list[CuratorLedgerAction] = Field(default_factory=list)
+    run_claim_present: bool = False
+    run_claim_pid: int | None = None
+    run_claim_age_seconds: float | None = None
+    # A claim is a live run only while its pid is alive and it is younger than
+    # upstream's one-hour takeover window.
+    run_claim_live: bool = False
 
 
 class HealthSummary(BaseModel):

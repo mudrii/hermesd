@@ -36,6 +36,12 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append("  Skills: ", style=theme.ui_label)
     lines.append(f"{sm.skill_count}", style=theme.ui_accent)
     lines.append(f" ({sm.skill_categories} cat)\n", style=theme.banner_dim)
+    if sm.hub_lock_present or sm.hub_quarantine_count:
+        lines.append("  Hub: ", style=theme.ui_label)
+        lines.append(f"{sm.hub_installed_count} installed", style=theme.banner_text)
+        if sm.hub_quarantine_count:
+            lines.append(f" · {sm.hub_quarantine_count} quarantined", style=theme.ui_warn)
+        lines.append("\n")
     lines.append("  Creds: ", style=theme.ui_label)
     lines.append(f"{len(sm.credential_pools)} pools", style=theme.banner_text)
     cooling = sum(
@@ -135,6 +141,10 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         boot_text.append("\nBOOT.md\n", style=f"bold {theme.ui_label}")
         boot_text.append("  Present", style=theme.banner_text)
         sections.append(boot_text)
+
+    if sm.hub_lock_present or sm.hub_quarantine_count:
+        sections.append(section_heading("Skills Hub", theme))
+        sections.append(_skills_hub_table(sm, theme))
 
     if sm.skills:
         # Every row: the app scrolls the rendered detail through its viewport.
@@ -609,6 +619,19 @@ def _mcp_servers_table(sm: SkillsMemory, theme: Theme) -> Table:
             escape(server.tool_filter) if server.tool_filter else "—",
         )
     return mcp_table
+
+
+def _skills_hub_table(sm: SkillsMemory, theme: Theme) -> Table:
+    """skills/.hub counts, as ``hermes doctor`` reports them."""
+    table = Table(box=None, show_header=False, padding=(0, 2))
+    table.add_column("Key", style=theme.ui_label)
+    table.add_column("Value", style=theme.banner_text)
+    table.add_row("Installed", str(sm.hub_installed_count) if sm.hub_lock_present else "no lock")
+    table.add_row(
+        "Quarantined",
+        f"{sm.hub_quarantine_count} pending review" if sm.hub_quarantine_count else "0",
+    )
+    return table
 
 
 def _skill_rows(sm: SkillsMemory) -> list[tuple[str, str, str]]:

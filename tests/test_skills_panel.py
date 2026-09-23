@@ -180,6 +180,35 @@ def test_skills_compact_counts_cooling_credential_pools():
     assert "Creds: 3 pools (2 cooling)" in text
 
 
+def test_skills_hub_counts_render_compact_and_detail():
+    state = DashboardState(
+        skills_memory=SkillsMemory(
+            hub_lock_present=True, hub_installed_count=5, hub_quarantine_count=2
+        )
+    )
+    compact = render_to_str(render_panel(7, state, Theme(), detail=False), no_color=True)
+    assert "Hub: 5 installed · 2 quarantined" in compact
+    detail = render_to_str(render_panel(7, state, Theme(), detail=True), no_color=True)
+    assert "Skills Hub" in detail
+    assert re.search(r"Installed\s+5", detail)
+    assert re.search(r"Quarantined\s+2 pending review", detail)
+
+
+def test_skills_hub_hidden_without_a_lock_or_quarantine():
+    state = DashboardState(skills_memory=SkillsMemory())
+    compact = render_to_str(render_panel(7, state, Theme(), detail=False), no_color=True)
+    detail = render_to_str(render_panel(7, state, Theme(), detail=True), no_color=True)
+    assert "Hub:" not in compact
+    assert "Skills Hub" not in detail
+
+
+def test_skills_hub_compact_without_quarantine():
+    state = DashboardState(skills_memory=SkillsMemory(hub_lock_present=True, hub_installed_count=1))
+    compact = render_to_str(render_panel(7, state, Theme(), detail=False), no_color=True)
+    assert "Hub: 1 installed" in compact
+    assert "quarantined" not in compact
+
+
 def test_skills_detail_shows_description_column():
     state = DashboardState(
         skills_memory=SkillsMemory(

@@ -13,6 +13,8 @@ Upstream references are quoted per function; the writer of the run report is
 
 from __future__ import annotations
 
+import json
+import math
 from typing import Any
 
 from hermesd.collect.common import (
@@ -20,8 +22,9 @@ from hermesd.collect.common import (
     _coerce_bool,
     _coerce_int,
     _iso_to_epoch,
+    _printable_capped,
 )
-from hermesd.models import CuratorRun, SkillCurationWindow
+from hermesd.models import CuratorLedgerAction, CuratorRun, SkillCurationWindow
 
 
 def _curator_with_scheduler_state(
@@ -41,8 +44,64 @@ def _curator_with_scheduler_state(
             "scheduler_last_run_at": str(state.get("last_run_at") or ""),
             "scheduler_last_report_path": str(state.get("last_report_path") or ""),
             "consolidate_enabled": bool(curator_cfg.get("consolidate")),
+            "last_run_duration_seconds": _duration_or_none(state.get("last_run_duration_seconds")),
         }
     )
+
+
+def _duration_or_none(value: object) -> float | None:
+    """A recorded non-negative duration; None when absent or not a number."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+# skills/.curator_ledger.jsonl is append-only telemetry (tools/skill_ledger.py:
+# 1-8) that trims at 5 MB; each row carries before/after file manifests, so
+# only a bounded tail is read and only the newest few rows are kept.
+_LEDGER_TAIL_BYTES = 64 * 1024
+_LEDGER_RECENT_LIMIT = 5
+_LEDGER_FIELD_CHARS = 120
+# agent/curator.py:1116 — a claim older than this is a crashed holder.
+_CURATOR_CLAIM_STALE_SECONDS = 3600.0
+
+
+def _suppressed_count(text: str) -> int:
+    """Non-blank lines of skills/.curator_suppressed (tools/skill_usage.py:194-207)."""
+    return sum(1 for line in text.splitlines() if line.strip())
+
+
+def _ledger_recent(text: str) -> tuple[CuratorLedgerAction, ...]:
+    """Newest-first actor/action/skill rows from a ledger tail; torn lines skipped."""
+    rows: list[CuratorLedgerAction] = []
+    for line in reversed(text.splitlines()):
+        if len(rows) >= _LEDGER_RECENT_LIMIT:
+            break
+        try:
+            row = json.loads(line)
+        except (json.JSONDecodeError, RecursionError):
+            continue
+        if not isinstance(row, dict) or not row.get("action"):
+            continue
+        rows.append(
+            CuratorLedgerAction(
+                ts=_printable_capped(row.get("ts"), _LEDGER_FIELD_CHARS),
+                actor=_printable_capped(row.get("actor"), _LEDGER_FIELD_CHARS),
+                action=_printable_capped(row.get("action"), _LEDGER_FIELD_CHARS),
+                skill=_printable_capped(row.get("skill"), _LEDGER_FIELD_CHARS),
+            )
+        )
+    return tuple(rows)
+
+
+def _claim_pid(text: str) -> int | None:
+    """The pid ``_claim_run`` writes into skills/.locks/curator-run."""
+    stripped = text.strip()
+    if not stripped.isdecimal():
+        return None
+    pid = int(stripped)
+    return pid if pid > 0 else None
 
 
 # Curator transition thresholds, agent/curator.py:29 — 14 days to stale, 30 to

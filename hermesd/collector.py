@@ -97,10 +97,15 @@ from hermesd.collect.cron import (
     _tail_latest_cron_output,
 )
 from hermesd.collect.curator import (
+    _CURATOR_CLAIM_STALE_SECONDS,
+    _LEDGER_TAIL_BYTES,
+    _claim_pid,
     _curator_thresholds,
     _curator_with_scheduler_state,
+    _ledger_recent,
     _skill_curation_hygiene,
     _state_transition_label,
+    _suppressed_count,
 )
 from hermesd.collect.desktop_plugins import read_desktop_plugins
 from hermesd.collect.gateway import (
@@ -391,6 +396,20 @@ _PLUGIN_LIMIT = 200
 # The desktop inventory enriches SkillsMemory through an independent health
 # source so a transient root listing failure cannot blank agent integrations.
 _DESKTOP_PLUGIN_FIELDS = ("desktop_plugins", "desktop_plugin_scan_truncated")
+# skills/.hub — the fields the `skills_hub` source owns on SkillsMemory.
+_SKILLS_HUB_FIELDS = ("hub_lock_present", "hub_installed_count", "hub_quarantine_count")
+# skills/.hub/quarantine/ listing bound: one entry per quarantined skill.
+_HUB_QUARANTINE_LIST_LIMIT = 1000
+# The `curator_activity` source's fields on CuratorRun.
+_CURATOR_ACTIVITY_FIELDS = (
+    "suppressed_count",
+    "ledger_present",
+    "ledger_recent",
+    "run_claim_present",
+    "run_claim_pid",
+    "run_claim_age_seconds",
+    "run_claim_live",
+)
 # backups/config/ scan — the fields the config-backups source owns on
 # ConfigSummary, so its last-good fallback restores exactly those.
 _CONFIG_BACKUP_FIELDS = (
@@ -1224,6 +1243,15 @@ class Collector:
                 lambda: results["skills_memory"],
                 fallback=lambda: self._last_plugin_catalog(results["skills_memory"]),
             ),
+            _SourceSpec(
+                "skills_memory",
+                "skills_hub",
+                lambda: self._with_skills_hub(results["skills_memory"]),
+                lambda: results["skills_memory"],
+                fallback=lambda: self._last_source_fields(
+                    "skills_hub", results["skills_memory"], _SKILLS_HUB_FIELDS
+                ),
+            ),
             _SourceSpec("mcp_cache", "mcp_cache", self._collect_mcp_cache, MCPSchemaCache),
             _SourceSpec(
                 "skills_prompt",
@@ -1239,6 +1267,15 @@ class Collector:
             # not the "" that the str default factory would yield.
             _SourceSpec("active_skin", "skin", self._collect_skin, str, fallback=self._last_skin),
             _SourceSpec("curator", "curator", self._collect_curator, CuratorRun),
+            _SourceSpec(
+                "curator",
+                "curator_activity",
+                lambda: self._with_curator_activity(results["curator"]),
+                lambda: results["curator"],
+                fallback=lambda: self._last_source_fields(
+                    "curator_activity", results["curator"], _CURATOR_ACTIVITY_FIELDS
+                ),
+            ),
             _SourceSpec(
                 "model_usage",
                 "model_usage",
@@ -3532,6 +3569,65 @@ class Collector:
             curator_cfg,
         ).model_copy(update=overlay)
 
+    def _with_curator_activity(self, current: CuratorRun) -> CuratorRun:
+        """Suppression list, ledger tail and run claim beside the curator state.
+
+        All three resolve through ``get_hermes_home()/"skills"`` upstream —
+        ``tools/skill_usage.py:194-207`` (``.curator_suppressed``),
+        ``tools/skill_ledger.py:79-84`` (``.curator_ledger.jsonl``) and
+        ``agent/curator.py:1119-1141`` (``.locks/curator-run``, the pid of an
+        ``O_EXCL`` claim taken over after an hour) — so they are PROFILE-scoped.
+        """
+        skills = self._paths.profile_path("skills")
+        root = self._paths.root_home
+        suppressed = skills / ".curator_suppressed"
+        ledger = skills / ".curator_ledger.jsonl"
+        claim = skills / ".locks" / "curator-run"
+        for path in (suppressed, ledger, claim):
+            if not _safe_or_absent_child_path(path, root):
+                raise RuntimeError(f"unsafe curator file: {path.name}")
+        suppressed_count = (
+            self._signature_cached(
+                "curator_suppressed",
+                suppressed,
+                lambda: _suppressed_count(self._text_reader(suppressed, root)),
+            )
+            if _exists_strict(suppressed)
+            else 0
+        )
+        ledger_present = _exists_strict(ledger)
+        recent = (
+            self._signature_cached(
+                "curator_ledger",
+                ledger,
+                lambda: _ledger_recent(_read_tail_text(ledger, _LEDGER_TAIL_BYTES)),
+            )
+            if ledger_present
+            else ()
+        )
+        claim_pid: int | None = None
+        claim_age: float | None = None
+        claim_present = _exists_strict(claim)
+        if claim_present:
+            claim_pid = _claim_pid(self._text_reader(claim, root)[:32])
+            claim_age = _age_seconds(_mtime(claim), self._clock())
+        return current.model_copy(
+            update={
+                "suppressed_count": suppressed_count,
+                "ledger_present": ledger_present,
+                "ledger_recent": list(recent),
+                "run_claim_present": claim_present,
+                "run_claim_pid": claim_pid,
+                "run_claim_age_seconds": claim_age,
+                "run_claim_live": (
+                    claim_pid is not None
+                    and claim_age is not None
+                    and claim_age <= _CURATOR_CLAIM_STALE_SECONDS
+                    and self._process_alive(claim_pid)
+                ),
+            }
+        )
+
     def _collect_model_caches(self) -> list[ModelCacheSummary]:
         cache_names = [
             "models_dev_cache.json",
@@ -3773,6 +3869,42 @@ class Collector:
             update={
                 "desktop_plugins": plugins,
                 "desktop_plugin_scan_truncated": truncated,
+            }
+        )
+
+    def _with_skills_hub(self, current: SkillsMemory) -> SkillsMemory:
+        """Hub-installed and quarantined skill counts, as ``hermes doctor`` reports them.
+
+        ``tools/skills_hub.py:59-62`` resolves ``skills/.hub/lock.json`` and
+        ``skills/.hub/quarantine/`` under ``get_hermes_home()`` (PROFILE);
+        ``hermes_cli/doctor_state.py:452-464`` counts ``installed`` entries and
+        quarantined directories. Names inside the lock are not surfaced.
+        """
+        hub = self._paths.profile_path("skills", ".hub")
+        root = self._paths.root_home
+        lock = hub / "lock.json"
+        quarantine = hub / "quarantine"
+        for path in (lock, quarantine):
+            if not _safe_or_absent_child_path(path, root):
+                raise RuntimeError(f"unsafe skills hub path: {path.name}")
+        lock_present = _exists_strict(lock)
+        installed = (
+            len(_as_dict(self._read_json_reporting_stale(lock).get("installed")))
+            if lock_present
+            else 0
+        )
+        quarantined = 0
+        if _exists_strict(quarantine) and quarantine.is_dir():
+            quarantined = sum(
+                1
+                for entry in islice(quarantine.iterdir(), _HUB_QUARANTINE_LIST_LIMIT)
+                if entry.is_dir() and not entry.is_symlink()
+            )
+        return current.model_copy(
+            update={
+                "hub_lock_present": lock_present,
+                "hub_installed_count": installed,
+                "hub_quarantine_count": quarantined,
             }
         )
 
