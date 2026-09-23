@@ -537,6 +537,7 @@ hermesd/
     config.py     config.yaml and auth.json summaries
     cron.py       Cron output discovery, excerpts, suggestions,
                   executions.db history/incidents, ticker health
+    curator.py    Curator run reports, scheduler state, thresholds, skill hygiene
     desktop_plugins.py
                   Content-free app-level Desktop plugin inventory
     gateway.py    Gateway heartbeat, lifecycle, updates, ledgers
@@ -548,7 +549,7 @@ hermesd/
     logs.py       Log line parsing constants and helpers
     migration.py  gateway_migration.json: recorded intent, progress,
                   and the verified-topology predicate
-    operations.py Verification, goals, projects, MoA, curator
+    operations.py Verification, goals, projects, MoA, delegations, receipts
     plugins.py    Agent-plugin discovery (3 manifest formats, 2 directory shapes),
                   the configured-activation gate, and install/catalog provenance
     recovery.py   state.db recovery evidence: repair ledger, forensic
@@ -564,6 +565,7 @@ hermesd/
   models.py            Pydantic models for dashboard state
   paths.py             HermesPaths root/profile path resolution (source
                        ownership: .codex/rules/source-ownership.md)
+  py.typed             PEP 561 typed-package marker
   theme.py             Skin/color system matching Hermes Agent
   panels/
     __init__.py        Panel dispatch and registry

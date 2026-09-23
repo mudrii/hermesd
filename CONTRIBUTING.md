@@ -34,17 +34,19 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
    uv run ruff format --check .
    uv run mypy hermesd scripts
    uv run python -m compileall hermesd
-   uv run pip-audit
+   uv run python scripts/pip_audit_gate.py
    uv lock --check
    uv build
    python -m venv /tmp/hermesd-wheel-smoke
    /tmp/hermesd-wheel-smoke/bin/python -m pip install dist/hermesd-*.whl
    /tmp/hermesd-wheel-smoke/bin/hermesd --version
    /tmp/hermesd-wheel-smoke/bin/python -I -m hermesd --version
+   /tmp/hermesd-wheel-smoke/bin/python scripts/installed_smoke.py
    python -m venv /tmp/hermesd-sdist-smoke
    /tmp/hermesd-sdist-smoke/bin/python -m pip install dist/hermesd-*.tar.gz
    /tmp/hermesd-sdist-smoke/bin/hermesd --version
    /tmp/hermesd-sdist-smoke/bin/python -I -m hermesd --version
+   /tmp/hermesd-sdist-smoke/bin/python scripts/installed_smoke.py
    uv run twine check dist/*
    ```
 
@@ -60,7 +62,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 3. Keep latest-release behavior and current-main behavior distinct: public release copy should describe the tag being released, while current-branch-only behavior stays under `[Unreleased]` or is clearly labeled unreleased.
 4. Move the current user-facing notes from `[Unreleased]` into a dated release section in `CHANGELOG.md`.
 5. Bump the package version in `pyproject.toml` and the editable-package entry in `uv.lock`.
-6. Keep `flake.nix` version metadata aligned with `pyproject.toml` when Nix support remains advertised.
+6. `flake.nix` derives its version from `pyproject.toml`; no separate Nix version bump is needed.
 7. Update README screenshot URLs when release screenshots change, and keep package metadata safe for PyPI rendering.
 8. Create and publish a GitHub Release tagged `vYYYY.M.D`; PyPI publishing runs from `.github/workflows/python-publish.yml` after the release is published. The workflow rejects mismatched package/changelog versions, skips prerelease build/publish after the test gate, pins GitHub Actions to immutable SHAs with version comments, and tracks action updates with Dependabot.
 
@@ -111,7 +113,8 @@ Test categories:
 - `test_db_extended.py` / `test_db_null_tolerance.py` — SQLite reader, WAL snapshotting, caching, NULL coalescing (including a static guard against `.get(col, default)` on rows)
 - `test_file_cache.py` — mtime-keyed JSON/YAML cache
 - `test_collector.py` — `Collector` construction, `collect()` orchestration, health/fallback, available tools
-- `test_collector_<source>.py` (`sessions`, `cron`, `kanban`, `skills`, `gateway`, `operations`, `config`, `logs`, `profiles`) — one file per `hermesd/collect/*.py` reader
+- `test_collector_<source>.py` — per-domain collector readers: `sessions`, `cron`, `kanban`, `skills`, `gateway`, `operations`, `config`, `logs`, `migration`, `hosted_rooms`, `api_runs`, `common`, plus `profiles` (profile-scoped collection)
+- `test_desktop_plugins.py` / `test_plugin_*.py` (`activation`, `catalog_cache`, `manifest_formats`, `provenance`) — desktop and agent plugin inventory
 - `test_paths.py` — `HermesPaths` resolution and profile scoping
 - `test_theme.py` — skin loading and theme inheritance
 - `test_formatting.py` — shared panel formatting helpers
@@ -124,7 +127,7 @@ Test categories:
 - `test_package_metadata.py` — packaging, workflow, long-description, and wheel-smoke contracts
 - `test_import_hygiene.py` / `test_readonly_invariant.py` — standalone-package and read-only safety contracts
 - `test_tui_integration.py` — real-pty end-to-end TUI test
-- `test_contract.py` — opt-in contract test against a real `~/.hermes` (not part of the default suite)
+- `test_contract.py` — fixture-backed contract checks (default suite) plus a live `~/.hermes` check that runs only with `HERMESD_CONTRACT_TEST=1`.
 
 ## Reporting Issues
 
