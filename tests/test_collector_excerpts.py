@@ -12,7 +12,8 @@ _SECRET = "sk-live-SUPERSECRETTOKEN0123456789"
 
 
 def test_excerpt_collapses_whitespace_redacts_then_caps():
-    text = "auth failed:\n  Authorization: Bearer " + _SECRET + " " + "x" * 200
+    # key=value secrets end at whitespace, so the filler survives and the cap applies.
+    text = "auth failed:\n  api_key=" + _SECRET + " " + "x" * 200
 
     excerpt = _excerpt(text, 80)
 
