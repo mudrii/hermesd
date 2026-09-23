@@ -29,10 +29,20 @@ def test_claim_owner_pid_rejects_non_ascii_digits():
     assert _claim_owner_pid({"by": "host:42"}, "host") == 42
 
 
-def test_cron_suggestion_count_survives_deeply_nested_json(tmp_path: Path):
+def test_cron_suggestion_count_survives_deeply_nested_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Whether a given nesting depth exhausts the decoder depends on the
+    # interpreter and the runner's stack size (CI's 3.14/macOS parse 100k levels
+    # that local 3.11 cannot), so force the decoder's RecursionError directly.
     cron_dir = tmp_path / "cron"
     cron_dir.mkdir()
-    (cron_dir / "suggestions.json").write_text("[" * 100_000 + "]" * 100_000)
+    (cron_dir / "suggestions.json").write_text("[[[]]]")
+
+    def exhausted(*_args: object, **_kwargs: object) -> object:
+        raise RecursionError("maximum recursion depth exceeded while decoding")
+
+    monkeypatch.setattr("hermesd.collect.cron.json.loads", exhausted)
 
     assert _cron_suggestion_count(cron_dir) == 0
 
