@@ -58,7 +58,7 @@ hermesd/
   collect/        Per-domain readers (sessions, kanban, cron, skills, plugins,
                   operations, curator, config, gateway, migration, logs,
                   redaction, sqlite_util, system, common, recovery,
-                  hosted_rooms, api_runs, desktop_plugins)
+                  hosted_rooms, api_runs, desktop_plugins, integrations)
   defaults.py     Shared refresh-rate and log-tail-bytes defaults
   db.py           Read-only SQLite with PRAGMA data_version caching
   file_cache.py   (mtime, size, inode)-keyed JSON/YAML cache
