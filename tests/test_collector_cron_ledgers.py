@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -160,3 +161,125 @@ def test_usage_audit_symlink_escape_fails_the_source_and_keeps_last_good(
     assert first.cron_usage.jobs[0].job_id == "job-a"
     assert "cron_usage_audit" in second.health.failed_sources
     assert second.cron_usage.jobs[0].job_id == "job-a"
+
+
+_DELIVERIES_SCHEMA = """
+CREATE TABLE deliveries (
+    execution_id TEXT PRIMARY KEY,
+    job_json TEXT NOT NULL,
+    content TEXT NOT NULL,
+    for_failure INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL CHECK(status IN
+      ('pending','delivering','delivered','failed','unknown','suppressed')),
+    owner_process_id TEXT,
+    owner_pid INTEGER,
+    owner_started_at INTEGER,
+    created_at TEXT NOT NULL,
+    finished_at TEXT,
+    error TEXT
+);
+CREATE TABLE delivery_tombstones (
+    execution_id TEXT PRIMARY KEY,
+    terminal_status TEXT NOT NULL,
+    finished_at TEXT
+);
+"""
+
+
+def _deliveries_db(home: Path, rows: list[tuple]) -> None:
+    """``cron/deliveries.db`` in upstream's schema (``cron/delivery_queue.py:108-128``)."""
+    conn = sqlite3.connect(str(home / "cron" / "deliveries.db"))
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.executescript(_DELIVERIES_SCHEMA)
+        conn.executemany(
+            "INSERT INTO deliveries (execution_id, job_json, content, for_failure, status, "
+            "created_at, finished_at, error) VALUES (?, '{}', 'secret body', ?, ?, ?, ?, ?)",
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_delivery_queue_counts_pending_and_recent_failures(hermes_home: Path):
+    _deliveries_db(
+        hermes_home,
+        [
+            ("exec-pending-old", 0, "pending", iso_ago(900), None, None),
+            ("exec-pending-new", 0, "pending", iso_ago(60), None, None),
+            ("exec-delivering", 1, "delivering", iso_ago(30), None, None),
+            ("exec-ok", 0, "delivered", iso_ago(3600), iso_ago(3590), None),
+            (
+                "exec-failed",
+                1,
+                "failed",
+                iso_ago(1800),
+                iso_ago(1700),
+                "telegram 401 token=abcdef1234567890abcdef\nretry later",
+            ),
+            ("exec-unknown", 0, "unknown", iso_ago(7200), iso_ago(7100), None),
+            ("exec-failed-old", 0, "failed", iso_ago(3 * 86400), iso_ago(3 * 86400), "old"),
+            ("exec-suppressed", 0, "suppressed", iso_ago(100), iso_ago(90), None),
+        ],
+    )
+
+    state = _collect(hermes_home)
+
+    queue = state.cron_deliveries
+    assert "cron_deliveries" not in state.health.failed_sources
+    assert queue.db_present is True
+    assert queue.status_counts == {
+        "delivered": 1,
+        "delivering": 1,
+        "failed": 2,
+        "pending": 2,
+        "suppressed": 1,
+        "unknown": 1,
+    }
+    assert queue.pending_count == 3
+    assert queue.oldest_pending_age_seconds == pytest.approx(900, abs=30)
+    assert queue.failed_24h == 2
+    assert [f.execution_id for f in queue.recent_failures] == [
+        "exec-failed",
+        "exec-unknown",
+        "exec-failed-old",
+    ]
+    failed = queue.recent_failures[0]
+    assert failed.status == "failed"
+    assert failed.for_failure is True
+    assert failed.finished_age_seconds == pytest.approx(1700, abs=30)
+    assert failed.error_excerpt.startswith("telegram 401")
+    assert "abcdef1234567890" not in failed.error_excerpt
+    assert "retry later" not in failed.error_excerpt
+    assert "secret body" not in queue.model_dump_json()
+
+
+def test_delivery_queue_absent_reads_as_not_present(hermes_home: Path):
+    state = _collect(hermes_home)
+    assert state.cron_deliveries.db_present is False
+    assert "cron_deliveries" not in state.health.failed_sources
+
+
+def test_delivery_queue_without_table_reads_as_empty(hermes_home: Path):
+    sqlite3.connect(str(hermes_home / "cron" / "deliveries.db")).close()
+    state = _collect(hermes_home)
+    assert state.cron_deliveries.db_present is True
+    assert state.cron_deliveries.pending_count == 0
+
+
+def test_delivery_queue_unsafe_path_fails_and_keeps_last_good(hermes_home: Path, tmp_path: Path):
+    _deliveries_db(hermes_home, [("exec-p", 0, "pending", iso_ago(60), None, None)])
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        db = hermes_home / "cron" / "deliveries.db"
+        moved = tmp_path / "elsewhere.db"
+        db.rename(moved)
+        db.symlink_to(moved)
+        second = c.collect()
+    finally:
+        c.close()
+    assert first.cron_deliveries.pending_count == 1
+    assert "cron_deliveries" in second.health.failed_sources
+    assert second.cron_deliveries.pending_count == 1

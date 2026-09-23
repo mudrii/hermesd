@@ -7,6 +7,8 @@ from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import (
+    CronDeliveryFailure,
+    CronDeliveryQueueState,
     CronExecution,
     CronExecutionsState,
     CronFireClaimState,
@@ -166,6 +168,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             f"newest {_fmt_error_age(newest_fire_error_age)}\n",
             style=theme.ui_error,
         )
+    lines.append_text(_delivery_queue_compact(state.cron_deliveries, theme))
     if executions.open_incident_count:
         lines.append("  Incidents: ", style=theme.ui_label)
         # ``acked_at`` is written only together with ``closed_at`` upstream, so an
@@ -242,6 +245,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         sections.append(Text("  No cron jobs configured\n", style=theme.banner_dim))
 
     sections.extend(_executions_sections(executions, theme))
+    sections.extend(_delivery_queue_sections(state.cron_deliveries, theme))
     sections.extend(_usage_sections(state.cron_usage, theme))
 
     return Panel(
@@ -685,6 +689,65 @@ def _incidents_table(executions: CronExecutionsState, theme: Theme) -> Table:
             escape(incident.error_excerpt) if incident.error_excerpt else "—",
         )
     return table
+
+
+# ``unknown`` is terminal and never retried upstream: the claiming gateway died
+# after taking the send, and losing it is preferred to duplicating it
+# (``cron/delivery_queue.py:1-7``).
+_DELIVERY_STATUS_NOTES = {"unknown": "sender died mid-send; never retried"}
+
+
+def _delivery_queue_compact(queue: CronDeliveryQueueState, theme: Theme) -> Text:
+    """One warning line when sends are waiting or recently failed, else nothing."""
+    line = Text()
+    parts = []
+    if queue.pending_count:
+        oldest = fmt_age_seconds(queue.oldest_pending_age_seconds)
+        parts.append(f"{queue.pending_count} pending (oldest {oldest})")
+    if queue.failed_24h:
+        parts.append(f"{queue.failed_24h} failed 24h")
+    if parts:
+        line.append(f"  ⚠ Delivery queue: {'  '.join(parts)}\n", style=theme.ui_warn)
+    return line
+
+
+def _delivery_failure_line(failure: CronDeliveryFailure, theme: Theme) -> Text:
+    line = Text("  ")
+    label = failure.status
+    notes = [note for note in (_DELIVERY_STATUS_NOTES.get(failure.status),) if note]
+    if failure.for_failure:
+        notes.insert(0, "failure notice")
+    if notes:
+        label += f" ({'; '.join(notes)})"
+    line.append(sanitize_terminal_text(f"{failure.execution_id} {label}"), style=theme.ui_label)
+    if failure.finished_age_seconds is not None:
+        line.append(f" {fmt_age_seconds(failure.finished_age_seconds)} ago", style=theme.banner_dim)
+    if failure.error_excerpt:
+        line.append(f": {sanitize_terminal_text(failure.error_excerpt)}", style=theme.ui_error)
+    line.append("\n")
+    return line
+
+
+def _delivery_queue_sections(queue: CronDeliveryQueueState, theme: Theme) -> list[RenderableType]:
+    """Retained status counts, the pending backlog and the newest failed sends."""
+    if not queue.db_present:
+        return []
+    body = Text("  ")
+    counts = "  ".join(f"{status} {count}" for status, count in queue.status_counts.items())
+    body.append(sanitize_terminal_text(counts) or "empty", style=theme.banner_text)
+    if queue.pending_count:
+        body.append(
+            f"\n  ⚠ {queue.pending_count} waiting for a gateway, oldest "
+            f"{fmt_age_seconds(queue.oldest_pending_age_seconds)}",
+            style=theme.ui_warn,
+        )
+    body.append("\n")
+    sections: list[RenderableType] = [
+        section_heading("Delivery Queue (deliveries.db)", theme),
+        body,
+    ]
+    sections.extend(_delivery_failure_line(failure, theme) for failure in queue.recent_failures)
+    return sections
 
 
 def _usage_sections(usage: CronUsageState, theme: Theme) -> list[RenderableType]:

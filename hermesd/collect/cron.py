@@ -43,6 +43,8 @@ from hermesd.collect.sqlite_util import (
     _table_exists,
 )
 from hermesd.models import (
+    CronDeliveryFailure,
+    CronDeliveryQueueState,
     CronExecution,
     CronExecutionsState,
     CronFireClaimState,
@@ -1141,4 +1143,79 @@ def _cron_usage_state(
         fires_7d=sum(job.fires_7d for job in jobs),
         window_truncated=audit.cut and (oldest is None or oldest > week_start),
         unparseable_lines=audit.unparseable,
+    )
+
+
+# ``cron/deliveries.db`` statuses (``cron/delivery_queue.py:108-122``). The
+# vocabulary is CHECK-constrained upstream; the kind cap only bounds a foreign
+# schema's values.
+_DELIVERY_PENDING_STATUSES = ("pending", "delivering")
+_DELIVERY_FAILED_STATUSES = ("failed", "unknown")
+_DELIVERY_STATUS_KIND_LIMIT = 8
+_DELIVERY_FAILURES_LIMIT = 5
+
+
+def _read_cron_delivery_queue(db_path: Path, *, now: float) -> CronDeliveryQueueState:
+    """Pending/failed counts, oldest pending age and the newest failures.
+
+    ``content`` and ``job_json`` hold the message payload and are never read.
+    The caller has already confined ``db_path``; read errors propagate so the
+    source keeps its last-good value.
+    """
+    with _connect_readonly_sqlite(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        if not _table_exists(conn, "deliveries"):
+            return CronDeliveryQueueState(db_present=True)
+        conn.create_function("hermes_epoch", 1, _memo_iso_to_epoch, deterministic=True)
+        counts = {
+            str(row.get("status") or ""): int(row.get("n") or 0)
+            for row in _query_rows(
+                conn,
+                "SELECT COALESCE(status, '') AS status, COUNT(*) AS n FROM deliveries "
+                f"GROUP BY COALESCE(status, '') ORDER BY n DESC LIMIT {_DELIVERY_STATUS_KIND_LIMIT}",
+            )
+        }
+        pending = ", ".join(f"'{status}'" for status in _DELIVERY_PENDING_STATUSES)
+        failed = ", ".join(f"'{status}'" for status in _DELIVERY_FAILED_STATUSES)
+        oldest = _query_rows(
+            conn,
+            f"SELECT MIN(hermes_epoch(created_at)) AS oldest FROM deliveries "
+            f"WHERE status IN ({pending})",
+        )[0].get("oldest")
+        failed_24h = _count_rows(
+            conn,
+            f"SELECT COUNT(*) FROM deliveries WHERE status IN ({failed}) "
+            "AND hermes_epoch(finished_at) >= ?",
+            (now - _EXECUTIONS_WINDOW_SECONDS,),
+        )
+        for_failure = (
+            "for_failure"
+            if _column_exists(conn, "deliveries", "for_failure")
+            else "0 AS for_failure"
+        )
+        rows = _query_rows(
+            conn,
+            f"SELECT execution_id, status, {for_failure}, finished_at, error FROM deliveries "
+            f"WHERE status IN ({failed}) "
+            "ORDER BY hermes_epoch(finished_at) DESC, execution_id DESC "
+            f"LIMIT {_DELIVERY_FAILURES_LIMIT}",
+        )
+    return CronDeliveryQueueState(
+        db_present=True,
+        status_counts=dict(sorted(counts.items())),
+        pending_count=sum(counts.get(status, 0) for status in _DELIVERY_PENDING_STATUSES),
+        oldest_pending_age_seconds=_age_seconds(oldest, now),
+        failed_24h=failed_24h,
+        recent_failures=[
+            CronDeliveryFailure(
+                execution_id=str(row.get("execution_id") or "")[:_EXCERPT_MAX_CHARS],
+                status=str(row.get("status") or ""),
+                for_failure=_coerce_bool(row.get("for_failure")),
+                finished_age_seconds=_age_seconds(
+                    _iso_to_epoch(str(row.get("finished_at") or "")), now
+                ),
+                error_excerpt=_cron_error_excerpt(str(row.get("error") or "")),
+            )
+            for row in rows
+        ],
     )

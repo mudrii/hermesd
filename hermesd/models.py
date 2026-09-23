@@ -1125,6 +1125,34 @@ class CronUsageState(BaseModel):
     unparseable_lines: int = 0
 
 
+class CronDeliveryFailure(BaseModel):
+    """A terminal delivery that did not land: ``failed``, or ``unknown`` (the
+    claiming gateway died mid-send; never retried, ``cron/delivery_queue.py:1-7``)."""
+
+    execution_id: str = ""
+    status: str = ""
+    for_failure: bool = False
+    finished_age_seconds: float | None = None
+    error_excerpt: str = ""
+
+
+class CronDeliveryQueueState(BaseModel):
+    """``cron/deliveries.db``: the durable gateway handoff for cron sends.
+
+    ``pending_count`` covers ``pending`` and in-flight ``delivering`` rows;
+    terminal rows are retained up to a 1000-row cap
+    (``MAX_TERMINAL_DELIVERIES``, ``cron/delivery_queue.py:35``), so
+    ``status_counts`` describes the retained rows only.
+    """
+
+    db_present: bool = False
+    status_counts: dict[str, int] = Field(default_factory=dict)
+    pending_count: int = 0
+    oldest_pending_age_seconds: float | None = None
+    failed_24h: int = 0
+    recent_failures: list[CronDeliveryFailure] = Field(default_factory=list)
+
+
 class CronState(BaseModel):
     last_tick_ago_seconds: float | None = None
     ticker_heartbeat_age_seconds: float | None = None
@@ -2675,6 +2703,7 @@ class DashboardState(BaseModel):
     cron: CronState = Field(default_factory=CronState)
     cron_executions: CronExecutionsState = Field(default_factory=CronExecutionsState)
     cron_usage: CronUsageState = Field(default_factory=CronUsageState)
+    cron_deliveries: CronDeliveryQueueState = Field(default_factory=CronDeliveryQueueState)
     channels: ChannelDirectoryState = Field(default_factory=ChannelDirectoryState)
     kanban: KanbanState = Field(default_factory=KanbanState)
     operations: OperationsState = Field(default_factory=OperationsState)

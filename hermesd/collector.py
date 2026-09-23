@@ -92,6 +92,7 @@ from hermesd.collect.cron import (
     _delivery_target_label,
     _latest_cron_output_excerpt,
     _latest_cron_output_file,
+    _read_cron_delivery_queue,
     _read_cron_executions_state,
     _read_usage_audit_records,
     _tail_latest_cron_output,
@@ -259,6 +260,7 @@ from hermesd.models import (
     CheckpointInfo,
     ConfigSummary,
     CredentialPoolEntry,
+    CronDeliveryQueueState,
     CronExecutionsState,
     CronJob,
     CronState,
@@ -1101,6 +1103,12 @@ class Collector:
                 "cron_usage_audit",
                 lambda: self._collect_cron_usage(results["cron"]),
                 CronUsageState,
+            ),
+            _SourceSpec(
+                "cron_deliveries",
+                "cron_deliveries",
+                self._collect_cron_deliveries,
+                CronDeliveryQueueState,
             ),
             _SourceSpec(
                 "channels",
@@ -2760,6 +2768,20 @@ class Collector:
         )
         job_names = {job.job_id: job.name for job in cron.jobs if job.job_id and job.name}
         return _cron_usage_state(audit, job_names, now=self._clock())
+
+    def _collect_cron_deliveries(self) -> CronDeliveryQueueState:
+        """The cron delivery handoff queue, ``cron/deliveries.db``.
+
+        Upstream resolves ``get_hermes_home()/cron/deliveries.db``
+        (``queue_path``, ``cron/delivery_queue.py:74-80``); read from the root
+        store with the rest of ``cron``.
+        """
+        db_path = self._paths.shared_path("cron", "deliveries.db")
+        if not _exists_strict(db_path):
+            return CronDeliveryQueueState()
+        if not _safe_child_path(db_path, self._paths.root_home) or not db_path.is_file():
+            raise RuntimeError("cron/deliveries.db replaced by unsafe path")
+        return _read_cron_delivery_queue(db_path, now=self._clock())
 
     def _collect_channels(self, gateway: GatewayState) -> ChannelDirectoryState:
         directory = self._read_json_reporting_stale(

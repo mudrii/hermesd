@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from hermesd.models import (
+    CronDeliveryFailure,
+    CronDeliveryQueueState,
     CronExecution,
     CronExecutionsState,
     CronFireClaimState,
@@ -1347,3 +1349,40 @@ def test_cron_panel_hides_token_usage_without_an_audit_ledger() -> None:
     detail = render_to_str(render_cron(state, Theme(), detail=True), width=220, no_color=True)
     assert "Token Usage" not in detail
     assert "Tokens 24h" not in render_to_str(render_cron(state, Theme()), no_color=True)
+
+
+def test_cron_panel_shows_the_delivery_queue() -> None:
+    queue = CronDeliveryQueueState(
+        db_present=True,
+        status_counts={"delivered": 10, "failed": 2, "pending": 3, "unknown": 1},
+        pending_count=3,
+        oldest_pending_age_seconds=900.0,
+        failed_24h=2,
+        recent_failures=[
+            CronDeliveryFailure(
+                execution_id="exec-1",
+                status="failed",
+                for_failure=True,
+                finished_age_seconds=1700.0,
+                error_excerpt="telegram 401 token=[REDACTED]",
+            ),
+            CronDeliveryFailure(execution_id="exec-2", status="unknown"),
+        ],
+    )
+    state = DashboardState(cron_deliveries=queue)
+    compact = render_to_str(render_cron(state, Theme()), no_color=True)
+    assert "Delivery queue: 3 pending (oldest 15m)" in compact
+    assert "2 failed 24h" in compact
+    detail = render_to_str(render_cron(state, Theme(), detail=True), width=220, no_color=True)
+    assert "Delivery Queue (deliveries.db)" in detail
+    assert "delivered 10  failed 2  pending 3  unknown 1" in detail
+    assert "exec-1 failed (failure notice) 28m ago: telegram 401 token=[REDACTED]" in detail
+    assert "exec-2 unknown (sender died mid-send; never retried)" in detail
+
+
+def test_cron_panel_hides_an_idle_delivery_queue_from_compact() -> None:
+    queue = CronDeliveryQueueState(db_present=True, status_counts={"delivered": 4})
+    compact = render_to_str(
+        render_cron(DashboardState(cron_deliveries=queue), Theme()), no_color=True
+    )
+    assert "Delivery queue" not in compact
