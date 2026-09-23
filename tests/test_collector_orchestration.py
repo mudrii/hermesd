@@ -188,6 +188,22 @@ def test_malformed_gateway_pid_file_reads_as_no_launchd_gateway(
     assert state.gateway.pid == 4242
 
 
+def test_derived_cache_never_serves_a_value_for_a_freed_rows_list(hermes_home: Path) -> None:
+    """The derived cache is keyed on the rows list itself, not its id().
+
+    A freed list's address is routinely reused by the next list allocated, so
+    an id()-keyed entry could hand one list's derived value to another.
+    """
+    c = Collector(hermes_home)
+    try:
+        first = c._derived_from_rows("probe", [{"id": "a"}], lambda rows: rows[0]["id"])
+        second = c._derived_from_rows("probe", [{"id": "b"}], lambda rows: rows[0]["id"])
+    finally:
+        c.close()
+
+    assert (first, second) == ("a", "b")
+
+
 def test_gateway_pid_file_names_the_live_replacement(hermes_home: Path) -> None:
     (hermes_home / "gateway_state.json").write_text(
         json.dumps({"pid": 4242, "gateway_state": "running", "platforms": {}})

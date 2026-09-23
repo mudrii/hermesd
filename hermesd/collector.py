@@ -817,10 +817,10 @@ class Collector:
         # MEMORY.md / USER.md / SOUL.md is not re-read on every tick.
         self._derived_file_cache: dict[str, tuple[tuple[str, int, int] | None, Any]] = {}
         self._kanban_board_errors: list[str] = []
-        # Session-row-derived values, one entry per derived name, keyed on
-        # (rows identity, local date, entry-specific deps) — see
-        # _derived_from_rows.
-        self._derived_cache: dict[str, tuple[tuple[object, ...], Any]] = {}
+        # Session-row-derived values, one entry per derived name: the rows
+        # list itself (compared by identity), then (local date, entry-specific
+        # deps) — see _derived_from_rows.
+        self._derived_cache: dict[str, tuple[list[dict[str, Any]], tuple[object, ...], Any]] = {}
         self._closed = False
         # Set by close() before it queues for _lock; an in-flight collect pass
         # checks it between sources and stops doing new work.
@@ -1414,21 +1414,23 @@ class Collector:
         deps: tuple[object, ...] = (),
     ) -> T:
         # HermesDB returns the same cached list object while data_version is
-        # unchanged, so row identity is a cheap invalidation key (the collector
-        # holds the list alive via _last_session_rows, so the id cannot be
-        # recycled). The local date is part of every key because "today"
+        # unchanged, so row identity is a cheap invalidation key. The entry
+        # holds the list itself and compares with `is`: an id() alone can be
+        # recycled by a later list once the one it named is freed (an entry
+        # left behind by a stale pass outlives _last_session_rows' reference).
+        # The local date is part of every key because "today"
         # aggregates shift at midnight; deps carry the entry-specific
         # dependencies (config file signatures, time buckets for the sliding
         # windows) so a change there recomputes only the entries that consume
         # it instead of invalidating the whole cache.
-        key = (id(rows), _local_date(self._clock()), deps)
+        key = (_local_date(self._clock()), deps)
         cached = self._derived_cache.get(name)
-        if cached is not None and cached[0] == key:
+        if cached is not None and cached[0] is rows and cached[1] == key:
             # type-ignore[no-any-return]: heterogeneous per-name cache; each
             # call site pins T via its compute callable.
-            return cached[1]  # type: ignore[no-any-return]
+            return cached[2]  # type: ignore[no-any-return]
         value = compute(rows)
-        self._derived_cache[name] = (key, value)
+        self._derived_cache[name] = (rows, key, value)
         return value
 
     def _collect_session_rows(
