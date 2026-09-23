@@ -195,6 +195,27 @@ class GatewayBackendGroup(BaseModel):
     live: bool = False
 
 
+class ServeRestartObligation(BaseModel):
+    """A manual ``hermes serve``/``dashboard`` an update could not restart.
+
+    ``verified`` is True when this host observed the recorded incarnation's start
+    time; False when the pid is alive but its identity could not be checked.
+    """
+
+    kind: str = ""
+    profile: str = ""
+    pid: int = 0
+    verified: bool = False
+
+
+class UpdateReceiptSummary(BaseModel):
+    """One archived update run that never reached a clean finish."""
+
+    outcome: str = ""
+    finished_age_seconds: float | None = None
+    failed_step: str = ""
+
+
 class DeadTargetSummary(BaseModel):
     """One confirmed-unreachable delivery target. The chat id is never read out."""
 
@@ -347,6 +368,25 @@ class GatewayState(BaseModel):
     # newest beat first and bounded.
     gateway_backend_groups: list[GatewayBackendGroup] = Field(default_factory=list)
     gateway_backend_groups_truncated: bool = False
+    # Planned-restart back-online notice still owed to home channels
+    # (.restart_pending.json, per profile). Pending is not "not restarted": the
+    # file outlives the restart until every home channel was notified.
+    restart_notice_pending: bool = False
+    restart_notice_requested_age_seconds: float | None = None
+    restart_notice_via_service: bool = False
+    restart_notice_detached: bool = False
+    restart_notice_delivered_count: int = 0
+    # Manual serve restarts an update still owes (serve_restart_pending/, per
+    # profile); only incarnations not provably gone are counted.
+    serve_restart_pending_count: int = 0
+    serve_restart_stale_count: int = 0
+    serve_restart_pending: list[ServeRestartObligation] = Field(default_factory=list)
+    serve_restart_scan_truncated: bool = False
+    # Archived update receipts (logs/update_receipts/update_*.json): how many of
+    # the newest runs were read, how many never finished cleanly, the newest few.
+    update_history_scanned: int = 0
+    update_history_failed: int = 0
+    update_failures: list[UpdateReceiptSummary] = Field(default_factory=list)
     # Dead delivery targets (gateway/dead_targets.json, per profile): chats the
     # gateway stopped sending to until a send succeeds. Newest few only.
     dead_target_count: int = 0

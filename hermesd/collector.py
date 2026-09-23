@@ -122,10 +122,17 @@ from hermesd.collect.gateway import (
     _read_forensic_companions,
     _read_gateway_ledger_rows,
     _read_start_storm,
+    _receipt_history_row,
     _record_writer,
     _respawn_storm_policy,
     _restart_loop_fields,
     _restart_loop_policy,
+    _restart_notice_fields,
+    _serve_obligation_fields,
+    _serve_obligation_paths,
+    _serve_obligation_row,
+    _update_history_fields,
+    _update_history_paths,
     _update_receipt_status,
     _watchdog_exit_reason,
 )
@@ -511,6 +518,20 @@ _UPDATE_RECEIPT_FIELDS = (
     "update_skip_count",
     "update_skip_names",
 )
+_RESTART_NOTICE_FIELDS = (
+    "restart_notice_pending",
+    "restart_notice_requested_age_seconds",
+    "restart_notice_via_service",
+    "restart_notice_detached",
+    "restart_notice_delivered_count",
+)
+_SERVE_OBLIGATION_FIELDS = (
+    "serve_restart_pending_count",
+    "serve_restart_stale_count",
+    "serve_restart_pending",
+    "serve_restart_scan_truncated",
+)
+_UPDATE_HISTORY_FIELDS = ("update_history_scanned", "update_history_failed", "update_failures")
 _DEAD_TARGET_FIELDS = ("dead_target_count", "dead_target_platforms", "dead_targets")
 _RESTART_LOOP_FIELDS = (
     "restart_loop_boots_recorded",
@@ -1062,6 +1083,33 @@ class Collector:
                 lambda: results["gateway"],
                 fallback=lambda: self._last_source_fields(
                     "restart_loop", results["gateway"], _RESTART_LOOP_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "gateway",
+                "restart_pending",
+                lambda: self._with_restart_notice(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "restart_pending", results["gateway"], _RESTART_NOTICE_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "gateway",
+                "serve_restart_pending",
+                lambda: self._with_serve_obligations(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "serve_restart_pending", results["gateway"], _SERVE_OBLIGATION_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "gateway",
+                "update_receipt_history",
+                lambda: self._with_update_history(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "update_receipt_history", results["gateway"], _UPDATE_HISTORY_FIELDS
                 ),
             ),
             # Own source_name so a malformed gateway_migration.json (upstream writes
@@ -1928,6 +1976,71 @@ class Collector:
         )
         policy = _restart_loop_policy(self._read_yaml_cached())
         return gateway.model_copy(update=_restart_loop_fields(data, self._clock(), policy))
+
+    def _with_restart_notice(self, gateway: GatewayState) -> GatewayState:
+        """The planned-restart back-online notice still owed (``.restart_pending.json``).
+
+        PROFILE-scoped: ``_hermes_home / ".restart_pending.json"`` where
+        ``_hermes_home = get_hermes_home()`` (``gateway/run.py:1585-1586,1602``).
+        """
+        path = self._paths.profile_path(".restart_pending.json")
+        last = self._last_good_by_source.get("restart_pending")
+        data = self._read_liveness_json(
+            path, bool(last is not None and last.restart_notice_pending)
+        )
+        return gateway.model_copy(update=_restart_notice_fields(data, self._clock()))
+
+    def _with_serve_obligations(self, gateway: GatewayState) -> GatewayState:
+        """Manual serve restarts an update still owes (``serve_restart_pending/``).
+
+        PROFILE-scoped: ``get_hermes_home()/"serve_restart_pending"``
+        (``hermes_cli/update_serve_obligations.py:40,91``). Each record is judged
+        like upstream's ``_pid_alive_matches``: a pid that is gone or now belongs to
+        another process is not owed; one whose identity cannot be checked still is.
+        """
+        directory = self._paths.profile_path("serve_restart_pending")
+        root = self._paths.root_home
+        paths, truncated = _serve_obligation_paths(directory, root)
+        rows = [
+            row
+            for path in paths
+            if _safe_child_path(path, root)
+            and (row := _serve_obligation_row(self._read_json_cached(path))) is not None
+        ]
+        pids = sorted({row[2] for row in rows})
+        observed = self._process_start_times(pids) if pids else {}
+        return gateway.model_copy(
+            update=_serve_obligation_fields(
+                rows,
+                lambda pid, created: _surface_liveness(pid, created, observed, self._pid_exists),
+                truncated=truncated,
+            )
+        )
+
+    def _with_update_history(self, gateway: GatewayState) -> GatewayState:
+        """Failures among the newest archived update receipts.
+
+        ROOT-scoped beside ``latest.json`` (the ``update_receipt`` source), so the
+        history and the latest run always describe the same home; upstream writes
+        both under ``get_hermes_home()/"logs"/"update_receipts"``
+        (``hermes_cli/update_receipt.py:120-122``). Memoized by the directory's
+        signature: archived receipts are never rewritten, only added and pruned.
+        """
+        directory = self._paths.shared_path("logs", "update_receipts")
+        root = self._paths.root_home
+
+        def read_rows() -> list[tuple[str, float | None, str, bool]]:
+            rows = []
+            for path in _update_history_paths(directory, root):
+                if not _safe_child_path(path, root):
+                    continue
+                data = self._read_json_cached(path)
+                if data and not self._file_cache.last_read_was_stale(path):
+                    rows.append(_receipt_history_row(data))
+            return rows
+
+        rows = self._signature_cached("update_history", directory, read_rows)
+        return gateway.model_copy(update=_update_history_fields(rows, self._clock()))
 
     def _collect_migration(self, gateway: GatewayState, *, gateway_fresh: bool) -> MigrationState:
         """Read ``gateway_migration.json`` and judge it against the live artifacts.

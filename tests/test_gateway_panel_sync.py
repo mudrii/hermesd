@@ -9,6 +9,8 @@ from hermesd.models import (
     GatewayState,
     MigrationProfileRecord,
     MigrationState,
+    ServeRestartObligation,
+    UpdateReceiptSummary,
 )
 from hermesd.panels.gateway import render_gateway
 from hermesd.theme import Theme
@@ -330,3 +332,69 @@ def test_backend_groups_render_by_profile_and_host() -> None:
 
 def test_backend_groups_line_is_omitted_when_empty() -> None:
     assert "Backends:" not in _render(_LIVE, detail=True)
+
+
+# --------------------------------------------------------------------------
+# restart / update backlog
+# --------------------------------------------------------------------------
+
+
+def test_restart_notice_and_serve_obligations_render() -> None:
+    gateway = _LIVE.model_copy(
+        update={
+            "restart_notice_pending": True,
+            "restart_notice_requested_age_seconds": 600.0,
+            "restart_notice_via_service": True,
+            "restart_notice_delivered_count": 1,
+            "serve_restart_pending_count": 2,
+            "serve_restart_stale_count": 1,
+            "serve_restart_pending": [
+                ServeRestartObligation(kind="serve", profile=HOSTILE, pid=501, verified=True),
+                ServeRestartObligation(kind="dashboard", profile="dev", pid=502),
+            ],
+        }
+    )
+
+    detail = _render(gateway, detail=True)
+    compact = _render(gateway, detail=False)
+
+    assert "Restart Backlog" in detail
+    assert (
+        "Planned restart 10m ago (via service): back-online notice still owed to home"
+        " channels (1 delivered)" in detail
+    )
+    assert "Manual serve restarts owed: 2  (1 stale record(s) for processes already gone)" in detail
+    assert "serve [/] boom [red]x[/red] clear pid 501" in detail
+    assert "dashboard dev pid 502 (identity unverified)" in detail
+    assert "\x1b[2J" not in detail
+    assert "⚠ restart notice owed" in compact
+    assert "⚠ 2 manual serve restart(s) pending" in compact
+
+
+def test_update_failure_history_renders_in_the_updates_section() -> None:
+    gateway = _LIVE.model_copy(
+        update={
+            "update_history_scanned": 10,
+            "update_history_failed": 2,
+            "update_failures": [
+                UpdateReceiptSummary(outcome="partial", finished_age_seconds=3600.0),
+                UpdateReceiptSummary(
+                    outcome=HOSTILE, finished_age_seconds=None, failed_step="pull"
+                ),
+            ],
+        }
+    )
+
+    detail = _render(gateway, detail=True)
+
+    assert "Updates" in detail
+    assert "Recent runs: 2 of the last 10 did not finish cleanly" in detail
+    assert "partial  1h ago" in detail
+    assert "[/] boom [red]x[/red] clear  — ago  failed step pull" in detail
+
+
+def test_restart_backlog_is_omitted_when_nothing_is_owed() -> None:
+    detail = _render(_LIVE, detail=True)
+
+    assert "Restart Backlog" not in detail
+    assert "Recent runs" not in detail

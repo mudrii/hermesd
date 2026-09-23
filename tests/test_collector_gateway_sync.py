@@ -810,3 +810,296 @@ def test_backend_groups_absent_table_is_empty(hermes_home: Path):
 
     assert gateway.gateway_backend_groups == []
     assert gateway.gateway_backend_groups_truncated is False
+
+
+# --------------------------------------------------------------------------
+# .restart_pending.json: a planned (non-chat) restart's back-online notice still
+# owed to home channels (gateway/run_shutdown.py:2054-2064 writes it,
+# gateway/run_notifications.py:936-972 unlinks it once every home was reached)
+# --------------------------------------------------------------------------
+
+
+def _write_restart_pending(home: Path, payload: object) -> Path:
+    path = home / ".restart_pending.json"
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def test_restart_notice_pending_is_surfaced(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_restart_pending(
+        hermes_home,
+        {
+            "requested_at": NOW - 600,
+            "via_service": True,
+            "detached": False,
+            "delivered_targets": [["default", "telegram", "1", None]],
+        },
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.restart_notice_pending is True
+    assert gateway.restart_notice_requested_age_seconds == pytest.approx(600.0)
+    assert gateway.restart_notice_via_service is True
+    assert gateway.restart_notice_detached is False
+    assert gateway.restart_notice_delivered_count == 1
+
+
+def test_restart_notice_absent_is_not_pending(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.restart_notice_pending is False
+    assert gateway.restart_notice_requested_age_seconds is None
+
+
+def test_restart_notice_wrong_types_do_not_crash(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_restart_pending(
+        hermes_home,
+        {"requested_at": "soon", "via_service": "yes", "delivered_targets": "x"},
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.restart_notice_pending is True
+    assert gateway.restart_notice_requested_age_seconds is None
+    assert gateway.restart_notice_via_service is False
+    assert gateway.restart_notice_delivered_count == 0
+
+
+def test_restart_notice_keeps_last_good_when_torn(hermes_home: Path):
+    from hermesd.collector import Collector
+    from tests.test_collector_gateway import _clock
+
+    _write_gateway_state(hermes_home)
+    path = _write_restart_pending(hermes_home, {"requested_at": NOW - 60})
+    collector = Collector(hermes_home, pid_exists=lambda pid: pid == 4242, clock=_clock)
+    try:
+        first = collector.collect()
+        path.write_text("{torn")
+        second = collector.collect()
+    finally:
+        collector.close()
+
+    assert first.gateway.restart_notice_pending is True
+    assert second.gateway.restart_notice_pending is True
+    assert "restart_pending" in second.health.failed_sources
+
+
+# --------------------------------------------------------------------------
+# serve_restart_pending/<pid>-<hex>.json (hermes_cli/update_serve_obligations.py:
+# 40-49 writes one immutable file per manual serve incarnation; :91-99 drops the
+# ones whose process is provably gone)
+# --------------------------------------------------------------------------
+
+
+def _write_obligation(home: Path, pid: int, create_time: float, **extra: object) -> Path:
+    directory = home / "serve_restart_pending"
+    directory.mkdir(exist_ok=True)
+    row: dict[str, object] = {
+        "kind": "serve",
+        "profile": "default",
+        "pid": pid,
+        "create_time": create_time,
+    }
+    row.update(extra)
+    path = directory / f"{pid}-{float(create_time).hex()}.json"
+    path.write_text(json.dumps(row))
+    return path
+
+
+def _collect_obligations(home: Path, starts: dict[int, float], live: set[int]):
+    from hermesd.collector import Collector
+    from tests.test_collector_gateway import _clock
+
+    collector = Collector(
+        home,
+        pid_exists=lambda pid: pid in live,
+        process_start_times=lambda pids: {pid: starts[pid] for pid in pids if pid in starts},
+        clock=_clock,
+    )
+    try:
+        return collector.collect()
+    finally:
+        collector.close()
+
+
+def test_serve_obligations_count_only_live_incarnations(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_obligation(hermes_home, 501, 1000.0, kind="dashboard", profile="dev")
+    _write_obligation(hermes_home, 502, 2000.0)  # pid reused by another process
+    _write_obligation(hermes_home, 503, 3000.0)  # pid gone
+    _write_obligation(hermes_home, 504, 4000.0)  # alive, start time unobservable
+
+    state = _collect_obligations(
+        hermes_home, starts={501: 1000.5, 502: 9999.0}, live={501, 502, 504, 4242}
+    )
+    gateway = state.gateway
+
+    assert gateway.serve_restart_pending_count == 2
+    assert gateway.serve_restart_stale_count == 2
+    assert sorted((o.kind, o.profile, o.pid) for o in gateway.serve_restart_pending) == [
+        ("dashboard", "dev", 501),
+        ("serve", "default", 504),
+    ]
+    assert {o.pid: o.verified for o in gateway.serve_restart_pending} == {501: True, 504: False}
+
+
+def test_serve_obligations_skip_junk_files_and_bound_the_scan(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    directory = hermes_home / "serve_restart_pending"
+    directory.mkdir()
+    (directory / "notes.txt").write_text("x")
+    (directory / "bad.json").write_text("{torn")
+    (directory / "wrong.json").write_text(json.dumps({"pid": "7", "create_time": None}))
+    for pid in range(1000, 1100):
+        _write_obligation(hermes_home, pid, float(pid))
+
+    state = _collect_obligations(
+        hermes_home,
+        starts={pid: float(pid) for pid in range(1000, 1100)},
+        live=set(range(1000, 1100)),
+    )
+
+    # Only the first 64 directory entries are examined; junk among them is skipped.
+    assert 60 <= state.gateway.serve_restart_pending_count <= 64
+    assert len(state.gateway.serve_restart_pending) == 5
+    assert state.gateway.serve_restart_scan_truncated is True
+    assert "serve_restart_pending" not in state.health.failed_sources
+
+
+def test_serve_obligations_absent_directory_is_zero(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.serve_restart_pending_count == 0
+    assert gateway.serve_restart_pending == []
+
+
+def test_serve_obligation_symlink_outside_home_is_ignored(hermes_home: Path, tmp_path: Path):
+    _write_gateway_state(hermes_home)
+    outside = tmp_path / "outside.json"
+    outside.write_text(
+        json.dumps({"kind": "serve", "profile": "x", "pid": 4242, "create_time": 1.0})
+    )
+    directory = hermes_home / "serve_restart_pending"
+    directory.mkdir()
+    (directory / "4242-0x1p+0.json").symlink_to(outside)
+
+    state = _collect_obligations(hermes_home, starts={4242: 1.0}, live={4242})
+
+    assert state.gateway.serve_restart_pending_count == 0
+
+
+# --------------------------------------------------------------------------
+# older update receipts (logs/update_receipts/update_*.json, 20 kept per home:
+# hermes_cli/update_receipt.py:21,206-211,241-246)
+# --------------------------------------------------------------------------
+
+
+def _write_archived_receipt(home: Path, stamp: str, **extra: object) -> Path:
+    directory = home / "logs" / "update_receipts"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"update_{stamp}_1.json"
+    path.write_text(json.dumps(_receipt(**extra)))
+    return path
+
+
+def test_update_history_lists_the_newest_failures(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_archived_receipt(hermes_home, "20260901_000000", outcome="success")
+    _write_archived_receipt(
+        hermes_home,
+        "20260902_000000",
+        outcome="failed",
+        finished_at=_iso(NOW - 7200),
+        steps=[{"name": "pull", "ok": False}],
+    )
+    _write_archived_receipt(
+        hermes_home, "20260903_000000", outcome="partial", finished_at=_iso(NOW - 3600)
+    )
+    _write_archived_receipt(hermes_home, "20260904_000000", outcome="success")
+    (hermes_home / "logs" / "update_receipts" / "latest.json").write_text(
+        json.dumps(_receipt(outcome="failed"))
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.update_history_scanned == 4
+    assert gateway.update_history_failed == 2
+    assert [(r.outcome, r.failed_step) for r in gateway.update_failures] == [
+        ("partial", ""),
+        ("failed", "pull"),
+    ]
+    assert gateway.update_failures[0].finished_age_seconds == pytest.approx(3600.0)
+
+
+def test_update_history_is_bounded_to_the_newest_receipts(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    for day in range(1, 29):
+        _write_archived_receipt(hermes_home, f"202609{day:02d}_000000", outcome="failed")
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.update_history_scanned == 10
+    assert gateway.update_history_failed == 10
+    assert len(gateway.update_failures) == 3
+
+
+def test_update_history_skips_unreadable_receipts(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_archived_receipt(hermes_home, "20260901_000000", outcome="failed")
+    (hermes_home / "logs" / "update_receipts" / "update_20260902_000000_1.json").write_text("{x")
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.update_history_scanned == 1
+    assert gateway.update_history_failed == 1
+
+
+def test_update_history_absent_directory_is_empty(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.update_history_scanned == 0
+    assert gateway.update_failures == []
+
+
+def test_receipt_outcome_and_skip_vocabularies_are_bounded(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_receipt(
+        hermes_home,
+        _receipt(
+            runtime_outcomes=[{"outcome": f"o{i}"} for i in range(20)],
+            skips=[{"name": f"s{i}"} for i in range(10)],
+        ),
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert len(gateway.update_runtime_outcomes) == 8
+    assert gateway.update_skip_count == 10
+    assert gateway.update_skip_names == ["s0", "s1", "s2"]
+
+
+@pytest.mark.parametrize("create_time", [None, True, "1.0", 0, -1.0])
+def test_serve_obligation_without_a_usable_create_time_is_ignored(
+    hermes_home: Path, create_time: object
+):
+    """Upstream files a reminder only for an identified incarnation (:28-37)."""
+    _write_gateway_state(hermes_home)
+    directory = hermes_home / "serve_restart_pending"
+    directory.mkdir()
+    (directory / "501-x.json").write_text(
+        json.dumps({"kind": "serve", "profile": "p", "pid": 501, "create_time": create_time})
+    )
+
+    state = _collect_obligations(hermes_home, starts={501: 1.0}, live={501})
+
+    assert state.gateway.serve_restart_pending_count == 0
+    assert state.gateway.serve_restart_stale_count == 0

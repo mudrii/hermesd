@@ -13,11 +13,13 @@ import contextlib
 import heapq
 import json
 import math
+import os
 import re
 import socket
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +56,9 @@ from hermesd.models import (
     GatewayLoopHealth,
     PlatformOwnership,
     PlatformStatus,
+    ProcessLiveness,
+    ServeRestartObligation,
+    UpdateReceiptSummary,
 )
 
 # The gateway watchdog rewrites state/gateway.heartbeat every 30s: three missed
@@ -84,6 +89,14 @@ _RESTART_LOOP_MAX_RESTARTS = 3
 _RESTART_LOOP_WINDOW_SECONDS = 60
 _RESTART_LOOP_MAX_GAP_SECONDS = 300
 _RESTART_LOOP_BOOT_LIMIT = 200
+# serve_restart_pending/: one file per owed manual serve; bound the listing.
+_SERVE_OBLIGATION_SCAN_LIMIT = 64
+_SERVE_OBLIGATION_ROW_LIMIT = 5
+# logs/update_receipts/: upstream keeps 20 archived runs; read only the newest.
+_ARCHIVED_RECEIPT_RE = re.compile(r"update_\d{8}_\d{6}_\d+\.json")
+_UPDATE_HISTORY_LIST_LIMIT = 64
+_UPDATE_HISTORY_SCAN_LIMIT = 10
+_UPDATE_FAILURE_LIMIT = 3
 # Loop-tick witness probe (hermes_cli/gateway.py:363-424): one byte, one second.
 _LOOP_TICK_PROBE_TIMEOUT_SECONDS = 1.0
 # Never escalate on a single silent probe (hermes_cli/gateway.py
@@ -1464,4 +1477,156 @@ def _restart_loop_fields(
         # the next restart-interrupted boot would inherit, evaluated at now.
         "restart_loop_tripped": policy.max_restarts > 0 and chain >= policy.max_restarts,
         "restart_loop_last_boot_age_seconds": _age_seconds(max(boots), now) if boots else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Planned-restart notice (.restart_pending.json)
+#
+# Written at shutdown for a restart that no chat asked for (``requested_at``,
+# ``via_service``, ``detached``; gateway/run_shutdown.py:2054-2064), then replayed
+# by the next boot and on every platform reconnect, recording each home channel
+# reached in ``delivered_targets`` and unlinking the file only once every owed
+# home got its back-online notice (gateway/run_notifications.py:936-972). A file
+# on disk therefore means "a planned restart's notice is still owed", not "the
+# restart has not happened". ``.restart_last_processed.json`` is unrelated: it is
+# the Telegram /restart redelivery dedup marker (gateway/slash_commands.py:565-569).
+# ---------------------------------------------------------------------------
+
+
+def _restart_notice_fields(data: JsonMapping, now: float) -> dict[str, Any]:
+    raw_requested = data.get("requested_at")
+    requested = (
+        float(raw_requested)
+        if isinstance(raw_requested, int | float) and not isinstance(raw_requested, bool)
+        else None
+    )
+    return {
+        "restart_notice_pending": bool(data),
+        "restart_notice_requested_age_seconds": _age_seconds(requested, now),
+        "restart_notice_via_service": data.get("via_service") is True,
+        "restart_notice_detached": data.get("detached") is True,
+        "restart_notice_delivered_count": len(_as_list(data.get("delivered_targets"))),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Manual serve restart obligations (serve_restart_pending/<pid>-<hex>.json)
+#
+# ``defer_manual_serve`` files one immutable ``{kind, profile, pid, create_time}``
+# per manual ``hermes serve``/``dashboard`` incarnation an update could not
+# restart (hermes_cli/update_serve_obligations.py:40-58); the CLI drops a file
+# once its ``(pid, create_time)`` is provably gone (:91-99). Only incarnations
+# that are not provably gone are owed.
+# ---------------------------------------------------------------------------
+
+
+def _serve_obligation_paths(directory: Path, root: Path) -> tuple[list[Path], bool]:
+    """``*.json`` entries of the obligation directory, bounded; symlinks never followed."""
+    if not _safe_child_path(directory, root) or not directory.is_dir():
+        return [], False
+    paths: list[Path] = []
+    truncated = False
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            if len(paths) >= _SERVE_OBLIGATION_SCAN_LIMIT:
+                truncated = True
+                break
+            paths.append(Path(entry.path))
+    return sorted(paths), truncated
+
+
+def _serve_obligation_row(data: JsonMapping) -> tuple[str, str, int, float] | None:
+    """``(kind, profile, pid, create_time)`` for a well-formed record, else None."""
+    pid = data.get("pid")
+    created = data.get("create_time")
+    if type(pid) is not int or pid <= 0:
+        return None
+    if isinstance(created, bool) or not isinstance(created, int | float):
+        return None
+    if not math.isfinite(float(created)) or created <= 0:
+        return None
+    return (
+        _excerpt(data.get("kind") or "unknown", _BACKEND_LABEL_CHARS),
+        _excerpt(data.get("profile") or "unknown", _BACKEND_LABEL_CHARS),
+        pid,
+        float(created),
+    )
+
+
+def _serve_obligation_fields(
+    rows: list[tuple[str, str, int, float]],
+    liveness: Callable[[int, float], ProcessLiveness],
+    *,
+    truncated: bool,
+) -> dict[str, Any]:
+    pending: list[ServeRestartObligation] = []
+    stale = 0
+    for kind, profile, pid, created in rows:
+        verdict = liveness(pid, created)
+        if verdict is ProcessLiveness.DEAD:
+            stale += 1
+            continue
+        pending.append(
+            ServeRestartObligation(
+                kind=kind, profile=profile, pid=pid, verified=verdict is ProcessLiveness.LIVE
+            )
+        )
+    return {
+        "serve_restart_pending_count": len(pending),
+        "serve_restart_stale_count": stale,
+        "serve_restart_pending": pending[:_SERVE_OBLIGATION_ROW_LIMIT],
+        "serve_restart_scan_truncated": truncated,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Update receipt history (logs/update_receipts/update_<stamp>_<pid>.json)
+#
+# ``finalize_update_receipt`` archives one file per run beside latest.json and
+# prunes to the newest 20 per home (hermes_cli/update_receipt.py:21,206-211,
+# 241-246). Only the newest few are read, newest first by the stamped name.
+# ---------------------------------------------------------------------------
+
+
+def _update_history_paths(directory: Path, root: Path) -> list[Path]:
+    """The newest archived receipts by stamped name, bounded at both steps."""
+    if not _safe_child_path(directory, root) or not directory.is_dir():
+        return []
+    names: list[str] = []
+    with os.scandir(directory) as entries:
+        for entry in islice(entries, _UPDATE_HISTORY_LIST_LIMIT):
+            if _ARCHIVED_RECEIPT_RE.fullmatch(entry.name):
+                names.append(entry.name)
+    newest = sorted(names, reverse=True)[:_UPDATE_HISTORY_SCAN_LIMIT]
+    return [directory / name for name in newest]
+
+
+def _receipt_history_row(data: JsonMapping) -> tuple[str, float | None, str, bool]:
+    """``(outcome, finished_at epoch, failed step, unfinished)`` for one archived run."""
+    return (
+        _excerpt(data.get("outcome") or "", _SKIP_NAME_CHARS),
+        _iso_to_epoch(data.get("finished_at")),
+        _excerpt(_first_failed_step(data.get("steps")), _SKIP_NAME_CHARS),
+        _receipt_looks_unfinished(data),
+    )
+
+
+def _update_history_fields(
+    rows: list[tuple[str, float | None, str, bool]], now: float
+) -> dict[str, Any]:
+    failures = [row for row in rows if row[3]]
+    return {
+        "update_history_scanned": len(rows),
+        "update_history_failed": len(failures),
+        "update_failures": [
+            UpdateReceiptSummary(
+                outcome=outcome,
+                finished_age_seconds=_age_seconds(finished, now),
+                failed_step=step,
+            )
+            for outcome, finished, step, _unfinished in failures[:_UPDATE_FAILURE_LIMIT]
+        ],
     }

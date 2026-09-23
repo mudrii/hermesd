@@ -95,6 +95,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     ]
     sections.extend(_ingress_section(state.gateway, theme))
     sections.extend(_updates_section(state.gateway, theme))
+    sections.extend(_restart_backlog_section(state.gateway, theme))
     sections.extend(_migration_section(state.migration, theme))
     sections.extend(_deliveries_section(state.gateway, theme))
 
@@ -556,6 +557,10 @@ def _append_compact_warnings(lines: Text, state: DashboardState, theme: Theme) -
         warnings.append("⚠ respawn backoff")
     if gw.restart_loop_tripped:
         warnings.append("⚠ restart loop")
+    if gw.restart_notice_pending:
+        warnings.append("⚠ restart notice owed")
+    if gw.serve_restart_pending_count:
+        warnings.append(f"⚠ {gw.serve_restart_pending_count} manual serve restart(s) pending")
     if gw.dead_target_count:
         warnings.append(f"⚠ {gw.dead_target_count} dead delivery target(s)")
     if gw.memory_pressure in _HIGH_MEMORY_PRESSURE:
@@ -693,7 +698,12 @@ def _forensic_files_text(gw: GatewayState, theme: Theme) -> Text:
 
 
 def _updates_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
-    if not (gw.last_update_outcome or gw.runtime_code_skew or gw.runtime_code_skew_source):
+    if not (
+        gw.last_update_outcome
+        or gw.runtime_code_skew
+        or gw.runtime_code_skew_source
+        or gw.update_history_failed
+    ):
         return []
     text = Text()
     text.append("\nUpdates\n", style=f"bold {theme.ui_label}")
@@ -723,6 +733,64 @@ def _updates_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
     _append_fleet_evidence(text, gw, theme)
     _append_skew_verdict(text, gw, theme)
     _append_receipt_followups(text, gw, theme)
+    _append_update_failure_history(text, gw, theme)
+    return [text]
+
+
+def _append_update_failure_history(text: Text, gw: GatewayState, theme: Theme) -> None:
+    """Archived runs that never finished cleanly, newest first; latest.json is one of them."""
+    if not gw.update_history_failed:
+        return
+    text.append(
+        f"\n  Recent runs: {gw.update_history_failed} of the last {gw.update_history_scanned}"
+        " did not finish cleanly",
+        style=theme.ui_warn,
+    )
+    for run in gw.update_failures:
+        step = f"  failed step {sanitize_terminal_text(run.failed_step)}" if run.failed_step else ""
+        text.append(
+            f"\n    {_text_or_dash(run.outcome)}  {fmt_age_seconds(run.finished_age_seconds)} ago{step}",
+            style=theme.banner_dim,
+        )
+
+
+def _restart_backlog_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
+    """Restarts still owed: a planned restart's home-channel notice, manual serves."""
+    if not (gw.restart_notice_pending or gw.serve_restart_pending_count):
+        return []
+    text = Text()
+    text.append("\nRestart Backlog\n", style=f"bold {theme.ui_label}")
+    if gw.restart_notice_pending:
+        via = " (via service)" if gw.restart_notice_via_service else ""
+        via += " (detached)" if gw.restart_notice_detached else ""
+        text.append(
+            f"  Planned restart {fmt_age_seconds(gw.restart_notice_requested_age_seconds)} ago{via}:"
+            " back-online notice still owed to home channels"
+            f" ({gw.restart_notice_delivered_count} delivered)\n",
+            style=theme.ui_warn,
+        )
+    if gw.serve_restart_pending_count:
+        stale = (
+            f"  ({gw.serve_restart_stale_count} stale record(s) for processes already gone)"
+            if gw.serve_restart_stale_count
+            else ""
+        )
+        more = "  (directory listing truncated)" if gw.serve_restart_scan_truncated else ""
+        text.append(
+            f"  Manual serve restarts owed: {gw.serve_restart_pending_count}{stale}{more}\n",
+            style=theme.ui_warn,
+        )
+        for obligation in gw.serve_restart_pending:
+            unverified = "" if obligation.verified else " (identity unverified)"
+            text.append(
+                f"    {_text_or_dash(obligation.kind)} {_text_or_dash(obligation.profile)}"
+                f" pid {obligation.pid}{unverified}\n",
+                style=theme.banner_dim,
+            )
+        text.append(
+            "    relaunch `hermes serve` / `hermes dashboard` to pick up the updated code\n",
+            style=theme.banner_dim,
+        )
     return [text]
 
 
