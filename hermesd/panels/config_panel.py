@@ -57,6 +57,10 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             lines.append(f" · corrupt {backups.corrupt_count}", style=theme.ui_error)
         if c.config_backup_groups_truncated:
             lines.append(" · truncated", style=theme.banner_dim)
+    findings = int(bool(c.stale_root_keys)) + int(bool(c.legacy_custom_provider_labels))
+    if findings:
+        lines.append("\n  Doctor: ", style=theme.ui_label)
+        lines.append(f"{findings} findings", style=theme.ui_warn)
 
     return Panel(
         lines,
@@ -75,6 +79,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     sections.extend(_kv_section("Agent limits", _agent_limit_rows(c), theme))
     sections.extend(_kv_section("Integrations", _integration_rows(c), theme))
     sections.extend(_backup_section(c, theme))
+    sections.extend(_kv_section("Doctor (file checks)", _doctor_rows(c), theme))
 
     if c.tool_gateway_routes:
         sections.append(section_heading("Tool Gateway (dashboard-local env)", theme))
@@ -131,6 +136,17 @@ def _settings_table(c: ConfigSummary, theme: Theme) -> Table:
     table.add_row("MoA", escape(_moa_label(c)))
     table.add_row("Auxiliary Slots", str(len(c.auxiliary_slots)))
     return table
+
+
+def _doctor_rows(c: ConfigSummary) -> list[tuple[str, str]]:
+    """The raw-file drift findings ``hermes doctor`` would report (warn-only)."""
+    rows = []
+    if c.stale_root_keys:
+        rows.append(("Stale root keys", f"{', '.join(c.stale_root_keys)} (belong under model:)"))
+    if c.legacy_custom_provider_labels:
+        labels = ", ".join(c.legacy_custom_provider_labels)
+        rows.append(("Legacy custom_providers", f"{labels} (no providers: twin)"))
+    return rows
 
 
 def _kv_section(title: str, rows: list[tuple[str, str]], theme: Theme) -> list[RenderableType]:

@@ -252,3 +252,25 @@ def test_config_compact_flags_truncated_backup_groups() -> None:
 
     assert "truncated" in truncated
     assert "truncated" not in calm
+
+
+def test_config_doctor_findings_render_compact_and_detail() -> None:
+    config = ConfigSummary(
+        stale_root_keys=["provider", "base_url"],
+        legacy_custom_provider_labels=["orphan", "[red]x[/]"],
+    )
+    compact = _render(config, detail=False)
+    detail = _render(config, detail=True)
+
+    assert "Doctor: 2 findings" in compact
+    assert "Doctor (file checks)" in detail
+    assert "provider, base_url (belong under model:)" in detail
+    assert "orphan, [red]x[/] (no providers: twin)" in detail
+
+
+def test_config_doctor_quiet_when_clean() -> None:
+    compact = _render(ConfigSummary(), detail=False)
+    detail = _render(ConfigSummary(), detail=True)
+    assert "Doctor:" not in compact
+    assert "Doctor (file checks)" in detail
+    assert "belong under model:" not in detail
