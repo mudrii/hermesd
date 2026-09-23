@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from hermesd.collect.skills import _skill_entries
 from hermesd.collector import (
     Collector,
     _count_skills,
@@ -283,7 +284,6 @@ Body
 @pytest.mark.parametrize(
     ("skill_md_content", "reason"),
     [
-        (None, "missing SKILL.md"),
         ("---\nname: lint\n---\nBody\n", "frontmatter without description"),
         ("---\ndescription: [unclosed\n---\nBody\n", "malformed YAML frontmatter"),
         ("No frontmatter at all\n", "no frontmatter delimiter"),
@@ -339,17 +339,95 @@ def test_word_count_oserror_returns_zero(tmp_path: Path):
         os.chmod(f, 0o644)
 
 
-def test_count_skills_ignores_dotdirs_and_files(tmp_path: Path):
+def _write_skill(path: Path, description: str = "") -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "SKILL.md").write_text(f"---\ndescription: {description}\n---\n")
+
+
+def _mixed_depth_skills(skills: Path, outside: Path) -> None:
+    """Flat, categorized and nested skills plus everything upstream refuses to scan."""
+    _write_skill(skills / "hermes-themes", "flat skill")
+    _write_skill(skills / "dev" / "skill-a", "categorized skill")
+    _write_skill(skills / "mlops" / "training" / "trl", "nested skill")
+    (skills / "mlops" / "DESCRIPTION.md").write_text("category blurb, not a skill")
+    (skills / "dev" / "not-a-skill").mkdir()  # no SKILL.md: not a skill
+    (skills / "dev" / "README.md").write_text("stray file")
+    (skills / "loose.txt").write_text("x")
+    _write_skill(skills / ".archive" / "old" / "gone")  # dot-dir: skipped
+    _write_skill(skills / "dev" / "node_modules" / "pkg")  # dependency dir: skipped
+    # A skill's own support dir holding a preserved package is documentation.
+    _write_skill(skills / "dev" / "skill-a" / "references" / "old-package")
+    _write_skill(outside / "escaped")
+    (skills / "linked").symlink_to(outside, target_is_directory=True)
+
+
+def test_skill_entries_find_skill_md_at_any_depth(tmp_path: Path):
     skills = tmp_path / "skills"
-    real = skills / "dev"
-    real.mkdir(parents=True)
-    (real / "skill-a").mkdir()
-    (real / "skill-b").mkdir()
-    (real / "README.md").write_text("not a skill dir")  # non-dir child: not counted
-    (skills / ".cache").mkdir()  # dotdir category: skipped
-    (skills / "loose.txt").write_text("x")  # non-dir category: skipped
-    assert _count_skills(skills) == 2
+    _mixed_depth_skills(skills, tmp_path / "outside")
+
+    entries = _skill_entries(skills)
+
+    assert [(e.name, e.category, e.parent) for e in entries] == [
+        ("skill-a", "dev", "dev"),
+        ("hermes-themes", "", ""),
+        ("trl", "mlops", "mlops/training"),
+    ]
+    assert _count_skills(skills) == 3
     assert _count_skills(tmp_path / "missing") == 0
+
+
+def test_skill_entries_scan_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    skills = tmp_path / "skills"
+    for index in range(5):
+        _write_skill(skills / f"cat-{index}" / "skill")
+    monkeypatch.setattr("hermesd.collect.skills._MAX_SKILL_SCAN_DIRS", 3)
+
+    assert len(_skill_entries(skills)) < 5
+
+
+@_skip_if_root
+def test_skill_entries_unreadable_root_fails_the_source(tmp_path: Path):
+    skills = tmp_path / "skills"
+    _write_skill(skills / "dev" / "a")
+    os.chmod(skills, 0o000)
+    try:
+        with pytest.raises(PermissionError):
+            _skill_entries(skills)
+    finally:
+        os.chmod(skills, 0o755)
+
+
+@_skip_if_root
+def test_skill_entries_skip_unreadable_nested_directory(tmp_path: Path):
+    skills = tmp_path / "skills"
+    _write_skill(skills / "dev" / "a")
+    locked = skills / "locked"
+    _write_skill(locked / "hidden")
+    os.chmod(locked, 0o000)
+    try:
+        assert [e.name for e in _skill_entries(skills)] == ["a"]
+    finally:
+        os.chmod(locked, 0o755)
+
+
+def test_collect_skills_lists_flat_and_nested_skills(hermes_home: Path, tmp_path: Path):
+    _mixed_depth_skills(hermes_home / "skills", tmp_path / "outside")
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    skills = {s.name: s for s in state.skills_memory.skills}
+    assert set(skills) == {"hermes-themes", "skill-a", "trl"}
+    assert state.skills_memory.skill_count == 3
+    assert state.skills_memory.skill_categories == 2
+    assert skills["hermes-themes"].category == ""
+    assert skills["hermes-themes"].description == "flat skill"
+    assert skills["trl"].category == "mlops"
+    assert skills["trl"].description == "nested skill"
+    assert skills["skill-a"].description == "categorized skill"
 
 
 def test_memory_files_symlinked_outside_hermes_home_are_ignored(hermes_home: Path, tmp_path: Path):

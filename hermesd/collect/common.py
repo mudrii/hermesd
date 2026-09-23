@@ -301,3 +301,25 @@ def _json_object_capped(
         if isinstance(decoded, dict):
             return decoded
     return None
+
+
+# Head of an untrusted free-text value that an excerpt scans: far more than any
+# cell shows, small enough that a megabyte error column is never redacted whole.
+_EXCERPT_SCAN_CHARS = 4096
+
+
+def _excerpt(value: object, cap: int) -> str:
+    """One-line excerpt of untrusted text: whitespace collapsed, redacted, then capped.
+
+    Redaction runs before the cap: slicing first can cut the ``Bearer ``/``key=``
+    marker off a credential and keep the token itself.
+    """
+    # Deferred so this leaf module keeps no import-time dependency on redaction.
+    from hermesd.collect.redaction import _redact_secret_text
+
+    return _redact_secret_text(" ".join(str(value)[:_EXCERPT_SCAN_CHARS].split()))[:cap]
+
+
+def _optional_int(value: object) -> int | None:
+    """Coerce to int, preserving a genuine null (an exit code that never happened)."""
+    return None if value is None else _coerce_int(value)

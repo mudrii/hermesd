@@ -216,6 +216,7 @@ from hermesd.collect.skills import (
     _memory_card_count,
     _read_soul_excerpt,
     _skill_description,
+    _skill_entries,
     _skill_frontmatter,
     _skills_prompt_summary,
     _toolset_availability,
@@ -3413,17 +3414,13 @@ class Collector:
         skills_dir = self._paths.profile_path("skills")
 
         # Build skill list from actual directory structure (authoritative)
-        if skills_dir.is_dir():
-            for cat_dir in sorted(skills_dir.iterdir()):
-                if not cat_dir.is_dir() or cat_dir.name.startswith("."):
-                    continue
-                cat = cat_dir.name
-                for skill_dir in sorted(cat_dir.iterdir()):
-                    if not skill_dir.is_dir():
-                        continue
-                    categories.add(cat)
-                    desc = self._read_skill_description(cat, skill_dir.name)
-                    skills.append(SkillInfo(name=skill_dir.name, category=cat, description=desc))
+        for entry in _skill_entries(skills_dir):
+            if entry.category:
+                categories.add(entry.category)
+            # The description lookup joins its first argument as a relative
+            # path, so the skill's full parent path finds a nested SKILL.md.
+            desc = self._read_skill_description(entry.parent, entry.name)
+            skills.append(SkillInfo(name=entry.name, category=entry.category, description=desc))
 
         mem_dir = self._paths.profile_path("memories")
         mem_count = len(_memory_file_names(mem_dir))
