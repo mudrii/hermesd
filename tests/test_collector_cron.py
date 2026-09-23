@@ -3222,3 +3222,55 @@ def test_cron_marker_symlinked_outside_home_reads_as_empty(hermes_home: Path, tm
     marker.symlink_to(outside)
 
     assert cron_module._read_cron_marker_text_strict(marker, hermes_home) == ""
+
+
+def test_recent_cron_executions_match_a_full_python_ordering(hermes_home: Path):
+    """Recent history equals the newest-first order over *every* row.
+
+    Guards trimming the recent-history query: SQL must order mixed ISO shapes
+    (Z, offsets, naive, fractional), ties and unparseable stamps exactly like
+    the shared parser, so fetching only the displayed rows loses nothing.
+    """
+    from hermesd.collect.common import _iso_to_epoch
+
+    db_path = hermes_home / "cron" / "executions.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    create_cron_executions_tables(conn)
+    now = time.time()
+    stamps: list[tuple[str, str]] = []
+    for index in range(40):
+        base = now - index * 37
+        shape = index % 6
+        if shape == 0:
+            claimed = iso_ago(index * 37, now=now).replace("+00:00", "Z")
+        elif shape == 1:
+            claimed = time.strftime("%Y-%m-%dT%H:%M:%S+02:00", time.gmtime(base + 7200))
+        elif shape == 2:
+            claimed = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(base))
+        elif shape == 3:
+            claimed = iso_ago(index * 37 + 0.25, now=now)
+        elif shape == 4:
+            claimed = iso_ago(37, now=now)  # deliberate ties on one instant
+        else:
+            claimed = "not-a-date" if index % 2 else ""
+        execution_id = f"exec_{index:03d}"
+        stamps.append((execution_id, claimed))
+        insert_cron_execution(conn, execution_id, "job-a", "completed", claimed_at=claimed)
+    conn.commit()
+    conn.close()
+
+    def key(item: tuple[str, str]) -> tuple[float, str]:
+        epoch = _iso_to_epoch(item[1])
+        return (float("-inf") if epoch is None else epoch, item[0])
+
+    expected = [execution_id for execution_id, _ in sorted(stamps, key=key, reverse=True)]
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    recent = [run.execution_id for run in state.cron_executions.recent]
+    assert recent == expected[:_EXECUTIONS_RECENT_LIMIT]

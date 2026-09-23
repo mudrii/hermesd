@@ -4,6 +4,7 @@ projects and MoA readers."""
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import math
 import os
@@ -955,6 +956,9 @@ def _model_cache_counts(data: dict[str, Any]) -> tuple[int, int]:
     return len(data), model_count
 
 
+# Pure in the command line, and the same process table is re-checked on every
+# refresh; shlex tokenizing dominated the operations source before this memo.
+@functools.lru_cache(maxsize=1024)
 def _is_dashboard_process(command: str) -> bool:
     if "hermes dashboard" in command:
         return True
