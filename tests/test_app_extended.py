@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from rich.cells import cell_len
 from rich.console import Console
+from rich.layout import Layout
 from rich.text import Text
 
 from hermesd import __version__
@@ -2403,5 +2404,36 @@ def test_logs_detail_window_keeps_minimum_on_tiny_terminal(populated_hermes_home
         app.handle_key("G")
         app._build_layout()
         assert app._view.scroll_offset == 57
+    finally:
+        app.close()
+
+
+@pytest.mark.parametrize(
+    ("width", "height"),
+    [(140, 30), (140, 34), (80, 24), (80, 26), (100, 23), (120, 40), (90, 55)],
+)
+def test_overview_gives_every_panel_room_for_content(
+    populated_hermes_home: Path, width: int, height: int
+):
+    """No panel is squeezed to bare borders or cropped off the bottom."""
+    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    try:
+        app._console = Console(file=io.StringIO(), width=width, height=height, no_color=True)
+        layout = app._build_layout()
+        body = layout["body"].renderable
+        assert isinstance(body, Layout)
+        body_height = height - 2  # one-line header and footer
+        regions = body.render(app._console, app._console.options.update(height=body_height))
+        panel_regions = [placed.region for child, placed in regions.items() if not child.children]
+
+        assert len(panel_regions) == len(PANEL_NAMES)
+        for region in panel_regions:
+            # Top border + at least one content line + bottom border, on screen.
+            assert region.height >= 3
+            assert region.y + region.height <= body_height
+        with app._console.capture() as captured:
+            app._console.print(layout)
+        for panel_name in PANEL_NAMES.values():
+            assert panel_name in captured.get()
     finally:
         app.close()

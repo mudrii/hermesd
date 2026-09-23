@@ -77,9 +77,32 @@ _COMPACT_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
     ("row7", 3, (10, 11)),
     ("row8", 3, (12, 13)),
 )
+# Last resort below the compact minimum: two panels per row after Gateway.
+_REDUCED_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
+    ("row1", 3, (1,)),
+    ("row2", 3, (2, 3)),
+    ("row3", 3, (4, 5)),
+    ("row4", 3, (6, 7)),
+    ("row5", 3, (8, 9)),
+    ("row6", 3, (10, 11)),
+    ("row7", 3, (12, 13)),
+)
 _TALL_NARROW_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = tuple(
     (f"row{panel_num}", None, (panel_num,)) for panel_num in _PANEL_NUMBERS
 )
+# Top border + one content line + bottom border: the least a flexible row
+# needs to show any content at all.
+_MIN_FLEX_ROW_HEIGHT = 3
+
+
+def _layout_min_height(spec: tuple[tuple[str, int | None, tuple[int, ...]], ...]) -> int:
+    """Terminal rows a spec needs so no panel is squeezed to bare borders."""
+    rows = sum(_MIN_FLEX_ROW_HEIGHT if size is None else size for _, size, _ in spec)
+    return rows + 2  # one-line header and footer
+
+
+_WIDE_LAYOUT_MIN_HEIGHT = _layout_min_height(_WIDE_LAYOUT_SPEC)
+_COMPACT_LAYOUT_MIN_HEIGHT = _layout_min_height(_COMPACT_LAYOUT_SPEC)
 _SESSION_SORTS = ("recent", "cost", "tokens")
 # SS3 cursor keys map onto their CSI form so both cursor modes decode alike.
 _SS3_TO_CSI = {final: f"\x1b[{final}" for final in "ABCDHF"}
@@ -960,10 +983,14 @@ class DashboardApp:
         height = active_console.height
 
         if width < 100 and height >= 50:
-            return self._build_overview_from_spec(state, active_theme, _TALL_NARROW_LAYOUT_SPEC)
-        if width < 100 or height < 30:
-            return self._build_overview_from_spec(state, active_theme, _COMPACT_LAYOUT_SPEC)
-        return self._build_overview_from_spec(state, active_theme, _WIDE_LAYOUT_SPEC)
+            spec = _TALL_NARROW_LAYOUT_SPEC
+        elif width >= 100 and height >= _WIDE_LAYOUT_MIN_HEIGHT:
+            spec = _WIDE_LAYOUT_SPEC
+        elif height >= _COMPACT_LAYOUT_MIN_HEIGHT:
+            spec = _COMPACT_LAYOUT_SPEC
+        else:
+            spec = _REDUCED_LAYOUT_SPEC
+        return self._build_overview_from_spec(state, active_theme, spec)
 
     def _build_overview_from_spec(
         self,
