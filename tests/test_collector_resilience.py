@@ -27,6 +27,11 @@ import hermesd.collector as collector_module
 from hermesd.collect.plugins import PLUGIN_KIND_STANDALONE
 from hermesd.collector import Collector
 from hermesd.models import ConfigSummary, DashboardState
+from tests.conftest import (
+    create_session_coordination_tables,
+    create_state_db_tables,
+    insert_gateway_route,
+)
 from tests.test_collector_api_runs import _build_populated_db as build_runs_db
 from tests.test_collector_hosted_rooms import _build_populated_db as build_shared_state_db
 from tests.test_collector_operations import (
@@ -755,6 +760,15 @@ def _setup_moa(home: Path) -> None:
     (home / "moa-traces" / "sess_moa.jsonl").write_text('{"event": "aggregate"}\n')
 
 
+def _setup_coordination_db(home: Path) -> None:
+    def build(conn: sqlite3.Connection) -> None:
+        create_state_db_tables(conn)
+        create_session_coordination_tables(conn)
+        insert_gateway_route(conn, "telegram:1", {"session_id": "s1"}, time.time())
+
+    _sqlite_file(home / "state.db", build)
+
+
 def _no_setup(home: Path) -> None:
     return None
 
@@ -939,8 +953,22 @@ def test_file_replaced_by_an_escaping_symlink_keeps_failing_with_last_good(
             lambda s: s.operations.api_runs.db_present,
             False,
         ),
+        (
+            "moa-traces",
+            _setup_moa,
+            "operations",
+            lambda s: s.operations.moa_trace_count,
+            0,
+        ),
+        (
+            "state.db",
+            _setup_coordination_db,
+            "gateway_routes",
+            lambda s: s.session_coordination.route_total,
+            0,
+        ),
     ],
-    ids=["kanban-current", "shared-state", "runs-idempotency"],
+    ids=["kanban-current", "shared-state", "runs-idempotency", "moa-traces", "state-db"],
 )
 def test_escaping_symlink_without_a_good_read_reads_as_absent(
     hermes_home: Path,
