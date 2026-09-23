@@ -151,9 +151,11 @@ from hermesd.collect.operations import (
     _live_log_tail,
     _moa_latest_record_summary,
     _model_cache_counts,
+    _pending_record_created_at,
     _read_checkpoint_prune_marker,
     _read_corrupt_ledger_marker,
     _read_delegation_live_manifests,
+    _read_pending_actions,
     _read_process_receipts,
     _read_projects_state,
     _read_state_snapshots,
@@ -444,6 +446,7 @@ _DELEGATION_LIVE_FIELDS = (
 )
 _PROCESS_RECEIPT_FIELDS = ("process_receipts",)
 _ESTOP_FIELDS = ("estop_engaged", "estop_reason", "estop_age_seconds", "estop_scope")
+_PENDING_ACTION_FIELDS = ("pending_actions", "pending_action_total")
 _STATE_SNAPSHOT_FIELDS = (
     "snapshot_count",
     "snapshot_total_bytes",
@@ -1148,6 +1151,17 @@ class Collector:
                 lambda: results["operations"],
                 fallback=lambda: self._last_source_fields(
                     "blocked_scripts", results["operations"], _BLOCKED_SCRIPT_FIELDS
+                ),
+            ),
+            # Staged writes awaiting operator review (pending/<subsystem>/):
+            # a failed scan keeps the last-good counts instead of a false zero.
+            _SourceSpec(
+                "operations",
+                "pending_actions",
+                lambda: self._with_pending_actions(results["operations"]),
+                lambda: results["operations"],
+                fallback=lambda: self._last_source_fields(
+                    "pending_actions", results["operations"], _PENDING_ACTION_FIELDS
                 ),
             ),
             # Fourth writer of `operations`: the state.db recovery artifacts are
@@ -3284,6 +3298,26 @@ class Collector:
                 self._paths.shared_path("cache", "blocked-scripts"),
                 self._paths.root_home,
                 now=self._clock(),
+            )
+        )
+
+    def _with_pending_actions(self, operations: OperationsState) -> OperationsState:
+        """Staged writes under PROFILE ``pending/`` (``tools/write_approval.py:64-65``).
+
+        Each record is parsed at most once per file signature: a staged skill
+        write carries its whole payload, so re-reading every record on every
+        refresh would cost far more than the two numbers it yields.
+        """
+        return operations.model_copy(
+            update=_read_pending_actions(
+                self._paths.profile_path("pending"),
+                self._paths.profile_home,
+                now=self._clock(),
+                created_at=lambda path, home: self._signature_cached(
+                    "pending-created-at",
+                    path,
+                    lambda: _pending_record_created_at(path, home),
+                ),
             )
         )
 

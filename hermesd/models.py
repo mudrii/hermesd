@@ -2402,6 +2402,23 @@ class ProcessReceiptsState(BaseModel):
     receipts_truncated: bool = False
 
 
+class PendingActionSubsystem(BaseModel):
+    """Writes staged for operator review under PROFILE ``pending/<subsystem>/``.
+
+    Upstream's write-approval gate stages a memory/skill write as one JSON
+    record per id (``tools/write_approval.py:64-86``) until it is approved or
+    discarded. Only the count and the oldest ``created_at`` are carried — the
+    staged payload is never read into state. ``unreadable_count`` records the
+    files upstream's own ``list_pending`` would skip; they are still counted
+    and aged by mtime.
+    """
+
+    subsystem: str
+    count: int = 0
+    oldest_age_seconds: float | None = None
+    unreadable_count: int = 0
+
+
 class StateSnapshotSummary(BaseModel):
     """One snapshot under ROOT ``state-snapshots/``.
 
@@ -2493,6 +2510,10 @@ class OperationsState(BaseModel):
     blocked_script_count: int = 0
     newest_blocked_script_age_seconds: float | None = None
     blocked_script_names: list[str] = Field(default_factory=list)
+    # Written by its own source (``pending_actions``): staged writes awaiting
+    # operator review, per subsystem.
+    pending_actions: list[PendingActionSubsystem] = Field(default_factory=list)
+    pending_action_total: int = 0
     # Written by its own source (``db_recovery``), so a corrupt repair ledger or
     # retired-WAL manifest degrades only this field and keeps its last-good value.
     db_recovery: DbRecoveryState = Field(default_factory=DbRecoveryState)

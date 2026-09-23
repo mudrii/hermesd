@@ -54,6 +54,7 @@ from hermesd.models import (
     DiscoveredRepoSummary,
     GoalSummary,
     OperationsState,
+    PendingActionSubsystem,
     ProcessReceipt,
     ProcessReceiptsState,
     ProjectSummary,
@@ -1109,3 +1110,71 @@ def _is_dashboard_process(command: str) -> bool:
     except ValueError:
         parts = command.split()
     return any(Path(part).name == "hermesd" for part in parts)
+
+
+# Subsystem directories and records per subsystem visited under pending/.
+_MAX_PENDING_SUBSYSTEMS = 16
+
+
+def _pending_record_created_at(path: Path, home: Path) -> float | None:
+    """``created_at`` of one staged record, None when unreadable or absent.
+
+    The record carries the full staged ``payload`` (``tools/write_approval.py:
+    71-86``); it is parsed only to reach ``created_at`` and never retained.
+    """
+    data = _json_object_capped(_read_text_capped(path, home), max_bytes=_MAX_TEXT_READ_BYTES)
+    if data is None:
+        return None
+    created_at = _coerce_float(data.get("created_at"))
+    return created_at if created_at > 0 else math.nan
+
+
+def _read_pending_actions(
+    pending_root: Path,
+    home: Path,
+    *,
+    now: float,
+    created_at: Callable[[Path, Path], float | None] = _pending_record_created_at,
+) -> dict[str, Any]:
+    """Count and oldest age of staged writes per ``pending/<subsystem>/``.
+
+    PROFILE scope: upstream stages under ``get_hermes_home()/"pending"``
+    (``tools/write_approval.py:64-65``). Bounded to 16 subsystem dirs and 200
+    records each; symlinked dirs and records are skipped. A record whose JSON
+    cannot be read is counted as unreadable and aged by mtime, as is one with no
+    usable ``created_at``.
+    """
+    subsystems: list[PendingActionSubsystem] = []
+    if not _safe_child_path(pending_root, home) or not pending_root.is_dir():
+        return {"pending_actions": [], "pending_action_total": 0}
+    for directory in sorted(islice(pending_root.iterdir(), _MAX_PENDING_SUBSYSTEMS)):
+        if directory.is_symlink() or not directory.is_dir():
+            continue
+        if not _path_resolves_under(directory, home):
+            continue
+        count = unreadable = 0
+        oldest: float | None = None
+        for record in islice(directory.glob("*.json"), _BOUNDED_SCAN_LIMIT):
+            if record.is_symlink() or not record.is_file():
+                continue
+            count += 1
+            stamp = created_at(record, home)
+            if stamp is None:
+                unreadable += 1
+            if stamp is None or not math.isfinite(stamp):
+                stamp = _mtime(record)
+            if stamp is not None and (oldest is None or stamp < oldest):
+                oldest = stamp
+        if count:
+            subsystems.append(
+                PendingActionSubsystem(
+                    subsystem=directory.name,
+                    count=count,
+                    oldest_age_seconds=_age_seconds(oldest, now),
+                    unreadable_count=unreadable,
+                )
+            )
+    return {
+        "pending_actions": subsystems,
+        "pending_action_total": sum(entry.count for entry in subsystems),
+    }

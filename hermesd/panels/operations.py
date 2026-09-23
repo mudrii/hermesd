@@ -177,6 +177,15 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     if ops.blocked_script_count:
         lines.append("  Blocked scripts: ", style=theme.ui_label)
         lines.append(f"{ops.blocked_script_count}\n", style=theme.ui_warn)
+    if ops.pending_action_total:
+        oldest = max(
+            (entry.oldest_age_seconds or 0.0 for entry in ops.pending_actions), default=None
+        )
+        lines.append("  Pending review: ", style=theme.ui_label)
+        lines.append(
+            f"{ops.pending_action_total} (oldest {fmt_age_seconds(oldest)})\n",
+            style=theme.ui_warn,
+        )
     if ops.snapshot_failed_count:
         lines.append("  ⚠ Snapshots: ", style=theme.ui_warn)
         lines.append(f"{ops.snapshot_failed_count} with failed DBs\n", style=theme.ui_warn)
@@ -338,6 +347,7 @@ def _has_no_artifacts(ops: OperationsState) -> bool:
         and not ops.web_ui_build_hash
         and not ops.desktop_build_stamp
         and not ops.blocked_script_count
+        and not ops.pending_action_total
         and not ops.checkpoint_prune_marker_present
         and not ops.spawn_ledger_corrupt_present
         and not ops.db_recovery.artifacts_present
@@ -605,6 +615,8 @@ def _summary_table(ops: OperationsState, theme: Theme) -> Table:
         )
     if ops.blocked_script_count:
         summary.add_row("Blocked scripts", _blocked_scripts_label(ops))
+    if ops.pending_action_total:
+        summary.add_row("Pending Review", _pending_actions_label(ops))
     if ops.checkpoint_prune_marker_present:
         summary.add_row("Checkpoint Prune", _checkpoint_prune_label(ops))
     if ops.spawn_ledger_corrupt_present:
@@ -636,6 +648,17 @@ def _spawn_ledger_corrupt_label(ops: OperationsState) -> str:
         f"⚠ corrupt ledger parked {fmt_age_seconds(ops.spawn_ledger_corrupt_age_seconds)} ago "
         "(read-only viewer; contents never parsed)"
     )
+
+
+def _pending_actions_label(ops: OperationsState) -> str:
+    """Staged writes per subsystem: counts and oldest age, never the payload."""
+    parts = []
+    for entry in ops.pending_actions:
+        label = f"{escape(entry.subsystem)}: {entry.count} · oldest {fmt_age_seconds(entry.oldest_age_seconds)}"
+        if entry.unreadable_count:
+            label += f" ({entry.unreadable_count} unreadable)"
+        parts.append(label)
+    return "  ".join(parts) + "  — /<subsystem> approve|reject <id>"
 
 
 def _blocked_scripts_label(ops: OperationsState) -> str:
