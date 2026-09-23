@@ -165,3 +165,40 @@ def test_load_theme_accepts_every_builtin_skin(hermes_home, skin: str):
 )
 def test_normalize_skin_name(given: str, expected: str):
     assert normalize_skin_name(given) == expected
+
+
+def test_load_theme_nesting_bomb_falls_back(hermes_home):
+    (hermes_home / "config.yaml").write_text("[" * 20000 + "]" * 20000)
+
+    assert load_theme(hermes_home).banner_title == "#FFD700"
+
+
+def test_load_theme_nesting_bomb_after_success_returns_last_good(hermes_home):
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text("display:\n  skin: ares\n")
+    assert load_theme(hermes_home).skin_name == "ares"
+
+    config_path.write_text("[" * 20000 + "]" * 20000)
+
+    assert load_theme(hermes_home).skin_name == "ares"
+
+
+@pytest.mark.parametrize("document", ["false\n", "0\n", "[]\n", "- a\n"])
+def test_load_theme_non_mapping_config_returns_last_good(hermes_home, document):
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text("display:\n  skin: ares\n")
+    assert load_theme(hermes_home).skin_name == "ares"
+
+    config_path.write_text(document)
+
+    assert load_theme(hermes_home).skin_name == "ares"
+
+
+def test_load_theme_empty_config_is_default(hermes_home):
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text("display:\n  skin: ares\n")
+    assert load_theme(hermes_home).skin_name == "ares"
+
+    config_path.write_text("")
+
+    assert load_theme(hermes_home).skin_name == "default"

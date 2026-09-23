@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from hermesd.collect.common import _exists_strict
-from hermesd.file_cache import _read_capped
+from hermesd.file_cache import _empty_yaml_as_mapping, _read_capped
 
 _BUILTIN_SKINS: dict[str, dict[str, str]] = {
     "default": {
@@ -180,15 +180,18 @@ def load_theme(hermes_home: Path) -> Theme:
     try:
         if not _exists_strict(config_path):
             return Theme()
-        cfg = yaml.safe_load(_read_capped(config_path)) or {}
+        cfg = _empty_yaml_as_mapping(yaml.safe_load(_read_capped(config_path)))
+        if not isinstance(cfg, dict):
+            # A non-mapping document is malformed config, like a parse error.
+            raise yaml.YAMLError(f"{config_path} is not a mapping")
         skin_name = "default"
-        if isinstance(cfg, dict):
-            display = cfg.get("display", {})
-            if isinstance(display, dict):
-                skin_name = str(display.get("skin", "default") or "default")
+        display = cfg.get("display", {})
+        if isinstance(display, dict):
+            skin_name = str(display.get("skin", "default") or "default")
         theme = Theme(normalize_skin_name(skin_name))
         _LAST_GOOD_THEMES[cache_key] = theme
         return theme
-    except (OSError, UnicodeError, yaml.YAMLError):
+    # RecursionError is how the YAML composer refuses a nesting bomb.
+    except (OSError, UnicodeError, yaml.YAMLError, RecursionError):
         last_good = _LAST_GOOD_THEMES.get(cache_key)
         return last_good if last_good is not None else Theme()
