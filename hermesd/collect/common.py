@@ -168,29 +168,13 @@ def _file_signature(path: Path) -> tuple[str, int, int] | None:
     return str(path), stat.st_mtime_ns, stat.st_size
 
 
-def _db_source_mtime_ns(db_path: Path) -> int | None:
-    """Newest mtime of a SQLite db and its -wal sidecar, in nanoseconds.
-
-    None when neither path can be stat'd, which callers treat as "unknown"
-    rather than "unchanged". Nanoseconds because a float st_mtime collides on
-    filesystems with 1-second granularity.
-    """
-    mtimes = []
-    for candidate in (db_path, db_path.with_name(f"{db_path.name}-wal")):
-        try:
-            mtimes.append(candidate.stat().st_mtime_ns)
-        except OSError:
-            continue
-    return max(mtimes) if mtimes else None
-
-
 _DbSourceSignature = tuple[tuple[int, int, int] | None, ...]
 
 
 def _db_source_signature(db_path: Path) -> _DbSourceSignature | None:
     """(st_mtime_ns, st_size, st_ino) of a SQLite db and its -wal sidecar.
 
-    Stricter change key than _db_source_mtime_ns: a same-timestamp write on a
+    Stricter change key than mtime alone: a same-timestamp write on a
     coarse-granularity filesystem still changes the size or inode. None when
     neither path can be stat'd ("unknown", not "unchanged").
     """

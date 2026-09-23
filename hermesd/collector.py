@@ -9,6 +9,7 @@ private name it resolved before the package split.
 from __future__ import annotations
 
 import functools
+import heapq
 import json
 import os
 import socket
@@ -34,7 +35,8 @@ from hermesd.collect.common import (
     _coerce_bool,
     _coerce_float,
     _coerce_int,
-    _db_source_mtime_ns,
+    _db_source_signature,
+    _DbSourceSignature,
     _exists_strict,
     _file_signature,
     _file_size,
@@ -511,6 +513,10 @@ _GENERATION_FIELDS = (
 # bound on live terminals, and only the newest rows are retained for display.
 _TERMINAL_SESSION_SCAN_LIMIT = 200
 _TERMINAL_SESSION_ROW_LIMIT = 12
+# Curator run dirs (``logs/curator/<stamp>``) are listed up to this many
+# entries per refresh, and only the lexically newest few are stat'ed.
+_CURATOR_RUN_LIST_LIMIT = 10_000
+_CURATOR_RUN_STAT_LIMIT = 50
 _TERMINAL_SESSION_WINDOW_SECONDS = 24 * 60 * 60
 # A file read successfully and then found missing fails its source on the
 # first absent pass (keeping last-good: it may be mid-rewrite), and the absence
@@ -794,12 +800,12 @@ class Collector:
                 tuple[str, bool, str, float | None],
             ],
         ] = {}
-        self._profile_count_cache: dict[str, tuple[int | None, int]] = {}
+        self._profile_count_cache: dict[str, tuple[_DbSourceSignature | None, int]] = {}
         self._kanban_board_cache: dict[str, KanbanBoardSummary] = {}
         # One state.db readout per changed mtime, shared by the goal/delegation
         # state and the gateway ledgers so a pass snapshots the (large, WAL)
         # db only once.
-        self._state_db_cache: tuple[int, _StateDbReadout] | None = None
+        self._state_db_cache: tuple[_DbSourceSignature, _StateDbReadout] | None = None
         # Consecutive passes each previously-read file has been found absent,
         # keyed by its label — see _present_or_confirmed_absent.
         self._absent_passes: dict[str, int] = {}
@@ -812,7 +818,7 @@ class Collector:
         # kanban.db's shared WAL snapshots, keyed by source path: each entry is
         # (source mtime, path to read, temp-dir owner). One per database, so the
         # boards' own stores do not evict the root one.
-        self._kanban_snapshots: dict[Path, tuple[int | None, Path, Any]] = {}
+        self._kanban_snapshots: dict[Path, tuple[_DbSourceSignature | None, Path, Any]] = {}
         self._checkpoint_summary_cache: dict[
             str, tuple[tuple[int, ...], tuple[int, float | None, str]]
         ] = {}
@@ -1840,7 +1846,9 @@ class Collector:
         )
         if readout is None:
             return gateway
-        return gateway.model_copy(update=_gateway_ledger_fields(readout.ledgers, self._clock()))
+        return gateway.model_copy(
+            update=_gateway_ledger_fields(readout.ledgers, self._clock(), running=gateway.running)
+        )
 
     def _collect_migration(self, gateway: GatewayState, *, gateway_fresh: bool) -> MigrationState:
         """Read ``gateway_migration.json`` and judge it against the live artifacts.
@@ -2793,7 +2801,7 @@ class Collector:
         Hermes home, and a failure on SQLite builds that refuse read-only WAL
         opens — nor serves stale data when a WAL appears mid-refresh.
         """
-        key = _db_source_mtime_ns(db_path)
+        key = _db_source_signature(db_path)
         cached = self._kanban_snapshots.get(db_path)
         if cached is not None and key is not None and cached[0] == key:
             # owner is a TemporaryDirectory exactly when the path is a snapshot.
@@ -3152,7 +3160,7 @@ class Collector:
         """Apply every state.db-backed operations source from one open.
 
         Goals, delegations and DB-maintenance metadata all live in state.db, so
-        they share the single (mtime-cached) readout with the gateway ledgers
+        they share the single (signature-cached) readout with the gateway ledgers
         rather than taking a WAL snapshot each.
         """
         last = self._last_good_by_source.get("operations")
@@ -3228,9 +3236,9 @@ class Collector:
             or not _path_resolves_under(db_path, self._paths.profile_home)
         ):
             return None
-        mtime = _db_source_mtime_ns(db_path)
+        signature = _db_source_signature(db_path)
         cached = self._state_db_cache
-        if cached is not None and mtime is not None and cached[0] == mtime:
+        if cached is not None and signature is not None and cached[0] == signature:
             return cached[1]
         this_pass = self._state_db_pass_readout
         if this_pass is not None and this_pass[0] == self._collect_pass:
@@ -3242,10 +3250,10 @@ class Collector:
         except sqlite3.Error as exc:
             self._state_db_pass_readout = (self._collect_pass, exc)
             raise
-        if readout.errors or mtime is None:
+        if readout.errors or signature is None:
             self._state_db_pass_readout = (self._collect_pass, readout)
         else:
-            self._state_db_cache = (mtime, readout)
+            self._state_db_cache = (signature, readout)
         return readout
 
     def _with_blocked_scripts(self, operations: OperationsState) -> OperationsState:
@@ -3463,11 +3471,18 @@ class Collector:
             or not curator_dir.is_dir()
         ):
             return base_run
-        # Skip symlinked run dirs and any path that escapes the Hermes home,
-        # matching the symlink hardening on the cron/checkpoint readers.
+        # Run dirs are timestamp-named, so list a bounded number of entries and
+        # stat only the lexically newest few rather than the whole (unpruned)
+        # directory each refresh. Skip symlinked run dirs and any path that
+        # escapes the Hermes home, matching the cron/checkpoint readers.
+        newest_named = heapq.nlargest(
+            _CURATOR_RUN_STAT_LIMIT,
+            islice(curator_dir.iterdir(), _CURATOR_RUN_LIST_LIMIT),
+            key=lambda p: p.name,
+        )
         run_dirs = sorted(
             p
-            for p in curator_dir.iterdir()
+            for p in newest_named
             if p.is_dir() and not p.is_symlink() and _path_resolves_under(p, self._paths.root_home)
         )
         if not run_dirs:
@@ -4124,7 +4139,8 @@ class Collector:
     def _read_skill_description(self, category: str, name: str) -> str:
         """Read the description from a skill's SKILL.md frontmatter."""
         skills_dir = self._paths.profile_path("skills")
-        # Skills are at skills/<category>/<name>/SKILL.md
+        # ``category`` may be empty (flat skill) or a nested relative path;
+        # see _skill_entries for the enumeration rules.
         skill_md = skills_dir / category / name / "SKILL.md"
         return self._signature_cached(
             "skill_desc",
@@ -4323,12 +4339,12 @@ class Collector:
 
     def _profile_session_count(self, name: str, db_path: Path) -> int:
         # Opening a profile DB snapshots WAL files to a temp dir, so only
-        # re-open and re-count when the db (or its -wal) mtime changes.
-        mtime = _db_source_mtime_ns(db_path)
+        # re-open and re-count when the db (or its -wal) signature changes.
+        signature = _db_source_signature(db_path)
         cached = self._profile_count_cache.get(name)
-        if cached is not None and mtime is not None and cached[0] == mtime:
+        if cached is not None and signature is not None and cached[0] == signature:
             return cached[1]
-        if cached is not None and mtime is None:
+        if cached is not None and signature is None:
             return cached[1]
         db = self._db_factory(db_path)
         try:
@@ -4337,7 +4353,7 @@ class Collector:
                 raise RuntimeError("profile db returned cached count after sqlite error")
         finally:
             db.close()
-        self._profile_count_cache[name] = (mtime, session_count)
+        self._profile_count_cache[name] = (signature, session_count)
         return session_count
 
     def _tail_log_stream(

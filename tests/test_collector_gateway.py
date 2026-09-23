@@ -1609,6 +1609,17 @@ def test_gateway_ledgers_from_state_db(hermes_home: Path):
     assert gateway.current_incarnation_uptime_seconds == pytest.approx(3600.0)
 
 
+def test_stopped_gateway_reports_no_incarnation_uptime(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_ledgers(hermes_home)
+
+    gateway = _collect(hermes_home, live_pid=-1).gateway
+
+    assert gateway.running is False
+    assert gateway.gateway_incarnation_count == 3
+    assert gateway.current_incarnation_uptime_seconds is None
+
+
 def test_delivery_obligation_counts_and_excerpts(hermes_home: Path):
     _write_gateway_state(hermes_home)
     _write_ledgers(hermes_home)

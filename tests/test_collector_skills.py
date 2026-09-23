@@ -588,6 +588,33 @@ def test_collect_curator_reads_newest_run(hermes_home: Path):
     c.close()
 
 
+def test_collect_curator_only_considers_the_newest_named_run_dirs(hermes_home: Path):
+    # Run dirs are timestamp-named; only the lexically newest window is stat'ed
+    # each refresh, so an old run.json behind 50 newer (empty) runs is ignored.
+    _write_curator_run(hermes_home, "20250101-000000", {"model": "ancient"})
+    for day in range(1, 51):
+        (hermes_home / "logs" / "curator" / f"20260601-{day:06d}").mkdir(parents=True)
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    c.close()
+
+    assert state.curator.run_present is False
+    assert "curator" not in state.health.failed_sources
+
+
+def test_collect_curator_newest_run_wins_among_many(hermes_home: Path):
+    for day in range(1, 60):
+        _write_curator_run(hermes_home, f"20260601-{day:06d}", {"model": f"m{day}"})
+
+    c = Collector(hermes_home)
+    state = c.collect()
+    c.close()
+
+    assert state.curator.stamp == "20260601-000059"
+    assert state.curator.model == "m59"
+
+
 def test_collect_curator_state_transition_state_only_shape(hermes_home: Path):
     # Alternate producer shape: a transition entry with only a `state` key (no
     # from/to) is labelled by that state, with the timestamp appended.
