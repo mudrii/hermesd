@@ -309,13 +309,19 @@ def _learning_summary(
     }
 
 
+# ``created_by`` values that mark a learned skill: "agent" is the curator
+# opt-in, "learn" a foreground /learn create (``record_created``,
+# ``tools/skill_usage.py:518-529``). Only "agent" counts as agent-created.
+_LEARNED_CREATED_BY = frozenset({"agent", "learn"})
+
+
 def _usage_indicates_learned(metadata: dict[str, Any]) -> bool:
     return bool(
         _coerce_bool(metadata.get("learned"))
         or _coerce_bool(metadata.get("agent_created"))
         or _coerce_bool(metadata.get("profile_skill"))
         or _coerce_bool(metadata.get("pinned"))
-        or str(metadata.get("created_by") or metadata.get("source") or "") == "agent"
+        or str(metadata.get("created_by") or metadata.get("source") or "") in _LEARNED_CREATED_BY
     )
 
 
