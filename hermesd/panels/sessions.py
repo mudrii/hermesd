@@ -19,6 +19,7 @@ from hermesd.models import (
     SessionLease,
     SessionLeaseKind,
     TerminalSessionReadout,
+    UsageAnalytics,
 )
 from hermesd.panels.formatting import (
     IdentityMemo,
@@ -31,6 +32,7 @@ from hermesd.panels.formatting import (
 from hermesd.panels.formatting import (
     escape_terminal_text as escape,
 )
+from hermesd.panels.tokens import sparkline
 from hermesd.theme import Theme
 
 
@@ -235,6 +237,7 @@ def _render_detail(
     if billing_table is not None:
         sections.append(section_heading("Billing & Context", theme))
         sections.append(billing_table)
+    sections.extend(_usage_pattern_sections(state.usage_analytics, theme))
     sections.append(section_heading("Sessions", theme))
     sections.append(
         _sessions_table(sessions[:_DETAIL_MAX_SESSION_ROWS], theme)
@@ -546,33 +549,67 @@ def _activity_table(sessions: list[SessionInfo], theme: Theme, *, now: float) ->
         or session.pinned
         or session.last_activity_at
         or session.last_activity_description
+        or session.transport_profile
     ]
     if not activity_sessions:
         return None
+    # transport_profile is new and usually NULL: show the column only when a
+    # conversation actually arrived through a named bot profile.
+    show_via = any(session.transport_profile for session in activity_sessions)
     table = Table(box=None, show_header=True, padding=(0, 1))
     table.add_column("ID", style=theme.session_label)
     table.add_column("Name", style=theme.banner_text)
     table.add_column("Branch", style=theme.banner_dim)
     table.add_column("Profile", style=theme.banner_dim)
     table.add_column("Chat", style=theme.banner_dim)
+    if show_via:
+        table.add_column("Via", style=theme.banner_dim)
     table.add_column("Age", justify="right", style=theme.ui_accent)
     table.add_column("Last Activity", style=theme.banner_text)
     for session in activity_sessions:
         pin = f"{_PIN_MARKER} " if session.pinned else ""
         name = _session_display_name(session)
         branch = session.git_branch
+        via = [escape(session.transport_profile) if session.transport_profile else "—"]
         table.add_row(
             escape(f"{pin}{session.session_id[-8:]}"),
             escape(_truncate(name, _MAX_NAME_CHARS)) if name else "—",
             escape(_truncate(branch, _MAX_BRANCH_CHARS)) if branch else "—",
             escape(session.profile_name) if session.profile_name else "—",
             escape(session.chat_type) if session.chat_type else "—",
+            *(via if show_via else []),
             _age_label(_activity_at(session), now),
             escape(_truncate(session.last_activity_description, _MAX_ACTIVITY_CHARS))
             if session.last_activity_description
             else "—",
         )
     return table
+
+
+def _usage_pattern_sections(analytics: UsageAnalytics, theme: Theme) -> list[RenderableType]:
+    """Repository and hour-of-day activity over all visible sessions (not the filter)."""
+    sections: list[RenderableType] = []
+    if analytics.repos:
+        sections.append(section_heading("Repositories", theme))
+        table = Table(box=None, show_header=True, padding=(0, 1))
+        table.add_column("Repo", style=theme.ui_label)
+        table.add_column("7d", justify="right", style=theme.ui_accent)
+        table.add_column("30d", justify="right", style=theme.banner_text)
+        for repo in analytics.repos:
+            table.add_row(
+                escape(_cwd_label(repo.repo_root)), str(repo.sessions_7d), str(repo.sessions_30d)
+            )
+        sections.append(table)
+    hourly = analytics.hourly_sessions_7d
+    if any(hourly):
+        peak = max(range(len(hourly)), key=lambda hour: hourly[hour])
+        sections.append(section_heading("Activity by Hour (7d, local)", theme))
+        line = Text("  00h ", style=theme.banner_dim)
+        line.append(sparkline(hourly), style=theme.ui_accent)
+        line.append(" 23h", style=theme.banner_dim)
+        line.append(f"   peak {peak:02d}:00 ({hourly[peak]})", style=theme.banner_text)
+        sections.append(line)
+    return sections
 
 
 def _visible_surfaces(
