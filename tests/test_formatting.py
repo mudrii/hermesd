@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from hermesd.panels.formatting import fmt_iso_timestamp, fmt_tokens, fmt_usd, sanitize_terminal_text
+from hermesd.panels.formatting import (
+    IdentityMemo,
+    fmt_iso_timestamp,
+    fmt_tokens,
+    fmt_usd,
+    sanitize_terminal_text,
+)
 
 
 def test_fmt_tokens_zero():
@@ -77,3 +83,27 @@ def test_sanitize_preserves_plain_text():
         == "調査 emoji 🎉 path\\x [brackets]"
     )
     assert sanitize_terminal_text("\x1b[31mred\x1b[0m") == "red"
+
+
+def test_identity_memo_reuses_value_for_same_objects_and_equal_strings():
+    memo: IdentityMemo[list[int]] = IdentityMemo()
+    items = [1, 2]
+    calls: list[int] = []
+
+    def compute() -> list[int]:
+        calls.append(1)
+        return sorted(items)
+
+    first = memo.get((items, "".join(["cost"])), compute)
+    second = memo.get((items, "cost"), compute)
+
+    assert first is second
+    assert len(calls) == 1
+
+
+def test_identity_memo_recomputes_for_equal_but_distinct_objects():
+    memo: IdentityMemo[int] = IdentityMemo()
+
+    assert memo.get(([1],), lambda: 1) == 1
+    assert memo.get(([1],), lambda: 2) == 2
+    assert memo.get(([1], "a"), lambda: 3) == 3
