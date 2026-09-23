@@ -23,7 +23,7 @@ from hermesd.models import (
     ToolGatewayRoute,
     ToolStats,
 )
-from hermesd.panels import render_panel
+from hermesd.panels import PANEL_NAMES, render_panel
 from hermesd.panels.sessions import extract_message_search_query
 from hermesd.theme import Theme
 from tests.conftest import render_to_str
@@ -1219,7 +1219,7 @@ def test_panels_render_with_ares_skin():
     assert "Running" in text
 
 
-@pytest.mark.parametrize("panel_num", range(1, 14))
+@pytest.mark.parametrize("panel_num", sorted(PANEL_NAMES))
 @pytest.mark.parametrize("detail", [False, True])
 def test_panel_renders_fully_empty_state_without_crashing(panel_num: int, detail: bool):
     """First-launch condition: ~/.hermes exists but the agent never ran.
@@ -1230,4 +1230,4 @@ def test_panel_renders_fully_empty_state_without_crashing(panel_num: int, detail
     """
     panel = render_panel(panel_num, DashboardState(), Theme(), detail=detail)
     text = render_to_str(panel)
-    assert text.strip()
+    assert PANEL_NAMES[panel_num] in text

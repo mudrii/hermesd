@@ -8,7 +8,11 @@ from rich.text import Text
 
 from hermesd.models import CuratorRun, DashboardState
 from hermesd.panels.formatting import escape_terminal_text as escape
-from hermesd.panels.formatting import fmt_age_seconds, section_heading
+from hermesd.panels.formatting import (
+    fmt_age_seconds,
+    sanitize_terminal_text,
+    section_heading,
+)
 from hermesd.theme import Theme
 
 _TITLE = "\\[13] Curator"
@@ -39,7 +43,10 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             lines.append("  No curation runs", style=theme.banner_dim)
     else:
         lines.append("  Last run: ", style=theme.ui_label)
-        lines.append(f"{escape(cur.stamp) if cur.stamp else '—'}\n", style=theme.banner_text)
+        lines.append(
+            f"{sanitize_terminal_text(cur.stamp) if cur.stamp else '—'}\n",
+            style=theme.banner_text,
+        )
         lines.append("  Skills: ", style=theme.ui_label)
         lines.append(f"{_delta_label(cur)}\n", style=theme.banner_text)
         lines.append("  Archived ", style=theme.ui_label)
@@ -122,18 +129,18 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         sections.append(section_heading("State Transitions", theme))
         transitions = Text()
         for transition in cur.state_transitions[:10]:
-            transitions.append(f"  {escape(transition)}\n", style=theme.banner_dim)
+            transitions.append(f"  {sanitize_terminal_text(transition)}\n", style=theme.banner_dim)
         sections.append(transitions)
 
     if cur.llm_error:
         sections.append(Text("\nError\n", style=f"bold {theme.ui_error}"))
-        sections.append(Text(f"  {escape(cur.llm_error)}", style=theme.ui_error))
+        sections.append(Text(f"  {sanitize_terminal_text(cur.llm_error)}", style=theme.ui_error))
     elif cur.llm_summary:
         sections.append(section_heading("Summary", theme))
         summary_text = cur.llm_summary[:_SUMMARY_MAX_CHARS]
         if len(cur.llm_summary) > _SUMMARY_MAX_CHARS:
             summary_text += "…"
-        sections.append(Text(escape(summary_text), style=theme.banner_dim))
+        sections.append(Text(sanitize_terminal_text(summary_text), style=theme.banner_dim))
 
     return Panel(
         Group(*sections),

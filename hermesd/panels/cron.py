@@ -271,7 +271,7 @@ def _cron_header(c: CronState, theme: Theme) -> Text:
         style=theme.banner_dim,
     )
     header.append(
-        f"Provider: provider={escape(c.provider)}",
+        f"Provider: provider={sanitize_terminal_text(c.provider)}",
         style=theme.banner_dim,
     )
     if c.suggestion_count:
