@@ -20,7 +20,7 @@ from hermesd.app import (
     _SESSIONS_PANEL_NUM,
     _SKILLS_PANEL_NUM,
     DashboardApp,
-    _decode_input_keys,
+    _decode_input_keys_with_remainder,
     _health_style,
     _normalize_json_payload,
     _panel_num_by_name,
@@ -99,6 +99,36 @@ def test_handle_key_help_toggle(populated_hermes_home: Path):
     assert app._view.show_help is True
     app.handle_key("?")
     assert app._view.show_help is False
+    app.close()
+
+
+def test_handle_key_escape_closes_help_before_detail(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+    app._view.enter_detail(2)
+    app._view.show_help = True
+
+    app.handle_key("\x1b")
+
+    assert app._view.show_help is False
+    assert app._view.mode == "detail"
+    assert app._view.detail_panel == 2
+
+    app.handle_key("\x1b")
+
+    assert app._view.mode == "overview"
+    app.close()
+
+
+def test_handle_key_j_k_ignored_when_view_not_scrollable(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5)
+
+    app.handle_key("j")
+    app.handle_key("j")
+
+    assert app._view.scroll_offset == 0
+    app._view.scroll_offset = 2
+    app.handle_key("k")
+    assert app._view.scroll_offset == 2
     app.close()
 
 
@@ -807,22 +837,29 @@ def test_close_cancels_inflight_message_search_without_state_write(
     assert app._state.session_message_match_ids == set()
 
 
-def test_decode_input_keys_splits_escape_with_trailing_digit():
-    assert _decode_input_keys(b"\x1b1") == ["\x1b", "1"]
+def test_decode_input_keys_treats_escape_with_printable_as_alt_key():
+    assert _decode_input_keys_with_remainder(b"\x1b1") == (["\x1b1"], b"")
+
+
+def test_decode_input_keys_splits_escape_followed_by_control_byte():
+    assert _decode_input_keys_with_remainder(b"\x1b\x1b") == (["\x1b"], b"\x1b")
 
 
 def test_decode_input_keys_keeps_arrow_sequence_together():
-    assert _decode_input_keys(b"\x1b[A") == ["\x1b[A"]
+    assert _decode_input_keys_with_remainder(b"\x1b[A") == (["\x1b[A"], b"")
+
+
+def test_decode_input_keys_maps_ss3_arrows_to_csi():
+    assert _decode_input_keys_with_remainder(b"\x1bOA\x1bOD") == (["\x1b[A", "\x1b[D"], b"")
 
 
 def test_handle_input_data_dispatches_escape_and_remaining_keys(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app._view.enter_detail(2)
 
-    app._handle_input_data(b"\x1b1")
+    app._handle_input_data(b"\x1b\x1b1")
 
-    assert app._view.mode == "detail"
-    assert app._view.detail_panel == 1
+    assert app._view.mode == "overview"
     app.close()
 
 
@@ -1920,15 +1957,15 @@ def test_panel_shortcut_label_variants(monkeypatch, panel_names: dict[int, str],
 
 
 def test_decode_input_keys_lone_escape():
-    assert _decode_input_keys(b"\x1b") == ["\x1b"]
+    assert _decode_input_keys_with_remainder(b"\x1b") == ([], b"\x1b")
 
 
 def test_decode_input_keys_keeps_parameterized_sequence_together():
-    assert _decode_input_keys(b"\x1b[1;5A") == ["\x1b[1;5A"]
+    assert _decode_input_keys_with_remainder(b"\x1b[1;5A") == (["\x1b[1;5A"], b"")
 
 
 def test_decode_input_keys_unterminated_sequence():
-    assert _decode_input_keys(b"\x1b[") == ["\x1b["]
+    assert _decode_input_keys_with_remainder(b"\x1b[") == ([], b"\x1b[")
 
 
 def test_health_style_defaults_theme_when_not_provided():

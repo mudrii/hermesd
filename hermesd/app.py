@@ -95,6 +95,8 @@ _TALL_NARROW_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = 
     (f"row{panel_num}", None, (panel_num,)) for panel_num in _PANEL_NUMBERS
 )
 _SESSION_SORTS = ("recent", "cost", "tokens")
+# SS3 cursor keys map onto their CSI form so both cursor modes decode alike.
+_SS3_TO_CSI = {final: f"\x1b[{final}" for final in "ABCDHF"}
 _TermiosSettings: TypeAlias = (
     list[int | list[bytes | int]] | list[int | list[bytes]] | list[int | list[int]]
 )
@@ -439,8 +441,10 @@ class DashboardApp:
             while self._running.is_set():
                 try:
                     if not select.select([fd], [], [], 0.25)[0]:
-                        if pending == b"\x1b":
-                            self.handle_key("\x1b")
+                        if pending in (b"\x1b", b"\x1bO"):
+                            # No continuation arrived: a lone Esc is Esc, and a
+                            # lone ESC O is Alt+O (ignored like other Alt keys).
+                            self.handle_key(pending.decode("ascii"))
                             pending = b""
                         failures = 0
                         continue
@@ -484,12 +488,20 @@ class DashboardApp:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
     def _handle_input_data(self, data: bytes, pending: bytes = b"") -> tuple[str | None, bytes]:
-        keys, remainder = _decode_input_keys_with_remainder(pending + data)
+        if pending == b"\x1b" and not data.startswith((b"[", b"O")):
+            # A lone Esc held across a read boundary was a real Esc keypress:
+            # terminals send Alt+key in one write, so it cannot be an Alt prefix.
+            keys, remainder = _decode_input_keys_with_remainder(data)
+            keys.insert(0, "\x1b")
+        else:
+            keys, remainder = _decode_input_keys_with_remainder(pending + data)
+        last_action: str | None = None
         for key in keys:
             action = self.handle_key(key)
-            if action is not None:
+            if action == "quit":
                 return action, b""
-        return None, remainder
+            last_action = action or last_action
+        return last_action, remainder
 
     def _set_state(self, state: DashboardState) -> None:
         with self._lock:
@@ -535,7 +547,9 @@ class DashboardApp:
         return self._handle_command_key(key)
 
     def _handle_escape_key(self, key: str) -> None:
-        if len(key) == 1 and self._view.filter_edit_mode:
+        if len(key) == 1 and self._view.show_help:
+            self._view.show_help = False
+        elif len(key) == 1 and self._view.filter_edit_mode:
             self._view.stop_filter()
         elif len(key) == 1 and self._view.mode == "detail":
             self._view.exit_detail()
@@ -590,10 +604,12 @@ class DashboardApp:
                 self._view.jump_bottom()
             return None
         if key == "j":
-            self._view.scroll_down()
+            if self._current_detail_is_scrollable():
+                self._view.scroll_down()
             return None
         if key == "k":
-            self._view.scroll_up()
+            if self._current_detail_is_scrollable():
+                self._view.scroll_up()
             return None
         if len(key) == 1 and key.isdigit():
             panel_num = 10 if key == "0" and 10 in _PANEL_NUMBERS else int(key)
@@ -1070,15 +1086,8 @@ def _panel_shortcut_label() -> str:
     return ",".join(shortcuts)
 
 
-def _decode_input_keys(data: bytes) -> list[str]:
-    keys, remainder = _decode_input_keys_with_remainder(data)
-    if remainder:
-        keys.append(remainder.decode("utf-8", errors="replace"))
-    return keys
-
-
 def _decode_input_keys_with_remainder(data: bytes) -> tuple[list[str], bytes]:
-    """Decode raw input into keys plus any incomplete trailing CSI sequence.
+    """Decode raw input into keys plus any incomplete trailing escape sequence.
 
     A partial escape sequence (e.g. "\\x1b[" split across the 64-byte bulk
     read boundary) is returned as the remainder so the caller can prepend it
@@ -1097,7 +1106,21 @@ def _decode_input_keys_with_remainder(data: bytes) -> tuple[list[str], bytes]:
         next_index = index + 1
         if next_index >= len(text):
             return keys, b"\x1b"
-        if text[next_index] != "[":
+        introducer = text[next_index]
+        if introducer == "O":
+            # SS3: application-cursor arrows (ESC O A) and F1-F4 (ESC O P).
+            if next_index + 1 >= len(text):
+                return keys, b"\x1bO"
+            final = text[next_index + 1]
+            keys.append(_SS3_TO_CSI.get(final, f"\x1bO{final}"))
+            index = next_index + 2
+            continue
+        if introducer != "[":
+            if introducer.isprintable():
+                # Alt+key arrives as ESC + key in one write: one key, not Esc.
+                keys.append(f"\x1b{introducer}")
+                index = next_index + 1
+                continue
             keys.append("\x1b")
             index = next_index
             continue
