@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 from pathlib import Path
 
@@ -255,7 +256,9 @@ def test_desktop_entries_vanishing_between_listing_and_stat_are_skipped(
 
     def racing_stat(path: Path, *args: object, **kwargs: object):
         if path in (gone_dir, gone_entry):
-            raise FileNotFoundError(path)
+            # Carry errno like a real vanished entry: pathlib's is_symlink()
+            # (3.11) only swallows ENOENT-tagged errors from stat().
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(path))
         return original_stat(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "stat", racing_stat)
