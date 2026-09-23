@@ -1970,8 +1970,8 @@ class Collector:
                 # SQLite columns are untyped: a text value in an epoch column must
                 # coerce, not fail model validation and blank the whole source.
                 started_at=_coerce_float(r.get("started_at")),
-                ended_at=r.get("ended_at"),
-                title=r.get("title"),
+                ended_at=None if r.get("ended_at") is None else _coerce_float(r.get("ended_at")),
+                title=None if r.get("title") is None else str(r.get("title")),
                 is_active=r.get("ended_at") is None and not _coerce_bool(r.get("archived")),
                 git_branch=r.get("git_branch") or "",
                 chat_type=r.get("chat_type") or "",

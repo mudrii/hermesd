@@ -423,6 +423,32 @@ def test_session_ended_detection(hermes_home: Path):
     c.close()
 
 
+def test_junk_ended_at_and_title_coerce_without_freezing_sessions(hermes_home: Path):
+    """SQLite columns are untyped: text in ended_at or a number in title must
+    coerce, not fail validation and pin the whole sessions list to last-good."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn)
+    now = time.time()
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, ended_at, title) VALUES (?, ?, ?, ?, ?)",
+        ("sess_junk", "cli", now - 3600, "not-a-time", 42),
+    )
+    conn.commit()
+    conn.close()
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "session_models" not in state.health.failed_sources
+    (session,) = state.sessions
+    assert session.ended_at == 0.0
+    assert session.title == "42"
+    assert session.is_active is False
+
+
 def test_token_analytics_windows_use_injected_clock(hermes_home: Path):
     fake_now = 1_000_000.0
     db_path = hermes_home / "state.db"
