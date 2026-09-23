@@ -21,7 +21,6 @@ class PanelRenderContext:
     filter_query: str = ""
     session_sort: str = "recent"
     session_message_match_ids: set[str] | None = None
-    expand_skills: bool = False
     # Rows available to a self-windowing detail (Logs); None = fixed default.
     detail_height: int | None = None
 
@@ -75,13 +74,7 @@ def _render_cron_panel(ctx: PanelRenderContext) -> Panel:
 def _render_skills_panel(ctx: PanelRenderContext) -> Panel:
     from hermesd.panels.overview import render_overview
 
-    return render_overview(
-        ctx.state,
-        ctx.theme,
-        detail=ctx.detail,
-        scroll_offset=ctx.scroll_offset,
-        expand_skills=ctx.expand_skills,
-    )
+    return render_overview(ctx.state, ctx.theme, detail=ctx.detail)
 
 
 def _render_logs_panel(ctx: PanelRenderContext) -> Panel:
@@ -178,7 +171,6 @@ def render_panel(
     filter_query: str = "",
     session_sort: str = "recent",
     session_message_match_ids: set[str] | None = None,
-    expand_skills: bool = False,
     detail_height: int | None = None,
 ) -> Panel:
     renderer = _RENDERERS.get(panel_num)
@@ -190,7 +182,6 @@ def render_panel(
         detail=detail,
         log_sub_view=log_sub_view,
         scroll_offset=scroll_offset,
-        expand_skills=expand_skills,
         profile_view_index=profile_view_index,
         filter_query=filter_query,
         session_sort=session_sort,

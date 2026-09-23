@@ -20,7 +20,6 @@ from hermesd.app import (
     _OSC52_TRUNCATION_MARKER,
     _PROFILES_PANEL_NUM,
     _SESSIONS_PANEL_NUM,
-    _SKILLS_PANEL_NUM,
     DashboardApp,
     _decode_input_keys_with_remainder,
     _health_style,
@@ -58,7 +57,6 @@ from tests.conftest import render_to_str
 def test_panel_name_constants_resolve():
     assert PANEL_NAMES[_LOG_PANEL_NUM] == "Logs"
     assert PANEL_NAMES[_SESSIONS_PANEL_NUM] == "Sessions"
-    assert PANEL_NAMES[_SKILLS_PANEL_NUM] == "Skills / Integrations"
     assert PANEL_NAMES[_PROFILES_PANEL_NUM] == "Profiles"
 
 

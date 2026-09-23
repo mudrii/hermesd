@@ -52,7 +52,6 @@ def _panel_num_by_name(name: str) -> int:
 
 _LOG_PANEL_NUM = _panel_num_by_name("Logs")
 _SESSIONS_PANEL_NUM = _panel_num_by_name("Sessions")
-_SKILLS_PANEL_NUM = _panel_num_by_name("Skills / Integrations")
 _PROFILES_PANEL_NUM = _panel_num_by_name("Profiles")
 # Every detail except Logs scrolls its complete rendered output: any detail can
 # outgrow the terminal, and without the viewport its tail is clipped with no
@@ -366,7 +365,6 @@ class DashboardApp:
             theme,
             detail=True,
             log_sub_view=view.log_sub_view,
-            expand_skills=panel_num == _SKILLS_PANEL_NUM,
             # Unbounded: the Logs window lists every line in a snapshot.
             detail_height=sys.maxsize,
         )
@@ -731,7 +729,6 @@ class DashboardApp:
                 detail=True,
                 log_sub_view=log_sub_view,
                 scroll_offset=scroll_offset,
-                expand_skills=detail_panel == _SKILLS_PANEL_NUM,
                 profile_view_index=profile_view_index,
                 filter_query=filter_query,
                 session_sort=session_sort,

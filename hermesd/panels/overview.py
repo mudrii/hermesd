@@ -23,23 +23,10 @@ from hermesd.panels.formatting import (
 )
 from hermesd.theme import Theme
 
-_DETAIL_VISIBLE_SKILL_ROWS = 20
 
-
-def max_skills_scroll_offset(state: DashboardState) -> int:
-    """Largest scroll offset that still shows a full skills window."""
-    return max(0, len(state.skills_memory.skills) - _DETAIL_VISIBLE_SKILL_ROWS)
-
-
-def render_overview(
-    state: DashboardState,
-    theme: Theme,
-    detail: bool = False,
-    scroll_offset: int = 0,
-    expand_skills: bool = False,
-) -> Panel:
+def render_overview(state: DashboardState, theme: Theme, detail: bool = False) -> Panel:
     if detail:
-        return _render_detail(state, theme, scroll_offset, expand_skills)
+        return _render_detail(state, theme)
     return _render_compact(state, theme)
 
 
@@ -99,12 +86,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     )
 
 
-def _render_detail(
-    state: DashboardState,
-    theme: Theme,
-    scroll_offset: int,
-    expand_skills: bool,
-) -> Panel:
+def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     sm = state.skills_memory
     sections: list[RenderableType] = [
         section_heading("Providers", theme, leading_blank=False),
@@ -145,7 +127,9 @@ def _render_detail(
         sections.append(boot_text)
 
     if sm.skills:
-        sections.extend(_skills_sections(sm, theme, scroll_offset, expand_skills=expand_skills))
+        # Every row: the app scrolls the rendered detail through its viewport.
+        sections.append(_skills_header(sm, theme))
+        sections.append(_skills_table(theme, _skill_rows(sm)))
 
     return Panel(
         Group(*sections),
@@ -622,61 +606,19 @@ def _skill_rows(sm: SkillsMemory) -> list[tuple[str, str, str]]:
     return rows
 
 
-def _skills_header(sm: SkillsMemory, theme: Theme, offset: int, shown: int, total: int) -> Text:
-    scroll_hint = (
-        f" [{offset + 1}-{min(offset + shown, total)}/{total}]"
-        if total > _DETAIL_VISIBLE_SKILL_ROWS
-        else ""
-    )
-    header = Text()
-    header.append(
-        f"\nSkills ({sm.skill_count} in {sm.skill_categories} categories){scroll_hint}  ",
+def _skills_header(sm: SkillsMemory, theme: Theme) -> Text:
+    return Text(
+        f"\nSkills ({sm.skill_count} in {sm.skill_categories} categories)\n",
         style=f"bold {theme.ui_label}",
     )
-    if offset > 0:
-        header.append("↑ ", style=theme.ui_accent)
-    header.append("\n")
-    return header
 
 
-def _skills_table(theme: Theme, visible: list[tuple[str, str, str]], offset: int) -> Table:
+def _skills_table(theme: Theme, rows: list[tuple[str, str, str]]) -> Table:
     skills_table = Table(box=None, show_header=True, padding=(0, 1))
     skills_table.add_column("Category", style=theme.ui_accent, min_width=12)
     skills_table.add_column("Skill", style=theme.banner_text, min_width=16)
     skills_table.add_column("Description", style=theme.banner_dim, ratio=1)
 
-    # Highlight the first visible row as "selected"
-    for idx, (cat_label, short, desc) in enumerate(visible):
-        if idx == 0 and offset > 0:
-            style = f"bold {theme.ui_accent}"
-            skills_table.add_row(
-                Text(sanitize_terminal_text(cat_label), style=style),
-                Text(sanitize_terminal_text(short), style=style),
-                Text(sanitize_terminal_text(desc) or "—", style=theme.banner_text),
-            )
-        else:
-            skills_table.add_row(escape(cat_label), escape(short), escape(desc) if desc else "—")
+    for cat_label, short, desc in rows:
+        skills_table.add_row(escape(cat_label), escape(short), escape(desc) if desc else "—")
     return skills_table
-
-
-def _skills_sections(
-    sm: SkillsMemory,
-    theme: Theme,
-    scroll_offset: int,
-    *,
-    expand_skills: bool = False,
-) -> list[RenderableType]:
-    rows = _skill_rows(sm)
-    total = len(rows)
-    if expand_skills:
-        offset = 0
-        visible = rows
-    else:
-        # Apply scroll — clamp both ends so the rendered page stays a full
-        # window; a negative offset would slice from the end and render nothing.
-        offset = max(0, min(scroll_offset, max(0, total - _DETAIL_VISIBLE_SKILL_ROWS)))
-        visible = rows[offset : offset + _DETAIL_VISIBLE_SKILL_ROWS]
-    return [
-        _skills_header(sm, theme, offset, len(visible), total),
-        _skills_table(theme, visible, offset),
-    ]
