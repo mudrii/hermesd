@@ -960,6 +960,14 @@ class CheckpointInfo(BaseModel):
     last_checkpoint_at: float | None = None
 
 
+class CronModelSource(StrEnum):
+    """Which axis resolved a cron job's model, in upstream's precedence order."""
+
+    PINNED = "pinned"
+    CRON_DEFAULT = "cron.model default"
+    MAIN_MODEL = "follows main model"
+
+
 class CronJob(BaseModel):
     job_id: str = ""
     name: str = ""
@@ -984,10 +992,19 @@ class CronJob(BaseModel):
     repeat_times: int | None = None
     repeat_completed: int = 0
     no_agent: bool = False
-    # Explicit inference pins from jobs.json. Empty means unpinned, which is the
-    # condition under which upstream records a resolution snapshot instead.
+    # Explicit inference pins from jobs.json. Empty means unpinned: the job
+    # follows ``cron.model`` or the main model at fire time.
     model: str = ""
     provider: str = ""
+    # The model the next fire resolves to, and which axis it came from
+    # (``_load_cron_job_config``, ``cron/scheduler.py:1561-1590``). "" / None for
+    # a no-agent job or when nothing is configured (upstream refuses to run).
+    effective_model: str = ""
+    model_source: CronModelSource | None = None
+    # ``quota_hold_until`` (``cron/quota_hold.py:27,69-93``): fires are parked
+    # past a closed provider usage window. Verbatim instant while the hold is
+    # active; "" once it has expired, which upstream treats as inert.
+    quota_hold_until: str = ""
     # ``fire_claim`` (``cron/jobs.py:2588-2608``): the dispatch lease, refreshed
     # every 60 s against a 300 s TTL. ``fire_claim_state`` is derived from the
     # claim age in the collector; both are None/"" when no usable claim exists.
@@ -1006,11 +1023,6 @@ class CronJob(BaseModel):
     # ``preflight_alerted`` (``cron/jobs.py:2190-2198``): upstream's alert-once
     # dedup marker for a config-blocked job.
     preflight_alerted: bool = False
-    # Creation-time resolution snapshots for unpinned axes
-    # (``cron/jobs.py:1600-1630``). Empty means pinned, no-agent, or unrecorded
-    # (older agent) — the snapshot is what the job will actually run.
-    model_snapshot: str = ""
-    provider_snapshot: str = ""
 
 
 class CronTickerHealth(StrEnum):
@@ -1087,6 +1099,10 @@ class CronIncident(BaseModel):
     failure_type: str = ""
     first_seen_age_seconds: float | None = None
     last_seen_age_seconds: float | None = None
+    # Age of the latest delivered failure ping: upstream restamps ``alerted_at``
+    # on every alert, including cooldown reminders (``cron/incidents.py:196-212``).
+    # None when no ping was delivered or the ledger predates the column.
+    alerted_age_seconds: float | None = None
     error_excerpt: str = ""
 
 
@@ -1094,9 +1110,16 @@ class CronExecutionsState(BaseModel):
     db_present: bool = False
     job_stats: list[CronJobExecutionStats] = Field(default_factory=list)
     recent: list[CronExecution] = Field(default_factory=list)
+    # The newest failed runs regardless of age, so a failure pushed out of
+    # ``recent`` by later successes still shows its (redacted) error.
+    recent_failures: list[CronExecution] = Field(default_factory=list)
     open_incident_count: int = 0
     unacked_incident_count: int = 0
     open_incidents: list[CronIncident] = Field(default_factory=list)
+    # ``resolved`` = the job ran OK after the failure; a repeat of the same error
+    # re-opens it (``cron/incidents.py:32,151-181,233-248``). Not open, not acked.
+    resolved_incident_count: int = 0
+    resolved_24h_count: int = 0
     # Retention. Upstream prunes terminal history to a fixed record cap, so every
     # aggregate above describes *recorded* attempts rather than every attempt that
     # happened. ``retention_cap`` is 0 when the table could not be read, which is
@@ -1107,6 +1130,129 @@ class CronExecutionsState(BaseModel):
     at_retention_cap: bool = False
     oldest_claimed_age_seconds: float | None = None
     newest_claimed_age_seconds: float | None = None
+
+
+class CronJobUsage(BaseModel):
+    """One job's fires and tokens from ``cron/usage_audit.jsonl``.
+
+    Tokens sum only the fires that recorded ``total_tokens``; a fire without
+    them (script job, pre-agent failure) still counts as a fire.
+    """
+
+    job_id: str = ""
+    job_name: str = ""
+    fires_24h: int = 0
+    tokens_24h: int = 0
+    fires_7d: int = 0
+    tokens_7d: int = 0
+    errors_7d: int = 0
+    last_fire_age_seconds: float | None = None
+    last_total_tokens: int | None = None
+    last_model: str = ""
+    last_duration_seconds: float | None = None
+    last_error_excerpt: str = ""
+
+
+class CronUsageState(BaseModel):
+    """Per-fire usage audit (``_FireAudit``, ``cron/scheduler.py:2415-2433``).
+
+    Upstream never prunes the ledger, so only a capped tail is read.
+    ``window_truncated`` means that tail was cut while still inside the 7d
+    window: the 7d figures are then a lower bound.
+    """
+
+    present: bool = False
+    jobs: list[CronJobUsage] = Field(default_factory=list)
+    tokens_24h: int = 0
+    tokens_7d: int = 0
+    fires_7d: int = 0
+    window_truncated: bool = False
+    unparseable_lines: int = 0
+
+
+class CronDeliveryFailure(BaseModel):
+    """A terminal delivery that did not land: ``failed``, or ``unknown`` (the
+    claiming gateway died mid-send; never retried, ``cron/delivery_queue.py:1-7``)."""
+
+    execution_id: str = ""
+    status: str = ""
+    for_failure: bool = False
+    finished_age_seconds: float | None = None
+    error_excerpt: str = ""
+
+
+class CronDeliveryQueueState(BaseModel):
+    """``cron/deliveries.db``: the durable gateway handoff for cron sends.
+
+    ``pending_count`` covers ``pending`` and in-flight ``delivering`` rows;
+    terminal rows are retained up to a 1000-row cap
+    (``MAX_TERMINAL_DELIVERIES``, ``cron/delivery_queue.py:35``), so
+    ``status_counts`` describes the retained rows only.
+    """
+
+    db_present: bool = False
+    status_counts: dict[str, int] = Field(default_factory=dict)
+    pending_count: int = 0
+    oldest_pending_age_seconds: float | None = None
+    failed_24h: int = 0
+    recent_failures: list[CronDeliveryFailure] = Field(default_factory=list)
+
+
+class CronBotChatReceipt(BaseModel):
+    """A deferred Bot Chat send needing attention; its ``content`` is never kept."""
+
+    receipt_id: str = ""
+    job_name: str = ""
+    status: str = ""
+    for_failure: bool = False
+    # From the receipt file's mtime: upstream records no timestamp.
+    age_seconds: float | None = None
+    error_excerpt: str = ""
+
+
+class CronBotChatState(BaseModel):
+    """``cron/bot_chat_pending/<key>.json`` deferred Bot Chat receipts.
+
+    Statuses (``cron/bot_chat_delivery.py:60-150``): ``queued`` and ``claimed``
+    are unsettled — a persisted claim never expires, so an old ``claimed`` is a
+    send that may never finish; ``ambiguous`` errored after the claim;
+    ``settled``/``transferred``/``suppressed`` are done. Upstream never prunes
+    the directory, so the scan is capped (``scan_truncated``).
+    """
+
+    present: bool = False
+    status_counts: dict[str, int] = Field(default_factory=dict)
+    unsettled_count: int = 0
+    oldest_unsettled_age_seconds: float | None = None
+    attention: list[CronBotChatReceipt] = Field(default_factory=list)
+    unreadable_count: int = 0
+    scan_truncated: bool = False
+
+
+class CronRecoveryLedger(BaseModel):
+    """One fire-path recovery ledger under ``cron/`` (append-only JSONL).
+
+    Each entry is a wedge the scheduler had to recover from: a stale-error
+    re-arm (``cron/jobs.py:1025-1036``), a timezone-migration catch-up fire
+    (``:1110-1126``) or a forced in-flight release (``cron/scheduler.py:868-884``).
+    Written best effort, so absence proves nothing. ``window_truncated`` means
+    the capped tail ended inside the 7d window (a lower bound).
+    """
+
+    kind: str = ""
+    label: str = ""
+    count_24h: int = 0
+    count_7d: int = 0
+    newest_age_seconds: float | None = None
+    newest_job_name: str = ""
+    newest_detail: str = ""
+    window_truncated: bool = False
+
+
+class CronRecoveryState(BaseModel):
+    """The recovery ledgers that exist on disk, in a fixed order."""
+
+    ledgers: list[CronRecoveryLedger] = Field(default_factory=list)
 
 
 class CronState(BaseModel):
@@ -2659,6 +2805,10 @@ class DashboardState(BaseModel):
     config: ConfigSummary = Field(default_factory=ConfigSummary)
     cron: CronState = Field(default_factory=CronState)
     cron_executions: CronExecutionsState = Field(default_factory=CronExecutionsState)
+    cron_usage: CronUsageState = Field(default_factory=CronUsageState)
+    cron_deliveries: CronDeliveryQueueState = Field(default_factory=CronDeliveryQueueState)
+    cron_bot_chat: CronBotChatState = Field(default_factory=CronBotChatState)
+    cron_recovery: CronRecoveryState = Field(default_factory=CronRecoveryState)
     channels: ChannelDirectoryState = Field(default_factory=ChannelDirectoryState)
     kanban: KanbanState = Field(default_factory=KanbanState)
     operations: OperationsState = Field(default_factory=OperationsState)

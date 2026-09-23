@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 import rich.box
 from rich.console import Group, RenderableType
 from rich.panel import Panel
@@ -7,13 +9,20 @@ from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import (
+    CronBotChatReceipt,
+    CronBotChatState,
+    CronDeliveryFailure,
+    CronDeliveryQueueState,
     CronExecution,
     CronExecutionsState,
     CronFireClaimState,
     CronJob,
     CronJobExecutionStats,
+    CronModelSource,
+    CronRecoveryState,
     CronState,
     CronTickerHealth,
+    CronUsageState,
     DashboardState,
 )
 from hermesd.panels.formatting import (
@@ -22,6 +31,7 @@ from hermesd.panels.formatting import (
 from hermesd.panels.formatting import (
     fmt_age_seconds,
     fmt_iso_timestamp,
+    fmt_tokens,
     sanitize_terminal_text,
     section_heading,
 )
@@ -57,8 +67,10 @@ _LAST_STATUS_STYLES = {
     "blocked_config": "ui_warn",
 }
 
-# Incident lifecycle is detected -> alerted -> closed (``cron/incidents.py:1-9``):
-# ``alerted`` is set only when a failure ping actually left the process
+# Incident lifecycle is detected -> alerted -> resolved | closed
+# (``cron/incidents.py:1-9,32``): ``resolved`` is automatic after a successful
+# run and re-opens on a repeat of the same error; ``closed`` is the operator's
+# ack. ``alerted`` is set only when a failure ping actually left the process
 # (``cron/scheduler.py:2745-2746``). An open row still in ``detected`` therefore
 # records no *delivered* failure ping — but that alone does not prove the alert
 # delivery path is broken, because upstream also leaves the row in ``detected``
@@ -110,6 +122,8 @@ def _job_markers(job: CronJob) -> str:
         markers.append(f"✗{job.failure_streak}")
     if job.paused:
         markers.append("⏸")
+    if job.quota_hold_until:
+        markers.append("held")
     return " ".join(markers)
 
 
@@ -159,6 +173,9 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             f"newest {_fmt_error_age(newest_fire_error_age)}\n",
             style=theme.ui_error,
         )
+    lines.append_text(_delivery_queue_compact(state.cron_deliveries, theme))
+    lines.append_text(_bot_chat_compact(state.cron_bot_chat, theme))
+    lines.append_text(_recovery_compact(state.cron_recovery, theme))
     if executions.open_incident_count:
         lines.append("  Incidents: ", style=theme.ui_label)
         # ``acked_at`` is written only together with ``closed_at`` upstream, so an
@@ -179,6 +196,9 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append(f"{c.error_count}\n", style=err_color)
     lines.append("  Parallel: ", style=theme.ui_label)
     lines.append(str(c.max_parallel_jobs or "—"), style=theme.banner_text)
+    if state.cron_usage.present:
+        lines.append("  Tokens 24h: ", style=theme.ui_label)
+        lines.append(fmt_tokens(state.cron_usage.tokens_24h), style=theme.banner_text)
 
     if c.jobs:
         lines.append("\n")
@@ -232,6 +252,10 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         sections.append(Text("  No cron jobs configured\n", style=theme.banner_dim))
 
     sections.extend(_executions_sections(executions, theme))
+    sections.extend(_delivery_queue_sections(state.cron_deliveries, theme))
+    sections.extend(_bot_chat_sections(state.cron_bot_chat, theme))
+    sections.extend(_recovery_sections(state.cron_recovery, theme))
+    sections.extend(_usage_sections(state.cron_usage, theme))
 
     return Panel(
         Group(*sections),
@@ -453,16 +477,24 @@ def _job_flags_line(j: CronJob, theme: Theme) -> Text | None:
     if j.paused:
         reason = sanitize_terminal_text(j.paused_reason)
         parts.append(f"paused: {reason}" if reason else "paused")
+    if j.quota_hold_until:
+        parts.append(
+            f"held until {sanitize_terminal_text(fmt_iso_timestamp(j.quota_hold_until))}"
+            " (provider usage window)"
+        )
     if j.last_delivery_error:
         parts.append(f"delivery: {sanitize_terminal_text(j.last_delivery_error[:80])}")
     if j.preflight_alerted:
         parts.append("config-block alert sent (alert-once)")
-    if not j.model and j.model_snapshot:
-        # An unpinned job runs whatever the snapshot resolved at creation; the
-        # panel would otherwise let an operator assume a pin that is not there.
-        parts.append(f"model {sanitize_terminal_text(j.model_snapshot)} (unpinned snapshot)")
-    if not j.provider and j.provider_snapshot:
-        parts.append(f"provider {sanitize_terminal_text(j.provider_snapshot)} (unpinned snapshot)")
+    if j.effective_model and j.model_source is not None:
+        # An unpinned job follows config at fire time; naming the axis keeps an
+        # operator from assuming a pin that is not there.
+        via = (
+            f" via {j.provider}" if j.model_source == CronModelSource.PINNED and j.provider else ""
+        )
+        parts.append(
+            sanitize_terminal_text(f"model {j.effective_model}{via} ({j.model_source.value})")
+        )
     if j.dispatch_lateness_seconds is not None:
         parts.append(_dispatch_flag(j))
     if j.repeat_completed or j.repeat_times is not None:
@@ -482,7 +514,12 @@ def _job_flags_line(j: CronJob, theme: Theme) -> Text | None:
 
 def _executions_sections(executions: CronExecutionsState, theme: Theme) -> list[RenderableType]:
     """Recent-execution and open-incident tables, or a single 'no data' line."""
-    if not executions.recent and not executions.open_incidents:
+    if (
+        not executions.recent
+        and not executions.recent_failures
+        and not executions.open_incidents
+        and not executions.resolved_incident_count
+    ):
         return [Text("\n  No execution history\n", style=theme.banner_dim)]
     sections: list[RenderableType] = []
     retention = _retention_line(executions, theme)
@@ -491,6 +528,9 @@ def _executions_sections(executions: CronExecutionsState, theme: Theme) -> list[
     if executions.recent:
         sections.append(section_heading("Recent Executions", theme))
         sections.append(_recent_executions_table(executions, theme))
+    if executions.recent_failures:
+        sections.append(section_heading("Recent Failures", theme))
+        sections.append(_joined(_failure_line(run, theme) for run in executions.recent_failures))
     if executions.open_incidents:
         sections.append(
             section_heading(
@@ -501,6 +541,15 @@ def _executions_sections(executions: CronExecutionsState, theme: Theme) -> list[
         )
         sections.append(_incidents_table(executions, theme))
         sections.append(Text(f"{_INCIDENT_ACK_NOTE}\n", style=theme.banner_dim))
+    if executions.resolved_incident_count:
+        sections.append(
+            Text(
+                f"\n  Resolved incidents: {executions.resolved_incident_count} "
+                f"({executions.resolved_24h_count} in the last 24h) — the job recovered;"
+                " the same error again re-opens and re-alerts.\n",
+                style=theme.banner_dim,
+            )
+        )
     return sections
 
 
@@ -564,6 +613,29 @@ def _recent_executions_table(executions: CronExecutionsState, theme: Theme) -> T
     return table
 
 
+def _joined(lines: Iterable[Text]) -> Text:
+    """One renderable for a list of newline-terminated lines.
+
+    Separate ``Text`` items in a ``Group`` each end their own block, so a list
+    of them renders with a blank line between entries.
+    """
+    body = Text()
+    for line in lines:
+        body.append_text(line)
+    return body
+
+
+def _failure_line(run: CronExecution, theme: Theme) -> Text:
+    """One failed run: job, age, and its error excerpt (redacted in the collector)."""
+    line = Text()
+    line.append(
+        f"  {sanitize_terminal_text(run.job_name or run.job_id or '—')} ", style=theme.ui_label
+    )
+    line.append(f"{_fmt_error_age(run.started_age_seconds)}: ", style=theme.banner_dim)
+    line.append(f"{sanitize_terminal_text(run.error_excerpt) or '—'}\n", style=theme.ui_error)
+    return line
+
+
 def _delivery_cell(run: CronExecution, theme: Theme) -> Text:
     """One run's recorded delivery outcome, kept visibly apart from its status."""
     cell = Text()
@@ -616,6 +688,7 @@ def _incidents_table(executions: CronExecutionsState, theme: Theme) -> Table:
     table.add_column("Type", style=theme.ui_label)
     table.add_column("First", style=theme.banner_dim)
     table.add_column("Last", style=theme.banner_dim)
+    table.add_column("Last alert", style=theme.banner_dim)
     table.add_column("Error", style=theme.ui_error)
 
     for incident in executions.open_incidents:
@@ -629,9 +702,214 @@ def _incidents_table(executions: CronExecutionsState, theme: Theme) -> Table:
             escape(incident.failure_type) or "—",
             fmt_age_seconds(incident.first_seen_age_seconds),
             fmt_age_seconds(incident.last_seen_age_seconds),
+            (
+                f"{fmt_age_seconds(incident.alerted_age_seconds)} ago"
+                if incident.alerted_age_seconds is not None
+                else "—"
+            ),
             escape(incident.error_excerpt) if incident.error_excerpt else "—",
         )
     return table
+
+
+# ``unknown`` is terminal and never retried upstream: the claiming gateway died
+# after taking the send, and losing it is preferred to duplicating it
+# (``cron/delivery_queue.py:1-7``).
+_DELIVERY_STATUS_NOTES = {"unknown": "sender died mid-send; never retried"}
+
+
+def _delivery_queue_compact(queue: CronDeliveryQueueState, theme: Theme) -> Text:
+    """One warning line when sends are waiting or recently failed, else nothing."""
+    line = Text()
+    parts = []
+    if queue.pending_count:
+        oldest = fmt_age_seconds(queue.oldest_pending_age_seconds)
+        parts.append(f"{queue.pending_count} pending (oldest {oldest})")
+    if queue.failed_24h:
+        parts.append(f"{queue.failed_24h} failed 24h")
+    if parts:
+        line.append(f"  ⚠ Delivery queue: {'  '.join(parts)}\n", style=theme.ui_warn)
+    return line
+
+
+def _delivery_failure_line(failure: CronDeliveryFailure, theme: Theme) -> Text:
+    line = Text("  ")
+    label = failure.status
+    notes = [note for note in (_DELIVERY_STATUS_NOTES.get(failure.status),) if note]
+    if failure.for_failure:
+        notes.insert(0, "failure notice")
+    if notes:
+        label += f" ({'; '.join(notes)})"
+    line.append(sanitize_terminal_text(f"{failure.execution_id} {label}"), style=theme.ui_label)
+    if failure.finished_age_seconds is not None:
+        line.append(f" {fmt_age_seconds(failure.finished_age_seconds)} ago", style=theme.banner_dim)
+    if failure.error_excerpt:
+        line.append(f": {sanitize_terminal_text(failure.error_excerpt)}", style=theme.ui_error)
+    line.append("\n")
+    return line
+
+
+def _delivery_queue_sections(queue: CronDeliveryQueueState, theme: Theme) -> list[RenderableType]:
+    """Retained status counts, the pending backlog and the newest failed sends."""
+    if not queue.db_present:
+        return []
+    body = Text("  ")
+    counts = "  ".join(f"{status} {count}" for status, count in queue.status_counts.items())
+    body.append(sanitize_terminal_text(counts) or "empty", style=theme.banner_text)
+    if queue.pending_count:
+        body.append(
+            f"\n  ⚠ {queue.pending_count} waiting for a gateway, oldest "
+            f"{fmt_age_seconds(queue.oldest_pending_age_seconds)}",
+            style=theme.ui_warn,
+        )
+    body.append("\n")
+    sections: list[RenderableType] = [
+        section_heading("Delivery Queue (deliveries.db)", theme),
+        body,
+    ]
+    if queue.recent_failures:
+        sections.append(
+            _joined(_delivery_failure_line(failure, theme) for failure in queue.recent_failures)
+        )
+    return sections
+
+
+def _bot_chat_compact(bot: CronBotChatState, theme: Theme) -> Text:
+    """One warning line while deferred Bot Chat sends are unsettled or ambiguous."""
+    line = Text()
+    ambiguous = bot.status_counts.get("ambiguous", 0)
+    parts = []
+    if bot.unsettled_count:
+        oldest = fmt_age_seconds(bot.oldest_unsettled_age_seconds)
+        parts.append(f"{bot.unsettled_count} unsettled (oldest {oldest})")
+    if ambiguous:
+        parts.append(f"{ambiguous} ambiguous")
+    if parts:
+        line.append(f"  ⚠ Bot Chat deferred: {'  '.join(parts)}\n", style=theme.ui_warn)
+    return line
+
+
+def _bot_chat_receipt_line(receipt: CronBotChatReceipt, theme: Theme) -> Text:
+    line = Text("  ")
+    label = f"{receipt.job_name} {receipt.receipt_id}" if receipt.job_name else receipt.receipt_id
+    label += f" {receipt.status}"
+    if receipt.for_failure:
+        label += " (failure notice)"
+    line.append(sanitize_terminal_text(label), style=theme.ui_label)
+    line.append(f" {_fmt_error_age(receipt.age_seconds)}", style=theme.banner_dim)
+    if receipt.error_excerpt:
+        line.append(f": {sanitize_terminal_text(receipt.error_excerpt)}", style=theme.ui_error)
+    line.append("\n")
+    return line
+
+
+def _bot_chat_sections(bot: CronBotChatState, theme: Theme) -> list[RenderableType]:
+    """Receipt status counts and the claimed/ambiguous receipts, newest first.
+
+    Receipts carry no timestamp upstream, so every age here is the file's mtime.
+    """
+    if not bot.present:
+        return []
+    body = Text("  ")
+    counts = "  ".join(f"{status} {count}" for status, count in bot.status_counts.items())
+    body.append(sanitize_terminal_text(counts) or "empty", style=theme.banner_text)
+    if bot.unreadable_count:
+        body.append(f"  {bot.unreadable_count} unreadable", style=theme.ui_warn)
+    if bot.scan_truncated:
+        body.append("  (listing capped — counts are partial)", style=theme.ui_warn)
+    if bot.unsettled_count:
+        body.append(
+            f"\n  ⚠ {bot.unsettled_count} unsettled, oldest "
+            f"{fmt_age_seconds(bot.oldest_unsettled_age_seconds)} — a claim never expires",
+            style=theme.ui_warn,
+        )
+    body.append("\n")
+    sections: list[RenderableType] = [
+        section_heading("Deferred Bot Chat (bot_chat_pending)", theme),
+        body,
+    ]
+    if bot.attention:
+        sections.append(
+            _joined(_bot_chat_receipt_line(receipt, theme) for receipt in bot.attention)
+        )
+    return sections
+
+
+def _recovery_compact(recovery: CronRecoveryState, theme: Theme) -> Text:
+    """One warning line when the scheduler recovered a wedged job in the last 24h."""
+    line = Text()
+    parts = [
+        f"{ledger.count_24h} {ledger.label}" for ledger in recovery.ledgers if ledger.count_24h
+    ]
+    if parts:
+        line.append(f"  ⚠ Recoveries 24h: {'  '.join(parts)}\n", style=theme.ui_warn)
+    return line
+
+
+def _recovery_sections(recovery: CronRecoveryState, theme: Theme) -> list[RenderableType]:
+    """Per-ledger 24h/7d counts and the newest entry; ``+`` marks a lower bound."""
+    if not recovery.ledgers:
+        return []
+    body = Text()
+    for ledger in recovery.ledgers:
+        body.append(f"  {ledger.label}: ", style=theme.ui_label)
+        week = f"{ledger.count_7d}{'+' if ledger.window_truncated else ''}"
+        parts = [f"24h {ledger.count_24h}  7d {week}"]
+        if ledger.newest_age_seconds is not None:
+            newest = f"newest {fmt_age_seconds(ledger.newest_age_seconds)} ago"
+            if ledger.newest_job_name:
+                newest += f" {ledger.newest_job_name}"
+            if ledger.newest_detail:
+                newest += f": {ledger.newest_detail}"
+            parts.append(newest)
+        style = theme.ui_warn if ledger.count_24h else theme.banner_text
+        body.append(sanitize_terminal_text("  ".join(parts)) + "\n", style=style)
+    return [section_heading("Recovery Ledgers", theme), body]
+
+
+def _usage_sections(usage: CronUsageState, theme: Theme) -> list[RenderableType]:
+    """Per-job fires and tokens from ``cron/usage_audit.jsonl``, biggest first."""
+    if not usage.present:
+        return []
+    body = Text()
+    body.append(
+        f"  Total: 24h {fmt_tokens(usage.tokens_24h)}  7d {fmt_tokens(usage.tokens_7d)}"
+        f" over {usage.fires_7d} fires\n",
+        style=theme.banner_text,
+    )
+    if usage.window_truncated:
+        body.append(
+            "  ⚠ Only the ledger tail is read and it ends inside the 7d window —"
+            " 7d figures are a lower bound.\n",
+            style=theme.ui_warn,
+        )
+    if usage.unparseable_lines:
+        body.append(
+            f"  {usage.unparseable_lines} unparseable line(s) skipped\n", style=theme.banner_dim
+        )
+    for job in usage.jobs:
+        body.append(
+            f"  {sanitize_terminal_text(job.job_name or job.job_id or '—')}: ", style=theme.ui_label
+        )
+        parts = [
+            f"24h {job.fires_24h} fires {fmt_tokens(job.tokens_24h)}",
+            f"7d {job.fires_7d} fires {fmt_tokens(job.tokens_7d)}",
+        ]
+        if job.errors_7d:
+            parts.append(f"{job.errors_7d} errors")
+        if job.last_fire_age_seconds is not None:
+            last = [f"last {fmt_age_seconds(job.last_fire_age_seconds)} ago"]
+            if job.last_total_tokens is not None:
+                last.append(fmt_tokens(job.last_total_tokens))
+            if job.last_model:
+                last.append(job.last_model)
+            if job.last_duration_seconds is not None:
+                last.append(f"{job.last_duration_seconds:.1f}s")
+            parts.append(" ".join(last))
+        if job.last_error_excerpt:
+            parts.append(f"error: {job.last_error_excerpt}")
+        body.append(sanitize_terminal_text("  ".join(parts)) + "\n", style=theme.banner_text)
+    return [section_heading("Token Usage (usage_audit.jsonl)", theme), body]
 
 
 def _latest_output_line(j: CronJob, theme: Theme) -> Text:

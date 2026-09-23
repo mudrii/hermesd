@@ -9,6 +9,7 @@ import json
 import math
 import sqlite3
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
 from typing import Any
@@ -22,8 +23,10 @@ from hermesd.collect.common import (
     _coerce_float,
     _coerce_int,
     _exists_strict,
+    _file_size,
     _iso_to_epoch,
     _mtime,
+    _open_regular_file,
     _optional_int,
     _path_resolves_under,
     _read_tail_text,
@@ -34,18 +37,27 @@ from hermesd.collect.common import (
 from hermesd.collect.logs import _MAX_LOG_LINE_CHARS
 from hermesd.collect.redaction import _redact_secret_text
 from hermesd.collect.sqlite_util import (
+    _column_exists,
     _connect_readonly_sqlite,
     _count_rows,
     _query_rows,
     _table_exists,
 )
 from hermesd.models import (
+    CronBotChatReceipt,
+    CronBotChatState,
+    CronDeliveryFailure,
+    CronDeliveryQueueState,
     CronExecution,
     CronExecutionsState,
     CronFireClaimState,
     CronIncident,
     CronJobExecutionStats,
+    CronJobUsage,
+    CronModelSource,
+    CronRecoveryLedger,
     CronTickerHealth,
+    CronUsageState,
     LogLine,
 )
 
@@ -57,6 +69,7 @@ from hermesd.models import (
 _EXECUTIONS_RECENT_LIMIT = 10
 _EXECUTIONS_WINDOW_SECONDS = 24 * 60 * 60.0
 _INCIDENTS_LIMIT = 5
+_RECENT_FAILURES_LIMIT = 5
 
 # The ticker fires every 60s. Two missed beats means stale; a heartbeat that
 # keeps arriving while last_success falls ten beats behind means failing.
@@ -467,6 +480,19 @@ def _recent_execution_rows(conn: sqlite3.Connection, *, columns: set[str]) -> li
     )
 
 
+def _recent_failure_rows(conn: sqlite3.Connection, *, columns: set[str]) -> list[dict[str, Any]]:
+    """The newest _RECENT_FAILURES_LIMIT failed executions, newest claim first."""
+    # The LIMIT is a module-level int constant, never caller-supplied text.
+    return _execution_rows(
+        conn,
+        f"SELECT {_execution_select_columns(columns)} "
+        "FROM executions WHERE status = 'failed' "
+        "ORDER BY hermes_epoch(claimed_at) DESC, id DESC "
+        f"LIMIT {_RECENT_FAILURES_LIMIT}",
+        columns=columns,
+    )
+
+
 def _execution_window_rows(
     conn: sqlite3.Connection, *, now: float, columns: set[str]
 ) -> list[dict[str, Any]]:
@@ -588,6 +614,7 @@ def _incident_from_row(
             _iso_to_epoch(str(row.get("first_seen_at") or "")), now
         ),
         last_seen_age_seconds=_age_seconds(_iso_to_epoch(str(row.get("last_seen_at") or "")), now),
+        alerted_age_seconds=_age_seconds(_iso_to_epoch(str(row.get("alerted_at") or "")), now),
         error_excerpt=_cron_error_excerpt(str(row.get("error") or "")),
     )
 
@@ -597,32 +624,54 @@ def _read_cron_incidents(
     job_names: Mapping[str, str],
     *,
     now: float,
-) -> tuple[int, int, list[CronIncident]]:
-    """Open/unacked incident counts plus the latest few open incidents.
+) -> dict[str, Any]:
+    """Open/unacked/resolved incident counts plus the latest few open incidents.
 
     A missing cron_incidents table (older agents) reads as zeros; operational
     read errors propagate so the source fails to its last-good value.
     """
     if not _table_exists(conn, "cron_incidents"):
-        return 0, 0, []
-    # Lifecycle is detected -> alerted -> closed, and ``acked_at`` is written only
-    # by the closing transition, together with ``closed_at``
-    # (``cron/incidents.py:172-203``): upstream has no acknowledge-without-close.
-    # So for data this schema produces, every open incident is unacked — the
-    # separate counter is kept because a foreign/newer schema may diverge.
-    open_clause = "WHERE COALESCE(state, '') != 'closed' AND closed_at IS NULL"
+        return {}
+    # Lifecycle is detected -> alerted -> resolved | closed
+    # (``INCIDENT_STATES``, ``cron/incidents.py:32``). ``resolved`` is the
+    # automatic transition after a successful run and stamps ``closed_at``
+    # (``:233-248``); a repeat of the same error re-opens it as ``detected``
+    # (``:151-181``). ``closed`` is the operator's ack, and ``acked_at`` is
+    # written only by that transition, together with ``closed_at`` (``:196-230``):
+    # upstream has no acknowledge-without-close. So for data this schema
+    # produces, every open incident is unacked — the separate counter is kept
+    # because a foreign/newer schema may diverge. Open is filtered on state as
+    # well as ``closed_at`` so a resolved row can never read as open.
+    open_clause = "WHERE COALESCE(state, '') NOT IN ('closed', 'resolved') AND closed_at IS NULL"
     open_count = _count_rows(conn, f"SELECT COUNT(*) FROM cron_incidents {open_clause}")
     unacked_count = _count_rows(
         conn,
         f"SELECT COUNT(*) FROM cron_incidents {open_clause} AND acked_at IS NULL",
     )
+    # ``alerted_at`` was added in place for older ledgers (``:83,90``).
+    has_alerted = _column_exists(conn, "cron_incidents", "alerted_at")
+    alerted = "alerted_at" if has_alerted else "NULL AS alerted_at"
     rows = _query_rows(
         conn,
-        "SELECT id, job_id, state, failure_type, first_seen_at, last_seen_at, error "
+        f"SELECT id, job_id, state, failure_type, first_seen_at, last_seen_at, {alerted}, error "
         f"FROM cron_incidents {open_clause} ORDER BY last_seen_at DESC, id DESC "
         f"LIMIT {_INCIDENTS_LIMIT}",
     )
-    return open_count, unacked_count, [_incident_from_row(row, job_names, now=now) for row in rows]
+    conn.create_function("hermes_epoch", 1, _memo_iso_to_epoch, deterministic=True)
+    resolved = _query_rows(
+        conn,
+        "SELECT COUNT(*) AS total, "
+        "SUM(CASE WHEN hermes_epoch(closed_at) >= ? THEN 1 ELSE 0 END) AS recent "
+        "FROM cron_incidents WHERE state = 'resolved'",
+        (now - _EXECUTIONS_WINDOW_SECONDS,),
+    )[0]
+    return {
+        "open_incident_count": open_count,
+        "unacked_incident_count": unacked_count,
+        "open_incidents": [_incident_from_row(row, job_names, now=now) for row in rows],
+        "resolved_incident_count": int(resolved.get("total") or 0),
+        "resolved_24h_count": int(resolved.get("recent") or 0),
+    }
 
 
 def _read_cron_executions_state(
@@ -643,10 +692,11 @@ def _read_cron_executions_state(
         conn.row_factory = sqlite3.Row
         columns = _executions_columns(conn)
         recent_rows = _recent_execution_rows(conn, columns=columns)
+        failure_rows = _recent_failure_rows(conn, columns=columns)
         window_rows = _execution_window_rows(conn, now=now, columns=columns)
         delivery_rows = _execution_delivery_rows(conn, now=now, columns=columns)
         last_rows = _last_execution_rows(conn, columns=columns)
-        open_count, unacked_count, incidents = _read_cron_incidents(conn, job_names, now=now)
+        incidents = _read_cron_incidents(conn, job_names, now=now)
         return CronExecutionsState(
             db_present=True,
             job_stats=_job_execution_stats(
@@ -656,9 +706,8 @@ def _read_cron_executions_state(
                 delivery_tracked="delivery_outcome" in columns,
             ),
             recent=[_execution_from_row(row, job_names, now=now) for row in recent_rows],
-            open_incident_count=open_count,
-            unacked_incident_count=unacked_count,
-            open_incidents=incidents,
+            recent_failures=[_execution_from_row(row, job_names, now=now) for row in failure_rows],
+            **incidents,
             **_execution_retention_fields(conn, now=now, columns=columns),
         )
 
@@ -939,8 +988,446 @@ def _cron_job_paused(job: dict[str, Any]) -> tuple[bool, str]:
     return paused_at_set or bool(reason), reason
 
 
+def _cron_job_model(
+    job: dict[str, Any], cfg: Mapping[str, Any]
+) -> tuple[str, CronModelSource | None]:
+    """The model the next fire resolves to and the axis it came from.
+
+    Mirrors ``_load_cron_job_config`` (``cron/scheduler.py:1561-1590``): a
+    per-job model is the pin; otherwise ``cron.model`` (the fleet default), then
+    the main ``model:`` (shorthand string, or the dict's ``default``/``model``/
+    ``name``). ``pinned`` is not stored (``cron/jobs.py:1900-1914``) and the
+    retired ``model_snapshot`` keys are ignored upstream, so they are here too.
+    The ``HERMES_MODEL`` env fallback is the scheduler's process env, which
+    hermesd cannot see, so an otherwise unconfigured job reads as unresolved.
+    """
+    if _coerce_bool(job.get("no_agent")):
+        return "", None
+    pinned = str(job.get("model") or "").strip()
+    if pinned:
+        return pinned, CronModelSource.PINNED
+    fleet = str(_as_dict(cfg.get("cron")).get("model") or "").strip()
+    if fleet:
+        return fleet, CronModelSource.CRON_DEFAULT
+    model_cfg = cfg.get("model") or {}
+    if isinstance(model_cfg, dict):
+        main = model_cfg.get("default") or model_cfg.get("model") or model_cfg.get("name")
+    else:
+        main = model_cfg
+    main_text = str(main or "").strip()
+    return (main_text, CronModelSource.MAIN_MODEL) if main_text else ("", None)
+
+
+def _cron_job_quota_hold(job: dict[str, Any], *, now: float) -> str:
+    """The ``quota_hold_until`` instant while the hold is active, else "".
+
+    Upstream's ``hold_active`` (``cron/quota_hold.py:58-64``) treats an expired
+    or unparseable marker as inert, so neither is reported.
+    """
+    until = str(job.get("quota_hold_until") or "")
+    until_epoch = _iso_to_epoch(until)
+    return until if until_epoch is not None and until_epoch > now else ""
+
+
 def _cron_job_repeat(job: dict[str, Any]) -> tuple[int | None, int]:
     """`repeat` times (None means unlimited) and completed count."""
     repeat = _as_dict(job.get("repeat"))
     times = _optional_int(repeat.get("times"))
     return times, _coerce_int(repeat.get("completed"))
+
+
+# ``cron/usage_audit.jsonl`` is appended once per fire and never pruned upstream
+# (``_write_usage_audit``, ``cron/scheduler.py:1196-1216``). A line is ~350
+# bytes, so this tail holds a few thousand fires; the parse is cached by file
+# signature and only the windowing reruns each refresh.
+_USAGE_AUDIT_TAIL_BYTES = 1024 * 1024
+_USAGE_WINDOW_7D_SECONDS = 7 * 24 * 60 * 60.0
+_USAGE_JOBS_LIMIT = 20
+
+
+@dataclass(frozen=True, slots=True)
+class _UsageRecord:
+    """One parsed audit line; the error is already a redacted excerpt."""
+
+    epoch: float
+    job_id: str
+    total_tokens: int | None
+    model: str
+    duration_seconds: float | None
+    error_excerpt: str
+
+
+@dataclass(frozen=True, slots=True)
+class _UsageAudit:
+    records: tuple[_UsageRecord, ...]
+    cut: bool
+    unparseable: int
+
+
+def _usage_record(data: dict[str, Any]) -> _UsageRecord | None:
+    epoch = _iso_to_epoch(str(data.get("ts") or ""))
+    if epoch is None:
+        return None
+    tokens = data.get("total_tokens")
+    duration_ms = data.get("duration_ms")
+    return _UsageRecord(
+        epoch=epoch,
+        job_id=str(data.get("job_id") or ""),
+        total_tokens=None if tokens is None else _coerce_int(tokens),
+        model=str(data.get("model") or "")[:_EXCERPT_MAX_CHARS],
+        duration_seconds=None if duration_ms is None else _coerce_float(duration_ms) / 1000.0,
+        error_excerpt=_cron_error_excerpt(str(data.get("error") or "")),
+    )
+
+
+def _jsonl_tail_objects(path: Path, max_bytes: int) -> tuple[list[dict[str, Any]], int, bool]:
+    """JSON objects from the last ``max_bytes`` of an append-only JSONL ledger.
+
+    Returns the objects, the count of torn/foreign non-blank lines, and whether
+    the file is longer than the tail read. An I/O error propagates so the
+    caller's source keeps its last-good value.
+    """
+    cut = _file_size(path) > max_bytes
+    objects: list[dict[str, Any]] = []
+    unparseable = 0
+    for line in _read_tail_text(path, max_bytes).splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        data: object = None
+        with contextlib.suppress(json.JSONDecodeError, RecursionError):
+            data = json.loads(stripped)
+        if isinstance(data, dict):
+            objects.append(data)
+        else:
+            unparseable += 1
+    return objects, unparseable, cut
+
+
+def _read_usage_audit_records(path: Path) -> _UsageAudit:
+    """Parse the capped tail of ``cron/usage_audit.jsonl``; stampless lines are junk."""
+    objects, unparseable, cut = _jsonl_tail_objects(path, _USAGE_AUDIT_TAIL_BYTES)
+    records: list[_UsageRecord] = []
+    for data in objects:
+        record = _usage_record(data)
+        if record is None:
+            unparseable += 1
+        else:
+            records.append(record)
+    return _UsageAudit(records=tuple(records), cut=cut, unparseable=unparseable)
+
+
+def _cron_usage_state(
+    audit: _UsageAudit, job_names: Mapping[str, str], *, now: float
+) -> CronUsageState:
+    """Roll the parsed audit up into 24h/7d per-job windows at ``now``."""
+    day_start = now - _EXECUTIONS_WINDOW_SECONDS
+    week_start = now - _USAGE_WINDOW_7D_SECONDS
+    by_job: dict[str, CronJobUsage] = {}
+    last_epoch: dict[str, float] = {}
+    for record in audit.records:
+        if record.epoch < week_start or record.epoch > now:
+            continue
+        entry = by_job.setdefault(
+            record.job_id,
+            CronJobUsage(
+                job_id=record.job_id, job_name=job_names.get(record.job_id) or record.job_id
+            ),
+        )
+        tokens = record.total_tokens or 0
+        entry.fires_7d += 1
+        entry.tokens_7d += tokens
+        entry.errors_7d += 1 if record.error_excerpt else 0
+        if record.epoch >= day_start:
+            entry.fires_24h += 1
+            entry.tokens_24h += tokens
+        if record.epoch >= last_epoch.get(record.job_id, -math.inf):
+            last_epoch[record.job_id] = record.epoch
+            entry.last_fire_age_seconds = _age_seconds(record.epoch, now)
+            entry.last_total_tokens = record.total_tokens
+            entry.last_model = record.model
+            entry.last_duration_seconds = record.duration_seconds
+            entry.last_error_excerpt = record.error_excerpt
+    jobs = sorted(by_job.values(), key=lambda job: (-job.tokens_7d, -job.fires_7d, job.job_id))
+    oldest = min((record.epoch for record in audit.records), default=None)
+    return CronUsageState(
+        present=True,
+        jobs=jobs[:_USAGE_JOBS_LIMIT],
+        tokens_24h=sum(job.tokens_24h for job in jobs),
+        tokens_7d=sum(job.tokens_7d for job in jobs),
+        fires_7d=sum(job.fires_7d for job in jobs),
+        window_truncated=audit.cut and (oldest is None or oldest > week_start),
+        unparseable_lines=audit.unparseable,
+    )
+
+
+# ``cron/deliveries.db`` statuses (``cron/delivery_queue.py:108-122``). The
+# vocabulary is CHECK-constrained upstream; the kind cap only bounds a foreign
+# schema's values.
+_DELIVERY_PENDING_STATUSES = ("pending", "delivering")
+_DELIVERY_FAILED_STATUSES = ("failed", "unknown")
+_DELIVERY_STATUS_KIND_LIMIT = 8
+_DELIVERY_FAILURES_LIMIT = 5
+
+
+def _read_cron_delivery_queue(db_path: Path, *, now: float) -> CronDeliveryQueueState:
+    """Pending/failed counts, oldest pending age and the newest failures.
+
+    ``content`` and ``job_json`` hold the message payload and are never read.
+    The caller has already confined ``db_path``; read errors propagate so the
+    source keeps its last-good value.
+    """
+    with _connect_readonly_sqlite(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        if not _table_exists(conn, "deliveries"):
+            return CronDeliveryQueueState(db_present=True)
+        conn.create_function("hermes_epoch", 1, _memo_iso_to_epoch, deterministic=True)
+        counts = {
+            str(row.get("status") or ""): int(row.get("n") or 0)
+            for row in _query_rows(
+                conn,
+                "SELECT COALESCE(status, '') AS status, COUNT(*) AS n FROM deliveries "
+                f"GROUP BY COALESCE(status, '') ORDER BY n DESC LIMIT {_DELIVERY_STATUS_KIND_LIMIT}",
+            )
+        }
+        pending = ", ".join(f"'{status}'" for status in _DELIVERY_PENDING_STATUSES)
+        failed = ", ".join(f"'{status}'" for status in _DELIVERY_FAILED_STATUSES)
+        oldest = _query_rows(
+            conn,
+            f"SELECT MIN(hermes_epoch(created_at)) AS oldest FROM deliveries "
+            f"WHERE status IN ({pending})",
+        )[0].get("oldest")
+        failed_24h = _count_rows(
+            conn,
+            f"SELECT COUNT(*) FROM deliveries WHERE status IN ({failed}) "
+            "AND hermes_epoch(finished_at) >= ?",
+            (now - _EXECUTIONS_WINDOW_SECONDS,),
+        )
+        for_failure = (
+            "for_failure"
+            if _column_exists(conn, "deliveries", "for_failure")
+            else "0 AS for_failure"
+        )
+        rows = _query_rows(
+            conn,
+            f"SELECT execution_id, status, {for_failure}, finished_at, error FROM deliveries "
+            f"WHERE status IN ({failed}) "
+            "ORDER BY hermes_epoch(finished_at) DESC, execution_id DESC "
+            f"LIMIT {_DELIVERY_FAILURES_LIMIT}",
+        )
+    return CronDeliveryQueueState(
+        db_present=True,
+        status_counts=dict(sorted(counts.items())),
+        pending_count=sum(counts.get(status, 0) for status in _DELIVERY_PENDING_STATUSES),
+        oldest_pending_age_seconds=_age_seconds(oldest, now),
+        failed_24h=failed_24h,
+        recent_failures=[
+            CronDeliveryFailure(
+                execution_id=str(row.get("execution_id") or "")[:_EXCERPT_MAX_CHARS],
+                status=str(row.get("status") or ""),
+                for_failure=_coerce_bool(row.get("for_failure")),
+                finished_age_seconds=_age_seconds(
+                    _iso_to_epoch(str(row.get("finished_at") or "")), now
+                ),
+                error_excerpt=_cron_error_excerpt(str(row.get("error") or "")),
+            )
+            for row in rows
+        ],
+    )
+
+
+# ``cron/bot_chat_pending/`` is never pruned upstream, so the listing is capped;
+# a receipt embeds the whole cron output as ``content``, so one past the byte
+# cap is counted unreadable instead of parsed.
+_BOT_CHAT_SCAN_LIMIT = 2000
+_BOT_CHAT_RECORD_MAX_BYTES = 1024 * 1024
+_BOT_CHAT_UNSETTLED_STATUSES = ("queued", "claimed")
+_BOT_CHAT_ATTENTION_STATUSES = ("ambiguous", "claimed")
+_BOT_CHAT_ATTENTION_LIMIT = 5
+_BOT_CHAT_STATUS_KIND_LIMIT = 8
+
+_BotChatSignature = tuple[int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _BotChatReceipt:
+    """The fields hermesd keeps from one receipt; ``content`` is dropped."""
+
+    receipt_id: str
+    status: str
+    job_name: str
+    for_failure: bool
+    error_excerpt: str
+
+
+def _read_bot_chat_receipt(path: Path) -> _BotChatReceipt | None:
+    """Parse one receipt, or None when it is oversize, torn or not an object.
+
+    Upstream keeps unreadable receipts as evidence and skips them
+    (``_records``, ``cron/bot_chat_delivery.py:38-55``); so does hermesd.
+    """
+    with _open_regular_file(path) as handle:
+        raw = handle.read(_BOT_CHAT_RECORD_MAX_BYTES + 1)
+    if len(raw) > _BOT_CHAT_RECORD_MAX_BYTES:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    job = _as_dict(data.get("job"))
+    return _BotChatReceipt(
+        receipt_id=str(data.get("id") or path.stem)[:_EXCERPT_MAX_CHARS],
+        status=str(data.get("status") or "")[:_EXCERPT_MAX_CHARS],
+        job_name=str(job.get("name") or job.get("id") or "")[:_EXCERPT_MAX_CHARS],
+        for_failure=_coerce_bool(data.get("for_failure")),
+        error_excerpt=_cron_error_excerpt(str(data.get("error") or "")),
+    )
+
+
+def _read_cron_bot_chat(
+    root_dir: Path,
+    *,
+    now: float,
+    cache: dict[str, tuple[_BotChatSignature, _BotChatReceipt | None]],
+) -> CronBotChatState:
+    """Status counts, the unsettled backlog and receipts needing attention.
+
+    ``cache`` maps a receipt name to its last parse, keyed by (mtime_ns, size,
+    inode), and is rewritten to the files seen this scan. The caller confines
+    ``root_dir``; a listing error propagates so the source keeps its last-good.
+    """
+    entries = list(islice(root_dir.iterdir(), _BOT_CHAT_SCAN_LIMIT + 1))
+    truncated = len(entries) > _BOT_CHAT_SCAN_LIMIT
+    counts: dict[str, int] = {}
+    unreadable = 0
+    oldest_unsettled: float | None = None
+    attention: list[tuple[float, _BotChatReceipt]] = []
+    seen: dict[str, tuple[_BotChatSignature, _BotChatReceipt | None]] = {}
+    for path in entries[:_BOT_CHAT_SCAN_LIMIT]:
+        if path.suffix != ".json":
+            continue
+        try:
+            stat = path.lstat()
+            signature = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+            cached = cache.get(path.name)
+            if cached is not None and cached[0] == signature:
+                receipt = cached[1]
+            else:
+                receipt = None if path.is_symlink() else _read_bot_chat_receipt(path)
+        except OSError:
+            unreadable += 1
+            continue
+        seen[path.name] = (signature, receipt)
+        if receipt is None:
+            unreadable += 1
+            continue
+        if receipt.status in counts or len(counts) < _BOT_CHAT_STATUS_KIND_LIMIT:
+            counts[receipt.status] = counts.get(receipt.status, 0) + 1
+        age = max(0.0, now - stat.st_mtime)
+        if receipt.status in _BOT_CHAT_UNSETTLED_STATUSES:
+            oldest_unsettled = age if oldest_unsettled is None else max(oldest_unsettled, age)
+        if receipt.status in _BOT_CHAT_ATTENTION_STATUSES:
+            attention.append((age, receipt))
+    cache.clear()
+    cache.update(seen)
+    attention.sort(key=lambda item: (item[0], item[1].receipt_id))
+    return CronBotChatState(
+        present=True,
+        status_counts=dict(sorted(counts.items())),
+        unsettled_count=sum(counts.get(status, 0) for status in _BOT_CHAT_UNSETTLED_STATUSES),
+        oldest_unsettled_age_seconds=oldest_unsettled,
+        attention=[
+            CronBotChatReceipt(
+                receipt_id=receipt.receipt_id,
+                job_name=receipt.job_name,
+                status=receipt.status,
+                for_failure=receipt.for_failure,
+                age_seconds=age,
+                error_excerpt=receipt.error_excerpt,
+            )
+            for age, receipt in attention[:_BOT_CHAT_ATTENTION_LIMIT]
+        ],
+        unreadable_count=unreadable,
+        scan_truncated=truncated,
+    )
+
+
+# Fire-path recovery telemetry, appended best effort and never pruned upstream:
+# ``_append_telemetry_record`` (``cron/jobs.py:1011-1023``) for the first two,
+# ``_record_forced_release`` (``cron/scheduler.py:868-884``) for the third.
+# (file name, label, timestamp key) per ledger.
+_RECOVERY_LEDGERS = (
+    ("persisted_error_recoveries.jsonl", "stale-error re-arm", "rearmed_at"),
+    ("timezone_migration_catchups.jsonl", "timezone-migration catch-up", "fired_at"),
+    ("inflight_forced_releases.jsonl", "forced in-flight release", "at"),
+)
+_RECOVERY_LEDGER_TAIL_BYTES = 256 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _RecoveryEntry:
+    epoch: float
+    job_name: str
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class _RecoveryLedgerRead:
+    entries: tuple[_RecoveryEntry, ...]
+    cut: bool
+
+
+def _recovery_detail(kind: str, data: dict[str, Any]) -> str:
+    """The one fact that distinguishes an entry, per ledger's own keys."""
+    if kind == "persisted_error_recoveries":
+        previous = str(data.get("previous_next_run_at") or "")
+        return f"was due {previous}" if previous else ""
+    if kind == "timezone_migration_catchups":
+        stored = str(data.get("stored_next_run_at") or "")
+        normalized = str(data.get("normalized_next_run_at") or "")
+        return f"{stored} -> {normalized}" if stored or normalized else ""
+    age = data.get("age_seconds")
+    allowance = data.get("allowance_seconds")
+    if age is None or allowance is None:
+        return ""
+    return f"ran {_coerce_float(age):.0f}s past a {_coerce_float(allowance):.0f}s allowance"
+
+
+def _read_recovery_ledger(path: Path, kind: str, stamp_key: str) -> _RecoveryLedgerRead:
+    """Parse one ledger's capped tail; entries without a usable stamp are skipped."""
+    objects, _unparseable, cut = _jsonl_tail_objects(path, _RECOVERY_LEDGER_TAIL_BYTES)
+    entries = []
+    for data in objects:
+        epoch = _iso_to_epoch(str(data.get(stamp_key) or ""))
+        if epoch is None:
+            continue
+        entries.append(
+            _RecoveryEntry(
+                epoch=epoch,
+                job_name=_cron_error_excerpt(str(data.get("name") or data.get("job_id") or "")),
+                detail=_cron_error_excerpt(_recovery_detail(kind, data)),
+            )
+        )
+    return _RecoveryLedgerRead(entries=tuple(entries), cut=cut)
+
+
+def _recovery_ledger(
+    read: _RecoveryLedgerRead, kind: str, label: str, *, now: float
+) -> CronRecoveryLedger:
+    """24h/7d counts and the newest entry of one parsed ledger at ``now``."""
+    week_start = now - _USAGE_WINDOW_7D_SECONDS
+    in_window = [entry for entry in read.entries if week_start <= entry.epoch <= now]
+    newest = max(read.entries, key=lambda entry: entry.epoch, default=None)
+    oldest = min((entry.epoch for entry in read.entries), default=None)
+    return CronRecoveryLedger(
+        kind=kind,
+        label=label,
+        count_24h=sum(1 for e in in_window if e.epoch >= now - _EXECUTIONS_WINDOW_SECONDS),
+        count_7d=len(in_window),
+        newest_age_seconds=None if newest is None else _age_seconds(newest.epoch, now),
+        newest_job_name="" if newest is None else newest.job_name,
+        newest_detail="" if newest is None else newest.detail,
+        window_truncated=read.cut and (oldest is None or oldest > week_start),
+    )

@@ -180,6 +180,8 @@ _KNOWN_TABLES = frozenset(
         "conversation_generations",
         "conversations",
         "cron_incidents",
+        # cron/deliveries.db (cron/delivery_queue.py:108-122).
+        "deliveries",
         "delivery_obligations",
         "discovered_repos",
         "executions",
