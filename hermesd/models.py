@@ -1291,6 +1291,13 @@ class ProviderInfo(BaseModel):
     free_tier: bool = False
 
 
+class ModelCooldown(BaseModel):
+    """One model a pooled credential is benched for (model name only)."""
+
+    model: str
+    remaining_seconds: float = 0.0
+
+
 class CredentialPoolEntry(BaseModel):
     name: str
     label: str = ""
@@ -1298,7 +1305,11 @@ class CredentialPoolEntry(BaseModel):
     source: str = ""
     last_status: str = ""
     request_count: int = 0
-    cooldown_remaining: str = ""
+    # Seconds the representative entry stays benched after an exhaustion
+    # (agent/credential_pool.py:468-480); None when it is not cooling down.
+    cooldown_remaining_seconds: float | None = None
+    # Active per-model cooldowns merged across the provider's entries.
+    model_cooldowns: list[ModelCooldown] = Field(default_factory=list)
     priority: int = 0
     token_present: bool = False
     expires_at: str = ""

@@ -57,15 +57,18 @@ from hermesd.collect.common import (
 )
 from hermesd.collect.config import (
     _CONFIG_BACKUP_ENTRY_LIMIT,
+    _active_model_cooldowns,
     _active_personality_name,
     _channel_capabilities,
     _config_agent_limits,
     _config_backup_groups,
     _credential_auth_type,
+    _credential_cooldown_remaining,
     _credential_expiry,
     _mcp_tool_filter_summary,
     _moa_config_summary,
     _platform_family_label,
+    _pool_entries,
     _provider_free_tier,
     _provider_model_label,
     _provider_routing_summary,
@@ -4164,8 +4167,10 @@ class Collector:
 
         providers_section = _as_dict(data.get("providers"))
         entries = []
+        now = self._clock()
         for name, raw_entry in sorted(_as_dict(data.get("credential_pool")).items()):
             entry = _select_pool_entry(raw_entry)
+            pool_entries = _pool_entries(raw_entry)
             provider_entry = _as_dict(providers_section.get(name))
             entries.append(
                 CredentialPoolEntry(
@@ -4175,7 +4180,15 @@ class Collector:
                     source=str(entry.get("source") or ""),
                     last_status=str(entry.get("last_status") or entry.get("status") or ""),
                     request_count=_coerce_int(entry.get("request_count") or entry.get("requests")),
-                    cooldown_remaining=str(entry.get("cooldown_remaining") or ""),
+                    cooldown_remaining_seconds=_credential_cooldown_remaining(
+                        entry,
+                        sole_credential=sum(
+                            1 for item in pool_entries if item.get("last_status") != "dead"
+                        )
+                        <= 1,
+                        now=now,
+                    ),
+                    model_cooldowns=_active_model_cooldowns(pool_entries, now=now),
                     priority=_coerce_int(entry.get("priority")),
                     token_present=_has_secret_material(entry)
                     or _has_secret_material(provider_entry),

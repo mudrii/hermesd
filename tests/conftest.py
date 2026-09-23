@@ -1042,7 +1042,6 @@ def sample_auth(hermes_home: Path) -> Path:
                         "source": "env:ANTHROPIC_API_KEY",
                         "last_status": "rate_limited",
                         "request_count": 3,
-                        "cooldown_remaining": "58m",
                         "priority": 2,
                         "api_key": "sk-live-secret",
                     },

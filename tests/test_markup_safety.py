@@ -51,6 +51,7 @@ from hermesd.models import (
     MCPServerInfo,
     MemoryOverview,
     ModelCacheSummary,
+    ModelCooldown,
     ModelUsage,
     OperationsState,
     PlatformStatus,
@@ -393,7 +394,7 @@ def _state_for(panel_num: int) -> DashboardState:
                         auth_type=INJECT,
                         source=INJECT,
                         last_status=INJECT,
-                        cooldown_remaining=INJECT,
+                        model_cooldowns=[ModelCooldown(model=INJECT, remaining_seconds=60)],
                         expires_at=INJECT,
                         last_refresh=INJECT,
                     )

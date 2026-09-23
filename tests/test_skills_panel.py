@@ -13,6 +13,7 @@ from hermesd.models import (
     MCPCacheEntryState,
     MCPSchemaCache,
     MCPServerInfo,
+    ModelCooldown,
     PluginActivation,
     PluginInfo,
     ProviderInfo,
@@ -86,7 +87,8 @@ def test_skills_detail_shows_credential_pools_without_secrets():
                     source="env:ANTHROPIC_API_KEY",
                     last_status="rate_limited",
                     request_count=3,
-                    cooldown_remaining="58m",
+                    cooldown_remaining_seconds=58 * 60,
+                    model_cooldowns=[ModelCooldown(model="claude-opus", remaining_seconds=300)],
                     priority=2,
                     token_present=True,
                 ),
@@ -100,6 +102,8 @@ def test_skills_detail_shows_credential_pools_without_secrets():
     assert "Fallback Anthropic" in text
     assert "rate_limited" in text
     assert "58m" in text
+    assert "Model cooldowns" in text
+    assert "anthropic: claude-opus 5m left" in text
     assert "Yes" in text
     assert "sk-live-secret" not in text
 
@@ -116,7 +120,6 @@ def test_skills_detail_uses_dash_for_missing_priority():
                     source="codex",
                     last_status="ok",
                     request_count=42,
-                    cooldown_remaining="ready",
                     priority=0,
                     token_present=True,
                 ),
@@ -158,6 +161,23 @@ def test_skills_compact_shows_summary():
     text = render_to_str(panel, width=100, no_color=True)
     assert re.search(r"Skills:\s+77\s+\(39 cat\)", text)
     assert "openai-codex" in text
+    assert "cooling" not in text
+
+
+def test_skills_compact_counts_cooling_credential_pools():
+    state = DashboardState(
+        skills_memory=SkillsMemory(
+            credential_pools=[
+                CredentialPoolEntry(name="a", cooldown_remaining_seconds=60),
+                CredentialPoolEntry(
+                    name="b", model_cooldowns=[ModelCooldown(model="m", remaining_seconds=5)]
+                ),
+                CredentialPoolEntry(name="c"),
+            ],
+        ),
+    )
+    text = render_to_str(render_panel(7, state, Theme(), detail=False), width=100, no_color=True)
+    assert "Creds: 3 pools (2 cooling)" in text
 
 
 def test_skills_detail_shows_description_column():

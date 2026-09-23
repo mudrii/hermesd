@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 
-from hermesd.collect.common import _age_seconds, _as_dict, _as_list, _coerce_bool, _coerce_int
+from hermesd.collect.common import (
+    _age_seconds,
+    _as_dict,
+    _as_list,
+    _coerce_bool,
+    _coerce_int,
+    _iso_to_epoch,
+)
 from hermesd.collect.plugins import plugin_name_set
 from hermesd.collect.redaction import _API_KEY_FIELD_NAMES, _OAUTH_FIELD_NAMES
-from hermesd.models import ConfigBackupGroup, ConfigBackupKind, PlatformStatus
+from hermesd.models import ConfigBackupGroup, ConfigBackupKind, ModelCooldown, PlatformStatus
 
 # Upper bound on name lists surfaced from config/cache mappings.
 _MAX_LISTED_NAMES = 20
@@ -436,6 +444,106 @@ def _select_pool_entry(raw_entry: object) -> dict[str, Any]:
             key=lambda pair: (_coerce_int(pair[1].get("priority")), pair[0]),
         )[1]
     return _as_dict(raw_entry)
+
+
+def _pool_entries(raw_entry: object) -> list[dict[str, Any]]:
+    """Every non-empty entry of a credential_pool value (list or legacy dict)."""
+    items = raw_entry if isinstance(raw_entry, list) else [raw_entry]
+    return [entry for entry in (_as_dict(item) for item in items) if entry]
+
+
+def _absolute_timestamp(value: object) -> float | None:
+    """``_parse_absolute_timestamp`` (``agent/credential_pool.py:402-424``).
+
+    Epoch seconds, epoch milliseconds (anything past 1e12) or ISO-8601; a
+    non-positive number is no timestamp at all.
+    """
+    if isinstance(value, bool) or value is None or value == "":
+        return None
+    if isinstance(value, int | float):
+        numeric = float(value)
+        if numeric <= 0 or not math.isfinite(numeric):
+            return None
+        return numeric / 1000.0 if numeric > 1_000_000_000_000 else numeric
+    if isinstance(value, str):
+        try:
+            numeric = float(value.strip())
+        except ValueError:
+            return _iso_to_epoch(value)
+        return _absolute_timestamp(numeric) if math.isfinite(numeric) else None
+    return None
+
+
+# Cooldown TTLs, ``agent/credential_pool.py:133-139`` and ``:143,149``.
+_EXHAUSTED_TTL_401_SECONDS = 5 * 60
+_EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60
+_EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS = 60
+_FAILURE_REASON_BILLING = "billing"
+_FAILURE_REASON_BILLING_UNVERIFIED = "billing_unverified"
+
+
+def _exhausted_ttl(error_code: int, *, sole_credential: bool, failure_reason: str) -> int:
+    """``_exhausted_ttl`` (``agent/credential_pool.py:372-398``).
+
+    429 and the catch-all default share the one-hour bench upstream, so a single
+    constant covers both here.
+    """
+    if error_code == 401:
+        return _EXHAUSTED_TTL_401_SECONDS
+    base = _EXHAUSTED_TTL_DEFAULT_SECONDS
+    if failure_reason == _FAILURE_REASON_BILLING_UNVERIFIED and error_code != 402:
+        return min(base, _EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS)
+    is_billing = error_code == 402 or failure_reason == _FAILURE_REASON_BILLING
+    if sole_credential and not is_billing:
+        return min(base, _EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS)
+    return base
+
+
+def _credential_cooldown_remaining(
+    entry: dict[str, Any], *, sole_credential: bool, now: float
+) -> float | None:
+    """Seconds an exhausted credential stays benched, as ``_exhausted_until`` decides.
+
+    ``agent/credential_pool.py:468-480``: only ``last_status == "exhausted"`` is
+    benched; the provider's ``last_error_reset_at`` wins, else
+    ``last_status_at`` plus the TTL for the recorded error. ``sole_credential``
+    mirrors ``_is_sole_credential`` (``:1064-1066``): at most one non-dead entry.
+    """
+    if str(entry.get("last_status") or "") != "exhausted":
+        return None
+    until = _absolute_timestamp(entry.get("last_error_reset_at"))
+    if until is None:
+        status_at = _absolute_timestamp(entry.get("last_status_at"))
+        if status_at is None:
+            return None
+        until = status_at + _exhausted_ttl(
+            _coerce_int(entry.get("last_error_code")),
+            sole_credential=sole_credential,
+            failure_reason=str(entry.get("failure_reason") or ""),
+        )
+    remaining = until - now
+    return remaining if remaining > 0 else None
+
+
+def _active_model_cooldowns(entries: list[dict[str, Any]], *, now: float) -> list[ModelCooldown]:
+    """Per-model cooldowns still running, merged across a provider's entries.
+
+    ``merge_model_cooldowns`` / ``model_cooldown_until``
+    (``agent/credential_pool_model_cooldowns.py:22-44``): the latest reset per
+    model wins, and only numeric resets still in the future are active. Model
+    names only; the values are epochs, not secrets.
+    """
+    merged: dict[str, float] = {}
+    for entry in entries:
+        for model, until in _as_dict(entry.get("model_cooldowns")).items():
+            if isinstance(until, bool) or not isinstance(until, int | float):
+                continue
+            merged[str(model)] = max(float(until), merged.get(str(model), 0.0))
+    return [
+        ModelCooldown(model=model, remaining_seconds=until - now)
+        for model, until in sorted(merged.items())
+        if until > now
+    ][:_MAX_LISTED_NAMES]
 
 
 def _credential_auth_type(entry: dict[str, Any], provider_entry: dict[str, Any]) -> str:

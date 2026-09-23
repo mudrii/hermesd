@@ -37,7 +37,15 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append(f"{sm.skill_count}", style=theme.ui_accent)
     lines.append(f" ({sm.skill_categories} cat)\n", style=theme.banner_dim)
     lines.append("  Creds: ", style=theme.ui_label)
-    lines.append(f"{len(sm.credential_pools)} pools\n", style=theme.banner_text)
+    lines.append(f"{len(sm.credential_pools)} pools", style=theme.banner_text)
+    cooling = sum(
+        1
+        for entry in sm.credential_pools
+        if entry.cooldown_remaining_seconds is not None or entry.model_cooldowns
+    )
+    if cooling:
+        lines.append(f" ({cooling} cooling)", style=theme.ui_warn)
+    lines.append("\n")
     lines.append("  Integrations: ", style=theme.ui_label)
     # A trailing "+" marks a walk that hit its directory budget: the number is
     # what hermesd retained, not what is on disk.
@@ -96,6 +104,8 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     if sm.credential_pools:
         sections.append(section_heading("Credential Pools", theme))
         sections.append(_credential_pools_table(sm, theme))
+        if any(entry.model_cooldowns for entry in sm.credential_pools):
+            sections.append(_model_cooldown_lines(sm, theme))
 
     if sm.hooks:
         sections.append(section_heading("Hooks", theme))
@@ -316,12 +326,26 @@ def _credential_pools_table(sm: SkillsMemory, theme: Theme) -> Table:
             "Yes" if entry.token_present else "No",
             escape(entry.last_status),
             str(entry.request_count),
-            escape(entry.cooldown_remaining),
+            fmt_age_seconds(entry.cooldown_remaining_seconds),
             escape(entry.expires_at) if entry.expires_at else "—",
             escape(entry.last_refresh) if entry.last_refresh else "—",
             str(entry.priority) if entry.priority else "—",
         )
     return pool_table
+
+
+def _model_cooldown_lines(sm: SkillsMemory, theme: Theme) -> Text:
+    """Models a pooled credential is benched for while its siblings stay usable."""
+    lines = Text()
+    lines.append("\nModel cooldowns\n", style=theme.ui_label)
+    for entry in sm.credential_pools:
+        for cooldown in entry.model_cooldowns:
+            lines.append(
+                f"  {sanitize_terminal_text(entry.name)}: {sanitize_terminal_text(cooldown.model)}"
+                f" {fmt_age_seconds(cooldown.remaining_seconds)} left\n",
+                style=theme.ui_warn,
+            )
+    return lines
 
 
 def _hooks_table(sm: SkillsMemory, theme: Theme) -> Table:
