@@ -306,3 +306,125 @@ def test_receipt_new_keys_tolerate_wrong_types(hermes_home: Path):
     assert gateway.update_runtime_outcomes == {}
     assert gateway.update_skip_count == 3
     assert gateway.update_skip_names == ["x" * 60]
+
+
+# --------------------------------------------------------------------------
+# heartbeat memory block (gateway/shutdown_watchdog.py:208-210 embeds
+# gateway/lifecycle_ledger.py:64-74 sample_memory; tiers gateway/memory_status.py:16-30)
+# --------------------------------------------------------------------------
+
+_GIB_KIB = 1024 * 1024
+
+
+def _mem(**extra: object) -> dict[str, object]:
+    block: dict[str, object] = {
+        "rss_kib": 512 * 1024,
+        "mem_total_kib": 8 * _GIB_KIB,
+        "mem_available_kib": 4 * _GIB_KIB,
+        "swap_used_kib": 0,
+    }
+    block.update(extra)
+    return block
+
+
+def test_heartbeat_memory_block_is_surfaced_with_ok_pressure(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(hermes_home, _armed_heartbeat(30.0, mem=_mem()))
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.memory_rss_kib == 512 * 1024
+    assert gateway.memory_total_kib == 8 * _GIB_KIB
+    assert gateway.memory_available_kib == 4 * _GIB_KIB
+    assert gateway.memory_swap_used_kib == 0
+    assert gateway.memory_pressure == "ok"
+
+
+@pytest.mark.parametrize(
+    ("available", "total", "expected"),
+    [
+        (60 * 1024, 0, "critical"),  # < 64 MiB, no total to take a fraction of
+        (int(0.04 * 8 * _GIB_KIB), 8 * _GIB_KIB, "critical"),  # < 5 %
+        (100 * 1024, 0, "elevated"),  # < 128 MiB
+        (int(0.10 * 8 * _GIB_KIB), 8 * _GIB_KIB, "elevated"),  # < 15 %
+        (int(0.20 * 8 * _GIB_KIB), 8 * _GIB_KIB, "ok"),
+        (int(0.20 * 8 * _GIB_KIB), 0, "ok"),  # no total: absolute floors only
+    ],
+)
+def test_memory_pressure_uses_upstream_tiers(
+    hermes_home: Path, available: int, total: int, expected: str
+):
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(
+        hermes_home,
+        _armed_heartbeat(30.0, mem=_mem(mem_available_kib=available, mem_total_kib=total)),
+    )
+
+    assert _collect(hermes_home).gateway.memory_pressure == expected
+
+
+def test_stale_memory_sample_keeps_numbers_but_not_pressure(hermes_home: Path):
+    """memory_status.py:98-104: a dead gateway's last sample must not pose as current."""
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(hermes_home, _armed_heartbeat(200.0, mem=_mem(mem_available_kib=1)))
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.memory_available_kib == 1
+    assert gateway.memory_pressure == "unknown"
+
+
+def test_absent_memory_block_reports_nothing(hermes_home: Path):
+    """sample_memory() is Linux-only and returns {} elsewhere."""
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(hermes_home, _armed_heartbeat(30.0))
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.memory_rss_kib is None
+    assert gateway.memory_available_kib is None
+    assert gateway.memory_pressure == ""
+
+
+def test_memory_block_rejects_non_integer_values(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_heartbeat_v2(
+        hermes_home,
+        _armed_heartbeat(
+            30.0,
+            mem={
+                "rss_kib": True,
+                "mem_total_kib": "8",
+                "mem_available_kib": -5,
+                "swap_used_kib": 1.5,
+            },
+        ),
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.memory_rss_kib is None
+    assert gateway.memory_total_kib is None
+    assert gateway.memory_available_kib is None
+    assert gateway.memory_swap_used_kib is None
+    assert gateway.memory_pressure == "unknown"
+
+
+def test_memory_block_keeps_last_good_when_the_heartbeat_turns_corrupt(hermes_home: Path):
+    from hermesd.collector import Collector
+    from tests.test_collector_gateway import _clock
+
+    _write_gateway_state(hermes_home)
+    path = _write_heartbeat_v2(hermes_home, _armed_heartbeat(30.0, mem=_mem()))
+    collector = Collector(hermes_home, pid_exists=lambda pid: pid == 4242, clock=_clock)
+    try:
+        first = collector.collect()
+        path.write_text("{broken")
+        second = collector.collect()
+    finally:
+        collector.close()
+
+    assert first.gateway.memory_rss_kib == 512 * 1024
+    assert second.gateway.memory_rss_kib == 512 * 1024
+    assert second.gateway.memory_pressure == "ok"
+    assert "gateway_heartbeat" in second.health.failed_sources

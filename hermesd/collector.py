@@ -110,6 +110,7 @@ from hermesd.collect.gateway import (
     _gateway_start_epoch,
     _GatewayLedgerRows,
     _heartbeat_liveness,
+    _heartbeat_memory,
     _lifecycle_status,
     _loop_tick_probe_plan,
     _loop_tick_verdict,
@@ -373,7 +374,15 @@ def _state_db_readout(conn: sqlite3.Connection) -> _StateDbReadout:
 
 # Fields each gateway sub-source owns, used to restore just that source's
 # values from the last good state when it fails.
-_HEARTBEAT_FIELDS = ("heartbeat_age_seconds", "loop_health")
+_HEARTBEAT_FIELDS = (
+    "heartbeat_age_seconds",
+    "loop_health",
+    "memory_rss_kib",
+    "memory_total_kib",
+    "memory_available_kib",
+    "memory_swap_used_kib",
+    "memory_pressure",
+)
 # The probe refines the same verdict the heartbeat ages into, plus the armed stamp.
 _LOOP_TICK_FIELDS = ("loop_health", "loop_tick_armed")
 # Upper bound on runtime/active_sessions.json entries turned into surfaces. Each
@@ -1705,7 +1714,13 @@ class Collector:
             self._clock(),
             running=_claims_serving(gateway.state),
         )
-        return gateway.model_copy(update={"heartbeat_age_seconds": age, "loop_health": health})
+        return gateway.model_copy(
+            update={
+                "heartbeat_age_seconds": age,
+                "loop_health": health,
+                **_heartbeat_memory(data, age).as_update(),
+            }
+        )
 
     def _probed_loop_tick(self, pid: int, tcp_port: int | None) -> bool | None:
         return _default_loop_tick_probe(pid, tcp_port, self._paths.root_home)

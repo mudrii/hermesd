@@ -400,6 +400,32 @@ def _witness_label(gw: GatewayState, theme: Theme) -> Text:
     return label
 
 
+# Pressure tiers upstream warns about (gateway/memory_status.py:16-26).
+_HIGH_MEMORY_PRESSURE = frozenset({"elevated", "critical"})
+
+
+def _kib_label(kib: int | None) -> str:
+    return "—" if kib is None else fmt_bytes(kib * 1024)
+
+
+def _memory_text(gw: GatewayState, theme: Theme) -> Text:
+    """The heartbeat's memory sample; absent (non-Linux gateway) renders nothing."""
+    if not gw.memory_pressure:
+        return Text()
+    text = Text("\n  Memory: ", style=theme.ui_label)
+    text.append(
+        f"gateway RSS {_kib_label(gw.memory_rss_kib)}"
+        f"  available {_kib_label(gw.memory_available_kib)} of {_kib_label(gw.memory_total_kib)}"
+        f"  swap {_kib_label(gw.memory_swap_used_kib)}  ",
+        style=theme.banner_dim,
+    )
+    style = {"critical": theme.ui_error, "elevated": theme.ui_warn, "ok": theme.ui_ok}.get(
+        gw.memory_pressure, theme.banner_dim
+    )
+    text.append(f"pressure {sanitize_terminal_text(gw.memory_pressure)}", style=style)
+    return text
+
+
 def _restart_storm_text(gw: GatewayState, theme: Theme) -> Text:
     """Start-ledger facts; an absent ledger is never rendered as zero restarts.
 
@@ -479,6 +505,8 @@ def _append_compact_warnings(lines: Text, state: DashboardState, theme: Theme) -
         warnings.append("⚠ suspected OOM")
     if gw.in_respawn_backoff:
         warnings.append("⚠ respawn backoff")
+    if gw.memory_pressure in _HIGH_MEMORY_PRESSURE:
+        warnings.append(f"⚠ memory pressure {gw.memory_pressure}")
     if gw.update_pending_manual_serve_count:
         warnings.append(f"⚠ {gw.update_pending_manual_serve_count} manual serve restart(s) owed")
     if warnings:
@@ -502,6 +530,7 @@ def _liveness_text(gw: GatewayState, theme: Theme) -> Text:
         style=theme.banner_dim,
     )
     text.append_text(_witness_label(gw, theme))
+    text.append_text(_memory_text(gw, theme))
     if gw.gateway_starts_recorded:
         text.append_text(_restart_storm_text(gw, theme))
     text.append_text(_dashboard_client_text(gw, theme))

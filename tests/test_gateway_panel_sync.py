@@ -196,3 +196,40 @@ def test_updates_section_omits_absent_receipt_keys() -> None:
 
     for absent in ("External checkouts", "post-swap", "manual serve", "settled", "Skipped"):
         assert absent not in detail
+
+
+# --------------------------------------------------------------------------
+# heartbeat memory
+# --------------------------------------------------------------------------
+
+
+def _memory(pressure: str) -> GatewayState:
+    return _LIVE.model_copy(
+        update={
+            "memory_rss_kib": 512 * 1024,
+            "memory_total_kib": 8 * 1024 * 1024,
+            "memory_available_kib": 100 * 1024,
+            "memory_swap_used_kib": 2048,
+            "memory_pressure": pressure,
+        }
+    )
+
+
+def test_memory_line_renders_in_detail() -> None:
+    detail = _render(_memory("elevated"), detail=True)
+
+    assert (
+        "Memory: gateway RSS 512.0 MB  available 100.0 MB of 8.0 GB  swap 2.0 MB  "
+        "pressure elevated" in detail
+    )
+
+
+def test_high_memory_pressure_is_a_compact_hint() -> None:
+    assert "⚠ memory pressure critical" in _render(_memory("critical"), detail=False)
+    assert "⚠ memory pressure elevated" in _render(_memory("elevated"), detail=False)
+    for quiet in ("ok", "unknown"):
+        assert "memory" not in _render(_memory(quiet), detail=False)
+
+
+def test_memory_line_is_omitted_without_a_sample() -> None:
+    assert "Memory:" not in _render(_LIVE, detail=True)

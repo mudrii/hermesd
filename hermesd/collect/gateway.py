@@ -60,6 +60,16 @@ from hermesd.models import (
 # nothing witnessed the loop and a long-silent file may just be a stopped gateway.
 _HEARTBEAT_TICKING_SECONDS = 90.0
 _HEARTBEAT_STALE_SECONDS = 300.0
+# Memory pressure tiers on system MemAvailable, worst first, copied from
+# gateway/memory_status.py:16-26 (``critical`` doubles as the lifecycle ledger's
+# OOM-suspicion heuristic). A sample older than the fresh TTL (:28-30) keeps its
+# numbers but classifies as "unknown", so a dead gateway's last gasp never reads
+# as a live critical.
+_MEMORY_PRESSURE_TIERS = (
+    ("critical", 64 * 1024, 0.05),
+    ("elevated", 128 * 1024, 0.15),
+)
+_MEMORY_SAMPLE_FRESH_SECONDS = 150.0
 # Loop-tick witness probe (hermes_cli/gateway.py:363-424): one byte, one second.
 _LOOP_TICK_PROBE_TIMEOUT_SECONDS = 1.0
 # Never escalate on a single silent probe (hermes_cli/gateway.py
@@ -381,6 +391,64 @@ def _heartbeat_liveness(
     # A long-silent heartbeat is only "wedged" while the gateway claims to run;
     # otherwise it is just an old file left by a stopped gateway.
     return age, GatewayLoopHealth.WEDGED if running else GatewayLoopHealth.STALE
+
+
+@dataclass(frozen=True, slots=True)
+class _HeartbeatMemory:
+    """The heartbeat's ``mem`` block (KiB) and its pressure tier.
+
+    ``sample_memory`` (gateway/lifecycle_ledger.py:64-74) is Linux-only and
+    returns ``{}`` elsewhere, and the heartbeat writer embeds it only when
+    non-empty (gateway/shutdown_watchdog.py:208-210): no block means "not
+    sampled" and ``pressure`` stays empty rather than claiming "ok".
+    """
+
+    rss_kib: int | None = None
+    total_kib: int | None = None
+    available_kib: int | None = None
+    swap_used_kib: int | None = None
+    pressure: str = ""
+
+    def as_update(self) -> dict[str, Any]:
+        return {
+            "memory_rss_kib": self.rss_kib,
+            "memory_total_kib": self.total_kib,
+            "memory_available_kib": self.available_kib,
+            "memory_swap_used_kib": self.swap_used_kib,
+            "memory_pressure": self.pressure,
+        }
+
+
+def _nonneg_kib(value: object) -> int | None:
+    """A non-negative ``int`` (bools rejected), as upstream's ``_nonneg_int``."""
+    return value if type(value) is int and value >= 0 else None
+
+
+def _memory_pressure(available: int | None, total: int | None) -> str:
+    """``classify_pressure`` (gateway/memory_status.py:50-60)."""
+    if available is None:
+        return "unknown"
+    fraction = available / total if total else None
+    for level, kib_floor, fraction_floor in _MEMORY_PRESSURE_TIERS:
+        if available < kib_floor or (fraction is not None and fraction < fraction_floor):
+            return level
+    return "ok"
+
+
+def _heartbeat_memory(data: JsonMapping, age_seconds: float | None) -> _HeartbeatMemory:
+    mem = data.get("mem") if data else None
+    if not isinstance(mem, dict):
+        return _HeartbeatMemory()
+    available = _nonneg_kib(mem.get("mem_available_kib"))
+    total = _nonneg_kib(mem.get("mem_total_kib"))
+    fresh = age_seconds is not None and age_seconds <= _MEMORY_SAMPLE_FRESH_SECONDS
+    return _HeartbeatMemory(
+        rss_kib=_nonneg_kib(mem.get("rss_kib")),
+        total_kib=total,
+        available_kib=available,
+        swap_used_kib=_nonneg_kib(mem.get("swap_used_kib")),
+        pressure=_memory_pressure(available, total) if fresh else "unknown",
+    )
 
 
 # ---------------------------------------------------------------------------

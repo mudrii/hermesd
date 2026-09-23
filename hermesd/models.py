@@ -226,6 +226,15 @@ class GatewayState(BaseModel):
     # Event-loop liveness (state/gateway.heartbeat)
     heartbeat_age_seconds: float | None = None
     loop_health: GatewayLoopHealth = GatewayLoopHealth.UNKNOWN
+    # The heartbeat's ``mem`` block in KiB (Linux-only upstream, absent elsewhere):
+    # gateway RSS, system MemTotal/MemAvailable and swap in use. ``memory_pressure``
+    # is upstream's tier (ok/elevated/critical) for a fresh sample, "unknown" for a
+    # stale or malformed one, and empty when no block was written.
+    memory_rss_kib: int | None = None
+    memory_total_kib: int | None = None
+    memory_available_kib: int | None = None
+    memory_swap_used_kib: int | None = None
+    memory_pressure: str = ""
     # Witness armed on the heartbeat that produced loop_health: True when the
     # payload advertised ``loop_tick_socket`` truthy, False when it wrote the key
     # with any other value (the witness could not be armed), and None when the
