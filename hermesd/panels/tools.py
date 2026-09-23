@@ -8,7 +8,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from hermesd.models import DashboardState, ToolStats
+from hermesd.models import BackgroundProcessInfo, DashboardState, ToolStats, WorkerIdentity
 from hermesd.panels.formatting import IdentityMemo, sanitize_terminal_text, section_heading
 from hermesd.panels.formatting import escape_terminal_text as escape
 from hermesd.theme import Theme
@@ -25,7 +25,11 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append(f"  {state.available_tools} available", style=theme.banner_text)
     lines.append(f"  {state.total_tool_calls} calls\n", style=theme.ui_accent)
     lines.append("  Background: ", style=theme.ui_label)
-    lines.append(f"{len(state.background_processes)} proc\n", style=theme.banner_text)
+    lines.append(f"{len(state.background_processes)} proc", style=theme.banner_text)
+    orphaned = sum(1 for process in state.background_processes if process.orphaned)
+    if orphaned:
+        lines.append(f"  ⚠ {orphaned} orphaned", style=theme.ui_warn)
+    lines.append("\n")
     lines.append("  Checkpoints: ", style=theme.ui_label)
     lines.append(f"{len(state.checkpoints)} repo\n", style=theme.banner_text)
     unavailable = len(state.toolset_availability.unavailable_toolsets)
@@ -156,8 +160,8 @@ def _background_processes_section(state: DashboardState, theme: Theme) -> list[R
     for process in state.background_processes:
         process_table.add_row(
             escape(process.session_id),
-            _pid_label(process.pid, process.alive),
-            escape(process.purpose) or "—",
+            _pid_label(process.pid, process.alive, process.identity),
+            _purpose_label(process),
             str(process.port) if process.port else "—",
             escape(process.profile) or "—",
             "Yes" if process.notify_on_complete else "No",
@@ -187,11 +191,24 @@ def _checkpoints_section(state: DashboardState, theme: Theme) -> list[Renderable
     return [header, checkpoint_table]
 
 
-def _pid_label(pid: int, alive: bool) -> str:
-    """PID cell, marked with ✗ when the recorded pid is gone."""
+def _pid_label(pid: int, alive: bool, identity: WorkerIdentity = WorkerIdentity.NONE) -> str:
+    """PID cell, marked with ✗ when the recorded pid is gone.
+
+    A live pid whose start time no longer matches the recorded ``create_time``
+    belongs to another process, so it is marked as reused rather than alive.
+    """
     if not pid:
         return "—"
+    if identity is WorkerIdentity.REUSED:
+        return f"{pid} ✗ pid reused"
     return str(pid) if alive else f"{pid} ✗"
+
+
+def _purpose_label(process: BackgroundProcessInfo) -> str:
+    purpose = escape(process.purpose) or "—"
+    if process.orphaned:
+        return f"{purpose} ⚠ orphaned (spawner {process.spawner_pid} gone)"
+    return purpose
 
 
 def _watch_summary(patterns: list[str], watcher_interval: int) -> str:

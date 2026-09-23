@@ -245,12 +245,14 @@ from hermesd.collect.system import (
     _RECENT_ACTIVITY_WINDOW_SECONDS,
     _git_checkpoint_summary,
     _git_ref_signature,
+    _kanban_worker_identity,
     _latest_runtime_activity_age,
     _lease_age_seconds,
     _observed_process_start_times,
     _pid_exists,
     _read_estop,
     _surface_liveness,
+    _worker_identity,
 )
 from hermesd.db import HermesDB
 from hermesd.defaults import DEFAULT_LOG_TAIL_BYTES
@@ -277,6 +279,7 @@ from hermesd.models import (
     HookInfo,
     KanbanBoardSummary,
     KanbanState,
+    KanbanTaskSummary,
     LogLine,
     LogState,
     LogStream,
@@ -307,6 +310,7 @@ from hermesd.models import (
     ToolGatewayRoute,
     ToolsetAvailability,
     ToolStats,
+    WorkerIdentity,
 )
 from hermesd.paths import HermesPaths
 from hermesd.theme import normalize_skin_name
@@ -1094,6 +1098,15 @@ class Collector:
                 self._collect_background_processes,
                 list,
             ),
+            # Second writer of `background_processes`: ledger identity (pid vs
+            # create_time) and orphaned helpers whose spawner is gone.
+            _SourceSpec(
+                "background_processes",
+                "process_identity",
+                lambda: self._with_process_identity(results["background_processes"]),
+                lambda: results["background_processes"],
+                fallback=lambda: self._last_process_identity(results["background_processes"]),
+            ),
             _SourceSpec("checkpoints", "checkpoints", self._collect_checkpoints, list),
             _SourceSpec("config", "config", self._collect_config, ConfigSummary),
             # Second writer of the `config` field: backups/config/ is scanned and
@@ -1134,6 +1147,15 @@ class Collector:
                 fallback=lambda: self._last_source_fields(
                     "kanban_notify", results["kanban"], _KANBAN_NOTIFY_FIELDS
                 ),
+            ),
+            # Worker identity verdicts need a live process probe on every pass;
+            # a failed probe keeps the last verdicts on the fresh board rows.
+            _SourceSpec(
+                "kanban",
+                "kanban_worker_identity",
+                lambda: self._with_kanban_worker_identity(results["kanban"]),
+                lambda: results["kanban"],
+                fallback=lambda: self._last_kanban_worker_identity(results["kanban"]),
             ),
             _SourceSpec(
                 "operations",
@@ -2399,6 +2421,83 @@ class Collector:
             if str(entry.get("session_id") or "")
         ]
 
+    def _with_process_identity(
+        self, processes: list[BackgroundProcessInfo]
+    ) -> list[BackgroundProcessInfo]:
+        """Check each ROOT ``spawn-ledger.json`` entry against its recorded identity.
+
+        Upstream keys every entry by ``(pid, create_time)`` and records the
+        spawner's ``(spawner_pid, spawner_create)`` (``hermes_cli/
+        process_identity.py:174-191,280-302``). A helper is orphaned when it is
+        still the recorded process but its spawner is provably gone — dead, or a
+        live pid with another start time — which is exactly when upstream's
+        startup sweep reaps it (``:325-360``). A spawner without a recorded
+        ``spawner_create`` is judged by pid existence alone, as upstream's
+        ``_same_incarnation`` treats ``None``. ``processes.json`` entries carry
+        no identity and get no verdict. The ledger read is the cached one the
+        ``background_processes`` source already made.
+        """
+        ledger_path = self._paths.shared_path("spawn-ledger.json")
+        by_pid = {
+            _coerce_int(entry.get("pid")): entry
+            for entry in self._read_json_list_cached(ledger_path)
+            if _coerce_int(entry.get("pid")) > 0
+        }
+        if not by_pid:
+            return processes
+        spawners = {_coerce_int(entry.get("spawner_pid")) for entry in by_pid.values()}
+        observed = self._process_start_times(sorted((set(by_pid) | spawners) - {0}))
+        enriched: list[BackgroundProcessInfo] = []
+        for process in processes:
+            entry = by_pid.get(process.pid)
+            if entry is None:
+                enriched.append(process)
+                continue
+            identity = _worker_identity(
+                process.pid, _optional_epoch(entry.get("create_time")), observed, self._pid_exists
+            )
+            spawner_pid = _coerce_int(entry.get("spawner_pid"))
+            spawner_create = _optional_epoch(entry.get("spawner_create"))
+            spawner = _worker_identity(
+                spawner_pid,
+                spawner_create,
+                observed,
+                self._pid_exists,
+                legacy=spawner_create is None,
+            )
+            enriched.append(
+                process.model_copy(
+                    update={
+                        "identity": identity,
+                        "spawner_pid": spawner_pid,
+                        "orphaned": identity is WorkerIdentity.LIVE
+                        and spawner in (WorkerIdentity.DEAD, WorkerIdentity.REUSED),
+                    }
+                )
+            )
+        return enriched
+
+    def _last_process_identity(
+        self, processes: list[BackgroundProcessInfo]
+    ) -> list[BackgroundProcessInfo]:
+        """Re-apply the last verdicts by pid onto the freshly read process list."""
+        last = {
+            process.pid: process
+            for process in self._last_good_by_source.get("process_identity", [])
+        }
+        return [
+            process.model_copy(
+                update={
+                    "identity": last[process.pid].identity,
+                    "spawner_pid": last[process.pid].spawner_pid,
+                    "orphaned": last[process.pid].orphaned,
+                }
+            )
+            if process.pid in last
+            else process
+            for process in processes
+        ]
+
     def _process_alive(self, pid: int) -> bool:
         return bool(pid) and self._pid_exists(pid)
 
@@ -3026,6 +3125,89 @@ class Collector:
                 known_profiles=self._kanban_notifier_profile_names(),
                 resolved=snapshotted,
             )
+        )
+
+    def _with_kanban_worker_identity(self, state: KanbanState) -> KanbanState:
+        """Verify each listed worker pid against its ``worker_started_at``.
+
+        Upstream refuses to trust bare pid existence: ``_worker_alive`` requires
+        the pid AND its spawn fingerprint to agree (``hermes_cli/
+        kanban_db_dispatch.py:381-413``, columns ``hermes_cli/kanban_db.py:
+        897-904,1011-1015``). The pids come from the rows the ``kanban`` source
+        already read; only one batched start-time probe runs per pass.
+        """
+        task_lists = (state.active_tasks, state.problem_tasks, state.recent_tasks)
+        pairs = {
+            (task.worker_pid, task.worker_started_at) for tasks in task_lists for task in tasks
+        } | {(run.worker_pid, run.worker_started_at) for run in state.recent_runs}
+        pids = sorted({pid for pid, _ in pairs if pid > 0})
+        observed = self._process_start_times(pids) if pids else {}
+        verdicts = {
+            pair: _kanban_worker_identity(pair[0], pair[1], observed, self._pid_exists)
+            for pair in pairs
+        }
+        return self._kanban_with_verdicts(
+            state,
+            verdicts,
+            reused_count=sum(
+                1 for verdict in verdicts.values() if verdict is WorkerIdentity.REUSED
+            ),
+        )
+
+    def _last_kanban_worker_identity(self, state: KanbanState) -> KanbanState:
+        """Re-apply the last verdicts onto the fresh rows, keyed by pid and fingerprint."""
+        last: KanbanState | None = self._last_good_by_source.get("kanban_worker_identity")
+        if last is None:
+            return state
+        verdicts = {
+            (task.worker_pid, task.worker_started_at): task.worker_identity
+            for tasks in (last.active_tasks, last.problem_tasks, last.recent_tasks)
+            for task in tasks
+        } | {
+            (run.worker_pid, run.worker_started_at): run.worker_identity for run in last.recent_runs
+        }
+        return self._kanban_with_verdicts(
+            state, verdicts, reused_count=last.worker_pid_reused_count
+        )
+
+    @staticmethod
+    def _kanban_with_verdicts(
+        state: KanbanState,
+        verdicts: Mapping[tuple[int, str], WorkerIdentity],
+        *,
+        reused_count: int,
+    ) -> KanbanState:
+        def tasks(entries: list[KanbanTaskSummary]) -> list[KanbanTaskSummary]:
+            return [
+                task.model_copy(
+                    update={
+                        "worker_identity": verdicts.get(
+                            (task.worker_pid, task.worker_started_at), WorkerIdentity.NONE
+                        )
+                    }
+                )
+                for task in entries
+            ]
+
+        runs = [
+            run.model_copy(
+                update={
+                    "worker_identity": verdicts.get(
+                        (run.worker_pid, run.worker_started_at), WorkerIdentity.NONE
+                    )
+                }
+            )
+            for run in state.recent_runs
+        ]
+        return state.model_copy(
+            update={
+                "active_tasks": tasks(state.active_tasks),
+                "problem_tasks": tasks(state.problem_tasks),
+                "recent_tasks": tasks(state.recent_tasks),
+                "recent_runs": runs,
+                # Distinct (pid, fingerprint) pairs: a task and its run share one.
+                "worker_pid_reused_count": reused_count,
+            }
         )
 
     def _kanban_notifier_profile_names(self) -> frozenset[str] | None:

@@ -879,6 +879,27 @@ class ToolStats(BaseModel):
     call_count: int = 0
 
 
+class WorkerIdentity(StrEnum):
+    """Whether a recorded pid is still the process that was recorded.
+
+    Upstream records a start-time fingerprint beside the pid (kanban
+    ``worker_started_at``, ``hermes_cli/kanban_db_dispatch.py:361-413``; the
+    spawn ledger's ``create_time``, ``hermes_cli/process_identity.py:174-191``)
+    because pids are reused. A live pid whose observed start time disagrees is
+    ``REUSED`` — a stranger holds the number and the recorded process is gone.
+    """
+
+    # No pid recorded (or not a ledger entry): nothing to verify.
+    NONE = ""
+    LIVE = "live"
+    DEAD = "dead"
+    REUSED = "reused"
+    # Recorded as "unverified" upstream, unparseable, or unobservable here.
+    UNVERIFIED = "unverified"
+    # A pre-fingerprint row: only pid existence can be checked.
+    LEGACY = "legacy"
+
+
 class BackgroundProcessInfo(BaseModel):
     session_id: str
     command: str = ""
@@ -904,6 +925,14 @@ class BackgroundProcessInfo(BaseModel):
     # True when the recorded pid is still live (checked via the injected
     # pid_exists); False marks a stale ledger/registry entry.
     alive: bool = False
+    # Written by the ``process_identity`` source for spawn-ledger entries: the
+    # pid checked against its recorded ``create_time``, and the recorded
+    # spawner. ``orphaned`` is a live helper whose spawner is provably gone —
+    # the case upstream's startup sweep reaps
+    # (``hermes_cli/process_identity.py:325-360``).
+    identity: WorkerIdentity = WorkerIdentity.NONE
+    spawner_pid: int = 0
+    orphaned: bool = False
 
 
 class CheckpointInfo(BaseModel):
@@ -1778,6 +1807,11 @@ class KanbanTaskSummary(BaseModel):
     # configured kanban.failure_limit at collect time.
     breaker_limit: int = 0
     breaker_tripped: bool = False
+    # Spawn-time fingerprint of worker_pid as stored ("<epoch>|<start>", a
+    # legacy integer, "unverified", or "" for NULL), and the verdict the
+    # ``kanban_worker_identity`` source derives from it.
+    worker_started_at: str = ""
+    worker_identity: WorkerIdentity = WorkerIdentity.NONE
 
 
 class KanbanRunSummary(BaseModel):
@@ -1787,6 +1821,8 @@ class KanbanRunSummary(BaseModel):
     status: str = ""
     outcome: str = ""
     worker_pid: int = 0
+    worker_started_at: str = ""
+    worker_identity: WorkerIdentity = WorkerIdentity.NONE
     started_at: int = 0
     ended_at: int = 0
     error: str = ""
@@ -1843,6 +1879,9 @@ class KanbanState(BaseModel):
     board_count: int = 0
     current_board: str = ""
     stale_claim_count: int = 0
+    # Listed tasks and runs whose live worker pid now belongs to another
+    # process (``kanban_worker_identity`` source).
+    worker_pid_reused_count: int = 0
     boards: list[KanbanBoardSummary] = Field(default_factory=list)
     status_counts: dict[str, int] = Field(default_factory=dict)
     assignee_counts: dict[str, int] = Field(default_factory=dict)
