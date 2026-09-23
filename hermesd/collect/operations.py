@@ -1,4 +1,5 @@
-"""Verification evidence, goals, projects, MoA and curator readers."""
+"""Verification evidence, goals, delegations, process receipts, state snapshots,
+projects and MoA readers."""
 
 from __future__ import annotations
 
@@ -23,8 +24,10 @@ from hermesd.collect.common import (
     _coerce_int,
     _excerpt,
     _exists_strict,
+    _file_size,
     _iso_to_epoch,
     _json_object_capped,
+    _mtime,
     _path_resolves_under,
     _read_tail_text,
     _read_text_capped,
@@ -141,7 +144,8 @@ def _goal_state_update(conn: sqlite3.Connection) -> dict[str, Any]:
 
 _DELEGATION_TERMINAL_STATES = ("completed", "error", "failed", "cancelled")
 _DELEGATION_FAILED_STATES = ("error", "failed")
-# Cap on any JSON object column decoded whole (delegation task/result payloads
+# Width of a delegation goal / error excerpt; the JSON payloads themselves are
+# bounded by ``_json_object_capped``.
 _DELEGATION_TEXT_MAX_CHARS = 80
 _BOUNDED_SCAN_LIMIT = 200
 _STATE_META_MAINTENANCE_KEYS = (
@@ -744,17 +748,18 @@ def _read_state_snapshots(root: Path, home: Path, *, now: float) -> dict[str, An
             if entry.is_dir():
                 total_bytes += _immediate_file_bytes(entry)
             elif entry.is_file():
-                total_bytes += entry.stat().st_size
+                total_bytes += _file_size(entry)
             else:
                 continue
             count += 1
-            mtime = entry.stat().st_mtime
-            if newest is None or mtime > newest:
+            # An entry deleted since the type check has no mtime to offer.
+            mtime = _mtime(entry)
+            if mtime is not None and (newest is None or mtime > newest):
                 newest = mtime
     return {
         "snapshot_count": count,
         "snapshot_total_bytes": total_bytes,
-        "newest_snapshot_age_seconds": max(0.0, now - newest) if newest is not None else None,
+        "newest_snapshot_age_seconds": _age_seconds(newest, now),
     }
 
 
@@ -762,7 +767,7 @@ def _immediate_file_bytes(directory: Path) -> int:
     total = 0
     for child in islice(directory.iterdir(), _BOUNDED_SCAN_LIMIT):
         if child.is_file() and not child.is_symlink():
-            total += child.stat().st_size
+            total += _file_size(child)
     return total
 
 

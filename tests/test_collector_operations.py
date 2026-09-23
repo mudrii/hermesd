@@ -1798,6 +1798,34 @@ def test_state_snapshot_failure_preserves_latest_count_and_fresh_operations(
         c.close()
 
 
+def test_state_snapshot_entry_vanishing_mid_scan_is_not_an_error(
+    hermes_home: Path, sample_db: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = hermes_home / "state-snapshots"
+    nested = root / "snap-dir"
+    nested.mkdir(parents=True)
+    (nested / "kept.db").write_bytes(b"k" * 100)
+    racing_child = nested / "gone.db"
+    racing_child.write_bytes(b"g" * 10)
+    racing_entry = root / "gone-file.db"
+    racing_entry.write_bytes(b"x" * 10)
+    original_is_file = Path.is_file
+
+    def racing_is_file(path: Path) -> bool:
+        result = original_is_file(path)
+        if path in (racing_child, racing_entry):
+            path.unlink()  # deleted between the type check and the stat
+        return result
+
+    monkeypatch.setattr(Path, "is_file", racing_is_file)
+
+    snapshots = operations_module._read_state_snapshots(root, hermes_home, now=time.time())
+
+    assert snapshots["snapshot_count"] == 2
+    assert snapshots["snapshot_total_bytes"] == 100
+    assert snapshots["newest_snapshot_age_seconds"] is not None
+
+
 def test_state_snapshots_directory_absent(hermes_home: Path, sample_db: Path):
     ops = _collect_ops(hermes_home).operations
     assert ops.snapshot_count == 0
