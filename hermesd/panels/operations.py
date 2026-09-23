@@ -25,6 +25,7 @@ from hermesd.models import (
     HostedRoomSummary,
     OperationsState,
     ProcessReceiptsState,
+    StateSnapshotSummary,
     checkpoint_prune_overdue_after,
 )
 from hermesd.panels.formatting import escape_terminal_text as escape
@@ -157,6 +158,9 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     if ops.blocked_script_count:
         lines.append("  Blocked scripts: ", style=theme.ui_label)
         lines.append(f"{ops.blocked_script_count}\n", style=theme.ui_warn)
+    if ops.snapshot_failed_count:
+        lines.append("  ⚠ Snapshots: ", style=theme.ui_warn)
+        lines.append(f"{ops.snapshot_failed_count} with failed DBs\n", style=theme.ui_warn)
     if ops.checkpoint_prune_overdue:
         age = ops.checkpoint_prune_marker_age_seconds
         lines.append("  ⚠ Checkpoint prune overdue ", style=theme.ui_warn)
@@ -231,6 +235,17 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     # "No operations artifacts found" line below instead of saying both.
     if not no_artifacts:
         sections.extend(_receipt_sections(ops.process_receipts, theme))
+
+    if ops.snapshots:
+        sections.append(_heading("State Snapshots", theme))
+        sections.append(_snapshots_table(ops, theme))
+        if ops.snapshot_count > len(ops.snapshots):
+            sections.append(
+                Text(
+                    f"  {_truncation_label(len(ops.snapshots), ops.snapshot_count)}",
+                    style=theme.banner_dim,
+                )
+            )
 
     if ops.state_db_size_bytes or ops.state_db_schema_version:
         sections.append(_heading("State DB", theme))
@@ -558,7 +573,12 @@ def _summary_table(ops: OperationsState, theme: Theme) -> Table:
         summary.add_row(
             "Snapshots",
             f"{ops.snapshot_count} · {_size_label(ops.snapshot_total_bytes)} · "
-            f"newest {fmt_age_seconds(ops.newest_snapshot_age_seconds)} ago",
+            f"newest {fmt_age_seconds(ops.newest_snapshot_age_seconds)} ago"
+            + (
+                f" · ⚠ {ops.snapshot_failed_count} with failed DBs"
+                if ops.snapshot_failed_count
+                else ""
+            ),
         )
     if ops.blocked_script_count:
         summary.add_row("Blocked scripts", _blocked_scripts_label(ops))
@@ -855,6 +875,43 @@ def _delegation_procs_label(delegation: DelegationInfo) -> str:
     if delegation.unread_completion_count:
         parts.append(f"{delegation.unread_completion_count} unread")
     return " · ".join(parts) if parts else "—"
+
+
+def _snapshots_table(ops: OperationsState, theme: Theme) -> Table:
+    """Newest snapshots with the manifest's verdict; names and labels escaped."""
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("Snapshot", style=theme.ui_accent)
+    table.add_column("Kind", style=theme.banner_dim)
+    table.add_column("Size", justify="right", style=theme.banner_text)
+    table.add_column("Age", justify="right", style=theme.banner_dim)
+    table.add_column("Label", style=theme.banner_text)
+    table.add_column("Manifest", style=theme.banner_text)
+    for snap in ops.snapshots:
+        size = _size_label(snap.size_bytes) + ("+" if snap.size_truncated else "")
+        table.add_row(
+            escape(snap.name),
+            snap.kind,
+            size,
+            fmt_age_seconds(snap.age_seconds),
+            escape(snap.label) or "—",
+            _snapshot_manifest_label(snap, theme),
+        )
+    return table
+
+
+def _snapshot_manifest_label(snap: StateSnapshotSummary, theme: Theme) -> str:
+    if snap.kind == "file":
+        return "loose db (no manifest)"
+    if not snap.manifest_present:
+        return f"[{theme.banner_dim}]no manifest[/]"
+    parts = [f"{snap.file_count} files"]
+    if snap.failed_dbs:
+        names = ", ".join(escape(name) for name in snap.failed_dbs)
+        parts.append(f"[{theme.ui_warn}]⚠ failed DBs: {names}[/]")
+    if snap.oversized_skipped:
+        names = ", ".join(escape(name) for name in snap.oversized_skipped)
+        parts.append(f"[{theme.ui_warn}]oversized skipped: {names}[/]")
+    return " · ".join(parts)
 
 
 def _state_db_table(ops: OperationsState, theme: Theme) -> Table:

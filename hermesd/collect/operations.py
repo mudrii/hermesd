@@ -57,6 +57,7 @@ from hermesd.models import (
     ProcessReceipt,
     ProcessReceiptsState,
     ProjectSummary,
+    StateSnapshotSummary,
     VerificationEventSummary,
     VerificationRootSummary,
 )
@@ -744,39 +745,172 @@ def _read_corrupt_ledger_marker(path: Path, home: Path, *, now: float) -> dict[s
     return update
 
 
-def _read_state_snapshots(root: Path, home: Path, *, now: float) -> dict[str, Any]:
-    """Stat state-snapshots/ one level deep, capped at 200 entries."""
-    count = 0
-    total_bytes = 0
-    newest: float | None = None
+# Entries a single bounded tree walk visits before it reports a lower bound.
+_TREE_WALK_MAX_ENTRIES = 5000
+# A cached tree size is trusted for this long even when the top directory's
+# signature is unchanged, because a nested write does not touch the top mtime.
+_TREE_SIZE_CACHE_TTL_SECONDS = 600.0
+# SQLite sidecars grouped with their database when parked loose.
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+_MAX_SNAPSHOT_ROWS = 8
+_SNAPSHOT_MANIFEST_MAX_BYTES = 64 * 1024
+_SNAPSHOT_LIST_MAX_ITEMS = 8
+_SNAPSHOT_TEXT_MAX_CHARS = 80
+
+# (top-dir signature, computed-at, bytes, truncated) per walked directory.
+TreeSizeCache = dict[str, tuple[tuple[int, int], float, int, bool]]
+
+
+def _bounded_tree_bytes(directory: Path, max_entries: int | None = None) -> tuple[int, bool]:
+    """Total regular-file bytes under ``directory``, never following symlinks.
+
+    Visits at most ``max_entries`` entries (default ``_TREE_WALK_MAX_ENTRIES``)
+    and returns ``(bytes, truncated)``; a truncated total is a lower bound. An
+    entry that vanishes mid-walk contributes nothing, and an unreadable
+    subdirectory is skipped rather than failing the whole walk.
+    """
+    limit = _TREE_WALK_MAX_ENTRIES if max_entries is None else max_entries
+    total = 0
+    visited = 0
+    stack = [directory]
+    while stack:
+        current = stack.pop()
+        try:
+            children = list(islice(current.iterdir(), limit - visited + 1))
+        except OSError:
+            continue
+        for child in children:
+            if visited >= limit:
+                return total, True
+            visited += 1
+            if child.is_symlink():
+                continue
+            if child.is_dir():
+                stack.append(child)
+            elif child.is_file():
+                total += _file_size(child)
+    return total, False
+
+
+def _cached_tree_bytes(
+    directory: Path, *, now: float, cache: TreeSizeCache | None
+) -> tuple[int, bool]:
+    """``_bounded_tree_bytes`` memoized on the directory's (mtime_ns, inode)
+    for at most ``_TREE_SIZE_CACHE_TTL_SECONDS``."""
+    if cache is None:
+        return _bounded_tree_bytes(directory)
+    try:
+        stat = directory.stat()
+    except OSError:
+        return 0, False
+    signature = (stat.st_mtime_ns, stat.st_ino)
+    key = str(directory)
+    cached = cache.get(key)
+    if (
+        cached is not None
+        and cached[0] == signature
+        and 0 <= now - cached[1] < _TREE_SIZE_CACHE_TTL_SECONDS
+    ):
+        return cached[2], cached[3]
+    size, truncated = _bounded_tree_bytes(directory)
+    cache[key] = (signature, now, size, truncated)
+    return size, truncated
+
+
+def _snapshot_group_name(name: str) -> str:
+    for suffix in _SQLITE_SIDECAR_SUFFIXES:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _snapshot_text_list(value: object) -> list[str]:
+    return [
+        _excerpt(item, _SNAPSHOT_TEXT_MAX_CHARS)
+        for item in _as_list(value)[:_SNAPSHOT_LIST_MAX_ITEMS]
+        if isinstance(item, str) and item
+    ]
+
+
+def _snapshot_manifest_update(snapshot: Path, home: Path) -> dict[str, Any]:
+    """Fields from one quick snapshot's ``manifest.json``; {} when absent or torn.
+
+    Upstream writes it last into the staging dir before the rename
+    (``hermes_cli/backup.py:1271-1276``). ``files`` is never read: the counts
+    are enough, and the list names every copied file.
+    """
+    data = _json_object_capped(
+        _read_text_capped(snapshot / "manifest.json", home),
+        max_bytes=_SNAPSHOT_MANIFEST_MAX_BYTES,
+    )
+    if data is None:
+        return {}
+    return {
+        "manifest_present": True,
+        "label": _excerpt(data.get("label") or "", _SNAPSHOT_TEXT_MAX_CHARS),
+        "file_count": _coerce_int(data.get("file_count")),
+        "manifest_total_size": _coerce_int(data.get("total_size")),
+        "failed_dbs": _snapshot_text_list(data.get("failed_dbs")),
+        "oversized_skipped": _snapshot_text_list(data.get("oversized_skipped")),
+    }
+
+
+def _read_state_snapshots(
+    root: Path,
+    home: Path,
+    *,
+    now: float,
+    size_cache: TreeSizeCache | None = None,
+) -> dict[str, Any]:
+    """Snapshots under ROOT ``state-snapshots/``, capped at 200 top entries.
+
+    Directories are upstream quick snapshots, sized by a bounded recursive walk
+    (a snapshot keeps ``cron/executions.db`` in a subdirectory) cached on the
+    directory signature, with their ``manifest.json`` read for label and
+    ``failed_dbs``. Loose files are parked databases, grouped with their SQLite
+    sidecars so ``x.db``/``x.db-wal``/``x.db-shm`` count as one snapshot.
+    """
+    snapshots: list[StateSnapshotSummary] = []
+    loose: dict[str, tuple[int, float | None]] = {}
     if _safe_child_path(root, home) and root.is_dir():
         for entry in islice(root.iterdir(), _BOUNDED_SCAN_LIMIT):
             if entry.is_symlink() or not _path_resolves_under(entry, home):
                 continue
             if entry.is_dir():
-                total_bytes += _immediate_file_bytes(entry)
+                size, truncated = _cached_tree_bytes(entry, now=now, cache=size_cache)
+                snapshots.append(
+                    StateSnapshotSummary(
+                        name=entry.name,
+                        kind="dir",
+                        size_bytes=size,
+                        size_truncated=truncated,
+                        age_seconds=_age_seconds(_mtime(entry), now),
+                        **_snapshot_manifest_update(entry, home),
+                    )
+                )
             elif entry.is_file():
-                total_bytes += _file_size(entry)
-            else:
-                continue
-            count += 1
-            # An entry deleted since the type check has no mtime to offer.
-            mtime = _mtime(entry)
-            if mtime is not None and (newest is None or mtime > newest):
-                newest = mtime
+                group = _snapshot_group_name(entry.name)
+                size, newest = loose.get(group, (0, None))
+                # An entry deleted since the type check has no mtime to offer.
+                mtime = _mtime(entry)
+                if mtime is not None and (newest is None or mtime > newest):
+                    newest = mtime
+                loose[group] = (size + _file_size(entry), newest)
+    snapshots.extend(
+        StateSnapshotSummary(
+            name=name, kind="file", size_bytes=size, age_seconds=_age_seconds(mtime, now)
+        )
+        for name, (size, mtime) in loose.items()
+    )
+    snapshots.sort(key=lambda snap: snap.age_seconds if snap.age_seconds is not None else math.inf)
+    ages = [snap.age_seconds for snap in snapshots if snap.age_seconds is not None]
     return {
-        "snapshot_count": count,
-        "snapshot_total_bytes": total_bytes,
-        "newest_snapshot_age_seconds": _age_seconds(newest, now),
+        "snapshot_count": len(snapshots),
+        "snapshot_total_bytes": sum(snap.size_bytes for snap in snapshots),
+        "newest_snapshot_age_seconds": min(ages) if ages else None,
+        "snapshots": snapshots[:_MAX_SNAPSHOT_ROWS],
+        "snapshot_failed_count": sum(1 for snap in snapshots if snap.failed_dbs),
     }
-
-
-def _immediate_file_bytes(directory: Path) -> int:
-    total = 0
-    for child in islice(directory.iterdir(), _BOUNDED_SCAN_LIMIT):
-        if child.is_file() and not child.is_symlink():
-            total += _file_size(child)
-    return total
 
 
 def _read_goal_summaries(conn: sqlite3.Connection) -> list[GoalSummary]:

@@ -2402,6 +2402,31 @@ class ProcessReceiptsState(BaseModel):
     receipts_truncated: bool = False
 
 
+class StateSnapshotSummary(BaseModel):
+    """One snapshot under ROOT ``state-snapshots/``.
+
+    A ``dir`` is an upstream quick snapshot (``hermes_cli/backup.py:1237-1294``)
+    whose ``manifest.json`` names what the copy captured; a ``file`` is a loose
+    parked database grouped with its ``-wal``/``-shm``/``-journal`` sidecars.
+    ``size_bytes`` is measured on disk by a bounded walk (``size_truncated`` when
+    the bound cut it short); ``manifest_total_size`` is what upstream recorded.
+    A non-empty ``failed_dbs`` means the snapshot is missing databases upstream
+    tried and failed to copy, so it cannot restore them.
+    """
+
+    name: str
+    kind: Literal["dir", "file"] = "dir"
+    size_bytes: int = 0
+    size_truncated: bool = False
+    age_seconds: float | None = None
+    manifest_present: bool = False
+    label: str = ""
+    file_count: int = 0
+    manifest_total_size: int = 0
+    failed_dbs: list[str] = Field(default_factory=list)
+    oversized_skipped: list[str] = Field(default_factory=list)
+
+
 class OperationsState(BaseModel):
     dashboard_process_count: int = 0
     desktop_build_stamp: str = ""
@@ -2459,6 +2484,10 @@ class OperationsState(BaseModel):
     snapshot_count: int = 0
     snapshot_total_bytes: int = 0
     newest_snapshot_age_seconds: float | None = None
+    # Newest-first slice of the snapshots counted above, and how many of ALL
+    # counted snapshots carry a manifest with failed_dbs.
+    snapshots: list[StateSnapshotSummary] = Field(default_factory=list)
+    snapshot_failed_count: int = 0
     web_ui_build_hash: str = ""
     web_ui_built_age_seconds: float | None = None
     blocked_script_count: int = 0

@@ -143,6 +143,7 @@ from hermesd.collect.migration import (
 from hermesd.collect.operations import (
     _BOUNDED_SCAN_LIMIT,
     StateDbRead,
+    TreeSizeCache,
     _checkpoint_prune_interval_seconds,
     _count_delegation_live_logs,
     _is_dashboard_process,
@@ -441,7 +442,13 @@ _DELEGATION_LIVE_FIELDS = (
     "delegation_live_unparsed_count",
 )
 _PROCESS_RECEIPT_FIELDS = ("process_receipts",)
-_STATE_SNAPSHOT_FIELDS = ("snapshot_count", "snapshot_total_bytes", "newest_snapshot_age_seconds")
+_STATE_SNAPSHOT_FIELDS = (
+    "snapshot_count",
+    "snapshot_total_bytes",
+    "newest_snapshot_age_seconds",
+    "snapshots",
+    "snapshot_failed_count",
+)
 _LIFECYCLE_FIELDS = (
     "lifecycle_phase",
     "last_exit_code",
@@ -817,6 +824,9 @@ class Collector:
         # (source mtime, path to read, temp-dir owner). One per database, so the
         # boards' own stores do not evict the root one.
         self._kanban_snapshots: dict[Path, tuple[_DbSourceSignature | None, Path, Any]] = {}
+        # Bounded recursive directory sizes (state snapshots, disk usage),
+        # memoized per directory signature with a TTL.
+        self._tree_size_cache: TreeSizeCache = {}
         self._checkpoint_summary_cache: dict[
             str, tuple[tuple[int, ...], tuple[int, float | None, str]]
         ] = {}
@@ -3269,6 +3279,7 @@ class Collector:
                 self._paths.shared_path("state-snapshots"),
                 self._paths.root_home,
                 now=self._clock(),
+                size_cache=self._tree_size_cache,
             )
         )
 
