@@ -180,3 +180,25 @@ def test_dict_shaped_pool_entry_reports_model_cooldowns(hermes_home: Path):
         {"anthropic": {"model_cooldowns": {"claude-opus": _NOW + 60}}},
     )
     assert [item.model for item in pools[0].model_cooldowns] == ["claude-opus"]
+
+
+@pytest.mark.parametrize(
+    ("reset_at", "expected"),
+    [
+        (str(_NOW + 45), 45.0),  # numeric string
+        (str((_NOW + 45) * 1000), 45.0),  # millisecond string
+        ("nan", None),
+        (0, None),
+        (True, None),
+        ("not a time", None),
+        ({"nested": 1}, None),
+    ],
+)
+def test_cooldown_reset_at_parsing(hermes_home: Path, reset_at: object, expected: float | None):
+    pools = _pools(
+        hermes_home, {"codex": [{"last_status": "exhausted", "last_error_reset_at": reset_at}]}
+    )
+    if expected is None:
+        assert pools[0].cooldown_remaining_seconds is None
+    else:
+        assert pools[0].cooldown_remaining_seconds == pytest.approx(expected)

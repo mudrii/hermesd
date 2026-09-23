@@ -157,3 +157,20 @@ def test_doctor_checks_quiet_on_a_clean_config(hermes_home: Path):
     )
     assert config.stale_root_keys == []
     assert config.legacy_custom_provider_labels == []
+
+
+def test_profile_route_names_are_validated_like_upstream(hermes_home: Path):
+    config = _config(
+        hermes_home,
+        {
+            "profile_routes": [
+                {"name": "a", "platform": "telegram", "profile": "DEFAULT"},
+                # Reserved and malformed ids are skipped (profiles.py:151,252-270).
+                {"name": "b", "platform": "telegram", "profile": "root"},
+                {"name": "c", "platform": "telegram", "profile": "../etc"},
+                {"name": "d", "platform": "telegram", "profile": "   "},
+            ]
+        },
+    )
+    assert [r.profile for r in config.profile_routes] == ["default"]
+    assert config.profile_routes_skipped == 3

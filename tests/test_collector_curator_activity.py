@@ -206,3 +206,15 @@ def test_curator_activity_keeps_last_good_on_failure(hermes_home: Path, tmp_path
     assert first.curator.suppressed_count == 1
     assert "curator_activity" in second.health.failed_sources
     assert second.curator.suppressed_count == 1
+
+
+def test_curator_ledger_skips_torn_and_actionless_rows(hermes_home: Path):
+    lines = [
+        json.dumps({"actor": "agent", "action": "create", "skill": "kept"}),
+        "{torn",
+        json.dumps(["not", "a", "row"]),
+        json.dumps({"actor": "agent", "skill": "no-action"}),
+    ]
+    (hermes_home / "skills" / ".curator_ledger.jsonl").write_text("\n".join(lines) + "\n")
+    state = _collect(hermes_home)
+    assert [row.skill for row in state.curator.ledger_recent] == ["kept"]
