@@ -17,6 +17,7 @@ from hermesd.models import (
     CronJob,
     CronJobExecutionStats,
     CronModelSource,
+    CronRecoveryState,
     CronState,
     CronTickerHealth,
     CronUsageState,
@@ -172,6 +173,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         )
     lines.append_text(_delivery_queue_compact(state.cron_deliveries, theme))
     lines.append_text(_bot_chat_compact(state.cron_bot_chat, theme))
+    lines.append_text(_recovery_compact(state.cron_recovery, theme))
     if executions.open_incident_count:
         lines.append("  Incidents: ", style=theme.ui_label)
         # ``acked_at`` is written only together with ``closed_at`` upstream, so an
@@ -250,6 +252,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     sections.extend(_executions_sections(executions, theme))
     sections.extend(_delivery_queue_sections(state.cron_deliveries, theme))
     sections.extend(_bot_chat_sections(state.cron_bot_chat, theme))
+    sections.extend(_recovery_sections(state.cron_recovery, theme))
     sections.extend(_usage_sections(state.cron_usage, theme))
 
     return Panel(
@@ -810,6 +813,38 @@ def _bot_chat_sections(bot: CronBotChatState, theme: Theme) -> list[RenderableTy
     ]
     sections.extend(_bot_chat_receipt_line(receipt, theme) for receipt in bot.attention)
     return sections
+
+
+def _recovery_compact(recovery: CronRecoveryState, theme: Theme) -> Text:
+    """One warning line when the scheduler recovered a wedged job in the last 24h."""
+    line = Text()
+    parts = [
+        f"{ledger.count_24h} {ledger.label}" for ledger in recovery.ledgers if ledger.count_24h
+    ]
+    if parts:
+        line.append(f"  ⚠ Recoveries 24h: {'  '.join(parts)}\n", style=theme.ui_warn)
+    return line
+
+
+def _recovery_sections(recovery: CronRecoveryState, theme: Theme) -> list[RenderableType]:
+    """Per-ledger 24h/7d counts and the newest entry; ``+`` marks a lower bound."""
+    if not recovery.ledgers:
+        return []
+    body = Text()
+    for ledger in recovery.ledgers:
+        body.append(f"  {ledger.label}: ", style=theme.ui_label)
+        week = f"{ledger.count_7d}{'+' if ledger.window_truncated else ''}"
+        parts = [f"24h {ledger.count_24h}  7d {week}"]
+        if ledger.newest_age_seconds is not None:
+            newest = f"newest {fmt_age_seconds(ledger.newest_age_seconds)} ago"
+            if ledger.newest_job_name:
+                newest += f" {ledger.newest_job_name}"
+            if ledger.newest_detail:
+                newest += f": {ledger.newest_detail}"
+            parts.append(newest)
+        style = theme.ui_warn if ledger.count_24h else theme.banner_text
+        body.append(sanitize_terminal_text("  ".join(parts)) + "\n", style=style)
+    return [section_heading("Recovery Ledgers", theme), body]
 
 
 def _usage_sections(usage: CronUsageState, theme: Theme) -> list[RenderableType]:

@@ -55,6 +55,7 @@ from hermesd.models import (
     CronJobExecutionStats,
     CronJobUsage,
     CronModelSource,
+    CronRecoveryLedger,
     CronTickerHealth,
     CronUsageState,
     LogLine,
@@ -1079,25 +1080,36 @@ def _usage_record(data: dict[str, Any]) -> _UsageRecord | None:
     )
 
 
-def _read_usage_audit_records(path: Path) -> _UsageAudit:
-    """Parse the capped tail of ``cron/usage_audit.jsonl``.
+def _jsonl_tail_objects(path: Path, max_bytes: int) -> tuple[list[dict[str, Any]], int, bool]:
+    """JSON objects from the last ``max_bytes`` of an append-only JSONL ledger.
 
-    Torn and foreign lines are counted, never fatal; an I/O error propagates so
-    the source keeps its last-good value.
+    Returns the objects, the count of torn/foreign non-blank lines, and whether
+    the file is longer than the tail read. An I/O error propagates so the
+    caller's source keeps its last-good value.
     """
-    max_bytes = _USAGE_AUDIT_TAIL_BYTES
     cut = _file_size(path) > max_bytes
-    records: list[_UsageRecord] = []
+    objects: list[dict[str, Any]] = []
     unparseable = 0
     for line in _read_tail_text(path, max_bytes).splitlines():
         stripped = line.strip()
         if not stripped:
             continue
-        record = None
+        data: object = None
         with contextlib.suppress(json.JSONDecodeError, RecursionError):
             data = json.loads(stripped)
-            if isinstance(data, dict):
-                record = _usage_record(data)
+        if isinstance(data, dict):
+            objects.append(data)
+        else:
+            unparseable += 1
+    return objects, unparseable, cut
+
+
+def _read_usage_audit_records(path: Path) -> _UsageAudit:
+    """Parse the capped tail of ``cron/usage_audit.jsonl``; stampless lines are junk."""
+    objects, unparseable, cut = _jsonl_tail_objects(path, _USAGE_AUDIT_TAIL_BYTES)
+    records: list[_UsageRecord] = []
+    for data in objects:
+        record = _usage_record(data)
         if record is None:
             unparseable += 1
         else:
@@ -1339,4 +1351,83 @@ def _read_cron_bot_chat(
         ],
         unreadable_count=unreadable,
         scan_truncated=truncated,
+    )
+
+
+# Fire-path recovery telemetry, appended best effort and never pruned upstream:
+# ``_append_telemetry_record`` (``cron/jobs.py:1011-1023``) for the first two,
+# ``_record_forced_release`` (``cron/scheduler.py:868-884``) for the third.
+# (file name, label, timestamp key) per ledger.
+_RECOVERY_LEDGERS = (
+    ("persisted_error_recoveries.jsonl", "stale-error re-arm", "rearmed_at"),
+    ("timezone_migration_catchups.jsonl", "timezone-migration catch-up", "fired_at"),
+    ("inflight_forced_releases.jsonl", "forced in-flight release", "at"),
+)
+_RECOVERY_LEDGER_TAIL_BYTES = 256 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _RecoveryEntry:
+    epoch: float
+    job_name: str
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class _RecoveryLedgerRead:
+    entries: tuple[_RecoveryEntry, ...]
+    cut: bool
+
+
+def _recovery_detail(kind: str, data: dict[str, Any]) -> str:
+    """The one fact that distinguishes an entry, per ledger's own keys."""
+    if kind == "persisted_error_recoveries":
+        previous = str(data.get("previous_next_run_at") or "")
+        return f"was due {previous}" if previous else ""
+    if kind == "timezone_migration_catchups":
+        stored = str(data.get("stored_next_run_at") or "")
+        normalized = str(data.get("normalized_next_run_at") or "")
+        return f"{stored} -> {normalized}" if stored or normalized else ""
+    age = data.get("age_seconds")
+    allowance = data.get("allowance_seconds")
+    if age is None or allowance is None:
+        return ""
+    return f"ran {_coerce_float(age):.0f}s past a {_coerce_float(allowance):.0f}s allowance"
+
+
+def _read_recovery_ledger(path: Path, kind: str, stamp_key: str) -> _RecoveryLedgerRead:
+    """Parse one ledger's capped tail; entries without a usable stamp are skipped."""
+    objects, _unparseable, cut = _jsonl_tail_objects(path, _RECOVERY_LEDGER_TAIL_BYTES)
+    entries = []
+    for data in objects:
+        epoch = _iso_to_epoch(str(data.get(stamp_key) or ""))
+        if epoch is None:
+            continue
+        entries.append(
+            _RecoveryEntry(
+                epoch=epoch,
+                job_name=_cron_error_excerpt(str(data.get("name") or data.get("job_id") or "")),
+                detail=_cron_error_excerpt(_recovery_detail(kind, data)),
+            )
+        )
+    return _RecoveryLedgerRead(entries=tuple(entries), cut=cut)
+
+
+def _recovery_ledger(
+    read: _RecoveryLedgerRead, kind: str, label: str, *, now: float
+) -> CronRecoveryLedger:
+    """24h/7d counts and the newest entry of one parsed ledger at ``now``."""
+    week_start = now - _USAGE_WINDOW_7D_SECONDS
+    in_window = [entry for entry in read.entries if week_start <= entry.epoch <= now]
+    newest = max(read.entries, key=lambda entry: entry.epoch, default=None)
+    oldest = min((entry.epoch for entry in read.entries), default=None)
+    return CronRecoveryLedger(
+        kind=kind,
+        label=label,
+        count_24h=sum(1 for e in in_window if e.epoch >= now - _EXECUTIONS_WINDOW_SECONDS),
+        count_7d=len(in_window),
+        newest_age_seconds=None if newest is None else _age_seconds(newest.epoch, now),
+        newest_job_name="" if newest is None else newest.job_name,
+        newest_detail="" if newest is None else newest.detail,
+        window_truncated=read.cut and (oldest is None or oldest > week_start),
     )

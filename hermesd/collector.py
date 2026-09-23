@@ -73,6 +73,7 @@ from hermesd.collect.config import (
     _stale_alias_count,
 )
 from hermesd.collect.cron import (
+    _RECOVERY_LEDGERS,
     _BotChatReceipt,
     _BotChatSignature,
     _chronos_configured,
@@ -97,7 +98,9 @@ from hermesd.collect.cron import (
     _read_cron_bot_chat,
     _read_cron_delivery_queue,
     _read_cron_executions_state,
+    _read_recovery_ledger,
     _read_usage_audit_records,
+    _recovery_ledger,
     _tail_latest_cron_output,
 )
 from hermesd.collect.curator import (
@@ -267,6 +270,7 @@ from hermesd.models import (
     CronDeliveryQueueState,
     CronExecutionsState,
     CronJob,
+    CronRecoveryState,
     CronState,
     CronUsageState,
     CuratorRun,
@@ -1121,6 +1125,12 @@ class Collector:
                 "cron_bot_chat_pending",
                 self._collect_cron_bot_chat,
                 CronBotChatState,
+            ),
+            _SourceSpec(
+                "cron_recovery",
+                "cron_recovery_ledgers",
+                self._collect_cron_recovery,
+                CronRecoveryState,
             ),
             _SourceSpec(
                 "channels",
@@ -2808,6 +2818,32 @@ class Collector:
         if not _safe_child_path(root_dir, self._paths.root_home) or not root_dir.is_dir():
             raise RuntimeError("cron/bot_chat_pending escapes the Hermes home")
         return _read_cron_bot_chat(root_dir, now=self._clock(), cache=self._bot_chat_cache)
+
+    def _collect_cron_recovery(self) -> CronRecoveryState:
+        """Fire-path recovery ledgers under ``cron/``.
+
+        Upstream appends ``persisted_error_recoveries.jsonl`` and
+        ``timezone_migration_catchups.jsonl`` to ``_current_cron_store().cron_dir``
+        (``cron/jobs.py:1011-1036,1110-1126``) and ``inflight_forced_releases.jsonl``
+        to ``get_hermes_home()/cron`` (``cron/scheduler.py:868-884``); read from
+        the root store with the rest of ``cron``. Each capped-tail parse is
+        cached by file signature.
+        """
+        ledgers = []
+        for name, label, stamp_key in _RECOVERY_LEDGERS:
+            path = self._paths.shared_path("cron", name)
+            if not _exists_strict(path):
+                continue
+            if not _safe_child_path(path, self._paths.root_home):
+                raise RuntimeError(f"cron/{name} escapes the Hermes home")
+            kind = name.removesuffix(".jsonl")
+            read = self._signature_cached(
+                "cron_recovery",
+                path,
+                functools.partial(_read_recovery_ledger, path, kind, stamp_key),
+            )
+            ledgers.append(_recovery_ledger(read, kind, label, now=self._clock()))
+        return CronRecoveryState(ledgers=ledgers)
 
     def _collect_channels(self, gateway: GatewayState) -> ChannelDirectoryState:
         directory = self._read_json_reporting_stale(

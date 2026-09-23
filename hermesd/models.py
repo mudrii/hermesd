@@ -1184,6 +1184,32 @@ class CronBotChatState(BaseModel):
     scan_truncated: bool = False
 
 
+class CronRecoveryLedger(BaseModel):
+    """One fire-path recovery ledger under ``cron/`` (append-only JSONL).
+
+    Each entry is a wedge the scheduler had to recover from: a stale-error
+    re-arm (``cron/jobs.py:1025-1036``), a timezone-migration catch-up fire
+    (``:1110-1126``) or a forced in-flight release (``cron/scheduler.py:868-884``).
+    Written best effort, so absence proves nothing. ``window_truncated`` means
+    the capped tail ended inside the 7d window (a lower bound).
+    """
+
+    kind: str = ""
+    label: str = ""
+    count_24h: int = 0
+    count_7d: int = 0
+    newest_age_seconds: float | None = None
+    newest_job_name: str = ""
+    newest_detail: str = ""
+    window_truncated: bool = False
+
+
+class CronRecoveryState(BaseModel):
+    """The recovery ledgers that exist on disk, in a fixed order."""
+
+    ledgers: list[CronRecoveryLedger] = Field(default_factory=list)
+
+
 class CronState(BaseModel):
     last_tick_ago_seconds: float | None = None
     ticker_heartbeat_age_seconds: float | None = None
@@ -2736,6 +2762,7 @@ class DashboardState(BaseModel):
     cron_usage: CronUsageState = Field(default_factory=CronUsageState)
     cron_deliveries: CronDeliveryQueueState = Field(default_factory=CronDeliveryQueueState)
     cron_bot_chat: CronBotChatState = Field(default_factory=CronBotChatState)
+    cron_recovery: CronRecoveryState = Field(default_factory=CronRecoveryState)
     channels: ChannelDirectoryState = Field(default_factory=ChannelDirectoryState)
     kanban: KanbanState = Field(default_factory=KanbanState)
     operations: OperationsState = Field(default_factory=OperationsState)

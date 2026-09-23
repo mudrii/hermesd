@@ -15,6 +15,8 @@ from hermesd.models import (
     CronJobExecutionStats,
     CronJobUsage,
     CronModelSource,
+    CronRecoveryLedger,
+    CronRecoveryState,
     CronState,
     CronTickerHealth,
     CronUsageState,
@@ -1426,3 +1428,48 @@ def test_cron_panel_hides_settled_bot_chat_from_compact() -> None:
     bot = CronBotChatState(present=True, status_counts={"settled": 3})
     compact = render_to_str(render_cron(DashboardState(cron_bot_chat=bot), Theme()), no_color=True)
     assert "Bot Chat" not in compact
+
+
+def test_cron_panel_shows_recovery_ledgers() -> None:
+    recovery = CronRecoveryState(
+        ledgers=[
+            CronRecoveryLedger(
+                kind="persisted_error_recoveries",
+                label="stale-error re-arm",
+                count_24h=2,
+                count_7d=5,
+                newest_age_seconds=600.0,
+                newest_job_name="Nightly",
+                newest_detail="was due 2026-09-24T04:00:00+00:00",
+            ),
+            CronRecoveryLedger(
+                kind="inflight_forced_releases",
+                label="forced in-flight release",
+                count_7d=1,
+                newest_age_seconds=3 * 86400.0,
+                newest_job_name="Stuck",
+                window_truncated=True,
+            ),
+        ]
+    )
+    state = DashboardState(cron_recovery=recovery)
+    compact = render_to_str(render_cron(state, Theme()), width=120, no_color=True)
+    assert "Recoveries 24h: 2 stale-error re-arm" in compact
+    assert "forced in-flight release" not in compact
+    detail = render_to_str(render_cron(state, Theme(), detail=True), width=220, no_color=True)
+    assert "Recovery Ledgers" in detail
+    assert (
+        "stale-error re-arm: 24h 2  7d 5  newest 10m ago Nightly: was due 2026-09-24T04:00:00+00:00"
+        in detail
+    )
+    assert "forced in-flight release: 24h 0  7d 1+  newest 3d ago Stuck" in detail
+
+
+def test_cron_panel_hides_quiet_recovery_ledgers_from_compact() -> None:
+    recovery = CronRecoveryState(
+        ledgers=[CronRecoveryLedger(kind="k", label="stale-error re-arm", count_7d=1)]
+    )
+    compact = render_to_str(
+        render_cron(DashboardState(cron_recovery=recovery), Theme()), no_color=True
+    )
+    assert "Recoveries" not in compact

@@ -405,3 +405,115 @@ def test_bot_chat_pending_escaping_dir_fails_and_keeps_last_good(hermes_home: Pa
     assert first.cron_bot_chat.unsettled_count == 1
     assert "cron_bot_chat_pending" in second.health.failed_sources
     assert second.cron_bot_chat.unsettled_count == 1
+
+
+def _write_jsonl(path: Path, records: list[object]) -> None:
+    path.write_text("".join(f"{json.dumps(record)}\n" for record in records) + "{torn\n")
+
+
+def test_recovery_ledgers_count_recent_entries_and_summarise_the_newest(hermes_home: Path):
+    cron_dir = hermes_home / "cron"
+    # cron/jobs.py:1025-1036
+    _write_jsonl(
+        cron_dir / "persisted_error_recoveries.jsonl",
+        [
+            {
+                "job_id": "j1",
+                "name": "Nightly",
+                "previous_next_run_at": "2026-09-30T04:00:00+00:00",
+                "rearmed_at": iso_ago(3 * 86400),
+            },
+            {
+                "job_id": "j1",
+                "name": "Nightly",
+                "previous_next_run_at": "2026-09-24T04:00:00+00:00",
+                "rearmed_at": iso_ago(600),
+            },
+            {"job_id": "j9", "name": "Ancient", "rearmed_at": iso_ago(30 * 86400)},
+            ["not", "an", "object"],
+        ],
+    )
+    # cron/jobs.py:1110-1126
+    _write_jsonl(
+        cron_dir / "timezone_migration_catchups.jsonl",
+        [
+            {
+                "job_id": "j2",
+                "name": "Morning",
+                "expr": "0 4 * * *",
+                "stored_next_run_at": "2026-09-02T04:00:00+00:00",
+                "normalized_next_run_at": "2026-09-02T06:00:00+02:00",
+                "fired_at": iso_ago(2 * 86400),
+            }
+        ],
+    )
+    # cron/scheduler.py:868-884
+    _write_jsonl(
+        cron_dir / "inflight_forced_releases.jsonl",
+        [
+            {
+                "job_id": "j3",
+                "name": "Stuck token=abcdef1234567890abcdef",
+                "age_seconds": 5400.0,
+                "allowance_seconds": 3600.0,
+                "at": iso_ago(120),
+            }
+        ],
+    )
+
+    state = _collect(hermes_home)
+
+    assert "cron_recovery_ledgers" not in state.health.failed_sources
+    ledgers = {ledger.kind: ledger for ledger in state.cron_recovery.ledgers}
+    rearm = ledgers["persisted_error_recoveries"]
+    assert (rearm.count_24h, rearm.count_7d) == (1, 2)
+    assert rearm.newest_job_name == "Nightly"
+    assert rearm.newest_age_seconds == pytest.approx(600, abs=30)
+    assert "2026-09-24" in rearm.newest_detail
+    catchup = ledgers["timezone_migration_catchups"]
+    assert (catchup.count_24h, catchup.count_7d) == (0, 1)
+    assert "04:00:00+00:00" in catchup.newest_detail
+    assert "06:00:00+02:00" in catchup.newest_detail
+    forced = ledgers["inflight_forced_releases"]
+    assert forced.count_24h == 1
+    assert forced.newest_detail == "ran 5400s past a 3600s allowance"
+    assert "abcdef1234567890" not in forced.newest_job_name
+
+
+def test_recovery_ledgers_absent_read_as_empty(hermes_home: Path):
+    state = _collect(hermes_home)
+    assert state.cron_recovery.ledgers == []
+    assert "cron_recovery_ledgers" not in state.health.failed_sources
+
+
+def test_recovery_ledger_tail_cut_inside_the_window_is_flagged(hermes_home: Path, monkeypatch):
+    monkeypatch.setattr(cron_module, "_RECOVERY_LEDGER_TAIL_BYTES", 300)
+    _write_jsonl(
+        hermes_home / "cron" / "inflight_forced_releases.jsonl",
+        [{"job_id": "j", "name": "n", "at": iso_ago(60 + index)} for index in range(20)],
+    )
+
+    (ledger,) = _collect(hermes_home).cron_recovery.ledgers
+
+    assert 0 < ledger.count_7d < 20
+    assert ledger.window_truncated is True
+
+
+def test_recovery_ledger_escaping_symlink_fails_and_keeps_last_good(
+    hermes_home: Path, tmp_path: Path
+):
+    path = hermes_home / "cron" / "inflight_forced_releases.jsonl"
+    _write_jsonl(path, [{"job_id": "j", "name": "n", "at": iso_ago(60)}])
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        outside = tmp_path / "outside.jsonl"
+        outside.write_text(path.read_text())
+        path.unlink()
+        path.symlink_to(outside)
+        second = c.collect()
+    finally:
+        c.close()
+    assert first.cron_recovery.ledgers[0].count_24h == 1
+    assert "cron_recovery_ledgers" in second.health.failed_sources
+    assert second.cron_recovery.ledgers[0].count_24h == 1
