@@ -184,6 +184,27 @@ def _db_source_mtime_ns(db_path: Path) -> int | None:
     return max(mtimes) if mtimes else None
 
 
+_DbSourceSignature = tuple[tuple[int, int, int] | None, ...]
+
+
+def _db_source_signature(db_path: Path) -> _DbSourceSignature | None:
+    """(st_mtime_ns, st_size, st_ino) of a SQLite db and its -wal sidecar.
+
+    Stricter change key than _db_source_mtime_ns: a same-timestamp write on a
+    coarse-granularity filesystem still changes the size or inode. None when
+    neither path can be stat'd ("unknown", not "unchanged").
+    """
+    signature: list[tuple[int, int, int] | None] = []
+    for candidate in (db_path, db_path.with_name(f"{db_path.name}-wal")):
+        try:
+            stat = candidate.stat()
+        except OSError:
+            signature.append(None)
+            continue
+        signature.append((stat.st_mtime_ns, stat.st_size, stat.st_ino))
+    return tuple(signature) if any(entry is not None for entry in signature) else None
+
+
 def _path_resolves_under(path: Path, root: Path) -> bool:
     try:
         resolved_path = path.resolve(strict=False)

@@ -726,7 +726,7 @@ def test_wal_snapshot_refusal_keeps_last_good_sessions(tmp_path: Path, dangling:
 
 
 @pytest.mark.parametrize("dangling", [False, True])
-@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+@pytest.mark.parametrize("suffix", ["-wal"])
 def test_wal_snapshot_refuses_unsafe_sidecars_and_cleans_temp_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str, dangling: bool
 ):
@@ -757,7 +757,7 @@ def test_wal_snapshot_refuses_unsafe_sidecars_and_cleans_temp_dir(
     assert not Path(created[0].name).exists()
 
 
-@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+@pytest.mark.parametrize("suffix", ["-wal"])
 def test_wal_snapshot_propagates_sidecar_probe_failures_and_cleans_temp_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str
 ):
@@ -1794,3 +1794,136 @@ def test_read_model_usage_reports_mixed_actual_estimated_groups(hermes_home):
         assert included["estimated_only_cost_usd"] == 0
     finally:
         db.close()
+
+
+def _make_wal_db(db_path: Path) -> None:
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    conn.execute("CREATE TABLE t (x)")
+    conn.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(10)])
+    conn.commit()
+    conn.close()
+    # Closing the last connection checkpoints and removes the WAL; recreate a
+    # standalone -wal so the snapshot path copies a sidecar.
+    db_path.with_name(f"{db_path.name}-wal").write_bytes(b"")
+
+
+def test_wal_snapshot_does_not_copy_shm(tmp_path: Path):
+    """SQLite rebuilds -shm from the WAL; a copied live index is never needed."""
+    db_path = tmp_path / "state.db"
+    _make_wal_db(db_path)
+    db_path.with_name("state.db-shm").write_bytes(b"shm")
+    snapshot_dir, snapshot_db = db_module.snapshot_wal_database(db_path, prefix="hermesd-test-")
+    try:
+        assert snapshot_db.exists()
+        assert snapshot_db.with_name("state.db-wal").exists()
+        assert not snapshot_db.with_name("state.db-shm").exists()
+    finally:
+        snapshot_dir.cleanup()
+
+
+def test_wal_snapshot_retries_when_source_changes_mid_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A checkpoint between the db and -wal copies would pair mismatched files."""
+    db_path = tmp_path / "state.db"
+    _make_wal_db(db_path)
+    db_path.with_name("state.db-wal")
+    real_copy2 = db_module.shutil.copy2
+    copies: list[str] = []
+
+    def racing_copy2(src, dst, *args, **kwargs):
+        copies.append(Path(src).name)
+        result = real_copy2(src, dst, *args, **kwargs)
+        if len(copies) == 1:
+            # A checkpoint rewrites the db after it was copied.
+            with db_path.open("ab") as db_file:
+                db_file.write(b"\0" * 4096)
+        return result
+
+    monkeypatch.setattr(db_module.shutil, "copy2", racing_copy2)
+    snapshot_dir, snapshot_db = db_module.snapshot_wal_database(db_path, prefix="hermesd-test-")
+    try:
+        assert copies == ["state.db", "state.db-wal", "state.db", "state.db-wal"]
+        assert snapshot_db.read_bytes() == db_path.read_bytes()
+    finally:
+        snapshot_dir.cleanup()
+
+
+def test_wal_snapshot_retries_when_wal_is_replaced_mid_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    db_path = tmp_path / "state.db"
+    _make_wal_db(db_path)
+    wal_path = db_path.with_name("state.db-wal")
+    real_copy2 = db_module.shutil.copy2
+    copies: list[str] = []
+
+    def racing_copy2(src, dst, *args, **kwargs):
+        copies.append(Path(src).name)
+        result = real_copy2(src, dst, *args, **kwargs)
+        if len(copies) == 1:
+            replacement = tmp_path / "new-wal"
+            replacement.write_bytes(b"")
+            os.link(wal_path, tmp_path / "old-wal")  # pin the old inode number
+            replacement.replace(wal_path)
+        return result
+
+    monkeypatch.setattr(db_module.shutil, "copy2", racing_copy2)
+    snapshot_dir, _snapshot_db = db_module.snapshot_wal_database(db_path, prefix="hermesd-test-")
+    snapshot_dir.cleanup()
+    assert copies == ["state.db", "state.db-wal", "state.db", "state.db-wal"]
+
+
+def test_wal_snapshot_tolerates_frames_appended_mid_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """WAL appends are self-delimiting by checksum; they must not force a retry."""
+    db_path = tmp_path / "state.db"
+    _make_wal_db(db_path)
+    wal_path = db_path.with_name("state.db-wal")
+    real_copy2 = db_module.shutil.copy2
+    copies: list[str] = []
+
+    def appending_copy2(src, dst, *args, **kwargs):
+        copies.append(Path(src).name)
+        result = real_copy2(src, dst, *args, **kwargs)
+        with wal_path.open("ab") as wal:
+            wal.write(b"x" * 64)
+        return result
+
+    monkeypatch.setattr(db_module.shutil, "copy2", appending_copy2)
+    snapshot_dir, _snapshot_db = db_module.snapshot_wal_database(db_path, prefix="hermesd-test-")
+    snapshot_dir.cleanup()
+    assert copies == ["state.db", "state.db-wal"]
+
+
+def test_wal_snapshot_gives_up_when_source_keeps_changing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    db_path = tmp_path / "state.db"
+    _make_wal_db(db_path)
+    db_path.with_name("state.db-wal")
+    real_copy2 = db_module.shutil.copy2
+    created = []
+    real_temporary_directory = db_module.tempfile.TemporaryDirectory
+
+    def tracking_temporary_directory(*args: object, **kwargs: object):
+        directory = real_temporary_directory(*args, **kwargs)
+        created.append(directory)
+        return directory
+
+    def always_racing_copy2(src, dst, *args, **kwargs):
+        result = real_copy2(src, dst, *args, **kwargs)
+        with db_path.open("ab") as db_file:
+            db_file.write(b"\0")
+        return result
+
+    monkeypatch.setattr(db_module.tempfile, "TemporaryDirectory", tracking_temporary_directory)
+    monkeypatch.setattr(db_module.shutil, "copy2", always_racing_copy2)
+
+    with pytest.raises(OSError, match="changed during snapshot"):
+        db_module.snapshot_wal_database(db_path, prefix="hermesd-test-")
+    assert created
+    assert all(not Path(directory.name).exists() for directory in created)

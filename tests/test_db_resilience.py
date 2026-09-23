@@ -295,3 +295,90 @@ def test_run_readout_propagates_sqlite_errors(tmp_path):
             db.run_readout(lambda conn: conn.execute("SELECT * FROM missing_table").fetchall())
     finally:
         db.close()
+
+
+@_skip_if_root
+def test_unreadable_parent_directory_does_not_fail_construction(tmp_path):
+    """chmod 000 on the home must not raise out of HermesDB() (snapshot traceback)."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    db_path = home / "state.db"
+    create_state_db_with_session(db_path)
+    original_mode = stat.S_IMODE(home.stat().st_mode)
+    home.chmod(0o000)
+    try:
+        if not _unreadable(db_path):
+            pytest.skip("filesystem does not enforce directory permissions")
+        db = HermesDB(db_path)
+        try:
+            assert db._conn is None
+            # The first read retries and surfaces the denial to the caller's
+            # collection boundary, which reports it as a failed source.
+            with pytest.raises(PermissionError):
+                db.read_sessions()
+        finally:
+            db.close()
+    finally:
+        home.chmod(original_mode)
+
+
+@_skip_if_root
+def test_snapshot_with_unreadable_hermes_home_exits_cleanly(tmp_path, capsys):
+    from hermesd.__main__ import main
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    create_state_db_with_session(home / "state.db")
+    original_mode = stat.S_IMODE(home.stat().st_mode)
+    home.chmod(0o000)
+    try:
+        if not _unreadable(home / "state.db"):
+            pytest.skip("filesystem does not enforce directory permissions")
+        main(["--hermes-home", str(home), "--snapshot", "--no-color"])
+    finally:
+        home.chmod(original_mode)
+    assert capsys.readouterr().out
+
+
+def test_reconnect_after_threshold_failing_keeps_last_good_rows(tmp_path):
+    """Threshold read errors reconnect; a failed reconnect resets the count, rows survive."""
+    db_path = tmp_path / "state.db"
+    create_state_db_with_session(db_path)
+    db = HermesDB(db_path)
+    try:
+        sessions = db.read_sessions()
+        assert sessions
+        db._conn.close()
+        for _ in range(_RECONNECT_ERROR_THRESHOLD - 1):
+            assert db.read_sessions() == sessions
+        db_path.unlink()
+        assert db.read_sessions() == sessions
+        assert db._conn is None
+        assert db._consecutive_errors == 0
+        assert db.last_read_sessions_stale is True
+    finally:
+        db.close()
+
+
+def test_same_mtime_rewrite_of_database_is_detected(tmp_path):
+    """Coarse-timestamp filesystems: a same-mtime change must still reconnect."""
+    import os
+
+    db_path = tmp_path / "state.db"
+    create_state_db_with_session(db_path)
+    db = HermesDB(db_path)
+    try:
+        assert db.read_sessions()
+        original = db_path.stat()
+        wal_path = db_path.with_name("state.db-wal")
+        wal_path.write_bytes(b"")
+        os.utime(wal_path, ns=(original.st_atime_ns, original.st_mtime_ns))
+        assert db._source_changed() is True
+        db._connect()
+        assert db._source_changed() is False
+        with wal_path.open("ab") as wal:
+            wal.write(b"x")
+        os.utime(wal_path, ns=(original.st_atime_ns, original.st_mtime_ns))
+        assert db._source_changed() is True
+    finally:
+        db.close()
