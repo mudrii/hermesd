@@ -740,3 +740,73 @@ def test_restart_loop_keeps_last_good_when_the_file_is_torn(hermes_home: Path):
     assert first.gateway.restart_loop_tripped is True
     assert second.gateway.restart_loop_tripped is True
     assert "restart_loop" in second.health.failed_sources
+
+
+# --------------------------------------------------------------------------
+# gateway_heartbeats grouped by profile and host (hermes_state_common.py:508-515;
+# refreshed every 60s by tui_gateway/session_reaper.py:380-445)
+# --------------------------------------------------------------------------
+
+
+def _write_backend_rows(home: Path, rows: list[tuple[object, ...]]) -> None:
+    import sqlite3
+
+    from tests.test_collector_gateway import _create_ledger_tables
+
+    conn = sqlite3.connect(str(home / "state.db"))
+    _create_ledger_tables(conn)
+    conn.executemany("INSERT INTO gateway_heartbeats VALUES (?,?,?,?,?,?)", rows)
+    conn.commit()
+    conn.close()
+
+
+def test_backend_heartbeats_are_grouped_by_profile_and_host(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_backend_rows(
+        hermes_home,
+        [
+            ("default@a:1", 1, NOW - 3600, NOW - 30, "default", "a"),
+            ("default@a:2", 2, NOW - 90_000, NOW - 80_000, "default", "a"),
+            ("dev@a:3", 3, NOW - 600, NOW - 400, "dev", "a"),
+            ("default@b:4", 4, NOW - 100, NOW - 50, "default", "b"),
+            ("legacy", 5, None, None, None, None),
+        ],
+    )
+
+    groups = _collect(hermes_home).gateway.gateway_backend_groups
+
+    assert [(g.profile, g.host, g.backends) for g in groups] == [
+        ("default", "a", 2),
+        ("default", "b", 1),
+        ("dev", "a", 1),
+        ("", "", 1),
+    ]
+    assert groups[0].last_heartbeat_age_seconds == pytest.approx(30.0)
+    assert groups[0].newest_start_age_seconds == pytest.approx(3600.0)
+    assert groups[0].live is True
+    assert groups[2].live is False
+    assert groups[3].last_heartbeat_age_seconds is None
+    assert groups[3].live is False
+
+
+def test_backend_groups_are_bounded(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_backend_rows(
+        hermes_home,
+        [(f"p{i}@h:{i}", i, NOW - 100, NOW - i, f"p{i}", "h") for i in range(1, 30)],
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert len(gateway.gateway_backend_groups) == 8
+    assert gateway.gateway_backend_groups_truncated is True
+    assert gateway.gateway_backend_groups[0].profile == "p1"
+
+
+def test_backend_groups_absent_table_is_empty(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.gateway_backend_groups == []
+    assert gateway.gateway_backend_groups_truncated is False

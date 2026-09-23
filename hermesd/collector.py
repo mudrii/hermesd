@@ -527,6 +527,8 @@ _LEDGER_FIELDS = (
     "pending_delivery_count",
     "failed_delivery_count",
     "pending_deliveries",
+    "gateway_backend_groups",
+    "gateway_backend_groups_truncated",
 )
 
 

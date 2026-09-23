@@ -50,6 +50,7 @@ from hermesd.models import (
     DeadTargetSummary,
     DeliveryObligationSummary,
     ForensicFile,
+    GatewayBackendGroup,
     GatewayLoopHealth,
     PlatformOwnership,
     PlatformStatus,
@@ -128,6 +129,14 @@ _DELIVERY_ERROR_EXCERPT_CHARS = 80
 # newest incarnations matter for uptime and the 24h restart count.
 _INCARNATION_SCAN_LIMIT = 500
 _OPEN_DELIVERY_LIMIT = 5
+# ``gateway_heartbeats`` holds one row per backend process (serve or gateway),
+# keyed ``<profile>@<host>:<pid>:<nonce>`` and refreshed every 60 s by default
+# (tui_gateway/session_reaper.py:380-445); crashed rows only age out. Group by
+# (profile, host), newest first, and call a group live when its newest beat is
+# within three refreshes.
+_BACKEND_GROUP_LIMIT = 8
+_BACKEND_LIVE_SECONDS = 180.0
+_BACKEND_LABEL_CHARS = 64
 # A recorded start_time is only usable as wall-clock when it lands inside this
 # window of now. gateway_state.json's start_time is a PID-reuse fingerprint
 # (``_get_process_start_time``, gateway/status.py:139-156): clock ticks since
@@ -1176,6 +1185,7 @@ class _GatewayLedgerRows:
     incarnation_starts: list[float] = field(default_factory=list)
     delivery_counts: dict[str, int] = field(default_factory=dict)
     delivery_rows: list[dict[str, Any]] = field(default_factory=list)
+    backend_groups: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _read_gateway_ledger_rows(conn: sqlite3.Connection) -> _GatewayLedgerRows:
@@ -1185,6 +1195,36 @@ def _read_gateway_ledger_rows(conn: sqlite3.Connection) -> _GatewayLedgerRows:
         incarnation_starts=_read_incarnation_starts(conn),
         delivery_counts=_read_delivery_counts(conn),
         delivery_rows=_read_open_delivery_rows(conn),
+        backend_groups=_read_backend_groups(conn),
+    )
+
+
+def _read_backend_groups(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Backend heartbeat rows per (profile, host), newest beat first; one extra row
+    is fetched so a cut list can say so."""
+    if not _table_exists(conn, "gateway_heartbeats"):
+        return []
+    return _query_rows(
+        conn,
+        "SELECT COALESCE(profile, '') AS profile, COALESCE(host, '') AS host, "
+        "COUNT(*) AS backends, MAX(last_heartbeat) AS last_heartbeat, "
+        "MAX(started_at) AS started_at "
+        "FROM gateway_heartbeats GROUP BY 1, 2 "
+        f"ORDER BY MAX(last_heartbeat) IS NULL, MAX(last_heartbeat) DESC LIMIT {_BACKEND_GROUP_LIMIT + 1}",
+    )
+
+
+def _backend_group(row: dict[str, Any], now: float) -> GatewayBackendGroup:
+    beat = _coerce_float(row.get("last_heartbeat") or 0.0)
+    started = _coerce_float(row.get("started_at") or 0.0)
+    beat_age = _age_seconds(beat or None, now)
+    return GatewayBackendGroup(
+        profile=_excerpt(row.get("profile") or "", _BACKEND_LABEL_CHARS),
+        host=_excerpt(row.get("host") or "", _BACKEND_LABEL_CHARS),
+        backends=_coerce_int(row.get("backends") or 0),
+        last_heartbeat_age_seconds=beat_age,
+        newest_start_age_seconds=_age_seconds(started or None, now),
+        live=beat_age is not None and beat_age <= _BACKEND_LIVE_SECONDS,
     )
 
 
@@ -1234,6 +1274,10 @@ def _gateway_ledger_fields(
         "pending_delivery_count": sum(counts.get(state) or 0 for state in _PENDING_DELIVERY_STATES),
         "failed_delivery_count": counts.get("failed") or 0,
         "pending_deliveries": [_delivery_summary(row, now) for row in rows.delivery_rows],
+        "gateway_backend_groups": [
+            _backend_group(row, now) for row in rows.backend_groups[:_BACKEND_GROUP_LIMIT]
+        ],
+        "gateway_backend_groups_truncated": len(rows.backend_groups) > _BACKEND_GROUP_LIMIT,
     }
 
 

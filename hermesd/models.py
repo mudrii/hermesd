@@ -182,6 +182,19 @@ class DeliveryObligationSummary(BaseModel):
     last_error: str = ""
 
 
+class GatewayBackendGroup(BaseModel):
+    """``gateway_heartbeats`` rows for one (profile, host): how many backends ever
+    registered there, and how fresh the newest one is. ``live`` means the newest
+    beat is within three 60 s refreshes; crashed rows only age out upstream."""
+
+    profile: str = ""
+    host: str = ""
+    backends: int = 0
+    last_heartbeat_age_seconds: float | None = None
+    newest_start_age_seconds: float | None = None
+    live: bool = False
+
+
 class DeadTargetSummary(BaseModel):
     """One confirmed-unreachable delivery target. The chat id is never read out."""
 
@@ -330,6 +343,10 @@ class GatewayState(BaseModel):
     pending_delivery_count: int = 0
     failed_delivery_count: int = 0
     pending_deliveries: list[DeliveryObligationSummary] = Field(default_factory=list)
+    # Backend heartbeats (state.db gateway_heartbeats) grouped by profile and host,
+    # newest beat first and bounded.
+    gateway_backend_groups: list[GatewayBackendGroup] = Field(default_factory=list)
+    gateway_backend_groups_truncated: bool = False
     # Dead delivery targets (gateway/dead_targets.json, per profile): chats the
     # gateway stopped sending to until a send succeeds. Newest few only.
     dead_target_count: int = 0

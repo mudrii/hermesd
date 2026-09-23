@@ -5,6 +5,7 @@ from __future__ import annotations
 from hermesd.models import (
     DashboardState,
     DeadTargetSummary,
+    GatewayBackendGroup,
     GatewayState,
     MigrationProfileRecord,
     MigrationState,
@@ -293,3 +294,39 @@ def test_restart_loop_and_dead_targets_are_silent_when_absent() -> None:
 
     assert "Restart-loop breaker" not in detail
     assert "Dead delivery targets" not in detail
+
+
+# --------------------------------------------------------------------------
+# backend heartbeat groups
+# --------------------------------------------------------------------------
+
+
+def test_backend_groups_render_by_profile_and_host() -> None:
+    gateway = _LIVE.model_copy(
+        update={
+            "gateway_backend_groups": [
+                GatewayBackendGroup(
+                    profile="default",
+                    host="pro32",
+                    backends=55,
+                    last_heartbeat_age_seconds=30.0,
+                    live=True,
+                ),
+                GatewayBackendGroup(
+                    profile=HOSTILE, host="", backends=1, last_heartbeat_age_seconds=None
+                ),
+            ],
+            "gateway_backend_groups_truncated": True,
+        }
+    )
+
+    detail = _render(gateway, detail=True)
+
+    assert "Backends: default@pro32 55 live (beat 30s ago)" in detail
+    assert "[/] boom [red]x[/red] clear@— 1 (beat — ago)" in detail
+    assert "\x1b[2J" not in detail
+    assert "more groups not shown" in detail
+
+
+def test_backend_groups_line_is_omitted_when_empty() -> None:
+    assert "Backends:" not in _render(_LIVE, detail=True)

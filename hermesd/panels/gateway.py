@@ -426,6 +426,32 @@ def _memory_text(gw: GatewayState, theme: Theme) -> Text:
     return text
 
 
+def _backend_groups_text(gw: GatewayState, theme: Theme) -> Text:
+    """Backend heartbeat rows per ``profile@host`` from state.db, newest first.
+
+    The count is every row that group ever registered (crashed rows only age out
+    upstream), so ``live`` — the newest beat within three refreshes — is the part
+    that describes now.
+    """
+    if not gw.gateway_backend_groups:
+        return Text()
+    text = Text("\n  Backends: ", style=theme.ui_label)
+    for index, group in enumerate(gw.gateway_backend_groups):
+        if index:
+            text.append("  ·  ", style=theme.banner_dim)
+        label = f"{_text_or_dash(group.profile)}@{_text_or_dash(group.host)} {group.backends}"
+        text.append(label, style=theme.banner_text)
+        if group.live:
+            text.append(" live", style=theme.ui_ok)
+        text.append(
+            f" (beat {fmt_age_seconds(group.last_heartbeat_age_seconds)} ago)",
+            style=theme.banner_dim,
+        )
+    if gw.gateway_backend_groups_truncated:
+        text.append("  more groups not shown", style=theme.ui_warn)
+    return text
+
+
 def _restart_storm_text(gw: GatewayState, theme: Theme) -> Text:
     """Start-ledger facts; an absent ledger is never rendered as zero restarts.
 
@@ -558,6 +584,7 @@ def _liveness_text(gw: GatewayState, theme: Theme) -> Text:
     )
     text.append_text(_witness_label(gw, theme))
     text.append_text(_memory_text(gw, theme))
+    text.append_text(_backend_groups_text(gw, theme))
     if gw.gateway_starts_recorded:
         text.append_text(_restart_storm_text(gw, theme))
     if gw.restart_loop_boots_recorded:
