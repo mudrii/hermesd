@@ -21,7 +21,8 @@ def test_cache_hit_reuses_value_until_mtime_changes(tmp_path):
     assert cache.read_json_mapping(path) == {"v": 1}
     original = path.stat()
 
-    path.write_text(json.dumps({"v": 99}))
+    # Same size, same inode, same mtime: indistinguishable, so still cached.
+    path.write_text(json.dumps({"v": 9}))
     os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
     assert cache.read_json_mapping(path) == {"v": 1}
 
@@ -513,3 +514,90 @@ def test_deeply_nested_json_is_refused_and_not_reparsed(tmp_path, monkeypatch):
     assert cache.read_json_mapping(path) == {}
     assert cache.read_json_mapping(path) == {}
     assert open_calls == 1
+
+
+def test_same_mtime_rewrite_with_new_size_is_reloaded(tmp_path):
+    """Coarse-timestamp filesystems: a same-mtime rewrite must not stay stale forever."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "data.json"
+    path.write_text(json.dumps({"v": 1}))
+    assert cache.read_json_mapping(path) == {"v": 1}
+    original = path.stat()
+
+    path.write_text(json.dumps({"v": 1234}))
+    os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+    assert cache.read_json_mapping(path) == {"v": 1234}
+
+
+def test_same_mtime_atomic_replace_is_reloaded(tmp_path):
+    """An atomic rename-over (new inode) with identical size and mtime still reloads."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "data.json"
+    path.write_text(json.dumps({"v": 1}))
+    assert cache.read_json_mapping(path) == {"v": 1}
+    original = path.stat()
+
+    replacement = tmp_path / "data.json.tmp"
+    replacement.write_text(json.dumps({"v": 2}))
+    os.utime(replacement, ns=(original.st_atime_ns, original.st_mtime_ns))
+    # Keep the old inode alive so the filesystem cannot recycle its number.
+    keep = tmp_path / "old.json"
+    os.link(path, keep)
+    replacement.replace(path)
+    assert path.stat().st_ino != original.st_ino
+
+    assert cache.read_json_mapping(path) == {"v": 2}
+
+
+def test_bad_file_fixed_with_same_mtime_but_new_size_is_reloaded(tmp_path):
+    cache = LastGoodFileCache()
+    path = tmp_path / "data.json"
+    path.write_text("{ not valid")
+    assert cache.read_json_mapping(path) == {}
+    original = path.stat()
+
+    path.write_text(json.dumps({"fixed": True}))
+    os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+    assert cache.read_json_mapping(path) == {"fixed": True}
+
+
+@pytest.mark.parametrize("document", ["false\n", "0\n", "[]\n", "- a\n", "text\n"])
+def test_non_mapping_yaml_document_keeps_last_good(tmp_path, document):
+    """Every non-mapping YAML document is rejected alike, falsy ones included."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "config.yaml"
+    path.write_text("ok: 1\n")
+    assert cache.read_yaml_mapping(path) == {"ok": 1}
+
+    path.write_text(document)
+
+    assert cache.read_yaml_mapping(path) == {"ok": 1}
+    assert cache.last_read_was_stale(path) is True
+
+
+def test_empty_yaml_document_reads_as_empty_mapping(tmp_path):
+    cache = LastGoodFileCache()
+    path = tmp_path / "config.yaml"
+    path.write_text("")
+    assert cache.read_yaml_mapping(path) == {}
+    assert cache.last_read_was_stale(path) is False
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
+def test_fifo_source_is_refused_without_blocking(tmp_path):
+    """A FIFO in place of config.yaml must not hang the collector thread."""
+    cache = LastGoodFileCache()
+    path = tmp_path / "config.yaml"
+    os.mkfifo(path)
+    result: list[object] = []
+    reader = threading.Thread(target=lambda: result.append(cache.read_yaml_mapping(path)))
+    reader.daemon = True
+    reader.start()
+    reader.join(timeout=5)
+    if reader.is_alive():  # pragma: no cover - only on regression
+        # Unblock the reader so the test process can exit.
+        os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+        pytest.fail("reading a FIFO blocked")
+    assert result == [{}]

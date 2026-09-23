@@ -5,11 +5,16 @@ import shutil
 import sqlite3
 import tempfile
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
-from hermesd.collect.common import _db_source_mtime_ns, _exists_strict, _safe_child_path
+from hermesd.collect.common import (
+    _db_source_signature,
+    _DbSourceSignature,
+    _exists_strict,
+    _safe_child_path,
+)
 from hermesd.models import AUTHORITATIVE_COST_STATUSES
 
 T = TypeVar("T")
@@ -42,7 +47,7 @@ _MODEL_USAGE_WINDOWS: tuple[tuple[str, float | None], ...] = (
 class HermesDB:
     def __init__(self, db_path: Path, allowed_root: Path | None = None):
         self._path = db_path
-        # When set, _open_targets re-validates on every (re)connect that the db
+        # When set, _open_target re-validates on every (re)connect that the db
         # path is not a symlink and still resolves under this root, closing the
         # profile symlink TOCTOU window left by startup-only validation.
         self._allowed_root = allowed_root
@@ -79,14 +84,19 @@ class HermesDB:
         self._uri = ""
         self._consecutive_errors = 0
         self._connect_backoff_reads = 0
-        self._connected_mtime_ns: int | None = None
+        self._connected_signature: _DbSourceSignature | None = None
         self._messages_fts_supports_session_id: bool | None = None
         self._messages_fts_available: bool | None = None
         self._session_column_names: set[str] | None = None
         self._message_column_names: set[str] | None = None
         self._snapshot_dir: tempfile.TemporaryDirectory[str] | None = None
         self._closed = False
-        self._connect()
+        # An unreadable parent directory (chmod 000 home) makes the existence
+        # check itself raise. Construction must not fail: the first read
+        # retries the connect and surfaces the denial at the caller's
+        # collection boundary as a failed source.
+        with contextlib.suppress(OSError):
+            self._connect()
 
     def _connect(self) -> None:
         if self._closed:
@@ -96,32 +106,25 @@ class HermesDB:
         # parent directory would otherwise read as "no database" and blank the
         # session panel instead of failing the source.
         if not _exists_strict(self._path):
-            self._connected_mtime_ns = None
+            self._connected_signature = None
             self._consecutive_errors = 0
             self._mark_cached_reads_stale()
             return
         try:
-            conn: sqlite3.Connection | None = None
-            uri = ""
-            for db_path, uri_params in self._open_targets():
-                uri = f"{db_path.resolve().as_uri()}?{uri_params}"
-                try:
-                    conn = sqlite3.connect(
-                        uri, uri=True, timeout=_SQLITE_TIMEOUT_SECONDS, check_same_thread=False
-                    )
-                    # Opening SQLite is lazy: validate the schema before
-                    # publishing the handle, so unreadable snapshots enter
-                    # the normal stale-data/reconnect path immediately.
-                    conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
-                except (OSError, sqlite3.Error):
-                    if conn is not None:
-                        with contextlib.suppress(sqlite3.Error):
-                            conn.close()
-                        conn = None
-                    continue
-                break
-            if conn is None:
-                raise sqlite3.OperationalError(f"unable to open database: {self._path}")
+            db_path, immutable = self._open_target()
+            uri = readonly_sqlite_uri(db_path, immutable=immutable)
+            conn = sqlite3.connect(
+                uri, uri=True, timeout=_SQLITE_TIMEOUT_SECONDS, check_same_thread=False
+            )
+            try:
+                # Opening SQLite is lazy: validate the schema before publishing
+                # the handle, so unreadable snapshots enter the normal
+                # stale-data/reconnect path immediately.
+                conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+            except sqlite3.Error:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.close()
+                raise
             self._uri = uri
             conn.row_factory = sqlite3.Row
             with self._connection_ref_lock:
@@ -135,14 +138,14 @@ class HermesDB:
             self._model_usage_available = None
             self._consecutive_errors = 0
             self._connect_backoff_reads = 0
-            self._connected_mtime_ns = self._source_mtime_ns()
+            self._connected_signature = self._source_signature()
             self._messages_fts_supports_session_id = None
             self._messages_fts_available = None
             self._session_column_names = None
             self._message_column_names = None
-        except (OSError, sqlite3.OperationalError):
+        except (OSError, sqlite3.Error):
             self._close_connection()
-            self._connected_mtime_ns = None
+            self._connected_signature = None
             self._consecutive_errors = 0
             self._connect_backoff_reads = _CONNECT_BACKOFF_READS
             self._mark_cached_reads_stale()
@@ -167,8 +170,10 @@ class HermesDB:
             self._snapshot_dir.cleanup()
             self._snapshot_dir = None
 
-    def _open_targets(self) -> Iterator[tuple[Path, str]]:
+    def _open_target(self) -> tuple[Path, bool]:
         """Select an immutable source read or a private WAL snapshot.
+
+        Returns the path to open and whether to open it ``immutable=1``.
 
         Even read-only WAL connections can reuse a writable shared-memory
         mapping held by another connection in this process. Always snapshot
@@ -184,21 +189,20 @@ class HermesDB:
         # would otherwise read as "no WAL" and silently route to immutable=1,
         # serving checkpoint-lagging data instead of failing the source.
         if not _exists_strict(wal_path):
-            yield self._path, "mode=ro&immutable=1"
-            return
-        yield self._snapshot_wal_database(), "mode=ro"
+            return self._path, True
+        return self._snapshot_wal_database(), False
 
     def _snapshot_wal_database(self) -> Path:
         snapshot_dir, snapshot_db = snapshot_wal_database(self._path, prefix="hermesd-state-")
         self._snapshot_dir = snapshot_dir
         return snapshot_db
 
-    def _source_mtime_ns(self) -> int | None:
-        return _db_source_mtime_ns(self._path)
+    def _source_signature(self) -> _DbSourceSignature | None:
+        return _db_source_signature(self._path)
 
     def _source_changed(self) -> bool:
-        current_mtime = self._source_mtime_ns()
-        return current_mtime is None or current_mtime != self._connected_mtime_ns
+        current = self._source_signature()
+        return current is None or current != self._connected_signature
 
     def _mark_cached_reads_stale(self) -> None:
         if self._cached_sessions_initialized:
@@ -705,33 +709,73 @@ def _escape_like_pattern(query: str) -> str:
     return query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def readonly_sqlite_uri(path: Path, *, immutable: bool) -> str:
+    """The read-only SQLite URI for ``path``; ``immutable`` for sidecar-free sources.
+
+    ``immutable=1`` tells SQLite the file cannot change, so it takes no locks
+    and never creates ``-wal``/``-shm`` beside it; only valid when no WAL exists
+    (or for a private snapshot hermesd owns).
+    """
+    suffix = "?mode=ro&immutable=1" if immutable else "?mode=ro"
+    return f"{path.resolve().as_uri()}{suffix}"
+
+
+# Copy attempts before a snapshot of a database that keeps changing is refused.
+_SNAPSHOT_ATTEMPTS = 2
+
+
+def _snapshot_stability_key(
+    db_path: Path, wal_path: Path
+) -> tuple[tuple[int, int, int] | None, int | None]:
+    signature = _db_source_signature(db_path)
+    db_key = signature[0] if signature is not None else None
+    try:
+        wal_inode: int | None = wal_path.stat().st_ino
+    except FileNotFoundError:
+        wal_inode = None
+    return db_key, wal_inode
+
+
 def snapshot_wal_database(
     db_path: Path, *, prefix: str
 ) -> tuple[tempfile.TemporaryDirectory[str], Path]:
-    """Copy a WAL-mode database and its sidecars into a fresh temp dir.
+    """Copy a WAL-mode database and its -wal sidecar into a fresh temp dir.
 
     Returns the TemporaryDirectory (caller owns cleanup) and the snapshot db
-    path. Missing sidecars are allowed; present sidecars must resolve safely
-    under db_path's directory or the snapshot is refused.
+    path. A missing -wal is allowed; a present one must resolve safely under
+    db_path's directory or the snapshot is refused. -shm is not copied: SQLite
+    rebuilds the wal-index from the WAL in the private snapshot directory.
+
+    The db and -wal are copied separately, so a checkpoint landing between
+    the two copies would pair mismatched files. A checkpoint rewrites the db,
+    so the pair is accepted only if the db is unchanged and the -wal is the
+    same file across the copy; otherwise it is retried, then refused with
+    OSError (callers keep their last-good data). Frames appended to the -wal
+    meanwhile are harmless: SQLite ignores a torn tail by frame checksum, so a
+    busy writer does not make every snapshot fail.
     """
     snapshot_dir = tempfile.TemporaryDirectory(prefix=prefix)
     snapshot_root = Path(snapshot_dir.name)
     snapshot_db = snapshot_root / db_path.name
+    wal_path = db_path.with_name(f"{db_path.name}-wal")
+    snapshot_wal = snapshot_root / wal_path.name
     try:
-        shutil.copy2(db_path, snapshot_db)
-        for suffix in ("-wal", "-shm"):
-            source = db_path.with_name(f"{db_path.name}{suffix}")
-            if source.is_symlink():
-                raise OSError(f"Refusing to snapshot unsafe SQLite sidecar: {source}")
-            if not _exists_strict(source):
-                continue
-            if not _safe_child_path(source, db_path.parent):
-                raise OSError(f"Refusing to snapshot unsafe SQLite sidecar: {source}")
-            shutil.copy2(source, snapshot_root / source.name)
+        for _attempt in range(_SNAPSHOT_ATTEMPTS):
+            before = _snapshot_stability_key(db_path, wal_path)
+            shutil.copy2(db_path, snapshot_db)
+            snapshot_wal.unlink(missing_ok=True)
+            if wal_path.is_symlink():
+                raise OSError(f"Refusing to snapshot unsafe SQLite sidecar: {wal_path}")
+            if _exists_strict(wal_path):
+                if not _safe_child_path(wal_path, db_path.parent):
+                    raise OSError(f"Refusing to snapshot unsafe SQLite sidecar: {wal_path}")
+                shutil.copy2(wal_path, snapshot_wal)
+            if _snapshot_stability_key(db_path, wal_path) == before:
+                return snapshot_dir, snapshot_db
+        raise OSError(f"SQLite database changed during snapshot: {db_path}")
     except OSError:
         snapshot_dir.cleanup()
         raise
-    return snapshot_dir, snapshot_db
 
 
 def _quote_fts_query(query: str) -> str:

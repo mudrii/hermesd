@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from hermesd.collect.common import _exists_strict, _optional_epoch
-from hermesd.db import _SQLITE_TIMEOUT_SECONDS, snapshot_wal_database
+from hermesd.db import _SQLITE_TIMEOUT_SECONDS, readonly_sqlite_uri, snapshot_wal_database
 
 
 def _snapshot_wal_if_present(
@@ -43,9 +43,8 @@ def _connect_resolved_sqlite(read_path: Path, *, immutable: bool) -> Iterator[sq
     snapshot check on it again would copy it a second time. Callers that hold
     the shared snapshot (one copy per refresh, several readers) open it here.
     """
-    suffix = "?mode=ro&immutable=1" if immutable else "?mode=ro"
     conn = sqlite3.connect(
-        f"{read_path.resolve().as_uri()}{suffix}",
+        readonly_sqlite_uri(read_path, immutable=immutable),
         uri=True,
         timeout=_SQLITE_TIMEOUT_SECONDS,
     )
@@ -71,32 +70,16 @@ def _connect_readonly_sqlite(
             yield resolved_conn
         return
     snapshot = _snapshot_wal_if_present(db_path)
-    if snapshot is not None:
-        snapshot_dir, snapshot_db = snapshot
-        conn: sqlite3.Connection | None = None
-        try:
-            conn = sqlite3.connect(
-                f"{snapshot_db.resolve().as_uri()}?mode=ro",
-                uri=True,
-                timeout=_SQLITE_TIMEOUT_SECONDS,
-            )
+    if snapshot is None:
+        with _connect_resolved_sqlite(db_path, immutable=True) as conn:
             yield conn
-        finally:
-            try:
-                if conn is not None:
-                    conn.close()
-            finally:
-                snapshot_dir.cleanup()
         return
-    conn = sqlite3.connect(
-        f"{db_path.resolve().as_uri()}?mode=ro&immutable=1",
-        uri=True,
-        timeout=_SQLITE_TIMEOUT_SECONDS,
-    )
+    snapshot_dir, snapshot_db = snapshot
     try:
-        yield conn
+        with _connect_resolved_sqlite(snapshot_db, immutable=False) as conn:
+            yield conn
     finally:
-        conn.close()
+        snapshot_dir.cleanup()
 
 
 # Every table hermesd reads by name. `_table_count` and `_column_exists` splice

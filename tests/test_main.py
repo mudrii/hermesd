@@ -1195,3 +1195,59 @@ def test_parse_args_profile_default_none():
 def test_parse_args_accepts_profile_flag():
     args = parse_args(["--profile", "coding"])
     assert args.profile == "coding"
+
+
+def test_parse_args_rejects_refresh_rate_above_one_day(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--refresh-rate", "10000000000"])
+    err = capsys.readouterr().err
+    assert "--refresh-rate" in err
+    assert "86400" in err
+    assert parse_args(["--refresh-rate", "86400"]).refresh_rate == 86400
+
+
+@pytest.mark.parametrize("option", ["--refresh-rate", "--log-tail-bytes"])
+def test_parse_args_non_integer_error_names_option_not_helper(option: str, capsys):
+    with pytest.raises(SystemExit):
+        parse_args([option, "abc"])
+    err = capsys.readouterr().err
+    assert option in err
+    assert "_positive_int" not in err
+    assert "positive integer" in err
+
+
+@pytest.mark.parametrize("value", ["00", "-0", "+0"])
+def test_parse_args_snapshot_panel_numeric_zero_spellings_alias_panel_ten(value: str):
+    assert parse_args(["--snapshot-panel", value]).snapshot_panel == 10
+
+
+def test_parse_args_snapshot_panel_non_integer_error_is_readable(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--snapshot-panel", "abc"])
+    err = capsys.readouterr().err
+    assert "_snapshot_panel_num" not in err
+    assert "snapshot panel must be one of:" in err
+
+
+@pytest.mark.parametrize("option", ["--hermes-home", "--snapshot-file"])
+def test_parse_args_rejects_empty_path(option: str, capsys):
+    with pytest.raises(SystemExit):
+        parse_args([option, ""])
+    assert "must not be empty" in capsys.readouterr().err
+
+
+def test_snapshot_file_guard_matches_home_by_identity(tmp_path: Path):
+    """On a case-insensitive filesystem, HOME and home are the same directory."""
+    home = tmp_path / "home"
+    home.mkdir()
+    alias = tmp_path / "HOME"
+    if not alias.exists():
+        pytest.skip("filesystem is case-sensitive")
+
+    assert _snapshot_file_inside_hermes_home(alias / "out.txt", home) is True
+    assert _snapshot_file_inside_hermes_home(alias / "new" / "out.txt", home) is True
+    assert _snapshot_file_inside_hermes_home(tmp_path / "other.txt", home) is False
+
+
+def test_snapshot_file_guard_missing_home_is_not_a_match(tmp_path: Path):
+    assert _snapshot_file_inside_hermes_home(tmp_path / "out.txt", tmp_path / "gone") is False
