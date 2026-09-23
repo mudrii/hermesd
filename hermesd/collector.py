@@ -65,6 +65,8 @@ from hermesd.collect.config import (
     _credential_auth_type,
     _credential_cooldown_remaining,
     _credential_expiry,
+    _doctor_config_findings,
+    _integration_flags,
     _mcp_tool_filter_summary,
     _moa_config_summary,
     _platform_family_label,
@@ -131,6 +133,15 @@ from hermesd.collect.gateway import (
     _update_receipt_status,
 )
 from hermesd.collect.hosted_rooms import _read_hosted_rooms
+from hermesd.collect.integrations import (
+    PAIRING_SUFFIXES,
+    RATE_LIMIT_NAMES,
+    pairing_platforms,
+    pairing_summary,
+    rate_limit_hold,
+    shared_metrics_readout,
+    webhook_summary,
+)
 from hermesd.collect.kanban import (
     _kanban_claim_ttl_seconds,
     _read_kanban_board_summary,
@@ -274,6 +285,7 @@ from hermesd.models import (
     GatewayState,
     HealthSummary,
     HookInfo,
+    IntegrationsState,
     KanbanBoardSummary,
     KanbanState,
     LogLine,
@@ -400,6 +412,26 @@ _DESKTOP_PLUGIN_FIELDS = ("desktop_plugins", "desktop_plugin_scan_truncated")
 _SKILLS_HUB_FIELDS = ("hub_lock_present", "hub_installed_count", "hub_quarantine_count")
 # skills/.hub/quarantine/ listing bound: one entry per quarantined skill.
 _HUB_QUARANTINE_LIST_LIMIT = 1000
+# Each integration store's fields on IntegrationsState, restored per source.
+_PAIRING_FIELDS = ("pairing_platforms",)
+_WEBHOOK_SUBSCRIPTION_FIELDS = (
+    "webhook_subscriptions_present",
+    "webhook_subscription_count",
+    "webhook_enabled_count",
+    "webhook_route_names",
+)
+_SHARED_METRICS_FIELDS = (
+    "shared_metrics_present",
+    "shared_metrics_counter_rows",
+    "shared_metrics_pending_periods",
+    "shared_metrics_outbox_by_state",
+    "shared_metrics_outbox_error_count",
+    "shared_metrics_consent_marks",
+)
+_RATE_LIMIT_FIELDS = ("rate_limit_holds",)
+# Pairing store listing bounds: files examined, platforms summarized.
+_PAIRING_DIR_ENTRY_LIMIT = 400
+_PAIRING_PLATFORM_LIMIT = 40
 # The `curator_activity` source's fields on CuratorRun.
 _CURATOR_ACTIVITY_FIELDS = (
     "suppressed_count",
@@ -848,6 +880,9 @@ class Collector:
         # MEMORY.md / USER.md / SOUL.md is not re-read on every tick.
         self._derived_file_cache: dict[str, tuple[tuple[str, int, int] | None, Any]] = {}
         self._kanban_board_errors: list[str] = []
+        # telemetry/shared_metrics/metrics.sqlite3 readout keyed on the db+WAL
+        # signature, so an idle store is not re-queried every refresh.
+        self._shared_metrics_cache: tuple[_DbSourceSignature, dict[str, Any]] | None = None
         # Session-row-derived values, one entry per derived name: the rows
         # list itself (compared by identity), then (local date, entry-specific
         # deps) — see _derived_from_rows.
@@ -1250,6 +1285,46 @@ class Collector:
                 lambda: results["skills_memory"],
                 fallback=lambda: self._last_source_fields(
                     "skills_hub", results["skills_memory"], _SKILLS_HUB_FIELDS
+                ),
+            ),
+            # Four stores enrich `integrations`, each failing (and falling back)
+            # on its own so one corrupt store cannot blank the others.
+            _SourceSpec(
+                "integrations",
+                "pairing",
+                lambda: self._with_pairing(results.get("integrations") or IntegrationsState()),
+                IntegrationsState,
+                fallback=lambda: self._last_source_fields(
+                    "pairing",
+                    results.get("integrations") or IntegrationsState(),
+                    _PAIRING_FIELDS,
+                ),
+            ),
+            _SourceSpec(
+                "integrations",
+                "webhook_subscriptions",
+                lambda: self._with_webhook_subscriptions(results["integrations"]),
+                lambda: results["integrations"],
+                fallback=lambda: self._last_source_fields(
+                    "webhook_subscriptions", results["integrations"], _WEBHOOK_SUBSCRIPTION_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "integrations",
+                "shared_metrics",
+                lambda: self._with_shared_metrics(results["integrations"]),
+                lambda: results["integrations"],
+                fallback=lambda: self._last_source_fields(
+                    "shared_metrics", results["integrations"], _SHARED_METRICS_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "integrations",
+                "rate_limits",
+                lambda: self._with_rate_limits(results["integrations"]),
+                lambda: results["integrations"],
+                fallback=lambda: self._last_source_fields(
+                    "rate_limits", results["integrations"], _RATE_LIMIT_FIELDS
                 ),
             ),
             _SourceSpec("mcp_cache", "mcp_cache", self._collect_mcp_cache, MCPSchemaCache),
@@ -2554,6 +2629,8 @@ class Collector:
             moa_save_traces=bool(moa_cfg.get("save_traces")),
             moa_trace_dir=str(moa_cfg.get("trace_dir") or ""),
             **_config_agent_limits(cfg),
+            **_integration_flags(cfg),
+            **_doctor_config_findings(cfg),
         )
 
     def _with_config_backups(self, current: ConfigSummary) -> ConfigSummary:
@@ -3907,6 +3984,95 @@ class Collector:
                 "hub_quarantine_count": quarantined,
             }
         )
+
+    def _pairing_dir(self) -> Path:
+        """``get_hermes_dir("platforms/pairing", "pairing")`` (``hermes_constants.py:376-388``).
+
+        A populated legacy ``pairing/`` wins; an empty one never shadows
+        ``platforms/pairing/``. Both are PROFILE-scoped (``gateway/pairing.py:58-59``).
+        """
+        legacy = self._paths.profile_path("pairing")
+        modern = self._paths.profile_path("platforms", "pairing")
+        for path in (legacy, modern):
+            if not _safe_or_absent_child_path(path, self._paths.root_home):
+                raise RuntimeError(f"unsafe pairing directory: {path.name}")
+        if _exists_strict(legacy) and legacy.is_dir() and any(islice(legacy.iterdir(), 1)):
+            return legacy
+        return modern
+
+    def _with_pairing(self, current: IntegrationsState) -> IntegrationsState:
+        """Per-platform live pending and approved counts; codes and ids stay unread."""
+        directory = self._pairing_dir()
+        if not _exists_strict(directory) or not directory.is_dir():
+            return current.model_copy(update={"pairing_platforms": []})
+        files = {
+            entry.name
+            for entry in islice(directory.iterdir(), _PAIRING_DIR_ENTRY_LIMIT)
+            if entry.is_file() and not entry.is_symlink()
+        }
+        now = self._clock()
+        summaries = []
+        for platform in pairing_platforms(sorted(files))[:_PAIRING_PLATFORM_LIMIT]:
+            stores = []
+            for suffix in PAIRING_SUFFIXES:
+                name = f"{platform}{suffix}"
+                stores.append(
+                    self._read_json_reporting_stale(directory / name) if name in files else {}
+                )
+            summaries.append(pairing_summary(platform, stores[0], stores[1], now=now))
+        return current.model_copy(update={"pairing_platforms": summaries})
+
+    def _with_webhook_subscriptions(self, current: IntegrationsState) -> IntegrationsState:
+        """Route names and enabled counts (``hermes_cli/webhook.py:18-35``, PROFILE)."""
+        path = self._paths.profile_path("webhook_subscriptions.json")
+        if not _safe_or_absent_child_path(path, self._paths.root_home):
+            raise RuntimeError("unsafe webhook_subscriptions.json")
+        present = _exists_strict(path)
+        subscriptions = self._read_json_reporting_stale(path) if present else {}
+        return current.model_copy(
+            update={"webhook_subscriptions_present": present, **webhook_summary(subscriptions)}
+        )
+
+    def _with_shared_metrics(self, current: IntegrationsState) -> IntegrationsState:
+        """Counts over ``telemetry/shared_metrics/metrics.sqlite3`` (PROFILE).
+
+        ``SharedMetricsStore`` roots at ``get_hermes_home()/"telemetry"/
+        "shared_metrics"`` (``hermes_cli/observability/shared_metrics.py:171-176``).
+        The readout is reused until the db or its WAL changes.
+        """
+        path = self._paths.profile_path("telemetry", "shared_metrics", "metrics.sqlite3")
+        if not _safe_or_absent_child_path(path, self._paths.root_home):
+            raise RuntimeError("unsafe shared metrics database")
+        if not _exists_strict(path):
+            self._shared_metrics_cache = None
+            empty = IntegrationsState()
+            return current.model_copy(
+                update={name: getattr(empty, name) for name in _SHARED_METRICS_FIELDS}
+            )
+        signature = _db_source_signature(path)
+        cached = self._shared_metrics_cache
+        if cached is not None and signature is not None and cached[0] == signature:
+            readout = cached[1]
+        else:
+            with _connect_readonly_sqlite(path) as conn:
+                readout = shared_metrics_readout(conn)
+            self._shared_metrics_cache = (signature, readout) if signature is not None else None
+        return current.model_copy(update={"shared_metrics_present": True, **readout})
+
+    def _with_rate_limits(self, current: IntegrationsState) -> IntegrationsState:
+        """Active provider holds from ``rate_limits/*.json`` (``agent/nous_rate_guard.py:37-46``)."""
+        now = self._clock()
+        holds = []
+        for name in RATE_LIMIT_NAMES:
+            path = self._paths.profile_path("rate_limits", f"{name}.json")
+            if not _safe_or_absent_child_path(path, self._paths.root_home):
+                raise RuntimeError(f"unsafe rate limit file: {path.name}")
+            if not _exists_strict(path):
+                continue
+            hold = rate_limit_hold(name, self._read_json_reporting_stale(path), now=now)
+            if hold is not None:
+                holds.append(hold)
+        return current.model_copy(update={"rate_limit_holds": holds})
 
     def _with_plugin_catalog(self, current: SkillsMemory) -> SkillsMemory:
         """Flag catalog drift, catalog removals and unmanaged installs.

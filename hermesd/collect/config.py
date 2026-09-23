@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
@@ -15,9 +16,20 @@ from hermesd.collect.common import (
     _coerce_int,
     _iso_to_epoch,
 )
-from hermesd.collect.plugins import plugin_name_set
-from hermesd.collect.redaction import _API_KEY_FIELD_NAMES, _OAUTH_FIELD_NAMES
-from hermesd.models import ConfigBackupGroup, ConfigBackupKind, ModelCooldown, PlatformStatus
+from hermesd.collect.plugins import PLUGIN_KIND_STANDALONE, gate_plugin, plugin_name_set
+from hermesd.collect.redaction import (
+    _API_KEY_FIELD_NAMES,
+    _OAUTH_FIELD_NAMES,
+    _redact_secret_url,
+)
+from hermesd.models import (
+    ConfigBackupGroup,
+    ConfigBackupKind,
+    ModelCooldown,
+    PlatformStatus,
+    PluginActivation,
+    ProfileRouteSummary,
+)
 
 # Upper bound on name lists surfaced from config/cache mappings.
 _MAX_LISTED_NAMES = 20
@@ -106,6 +118,148 @@ def _active_personality_name(cfg: dict[str, Any]) -> str:
     for user in (cfg.get("personalities"), _as_dict(cfg.get("agent")).get("personalities")):
         known.update(_normalize_personality_name(key) for key in _as_dict(user))
     return name if name in known else ""
+
+
+# ``PROFILE_ID_RE`` (``hermes_constants.py:283``) and ``_RESERVED_NAMES``
+# (``hermes_cli/profiles.py:151``); ``default`` is always valid.
+_PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_RESERVED_PROFILE_NAMES = frozenset({"hermes", "test", "tmp", "root", "sudo"})
+_ROUTE_DISCRIMINATORS = ("guild_id", "chat_id", "thread_id", "user_id")
+
+
+def _route_profile_name(value: object) -> str | None:
+    """``normalize_profile_name`` + ``validate_profile_name`` (``profiles.py:235-270``)."""
+    stripped = str(value).strip()
+    if not stripped:
+        return None
+    if stripped.casefold() == "default":
+        return "default"
+    name = stripped.lower()
+    if not _PROFILE_ID_RE.match(name) or name in _RESERVED_PROFILE_NAMES:
+        return None
+    return name
+
+
+def _route_id_present(value: object) -> bool:
+    """Whether ``_coerce_route_id`` leaves a truthy discriminator (``:110-131``)."""
+    return value is not None and str(value) != ""
+
+
+def _profile_routes(cfg: dict[str, Any]) -> tuple[list[ProfileRouteSummary], int]:
+    """The routes ``parse_profile_routes`` keeps, most-specific first, and a skip count.
+
+    The list comes from the root ``profile_routes`` key, else
+    ``gateway.profile_routes`` (``gateway/config_loader.py:93,117-121``); only a
+    list is accepted. Discriminator *names* are reported, never the chat, guild
+    or user ids themselves (``gateway/profile_routing.py:133-171``).
+    """
+    raw = cfg.get("profile_routes")
+    if raw is None:
+        raw = _as_dict(cfg.get("gateway")).get("profile_routes")
+    if not isinstance(raw, list):
+        return [], 0
+    routes: list[ProfileRouteSummary] = []
+    skipped = 0
+    for entry in raw:
+        if not isinstance(entry, dict):
+            skipped += 1
+            continue
+        platform = entry.get("platform") or ""
+        profile = _route_profile_name(entry.get("profile") or "")
+        user_id = entry.get("user_id")
+        if (
+            not platform
+            or profile is None
+            or ("user_id" in entry and (user_id is None or not str(user_id).strip()))
+        ):
+            skipped += 1
+            continue
+        bot_profile = str(entry.get("bot_profile") or "").strip()
+        routes.append(
+            ProfileRouteSummary(
+                name=str(entry.get("name") or ""),
+                platform=str(platform),
+                profile=profile,
+                enabled=entry.get("enabled", True) is not False,
+                bot_profile="" if bot_profile == "default" else bot_profile,
+                discriminators=[
+                    key for key in _ROUTE_DISCRIMINATORS if _route_id_present(entry.get(key))
+                ],
+            )
+        )
+    routes.sort(key=_route_specificity, reverse=True)
+    return routes, skipped
+
+
+def _route_specificity(route: ProfileRouteSummary) -> int:
+    """``ProfileRoute.specificity``: guild 2, chat 4, thread 8, user 16."""
+    weights = {"guild_id": 2, "chat_id": 4, "thread_id": 8, "user_id": 16}
+    return sum(weights[key] for key in route.discriminators)
+
+
+def _integration_flags(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Monitoring, webhook and Langfuse switches — flags only, never endpoints."""
+    monitoring = _as_dict(cfg.get("monitoring"))
+    otlp = _as_dict(_as_dict(monitoring.get("export")).get("otlp"))
+    plugins = _as_dict(cfg.get("plugins"))
+    langfuse = gate_plugin(
+        key="observability/langfuse",
+        name="langfuse",
+        kind=PLUGIN_KIND_STANDALONE,
+        enabled=plugin_name_set(plugins.get("enabled")),
+        disabled=plugin_name_set(plugins.get("disabled")),
+    )
+    routes, skipped = _profile_routes(cfg)
+    return {
+        "webhook_platform_enabled": bool(
+            _as_dict(_as_dict(cfg.get("platforms")).get("webhook")).get("enabled")
+        ),
+        "profile_routes": routes,
+        "profile_routes_skipped": skipped,
+        "monitoring_health_export_enabled": bool(
+            _as_dict(monitoring.get("gateway_health_export")).get("enabled")
+        ),
+        "monitoring_otlp_enabled": bool(otlp.get("enabled")),
+        "monitoring_otlp_endpoint_configured": bool(str(otlp.get("endpoint") or "").strip()),
+        "langfuse_plugin_enabled": langfuse.activation is PluginActivation.ENABLED,
+    }
+
+
+def _endpoint_url(entry: dict[str, Any]) -> str:
+    """``_endpoint_url`` (``hermes_cli/doctor_config.py:398-401``)."""
+    url = entry.get("api") or entry.get("base_url") or entry.get("url") or ""
+    return str(url).strip().rstrip("/").lower()
+
+
+def _doctor_config_findings(cfg: dict[str, Any]) -> dict[str, Any]:
+    """The raw-file drift checks ``hermes doctor`` runs that need nothing but the file.
+
+    ``_drift_stale_root_keys`` (``hermes_cli/doctor_config.py:341-361``): string
+    root ``provider``/``base_url``. ``_drift_legacy_custom_providers``
+    (``:405-430``): ``custom_providers`` list entries whose endpoint has no
+    ``providers:`` twin. Labels are the entry name, else its URL redacted.
+    """
+    stale = [key for key in ("provider", "base_url") if isinstance(cfg.get(key), str)]
+    legacy = cfg.get("custom_providers")
+    labels: list[str] = []
+    if isinstance(legacy, list):
+        providers = cfg.get("providers")
+        twins = {
+            _endpoint_url(entry)
+            for entry in (providers.values() if isinstance(providers, dict) else ())
+            if isinstance(entry, dict)
+        }
+        for entry in legacy:
+            if not isinstance(entry, dict):
+                continue
+            url = _endpoint_url(entry)
+            if not url or url in twins:
+                continue
+            labels.append(str(entry.get("name") or "").strip() or _redact_secret_url(url))
+    return {
+        "stale_root_keys": stale,
+        "legacy_custom_provider_labels": labels[:_MAX_LISTED_NAMES],
+    }
 
 
 def _coerce_session_cap(value: object) -> int | None:
