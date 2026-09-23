@@ -348,15 +348,17 @@ _CONFIG_BACKUP_FIELDS = (
     "config_backup_groups_truncated",
 )
 # The catalog-cache enrichment owns these SkillsMemory fields plus the flags it
-# stamps onto the plugin rows, so its last-good fallback restores both.
+# stamps onto the plugin rows. The rows themselves belong to the skills source,
+# so its last-good fallback restores these fields and re-stamps the flags by
+# plugin name onto the freshly discovered list (see _last_plugin_catalog).
 _PLUGIN_CATALOG_FIELDS = (
-    "plugins",
     "plugin_catalog_cache_present",
     "plugin_catalog_cache_usable",
     "plugin_catalog_cache_age_seconds",
     "plugin_catalog_update_count",
     "plugin_catalog_removed_count",
 )
+_PLUGIN_CATALOG_FLAGS = ("catalog_update_available", "catalog_removed", "catalog_removed_reason")
 # cache/blocked-scripts/ scan bounds and the fields the source owns.
 _BLOCKED_SCRIPT_SCAN_LIMIT = 200
 _BLOCKED_SCRIPT_NAME_LIMIT = 3
@@ -1149,9 +1151,7 @@ class Collector:
                 "plugin_catalog",
                 lambda: self._with_plugin_catalog(results["skills_memory"]),
                 lambda: results["skills_memory"],
-                fallback=lambda: self._last_source_fields(
-                    "plugin_catalog", results["skills_memory"], _PLUGIN_CATALOG_FIELDS
-                ),
+                fallback=lambda: self._last_plugin_catalog(results["skills_memory"]),
             ),
             _SourceSpec("mcp_cache", "mcp_cache", self._collect_mcp_cache, MCPSchemaCache),
             _SourceSpec(
@@ -1314,6 +1314,22 @@ class Collector:
         if last is None:
             return current
         return current.model_copy(update={name: getattr(last, name) for name in fields})
+
+    def _last_plugin_catalog(self, current: SkillsMemory) -> SkillsMemory:
+        """Restore the catalog verdicts onto the current plugin rows, by name."""
+        restored = self._last_source_fields("plugin_catalog", current, _PLUGIN_CATALOG_FIELDS)
+        last: SkillsMemory | None = self._last_good_by_source.get("plugin_catalog")
+        if last is None:
+            return restored
+        flags = {
+            plugin.name: {name: getattr(plugin, name) for name in _PLUGIN_CATALOG_FLAGS}
+            for plugin in last.plugins
+        }
+        plugins = [
+            plugin.model_copy(update=flags[plugin.name]) if plugin.name in flags else plugin
+            for plugin in current.plugins
+        ]
+        return restored.model_copy(update={"plugins": plugins})
 
     def _fresh_session_rows(
         self,
