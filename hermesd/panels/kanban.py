@@ -387,4 +387,4 @@ def _task_metadata_table(
 def _age_label(timestamp: int, now: float) -> str:
     if timestamp <= 0:
         return "—"
-    return fmt_age_seconds(max(0, int(now) - timestamp))
+    return fmt_age_seconds(int(now) - timestamp)

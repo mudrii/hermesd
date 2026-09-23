@@ -19,6 +19,7 @@ from hermesd.panels.formatting import (
 from hermesd.panels.formatting import (
     fmt_tokens,
     fmt_usd,
+    sanitize_terminal_text,
     section_heading,
 )
 from hermesd.theme import Theme
@@ -166,7 +167,7 @@ def _append_top_models(lines: Text, state: DashboardState, theme: Theme) -> None
     lines.append("\n  Models", style=theme.ui_label)
     for index, usage in enumerate(top):
         lines.append("  " if index else " ", style=theme.banner_dim)
-        lines.append(escape(usage.model or "unknown"), style=theme.banner_text)
+        lines.append(sanitize_terminal_text(usage.model or "unknown"), style=theme.banner_text)
         lines.append(f" {_usage_cost_cell(usage)}", style=theme.ui_accent)
 
 
@@ -267,7 +268,7 @@ def _cost_status_line(analytics: TokenAnalytics, theme: Theme) -> Text:
     for index, (status, count) in enumerate(ordered):
         if index:
             line.append("  ·  ", style=theme.banner_dim)
-        line.append(escape(status), style=theme.ui_label)
+        line.append(sanitize_terminal_text(status), style=theme.ui_label)
         line.append(f" {count}", style=theme.banner_text)
     return line
 

@@ -91,16 +91,9 @@ _CATCH_UP_ABSENCE_NOTE = (
 )
 
 
-def _fmt_age(age: float | None) -> str:
-    """Compact age label, or the panel's placeholder when the age is unknown."""
-    if age is None:
-        return "—"
-    return fmt_age_seconds(max(0, int(age)))
-
-
 def _fmt_error_age(age: float | None) -> str:
     """Age phrase for a recorded failure; the stamp can be missing while the message is not."""
-    return f"{_fmt_age(age)} ago" if age is not None else "at an unknown time"
+    return f"{fmt_age_seconds(age)} ago" if age is not None else "at an unknown time"
 
 
 def _job_markers(job: CronJob) -> str:
@@ -266,12 +259,12 @@ def _cron_header(c: CronState, theme: Theme) -> Text:
     header.append("Ticker: ", style=theme.ui_label)
     header.append(c.ticker_health.value, style=getattr(theme, _TICKER_STYLES[c.ticker_health]))
     header.append(
-        f"  (beat {_fmt_age(c.ticker_heartbeat_age_seconds)}, "
-        f"success {_fmt_age(c.ticker_last_success_age_seconds)})\n\n",
+        f"  (beat {fmt_age_seconds(c.ticker_heartbeat_age_seconds)}, "
+        f"success {fmt_age_seconds(c.ticker_last_success_age_seconds)})\n\n",
         style=theme.banner_dim,
     )
     header.append(
-        f"Provider: provider={escape(c.provider)}",
+        f"Provider: provider={sanitize_terminal_text(c.provider)}",
         style=theme.banner_dim,
     )
     if c.suggestion_count:
@@ -437,15 +430,15 @@ def _job_flags_line(j: CronJob, theme: Theme) -> Text | None:
     """One line of the jobs.json fields too narrow to earn a table column."""
     parts = []
     if j.fire_claim_state == CronFireClaimState.RUNNING:
-        parts.append(f"running now (claim {_fmt_age(j.fire_claim_age_seconds)} old)")
+        parts.append(f"running now (claim {fmt_age_seconds(j.fire_claim_age_seconds)} old)")
     elif j.fire_claim_state == CronFireClaimState.ABANDONED_RUN:
         # The claim outlived upstream's 300 s TTL without a run outcome: the
         # runner died mid-run and never cleared or heartbeated it.
-        parts.append(f"abandoned run (claim {_fmt_age(j.fire_claim_age_seconds)} old)")
+        parts.append(f"abandoned run (claim {fmt_age_seconds(j.fire_claim_age_seconds)} old)")
     if j.pending_slot_scheduled_at:
         stamp = ""
         if j.pending_slot_age_seconds is not None:
-            stamp = f", stamped {_fmt_age(j.pending_slot_age_seconds)} ago"
+            stamp = f", stamped {fmt_age_seconds(j.pending_slot_age_seconds)} ago"
         parts.append(
             f"pending slot {sanitize_terminal_text(fmt_iso_timestamp(j.pending_slot_scheduled_at))}"
             f"{stamp} — may never have run"
@@ -527,8 +520,8 @@ def _retention_line(executions: CronExecutionsState, theme: Theme) -> Text | Non
     line.append(f" ({executions.retained_terminal_count} terminal)", style=theme.banner_dim)
     if executions.oldest_claimed_age_seconds is not None:
         line.append(
-            f"  spanning {_fmt_age(executions.newest_claimed_age_seconds)}"
-            f" to {_fmt_age(executions.oldest_claimed_age_seconds)} ago",
+            f"  spanning {fmt_age_seconds(executions.newest_claimed_age_seconds)}"
+            f" to {fmt_age_seconds(executions.oldest_claimed_age_seconds)} ago",
             style=theme.banner_dim,
         )
     if executions.at_retention_cap:
@@ -564,8 +557,8 @@ def _recent_executions_table(executions: CronExecutionsState, theme: Theme) -> T
             escape(run.job_name or run.job_id or "—"),
             Text(sanitize_terminal_text(run.status) or "—", style=status_color),
             *delivery,
-            _fmt_age(run.started_age_seconds),
-            _fmt_age(run.duration_seconds),
+            fmt_age_seconds(run.started_age_seconds),
+            fmt_age_seconds(run.duration_seconds),
             escape(run.error_excerpt) if run.error_excerpt else "—",
         )
     return table
@@ -634,8 +627,8 @@ def _incidents_table(executions: CronExecutionsState, theme: Theme) -> Table:
                 style=getattr(theme, _INCIDENT_STATE_STYLES.get(state, "banner_text")),
             ),
             escape(incident.failure_type) or "—",
-            _fmt_age(incident.first_seen_age_seconds),
-            _fmt_age(incident.last_seen_age_seconds),
+            fmt_age_seconds(incident.first_seen_age_seconds),
+            fmt_age_seconds(incident.last_seen_age_seconds),
             escape(incident.error_excerpt) if incident.error_excerpt else "—",
         )
     return table

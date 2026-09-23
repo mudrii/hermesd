@@ -10,7 +10,6 @@ from pathlib import Path
 import pytest
 
 from hermesd.app import (
-    _LOG_PANEL_NUM,
     DashboardApp,
     ViewState,
     _osc52_sequence,
@@ -487,76 +486,6 @@ def test_osc52_sequence():
     sequence = _osc52_sequence("hello")
     assert sequence.startswith("\033]52;c;")
     assert sequence.endswith("\a")
-
-
-def test_build_footer_reads_log_sub_view_under_view_lock(populated_hermes_home: Path, monkeypatch):
-    """The fallback view read in _build_footer must hold _view_lock."""
-
-    class TrackingLock:
-        def __init__(self) -> None:
-            self._lock = threading.RLock()
-            self.held = False
-
-        def __enter__(self):
-            self._lock.acquire()
-            self.held = True
-            return self
-
-        def __exit__(self, exc_type, exc, traceback):
-            self.held = False
-            self._lock.release()
-
-    app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    lock = TrackingLock()
-    app._view_lock = lock
-    observed: list[bool] = []
-    checking = [False]
-
-    class LockCheckingView(ViewState):
-        def __getattribute__(self, name: str):
-            if name == "log_sub_view" and checking[0]:
-                observed.append(lock.held)
-            return super().__getattribute__(name)
-
-    app._view = LockCheckingView()
-    app._view.mode = "detail"
-    app._view.detail_panel = _LOG_PANEL_NUM
-    checking[0] = True
-
-    app._build_footer(app._collector.collect())
-
-    assert observed
-    assert all(observed)
-    app.close()
-
-
-def test_build_footer_uses_passed_log_sub_view(populated_hermes_home: Path, monkeypatch):
-    """log_sub_view is passed in as a parameter like the other view fields."""
-    import hermesd.app as app_module
-
-    app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    captured: dict[str, str] = {}
-    real_max_scroll = app_module._detail_max_scroll_offset
-
-    def spy_max_scroll(panel_num, state, log_sub_view, filter_query, **kwargs):
-        captured["log_sub_view"] = log_sub_view
-        return real_max_scroll(panel_num, state, log_sub_view, filter_query, **kwargs)
-
-    monkeypatch.setattr(app_module, "_detail_max_scroll_offset", spy_max_scroll)
-    app._view.log_sub_view = "agent"
-
-    app._build_footer(
-        app._collector.collect(),
-        view_mode="detail",
-        detail_panel=_LOG_PANEL_NUM,
-        filter_query="",
-        filter_edit_mode=False,
-        session_sort="recent",
-        log_sub_view="errors",
-    )
-
-    assert captured["log_sub_view"] == "errors"
-    app.close()
 
 
 def test_capture_layout_text_does_not_mutate_view(populated_hermes_home: Path, monkeypatch):

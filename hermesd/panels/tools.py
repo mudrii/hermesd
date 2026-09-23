@@ -9,8 +9,8 @@ from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import DashboardState, ToolStats
+from hermesd.panels.formatting import IdentityMemo, sanitize_terminal_text, section_heading
 from hermesd.panels.formatting import escape_terminal_text as escape
-from hermesd.panels.formatting import sanitize_terminal_text, section_heading
 from hermesd.theme import Theme
 
 
@@ -77,21 +77,15 @@ def _tool_calls_section(state: DashboardState, theme: Theme) -> list[RenderableT
     return [header, _tool_calls_table(state.tool_stats, theme)]
 
 
-# Same per-frame recompute pattern as the sessions detail: the collector
-# fallback can emit one ToolStats per session, so this table is rebuilt from
-# an unbounded list at 2 Hz. Single-entry memo on input identity; the entry
-# holds strong references, so a key match is always the same objects.
-_tool_calls_table_cache: tuple[list[ToolStats], Theme, Table] | None = None
+# The collector fallback can emit one ToolStats per session, so without a
+# memo this table is rebuilt from an unbounded list at 2 Hz.
+_tool_calls_table_memo: IdentityMemo[Table] = IdentityMemo()
 
 
 def _tool_calls_table(tool_stats: list[ToolStats], theme: Theme) -> Table:
-    global _tool_calls_table_cache
-    cached = _tool_calls_table_cache
-    if cached is not None and cached[0] is tool_stats and cached[1] is theme:
-        return cached[2]
-    table = _build_tool_calls_table(tool_stats, theme)
-    _tool_calls_table_cache = (tool_stats, theme, table)
-    return table
+    return _tool_calls_table_memo.get(
+        (tool_stats, theme), lambda: _build_tool_calls_table(tool_stats, theme)
+    )
 
 
 def _build_tool_calls_table(tool_stats: list[ToolStats], theme: Theme) -> Table:

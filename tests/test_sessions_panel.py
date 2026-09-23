@@ -1096,3 +1096,22 @@ def test_hygiene_note_names_the_configurable_default_base() -> None:
     )
     assert "default 300s base" in detail
     assert "hygiene_failure_cooldown_seconds" in detail
+
+
+def test_cost_sort_orders_by_displayed_cost() -> None:
+    """Sort by the Cost column value: provider-billed cost wins over the estimate."""
+    billed = _session(
+        session_id="sess_billed", started_at=_NOW - 60, actual_cost_usd=5.0, estimated_cost_usd=0.1
+    )
+    estimated = _session(session_id="sess_estim", started_at=_NOW - 60, estimated_cost_usd=1.0)
+
+    ordered = sessions_module._sort_sessions([estimated, billed], "cost")
+
+    assert [session.session_id for session in ordered] == ["sess_billed", "sess_estim"]
+
+
+@pytest.mark.parametrize("query", ["msg:", "message:", "message:  model:"])
+def test_empty_message_filter_does_not_hide_sessions(query: str) -> None:
+    sessions = [_session(session_id="sess_one", started_at=_NOW - 60)]
+
+    assert sessions_module._filter_sessions(sessions, query, set()) == sessions

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import math
 import re
+from collections.abc import Callable
 from datetime import datetime
+from typing import Generic, TypeVar
 
 from rich.markup import escape
 from rich.text import Text
@@ -20,6 +23,36 @@ _ANSI_STRIP_PATTERN = re.compile(
     r"|\x1b."  # any remaining ESC + one byte (charset selects, stray ST, ...)
     r"|[\x00-\x08\x0b-\x1f\x7f\x80-\x9f]"  # leftover C0 (keep \t \n) and C1 controls
 )
+
+T = TypeVar("T")
+
+
+class IdentityMemo(Generic[T]):
+    """Single-entry memo for per-frame panel work keyed on input identity.
+
+    The render loop redraws at 2 Hz while the collector replaces state objects
+    only once per collect, so a key element matches when it is the same object
+    (strings: an equal value). The entry holds strong references, so ids cannot
+    be recycled into a false hit, and a fresh collect always misses.
+    """
+
+    def __init__(self) -> None:
+        self._entry: tuple[tuple[object, ...], T] | None = None
+
+    def get(self, key: tuple[object, ...], compute: Callable[[], T]) -> T:
+        entry = self._entry
+        if entry is not None and _same_key(entry[0], key):
+            return entry[1]
+        value = compute()
+        self._entry = (key, value)
+        return value
+
+
+def _same_key(cached: tuple[object, ...], key: tuple[object, ...]) -> bool:
+    return len(cached) == len(key) and all(
+        old is new or (isinstance(old, str) and old == new)
+        for old, new in zip(cached, key, strict=True)
+    )
 
 
 def fmt_tokens(n: int) -> str:
@@ -52,13 +85,33 @@ def escape_terminal_text(value: str) -> str:
     return escape(sanitize_terminal_text(value))
 
 
-def fmt_age_seconds(age: int) -> str:
-    """Render a non-negative age in seconds as a compact s/m/h label."""
-    if age < 60:
-        return f"{age}s"
-    if age < 3600:
-        return f"{age // 60}m"
-    return f"{age // 3600}h"
+def fmt_age_seconds(age: float | None) -> str:
+    """Compact s/m/h/d label for an age in seconds; "—" when unknown or not finite.
+
+    Negative ages (clock skew) clamp to "0s".
+    """
+    if age is None or not math.isfinite(age):
+        return "—"
+    seconds = max(0, int(age))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def fmt_bytes(size_bytes: int) -> str:
+    """Binary-unit size label: B, then KB/MB/GB/TB with one decimal."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    value = float(size_bytes)
+    for unit in ("KB", "MB", "GB"):
+        value /= 1024
+        if value < 1024:
+            return f"{value:.1f} {unit}"
+    return f"{value / 1024:.1f} TB"
 
 
 def section_heading(label: str, theme: Theme, *, leading_blank: bool = True) -> Text:

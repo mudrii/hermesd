@@ -245,8 +245,10 @@ def _state_for(panel_num: int) -> DashboardState:
                 by_provider=[TokenBreakdown(label=INJECT, session_count=1)],
                 usage_source="session_model_usage",
                 model_usage_all=[
-                    ModelUsage(model=INJECT, provider=INJECT, task=INJECT, api_calls=2)
+                    ModelUsage(model=INJECT, provider=INJECT, task=INJECT, api_calls=2),
+                    ModelUsage(model=INJECT, provider=INJECT, api_calls=3),
                 ],
+                cost_status_counts={INJECT: 1},
                 model_usage_24h=[
                     ModelUsage(model=INJECT, provider=INJECT, task=INJECT, api_calls=1)
                 ],
@@ -319,6 +321,7 @@ def _state_for(panel_num: int) -> DashboardState:
         return DashboardState(
             cron=CronState(
                 job_count=1,
+                provider=INJECT,
                 jobs=[
                     CronJob(
                         job_id="job_injection",
@@ -709,7 +712,7 @@ def _state_for(panel_num: int) -> DashboardState:
 _NO_FREE_TEXT_COMPACT_PANELS = {3, 12}
 
 
-@pytest.mark.parametrize("panel_num", range(1, 14))
+@pytest.mark.parametrize("panel_num", sorted(PANEL_NAMES))
 @pytest.mark.parametrize("detail", [False, True])
 def test_panel_does_not_crash_on_markup_injection(panel_num: int, detail: bool) -> None:
     state = _state_for(panel_num)
@@ -724,7 +727,7 @@ def test_panel_does_not_crash_on_markup_injection(panel_num: int, detail: bool) 
         assert "desc" in rendered
 
 
-@pytest.mark.parametrize("panel_num", range(1, 14))
+@pytest.mark.parametrize("panel_num", sorted(PANEL_NAMES))
 @pytest.mark.parametrize("detail", [False, True])
 def test_panel_preserves_literal_brackets(panel_num: int, detail: bool) -> None:
     state = _state_for(panel_num)
@@ -736,6 +739,9 @@ def test_panel_preserves_literal_brackets(panel_num: int, detail: bool) -> None:
     view = "detail" if detail else "compact"
     assert PAIR in rendered, f"panel {panel_num} {view} stripped literal {PAIR!r}"
     assert CLOSER in rendered, f"panel {panel_num} {view} dropped literal {CLOSER!r}"
+    # "\\[xy]" also contains PAIR: escape() applied to text that never goes
+    # through the markup parser (Text/Text.append) shows a literal backslash.
+    assert "\\[" not in rendered, f"panel {panel_num} {view} shows an escaped bracket"
 
 
 @pytest.mark.parametrize(
@@ -746,7 +752,7 @@ def test_panel_preserves_literal_brackets(panel_num: int, detail: bool) -> None:
     ],
     ids=["csi", "osc"],
 )
-@pytest.mark.parametrize("panel_num", range(1, 14))
+@pytest.mark.parametrize("panel_num", sorted(PANEL_NAMES))
 @pytest.mark.parametrize("detail", [False, True])
 def test_panel_strips_terminal_control_sequences(
     panel_num: int,

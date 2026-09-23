@@ -18,9 +18,10 @@ import pytest
 from rich.cells import cell_len
 from rich.text import Text
 
+from hermesd import __version__
 from hermesd.app import DashboardApp
 from hermesd.collector import Collector
-from hermesd.panels import render_panel
+from hermesd.panels import PANEL_NAMES, render_panel
 from hermesd.theme import Theme
 from tests.conftest import create_state_db_tables, render_to_str
 
@@ -121,12 +122,12 @@ def test_dashboard_header_and_footer_render_unicode_state(unicode_hermes_home: P
     try:
         state = app._collector.collect()
         header = app._build_header(state)
-        footer = app._build_footer(state)
+        footer = app._build_footer(state, app._theme, app._snapshot_view_state(), None)
     finally:
         app.close()
 
-    assert header.plain
-    assert footer.plain
+    assert f"hermesd {__version__}" in header.plain
+    assert "[q] Quit" in footer.plain
 
 
 def test_full_snapshot_renders_unicode_home_without_crash(unicode_hermes_home: Path):
@@ -136,4 +137,7 @@ def test_full_snapshot_renders_unicode_home_without_crash(unicode_hermes_home: P
     finally:
         app.close()
 
-    assert snapshot
+    assert f"hermesd {__version__}" in snapshot
+    assert "ツール呼び出し完了" in snapshot
+    for panel_name in PANEL_NAMES.values():
+        assert panel_name in snapshot
