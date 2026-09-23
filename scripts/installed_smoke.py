@@ -35,6 +35,12 @@ REQUIRED_DIST_FILES = (
 )
 
 
+def _check(condition: object, message: str) -> None:
+    """Fail the smoke run; unlike ``assert`` this survives ``python -O``."""
+    if not condition:
+        raise SystemExit(message)
+
+
 def hermesd(*args: str, home: Path | None = None) -> subprocess.CompletedProcess[str]:
     """Run the installed CLI from an isolated cwd, never the source tree."""
     command = [sys.executable, "-I", "-m", "hermesd"]
@@ -86,88 +92,99 @@ def snapshot_state(home: Path) -> dict[Path, str]:
 def check_missing_home(home: Path) -> None:
     """Verify the installed CLI rejects an absent Hermes home without creating it."""
     result = hermesd("--snapshot", "--no-color", home=home)
-    assert result.returncode == 1, f"missing home: unexpected exit {result.returncode}"
-    assert not result.stdout, f"missing home: unexpected output: {result.stdout!r}"
-    assert "does not exist" in result.stderr, f"missing home: wrong error: {result.stderr!r}"
-    assert not home.exists(), "missing home: hermesd created the absent home"
+    _check(result.returncode == 1, f"missing home: unexpected exit {result.returncode}")
+    _check(not result.stdout, f"missing home: unexpected output: {result.stdout!r}")
+    _check("does not exist" in result.stderr, f"missing home: wrong error: {result.stderr!r}")
+    _check(not home.exists(), "missing home: hermesd created the absent home")
 
 
 def check_snapshots(home: Path, label: str, *, populated: bool) -> None:
     before = snapshot_state(home)
 
     overview = hermesd("--snapshot", "--no-color", home=home)
-    assert overview.returncode == 0, f"{label}: overview failed: {overview.stderr}"
-    assert overview.stdout.strip(), f"{label}: empty overview output"
+    _check(overview.returncode == 0, f"{label}: overview failed: {overview.stderr}")
+    _check(overview.stdout.strip(), f"{label}: empty overview output")
 
     full_json = hermesd("--snapshot-format", "json", home=home)
-    assert full_json.returncode == 0, f"{label}: full JSON failed: {full_json.stderr}"
+    _check(full_json.returncode == 0, f"{label}: full JSON failed: {full_json.stderr}")
     payload = json.loads(full_json.stdout)
-    assert payload["panel_num"] is None, f"{label}: unexpected panel annotation"
+    _check(payload["panel_num"] is None, f"{label}: unexpected panel annotation")
     state = payload.get("state")
-    assert isinstance(state, dict), f"{label}: JSON payload missing state"
+    _check(isinstance(state, dict), f"{label}: JSON payload missing state")
     if populated:
-        assert state["config"]["model"] == "smoke-model", f"{label}: fixture model not collected"
-        assert state["config"]["provider"] == "smoke-provider", (
-            f"{label}: fixture provider not collected"
+        _check(state["config"]["model"] == "smoke-model", f"{label}: fixture model not collected")
+        _check(
+            state["config"]["provider"] == "smoke-provider",
+            f"{label}: fixture provider not collected",
         )
-        assert state["skills_memory"]["skills"] == [
-            {
-                "category": "notes",
-                "description": "Smoke fixture skill",
-                "name": "readme",
-            }
-        ], f"{label}: fixture skill not collected"
-        assert [line["message"] for line in state["logs"]["agent_lines"]] == [
-            "smoke log line one",
-            "smoke log line two",
-        ], f"{label}: fixture logs not collected"
+        _check(
+            state["skills_memory"]["skills"]
+            == [
+                {
+                    "category": "notes",
+                    "description": "Smoke fixture skill",
+                    "name": "readme",
+                }
+            ],
+            f"{label}: fixture skill not collected",
+        )
+        _check(
+            [line["message"] for line in state["logs"]["agent_lines"]]
+            == [
+                "smoke log line one",
+                "smoke log line two",
+            ],
+            f"{label}: fixture logs not collected",
+        )
 
     panel_json = hermesd("--snapshot-format", "json", "--snapshot-panel", "12", home=home)
-    assert panel_json.returncode == 0, f"{label}: panel JSON failed: {panel_json.stderr}"
+    _check(panel_json.returncode == 0, f"{label}: panel JSON failed: {panel_json.stderr}")
     payload = json.loads(panel_json.stdout)
-    assert payload["panel_num"] == 12, f"{label}: panel number not annotated"
-    assert payload["panel_name"] == "Operations", f"{label}: wrong panel name"
+    _check(payload["panel_num"] == 12, f"{label}: panel number not annotated")
+    _check(payload["panel_name"] == "Operations", f"{label}: wrong panel name")
 
     panel_text = hermesd("--snapshot-panel", "8", "--no-color", home=home)
-    assert panel_text.returncode == 0, f"{label}: panel text failed: {panel_text.stderr}"
-    assert "[8] Logs" in panel_text.stdout, f"{label}: wrong text panel output"
+    _check(panel_text.returncode == 0, f"{label}: panel text failed: {panel_text.stderr}")
+    _check("[8] Logs" in panel_text.stdout, f"{label}: wrong text panel output")
     if populated:
-        assert "smoke log line two" in panel_text.stdout, f"{label}: fixture log not rendered"
+        _check("smoke log line two" in panel_text.stdout, f"{label}: fixture log not rendered")
 
     after = snapshot_state(home)
     changed = {key for key in before if before[key] != after.get(key)} | (set(before) ^ set(after))
-    assert not changed, (
-        f"{label}: hermesd wrote under the Hermes home (read-only invariant): {sorted(changed)}"
+    _check(
+        not changed,
+        f"{label}: hermesd wrote under the Hermes home (read-only invariant): {sorted(changed)}",
     )
 
 
 def check_distribution() -> str:
     version_output = hermesd("--version")
-    assert version_output.returncode == 0, f"--version failed: {version_output.stderr}"
-    assert str(version_output.stdout).strip(), "--version printed nothing"
+    _check(version_output.returncode == 0, f"--version failed: {version_output.stderr}")
+    _check(str(version_output.stdout).strip(), "--version printed nothing")
 
     dist_version = metadata.version("hermesd")
-    assert dist_version in version_output.stdout, (
+    _check(
+        dist_version in version_output.stdout,
         f"--version output {version_output.stdout!r} does not report metadata version "
-        f"{dist_version}"
+        f"{dist_version}",
     )
 
     dist_files = {str(path) for path in (metadata.files("hermesd") or [])}
     missing = [name for name in REQUIRED_DIST_FILES if name not in dist_files]
-    assert not missing, f"distribution is missing required files: {missing}"
+    _check(not missing, f"distribution is missing required files: {missing}")
 
     runtime_requirements = [
         requirement
         for requirement in (metadata.requires("hermesd") or [])
         if "extra ==" not in requirement
     ]
-    assert runtime_requirements, "distribution metadata lists no runtime requirements"
+    _check(runtime_requirements, "distribution metadata lists no runtime requirements")
     unpinned = [
         requirement
         for requirement in runtime_requirements
         if "==" not in requirement.split(";", 1)[0]
     ]
-    assert not unpinned, f"runtime requirements are not exact pins: {unpinned}"
+    _check(not unpinned, f"runtime requirements are not exact pins: {unpinned}")
     return dist_version
 
 
@@ -180,8 +197,9 @@ def main() -> int:
     # a source checkout that happens to be on sys.path.
     purelib = Path(sysconfig.get_paths()["purelib"]).resolve()
     origin = Path(hermesd.__file__).resolve()
-    assert origin.is_relative_to(purelib), (
-        f"hermesd imported from {origin}, not the installing environment's {purelib}"
+    _check(
+        origin.is_relative_to(purelib),
+        f"hermesd imported from {origin}, not the installing environment's {purelib}",
     )
 
     version = check_distribution()
