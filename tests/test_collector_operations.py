@@ -3149,3 +3149,39 @@ def test_curator_paused_flag_is_read_strictly(hermes_home: Path):
     assert state.operations.projects[0].archived is False
     assert state.curator.scheduler_state_present is True
     assert state.curator.scheduler_paused is False
+
+
+def test_delegation_task_log_symlinked_outside_home_is_never_read(
+    hermes_home: Path, sample_db: Path, tmp_path: Path
+):
+    outside = tmp_path / "outside-task.log"
+    outside.write_text("OUTSIDE-SENTINEL leaked line\n")
+    live = hermes_home / "cache" / "delegation" / "live"
+    run_dir = _write_live_delegation(
+        live, "deleg_live01", _sample_manifest(), logs={"task-1.log": "inside line\n"}
+    )
+    (run_dir / "task-0.log").symlink_to(outside)
+
+    state = _collect_ops(hermes_home)
+
+    manifest = state.operations.delegation_live_manifests[0]
+    task0 = next(task for task in manifest.tasks if task.index == 0)
+    assert task0.log_tail == []
+    assert task0.log_name == ""
+    assert "OUTSIDE-SENTINEL" not in state.model_dump_json()
+
+
+def test_process_receipt_symlinked_outside_home_is_never_read(
+    hermes_home: Path, sample_db: Path, tmp_path: Path
+):
+    outside = tmp_path / "proc_outside.json"
+    outside.write_text(json.dumps(_receipt_record(id="OUTSIDE-SENTINEL")))
+    _write_receipt(hermes_home, "proc_inside.json", _receipt_record(id="proc_inside"))
+    (hermes_home / "logs" / "process-results" / "proc_linked.json").symlink_to(outside)
+
+    state = _collect_ops(hermes_home)
+
+    receipts = state.operations.process_receipts
+    assert [receipt.process_id for receipt in receipts.receipts] == ["proc_inside"]
+    assert receipts.receipt_count == 1
+    assert "OUTSIDE-SENTINEL" not in state.model_dump_json()

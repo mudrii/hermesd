@@ -32,7 +32,7 @@ from hermesd.collector import (
 from hermesd.models import DashboardState, GatewayLoopHealth, PlatformOwnership, PlatformStatus
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
-from tests.conftest import create_state_db_tables, render_to_str
+from tests.conftest import _skip_if_root, create_state_db_tables, render_to_str
 
 
 def test_collect_gateway_preserves_last_good_mapping_on_non_mapping_json(hermes_home: Path):
@@ -3699,3 +3699,32 @@ def test_gateway_stringified_request_flags_are_read_strictly(hermes_home: Path):
 
     assert gw.restart_requested is False
     assert gw.drain_suppress_notification is False
+
+
+@_skip_if_root
+def test_unreadable_non_empty_start_ledger_yields_no_verdict(hermes_home: Path):
+    from hermesd.collect.gateway import _read_start_storm
+
+    ledger = hermes_home / "gateway-starts.log"
+    ledger.write_text(f"{NOW - 10}\n{NOW - 5}\n")
+    os.chmod(ledger, 0o000)
+    try:
+        storm = _read_start_storm(ledger, hermes_home, NOW)
+    finally:
+        os.chmod(ledger, 0o644)
+
+    assert storm.recorded is False
+    assert storm.starts_window == 0
+
+
+def test_loop_tick_probe_with_unstatable_socket_node_has_no_node_to_ask(
+    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from hermesd.collect.gateway import _default_loop_tick_probe
+
+    def failing_is_socket(path: Path) -> bool:
+        raise PermissionError(path)
+
+    monkeypatch.setattr(Path, "is_socket", failing_is_socket)
+
+    assert _default_loop_tick_probe(4242, None, hermes_home) is None

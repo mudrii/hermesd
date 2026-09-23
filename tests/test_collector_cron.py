@@ -3198,3 +3198,27 @@ def test_tail_latest_cron_output_picks_newest_across_jobs(hermes_home: Path):
     lines = cron_module._tail_latest_cron_output(output_root, 5, 1024)
 
     assert [line.message for line in lines] == ["2026-09-23_00-00-00.md"]
+
+
+def test_delivery_rows_for_a_job_without_executions_still_get_stats():
+    stats = cron_module._job_execution_stats(
+        [],
+        [],
+        [{"job_id": "job-orphan", "delivery_outcome": "delivered", "row_count": 2}],
+        delivery_tracked=True,
+    )
+
+    assert [entry.job_id for entry in stats] == ["job-orphan"]
+    assert stats[0].delivery_outcomes_24h == {"delivered": 2}
+    assert stats[0].last_status == ""
+    assert stats[0].delivery_tracked is True
+
+
+def test_cron_marker_symlinked_outside_home_reads_as_empty(hermes_home: Path, tmp_path: Path):
+    outside = tmp_path / "outside-marker"
+    outside.write_text("OUTSIDE-SENTINEL\n")
+    marker = hermes_home / "cron" / "ticker_last_error"
+    marker.parent.mkdir(exist_ok=True)
+    marker.symlink_to(outside)
+
+    assert cron_module._read_cron_marker_text_strict(marker, hermes_home) == ""
