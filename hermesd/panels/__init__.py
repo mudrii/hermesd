@@ -22,6 +22,8 @@ class PanelRenderContext:
     session_sort: str = "recent"
     session_message_match_ids: set[str] | None = None
     expand_skills: bool = False
+    # Rows available to a self-windowing detail (Logs); None = fixed default.
+    detail_height: int | None = None
 
 
 PanelRenderer = Callable[[PanelRenderContext], Panel]
@@ -92,6 +94,7 @@ def _render_logs_panel(ctx: PanelRenderContext) -> Panel:
         sub_view=ctx.log_sub_view,
         scroll_offset=ctx.scroll_offset,
         filter_query=ctx.filter_query,
+        detail_height=ctx.detail_height,
     )
 
 
@@ -176,6 +179,7 @@ def render_panel(
     session_sort: str = "recent",
     session_message_match_ids: set[str] | None = None,
     expand_skills: bool = False,
+    detail_height: int | None = None,
 ) -> Panel:
     renderer = _RENDERERS.get(panel_num)
     if renderer is None:
@@ -191,5 +195,6 @@ def render_panel(
         filter_query=filter_query,
         session_sort=session_sort,
         session_message_match_ids=session_message_match_ids,
+        detail_height=detail_height,
     )
     return renderer(context)

@@ -121,7 +121,7 @@ def test_dashboard_header_and_footer_render_unicode_state(unicode_hermes_home: P
     try:
         state = app._collector.collect()
         header = app._build_header(state)
-        footer = app._build_footer(state)
+        footer = app._build_footer(state, app._theme, app._snapshot_view_state(), None)
     finally:
         app.close()
 

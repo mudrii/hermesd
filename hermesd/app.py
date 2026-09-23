@@ -321,9 +321,36 @@ class DashboardApp:
             scratch = ViewState()
             scratch.log_sub_view = view.log_sub_view
             scratch.enter_detail(panel_num)
-            view = _view_snapshot(scratch)
+            return self._capture_full_detail_text(
+                snapshot_console, panel_num, _view_snapshot(scratch)
+            )
         with snapshot_console.capture() as capture:
             snapshot_console.print(self._build_layout(console=snapshot_console, view=view))
+        return capture.get()
+
+    def _capture_full_detail_text(
+        self, console: Console, panel_num: int, view: ViewSnapshot
+    ) -> str:
+        # A detail snapshot prints the whole panel: going through the Layout
+        # would crop it to the console height, silently truncating piped output.
+        with self._lock:
+            state = self._state
+            theme = self._theme
+            input_error = self._input_error
+        panel = render_panel(
+            panel_num,
+            state,
+            theme,
+            detail=True,
+            log_sub_view=view.log_sub_view,
+            expand_skills=panel_num == _SKILLS_PANEL_NUM,
+            # Unbounded: the Logs window lists every line in a snapshot.
+            detail_height=sys.maxsize,
+        )
+        with console.capture() as capture:
+            console.print(self._build_header(state, theme, console=console))
+            console.print(panel)
+            console.print(self._build_footer(state, theme, view, input_error))
         return capture.get()
 
     def render_snapshot_text(self, panel_num: int | None = None) -> str:
@@ -614,22 +641,9 @@ class DashboardApp:
         return _LOG_VIEWS
 
     def _current_detail_is_scrollable(self) -> bool:
-        detail_panel = self._view.detail_panel
-        if detail_panel is None:
-            return False
-        if detail_panel in _RENDERED_VIEWPORT_PANEL_NUMS:
-            return True
-        with self._lock:
-            state = self._state
-        return (
-            _detail_max_scroll_offset(
-                detail_panel,
-                state,
-                self._view.log_sub_view,
-                self._view.filter_query,
-            )
-            is not None
-        )
+        # Every detail scrolls: Logs windows its own lines and all other
+        # panels use the rendered-line viewport, clamped on the next render.
+        return self._view.detail_panel is not None
 
     def _build_layout(
         self, console: Console | None = None, view: ViewSnapshot | None = None
@@ -650,7 +664,6 @@ class DashboardApp:
         show_help = view.show_help
         profile_view_index = view.profile_cycle_index
         filter_query = view.filter_query
-        filter_edit_mode = view.filter_edit_mode
         session_sort = view.session_sort
         session_message_match_ids: set[str] | None = None
         message_query = ""
@@ -662,6 +675,8 @@ class DashboardApp:
             self._ensure_session_message_search(message_query)
             if state.session_message_match_query == message_query:
                 session_message_match_ids = state.session_message_match_ids
+        # Rows between the one-line header and footer.
+        body_height = max(1, render_console.height - 2)
         max_offset = None
         if mode == "detail" and detail_panel is not None:
             max_offset = _detail_max_scroll_offset(
@@ -669,6 +684,7 @@ class DashboardApp:
                 state,
                 log_sub_view,
                 filter_query,
+                body_height,
             )
             if max_offset is not None and scroll_offset > max_offset:
                 scroll_offset = max_offset
@@ -697,6 +713,7 @@ class DashboardApp:
                 filter_query=filter_query,
                 session_sort=session_sort,
                 session_message_match_ids=session_message_match_ids,
+                detail_height=body_height,
             )
             if detail_panel in _RENDERED_VIEWPORT_PANEL_NUMS:
                 viewport, max_offset = _rendered_detail_viewport(
@@ -719,19 +736,7 @@ class DashboardApp:
                 ):
                     self._view.scroll_offset = max_offset
 
-        layout["footer"].update(
-            self._build_footer(
-                state,
-                theme,
-                input_error=input_error,
-                view_mode=mode,
-                detail_panel=detail_panel,
-                filter_query=filter_query,
-                filter_edit_mode=filter_edit_mode,
-                session_sort=session_sort,
-                log_sub_view=log_sub_view,
-            )
-        )
+        layout["footer"].update(self._build_footer(state, theme, view, input_error))
         return layout
 
     def _ensure_session_message_search(self, message_query: str) -> None:
@@ -835,68 +840,29 @@ class DashboardApp:
     def _build_footer(
         self,
         state: DashboardState,
-        theme: Theme | None = None,
-        input_error: str | None = None,
-        view_mode: str | None = None,
-        detail_panel: int | None = None,
-        filter_query: str | None = None,
-        filter_edit_mode: bool | None = None,
-        session_sort: str | None = None,
-        log_sub_view: str | None = None,
+        theme: Theme,
+        view: ViewSnapshot,
+        input_error: str | None,
     ) -> Text:
-        active_theme = theme or self._theme
-        if input_error is None:
-            with self._lock:
-                footer_error = self._input_error
+        t = Text(style=f"on {theme.status_bar_bg}")
+        if view.mode == "overview":
+            self._append_overview_footer_actions(t, theme)
         else:
-            footer_error = input_error
-        if (
-            view_mode is None
-            or detail_panel is None
-            or filter_query is None
-            or filter_edit_mode is None
-            or session_sort is None
-            or log_sub_view is None
-        ):
-            with self._view_lock:
-                mode = self._view.mode if view_mode is None else view_mode
-                panel = self._view.detail_panel if detail_panel is None else detail_panel
-                query = self._view.filter_query if filter_query is None else filter_query
-                editing = (
-                    self._view.filter_edit_mode if filter_edit_mode is None else filter_edit_mode
-                )
-                sort_mode = self._view.session_sort if session_sort is None else session_sort
-                sub_view = self._view.log_sub_view if log_sub_view is None else log_sub_view
-        else:
-            mode = view_mode
-            panel = detail_panel
-            query = filter_query
-            editing = filter_edit_mode
-            sort_mode = session_sort
-            sub_view = log_sub_view
-        t = Text(style=f"on {active_theme.status_bar_bg}")
-        if mode == "overview":
-            self._append_overview_footer_actions(t, active_theme)
-        else:
-            scrollable = panel in _RENDERED_VIEWPORT_PANEL_NUMS or (
-                panel is not None
-                and _detail_max_scroll_offset(panel, state, sub_view, query) is not None
-            )
             self._append_detail_footer_actions(
                 t,
-                active_theme,
-                panel=panel,
-                scrollable=scrollable,
-                editing=editing,
-                query=query,
-                sort_mode=sort_mode,
+                theme,
+                panel=view.detail_panel,
+                scrollable=view.detail_panel is not None,
+                editing=view.filter_edit_mode,
+                query=view.filter_query,
+                sort_mode=view.session_sort,
             )
 
         self._append_footer_status(
             t,
-            active_theme,
+            theme,
             state=state,
-            footer_error=footer_error,
+            footer_error=input_error,
         )
         return t
 
@@ -1143,8 +1109,9 @@ def _detail_max_scroll_offset(
     state: DashboardState,
     log_sub_view: str,
     filter_query: str,
+    detail_height: int,
 ) -> int | None:
-    """Effective max scroll offset for scrollable detail panels, else None.
+    """Logs' max scroll offset for ``detail_height`` rows; None for other panels.
 
     Logs delegates to its panel's own clamp. Every other detail uses the
     rendered-line viewport instead.
@@ -1152,7 +1119,7 @@ def _detail_max_scroll_offset(
     if panel_num == _LOG_PANEL_NUM:
         from hermesd.panels.logs import max_detail_scroll_offset
 
-        return max_detail_scroll_offset(state, log_sub_view, filter_query)
+        return max_detail_scroll_offset(state, log_sub_view, filter_query, detail_height)
     return None
 
 

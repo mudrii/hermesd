@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from rich.cells import cell_len
 from rich.console import Console
+from rich.text import Text
 
 from hermesd import __version__
 from hermesd.app import (
@@ -58,6 +59,17 @@ def test_panel_name_constants_resolve():
     assert PANEL_NAMES[_SESSIONS_PANEL_NUM] == "Sessions"
     assert PANEL_NAMES[_SKILLS_PANEL_NUM] == "Skills / Integrations"
     assert PANEL_NAMES[_PROFILES_PANEL_NUM] == "Profiles"
+
+
+def _footer(
+    app: DashboardApp, state: DashboardState | None = None, input_error: str | None = None
+) -> Text:
+    return app._build_footer(
+        app._state if state is None else state,
+        app._theme,
+        app._snapshot_view_state(),
+        input_error,
+    )
 
 
 def test_panel_name_lookup_fails_with_context():
@@ -336,22 +348,22 @@ def test_footer_advertises_top_bottom_only_for_scrollable_detail_panels(
     state = app._state
 
     app.handle_key("7")
-    skills_footer = app._build_footer(state).plain
+    skills_footer = _footer(app, state).plain
     assert "Scroll" in skills_footer
     assert "Top/bottom" in skills_footer
 
     app.handle_key("8")
-    logs_footer = app._build_footer(state).plain
+    logs_footer = _footer(app, state).plain
     assert "Scroll" in logs_footer
     assert "Top/bottom" in logs_footer
 
     app.handle_key("2")
-    sessions_footer = app._build_footer(state).plain
+    sessions_footer = _footer(app, state).plain
     assert "Scroll" in sessions_footer
     assert "Top/bottom" in sessions_footer
 
     app.handle_key("5")
-    config_footer = app._build_footer(state).plain
+    config_footer = _footer(app, state).plain
     # The Config detail is longer than a default terminal (72 lines against a
     # 22-line viewport at 80x24), so its corrupt-snapshot alert is only
     # reachable if the panel scrolls.
@@ -365,6 +377,8 @@ def test_jump_bottom_then_scroll_up_changes_logs_offset(populated_hermes_home: P
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     lines = [LogLine(message=f"line {i}") for i in range(15)]
     app._set_state(app._state.model_copy(update={"logs": LogState(agent_lines=lines)}))
+    # 20 rows leave an 18-row body: 8 rows of Logs chrome + a 10-line window.
+    app._console = Console(file=io.StringIO(), width=120, height=20)
     app.handle_key("8")
     app.handle_key("G")
     app._build_layout()
@@ -575,7 +589,7 @@ def test_operations_detail_scroll_reaches_lower_sections_and_reclamps(
         app.copy_current_view()
         assert app._snapshot_view_state() == before
 
-        footer = app._build_footer(app._state).plain
+        footer = _footer(app).plain
         assert "Scroll" in footer
         assert "Top/bottom" in footer
     finally:
@@ -1053,7 +1067,7 @@ def test_capture_layout_text_leaves_view_untouched_when_build_layout_raises(
     def fail_build_layout(*args, **kwargs):
         raise RuntimeError("render failed")
 
-    monkeypatch.setattr(app, "_build_layout", fail_build_layout)
+    monkeypatch.setattr("hermesd.app.render_panel", fail_build_layout)
 
     with pytest.raises(RuntimeError, match="render failed"):
         app._capture_layout_text(panel_num=2)
@@ -1139,7 +1153,7 @@ def test_app_unknown_skin_keeps_fallback_theme_on_repeated_updates(populated_her
 
 def test_build_footer_overview(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    footer = app._build_footer(app._state)
+    footer = _footer(app)
     assert footer is not None
     assert "1-9,0" in footer.plain
     assert "Prev/next" in footer.plain
@@ -1165,7 +1179,7 @@ def test_build_footer_overview_uses_dynamic_panel_range(populated_hermes_home: P
             9: "Profiles",
         },
     )
-    footer = app._build_footer(app._state)
+    footer = _footer(app)
     assert "[1-9]" in footer.plain
     app.close()
 
@@ -1173,7 +1187,7 @@ def test_build_footer_overview_uses_dynamic_panel_range(populated_hermes_home: P
 def test_build_footer_detail_logs(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app._view.enter_detail(8)
-    footer = app._build_footer(app._state)
+    footer = _footer(app)
     from rich.text import Text
 
     assert isinstance(footer, Text)
@@ -1187,7 +1201,7 @@ def test_build_footer_detail_logs(populated_hermes_home: Path):
 def test_build_footer_detail_sessions_shows_sort(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app._view.enter_detail(2)
-    footer = app._build_footer(app._state)
+    footer = _footer(app)
     assert "[s]" in footer.plain
     assert "[j/k]" in footer.plain
     assert "[g/G]" in footer.plain
@@ -1227,7 +1241,7 @@ def test_every_non_logs_detail_scrolls_through_rendered_viewport(
         assert bottom_capture.get() != top_capture.get()
         app.handle_key("k")
         assert app._view.scroll_offset == bottom - 1
-        footer = app._build_footer(app._state).plain
+        footer = _footer(app).plain
         assert "[j/k]" in footer
     finally:
         app.close()
@@ -1298,7 +1312,7 @@ def test_build_help_panel_shows_filter_shortcut(populated_hermes_home: Path):
 def test_build_footer_shows_input_error(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app._input_error = "input failure"
-    footer = app._build_footer(app._state)
+    footer = app._build_layout()["footer"].renderable
     assert "input failure" in footer.plain
     app.close()
 
@@ -1312,7 +1326,7 @@ def test_build_footer_shows_health_failures(populated_hermes_home: Path):
             )
         }
     )
-    footer = app._build_footer(state)
+    footer = _footer(app, state)
     assert "14/16" in footer.plain
     assert "logs,cron" in footer.plain
     app.close()
@@ -1333,7 +1347,7 @@ def test_build_footer_shows_offline_banner(populated_hermes_home: Path):
     state = app._state.model_copy(
         update={"runtime": RuntimeStatus(agent_running=False, banner="AGENT OFFLINE")}
     )
-    footer = app._build_footer(state)
+    footer = _footer(app, state)
     assert "agent offline" in footer.plain
     app.close()
 
@@ -1553,6 +1567,8 @@ def test_jump_bottom_clamps_to_first_stream_when_sub_view_missing(populated_herm
     lines = [LogLine(message=f"line {i}") for i in range(15)]
     streams = [LogStream(name="custom", lines=lines)]
     app._set_state(app._state.model_copy(update={"logs": LogState(streams=streams)}))
+    # 20 rows leave an 18-row body: 8 rows of Logs chrome + a 10-line window.
+    app._console = Console(file=io.StringIO(), width=120, height=20)
     app.handle_key("8")
     app.handle_key("G")
     app._build_layout()
@@ -1939,7 +1955,7 @@ def test_build_header_truncates_when_wider_than_console(populated_hermes_home: P
 
 def test_build_footer_uses_explicit_input_error_argument(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
-    footer = app._build_footer(app._state, input_error="render thread error")
+    footer = _footer(app, input_error="render thread error")
     assert "render thread error" in footer.plain
     app.close()
 
@@ -1947,7 +1963,7 @@ def test_build_footer_uses_explicit_input_error_argument(populated_hermes_home: 
 def test_build_footer_detail_profiles_shows_cycle_action(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app._view.enter_detail(_PROFILES_PANEL_NUM)
-    footer = app._build_footer(app._state)
+    footer = _footer(app)
     assert "[p]" in footer.plain
     assert "Cycle profile" in footer.plain
     app.close()
@@ -1957,7 +1973,7 @@ def test_build_footer_shows_enter_apply_while_editing_filter(populated_hermes_ho
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     app.handle_key("2")
     app.handle_key("/")
-    footer = app._build_footer(app._state)
+    footer = _footer(app)
     assert "[Enter]" in footer.plain
     assert "Apply" in footer.plain
     app.close()
@@ -1974,7 +1990,7 @@ def test_build_footer_truncates_long_failed_source_list(populated_hermes_home: P
             )
         }
     )
-    footer = app._build_footer(state)
+    footer = _footer(app, state)
     assert "a,b,c,+2" in footer.plain
     app.close()
 
@@ -2309,3 +2325,83 @@ def test_input_loop_survives_tcgetattr_failure_without_restoring(
     assert app._input_error is not None
     assert "not a terminal" in app._input_error
     app.close()
+
+
+def test_snapshot_panel_prints_full_detail_without_viewport_truncation(
+    populated_hermes_home: Path, monkeypatch
+):
+    """A piped --snapshot-panel must include every row, not a terminal-height crop."""
+    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    try:
+        sessions = [
+            SessionInfo(session_id=f"sess{i:04d}", started_at=float(i + 1)) for i in range(45)
+        ]
+        state = app._collector.collect().model_copy(update={"sessions": sessions})
+        monkeypatch.setattr(app._collector, "collect", lambda: state)
+        app._console = Console(file=io.StringIO(), width=120, height=24, no_color=True)
+
+        snapshot = app.render_snapshot_text(panel_num=_SESSIONS_PANEL_NUM)
+    finally:
+        app.close()
+
+    lines = snapshot.splitlines()
+    assert f"hermesd {__version__}" in lines[0]
+    assert "sess0044" in snapshot
+    assert "sess0000" in snapshot
+    assert snapshot.rindex("[Esc] Back") > snapshot.rindex("sess0000")
+    # The old Layout path cropped piped output at max(height, 48) rows.
+    assert len(lines) > 48
+
+
+def test_snapshot_panel_logs_lists_every_line(populated_hermes_home: Path, monkeypatch):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    try:
+        lines = [LogLine(message=f"logline-{i:03d}") for i in range(60)]
+        state = app._collector.collect().model_copy(update={"logs": LogState(agent_lines=lines)})
+        monkeypatch.setattr(app._collector, "collect", lambda: state)
+
+        snapshot = app.render_snapshot_text(panel_num=_LOG_PANEL_NUM)
+    finally:
+        app.close()
+
+    assert "logline-000" in snapshot
+    assert "logline-059" in snapshot
+
+
+def test_logs_detail_window_fills_available_height(populated_hermes_home: Path):
+    """The Logs window grows with the terminal instead of a fixed 10 lines."""
+    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    try:
+        lines = [LogLine(message=f"logline-{i:03d}") for i in range(60)]
+        app._set_state(app._state.model_copy(update={"logs": LogState(agent_lines=lines)}))
+        app._console = Console(file=io.StringIO(), width=120, height=40, no_color=True)
+        app.handle_key("8")
+        with app._console.capture() as captured:
+            app._console.print(app._build_layout())
+        text = captured.get()
+        match = re.search(r"\[1-(\d+)/60\]", text)
+        assert match is not None
+        visible = int(match.group(1))
+        assert visible > 10
+        assert f"logline-{visible - 1:03d}" in text
+        assert f"logline-{visible:03d}" not in text
+
+        app.handle_key("G")
+        app._build_layout()
+        assert app._view.scroll_offset == 60 - visible
+    finally:
+        app.close()
+
+
+def test_logs_detail_window_keeps_minimum_on_tiny_terminal(populated_hermes_home: Path):
+    app = DashboardApp(populated_hermes_home, refresh_rate=5, no_color=True)
+    try:
+        lines = [LogLine(message=f"logline-{i:03d}") for i in range(60)]
+        app._set_state(app._state.model_copy(update={"logs": LogState(agent_lines=lines)}))
+        app._console = Console(file=io.StringIO(), width=120, height=6, no_color=True)
+        app.handle_key("8")
+        app.handle_key("G")
+        app._build_layout()
+        assert app._view.scroll_offset == 57
+    finally:
+        app.close()

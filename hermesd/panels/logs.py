@@ -25,6 +25,10 @@ _LOG_LEVEL_RANK = {
     "critical": 50,
 }
 _DETAIL_VISIBLE_LOG_LINES = 10
+_MIN_DETAIL_VISIBLE_LOG_LINES = 3
+# Rows the detail spends around its log lines: panel borders and padding (4),
+# tab bar, scope line, position line and the blank row below it (4).
+_DETAIL_CHROME_ROWS = 8
 
 
 def _resolve_log_view(
@@ -38,14 +42,20 @@ def _resolve_log_view(
     return log_map, sub_view, unfiltered, _filter_log_lines(unfiltered, filter_query)
 
 
-def _max_offset(line_count: int) -> int:
-    return max(0, line_count - _DETAIL_VISIBLE_LOG_LINES)
+def _visible_line_count(detail_height: int | None, filter_query: str) -> int:
+    """Log lines that fit in ``detail_height`` rows (fixed default when unknown)."""
+    if detail_height is None:
+        return _DETAIL_VISIBLE_LOG_LINES
+    chrome = _DETAIL_CHROME_ROWS + (1 if filter_query else 0)
+    return max(_MIN_DETAIL_VISIBLE_LOG_LINES, detail_height - chrome)
 
 
-def max_detail_scroll_offset(state: DashboardState, sub_view: str, filter_query: str) -> int:
+def max_detail_scroll_offset(
+    state: DashboardState, sub_view: str, filter_query: str, detail_height: int | None = None
+) -> int:
     """Effective max scroll offset for the logs detail view."""
     _, _, _, lines = _resolve_log_view(state, sub_view, filter_query)
-    return _max_offset(len(lines))
+    return max(0, len(lines) - _visible_line_count(detail_height, filter_query))
 
 
 def render_logs(
@@ -55,9 +65,10 @@ def render_logs(
     sub_view: str = "agent",
     scroll_offset: int = 0,
     filter_query: str = "",
+    detail_height: int | None = None,
 ) -> Panel:
     if detail:
-        return _render_detail(state, theme, sub_view, scroll_offset, filter_query)
+        return _render_detail(state, theme, sub_view, scroll_offset, filter_query, detail_height)
     return _render_compact(state, theme)
 
 
@@ -115,16 +126,18 @@ def _render_detail(
     sub_view: str,
     scroll_offset: int,
     filter_query: str,
+    detail_height: int | None,
 ) -> Panel:
     log_map, sub_view, unfiltered_lines, log_lines = _resolve_log_view(
         state, sub_view, filter_query
     )
     total = len(log_lines)
-    max_offset = _max_offset(total)
+    window = _visible_line_count(detail_height, filter_query)
+    max_offset = max(0, total - window)
     # Clamp both ends: a negative offset would slice from the end of the list
     # and render an empty page with a negative line counter.
     offset = max(0, min(scroll_offset, max_offset))
-    visible_lines = log_lines[offset : offset + _DETAIL_VISIBLE_LOG_LINES]
+    visible_lines = log_lines[offset : offset + window]
 
     lines = Text()
     tab_bar = Text()

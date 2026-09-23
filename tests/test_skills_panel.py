@@ -340,7 +340,7 @@ def test_detail_max_scroll_offset_skills_uses_rendered_viewport():
     from hermesd.app import _SKILLS_PANEL_NUM, _detail_max_scroll_offset
 
     state = build_skills_state(30)
-    assert _detail_max_scroll_offset(_SKILLS_PANEL_NUM, state, "", "") is None
+    assert _detail_max_scroll_offset(_SKILLS_PANEL_NUM, state, "", "", 24) is None
 
 
 def test_skills_detail_uses_dash_for_empty_descriptions_after_scrolling():
