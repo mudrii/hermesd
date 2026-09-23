@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import contextlib
+import heapq
 import json
 import math
 import sqlite3
 from collections.abc import Callable, Mapping
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +77,13 @@ _TICKER_ERROR_MIN_LINES = 2
 # ``config.yaml`` key deciding whether a recurring run missed beyond the grace
 # window is caught up or silently skipped (``cron/jobs.py:2908``).
 _CATCH_UP_MISSED_KEY = "catch_up_missed"
+# Per-run output files are named ``%Y-%m-%d_%H-%M-%S.md``, and upstream itself
+# orders them newest-first by reverse name when pruning to ``output_retention``
+# (50 by default; non-positive disables pruning, ``cron/jobs.py:2040-2087``).
+# Each refresh therefore lists a bounded number of entries and stats only the
+# lexically newest few, instead of stat'ing an unpruned directory whole.
+_CRON_OUTPUT_LIST_LIMIT = 10_000
+_CRON_OUTPUT_STAT_LIMIT = 50
 
 
 def _truncate_lines(text: str) -> list[str]:
@@ -101,7 +110,7 @@ def _latest_cron_output_file(
     if output_root_escaped or job_output_dir_escaped or not job_output_dir.is_dir():
         return None
     files = []
-    for path in job_output_dir.iterdir():
+    for path in _newest_named_outputs(job_output_dir):
         try:
             if not path.is_symlink() and path.is_file():
                 files.append(path)
@@ -110,6 +119,22 @@ def _latest_cron_output_file(
     if not files:
         return None
     return max(files, key=_safe_mtime)
+
+
+def _newest_named_outputs(job_output_dir: Path) -> list[Path]:
+    """The lexically newest entries of one job's output dir; [] when unreadable.
+
+    Only these are stat'ed. An unreadable directory reads as no output, which
+    the Collector turns into its cached excerpt rather than failing every job.
+    """
+    try:
+        return heapq.nlargest(
+            _CRON_OUTPUT_STAT_LIMIT,
+            islice(job_output_dir.iterdir(), _CRON_OUTPUT_LIST_LIMIT),
+            key=lambda path: path.name,
+        )
+    except OSError:
+        return []
 
 
 def _latest_cron_output_excerpt(
@@ -147,16 +172,20 @@ def _tail_latest_cron_output(
         return []
     latest_file: Path | None = None
     latest_mtime = 0.0
-    for job_dir in output_root.iterdir():
+    try:
+        job_dirs = list(islice(output_root.iterdir(), _CRON_OUTPUT_LIST_LIMIT))
+    except OSError:
+        return []
+    for job_dir in job_dirs:
         if job_dir.is_symlink() or not job_dir.is_dir():
             continue
-        for path in job_dir.iterdir():
+        for path in _newest_named_outputs(job_dir):
             try:
                 if path.is_symlink() or not path.is_file():
                     continue
-                mtime = path.stat().st_mtime
             except OSError:
                 continue
+            mtime = _safe_mtime(path)
             if mtime > latest_mtime:
                 latest_file = path
                 latest_mtime = mtime
