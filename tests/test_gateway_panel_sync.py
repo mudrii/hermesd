@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from hermesd.models import (
     DashboardState,
+    DeadTargetSummary,
     GatewayState,
     MigrationProfileRecord,
     MigrationState,
@@ -233,3 +234,62 @@ def test_high_memory_pressure_is_a_compact_hint() -> None:
 
 def test_memory_line_is_omitted_without_a_sample() -> None:
     assert "Memory:" not in _render(_LIVE, detail=True)
+
+
+# --------------------------------------------------------------------------
+# dead targets and the restart-loop breaker
+# --------------------------------------------------------------------------
+
+
+def test_dead_targets_render_in_detail_and_compact() -> None:
+    gateway = _LIVE.model_copy(
+        update={
+            "dead_target_count": 3,
+            "dead_target_platforms": {"telegram": 2, HOSTILE: 1},
+            "dead_targets": [
+                DeadTargetSummary(
+                    platform="telegram", reason="forbidden " + HOSTILE, age_seconds=60
+                ),
+                DeadTargetSummary(platform="discord", reason="", age_seconds=None),
+            ],
+        }
+    )
+
+    detail = _render(gateway, detail=True)
+    compact = _render(gateway, detail=False)
+
+    assert "Dead delivery targets: 3" in detail
+    assert "telegram 2" in detail
+    assert "telegram  forbidden [/] boom" in detail
+    assert "1m ago" in detail
+    assert "\x1b[2J" not in detail
+    assert "⚠ 3 dead delivery target(s)" in compact
+
+
+def test_restart_loop_chain_renders_and_trips() -> None:
+    quiet = _LIVE.model_copy(
+        update={
+            "restart_loop_boots_recorded": 2,
+            "restart_loop_chain": 2,
+            "restart_loop_max_restarts": 3,
+            "restart_loop_chain_gap_seconds": 300.0,
+            "restart_loop_last_boot_age_seconds": 30.0,
+        }
+    )
+    tripped = quiet.model_copy(update={"restart_loop_chain": 3, "restart_loop_tripped": True})
+
+    quiet_detail = _render(quiet, detail=True)
+    tripped_detail = _render(tripped, detail=True)
+
+    assert "Restart-loop breaker: chain 2/3 (gaps ≤ 5m)  last boot 30s ago" in quiet_detail
+    assert "TRIPPED" not in quiet_detail
+    assert "restart loop" not in _render(quiet, detail=False)
+    assert "⚠ TRIPPED — the next restart-interrupted boot skips auto-resume" in tripped_detail
+    assert "⚠ restart loop" in _render(tripped, detail=False)
+
+
+def test_restart_loop_and_dead_targets_are_silent_when_absent() -> None:
+    detail = _render(_LIVE, detail=True)
+
+    assert "Restart-loop breaker" not in detail
+    assert "Dead delivery targets" not in detail

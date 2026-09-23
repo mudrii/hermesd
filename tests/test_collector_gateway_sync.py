@@ -428,3 +428,315 @@ def test_memory_block_keeps_last_good_when_the_heartbeat_turns_corrupt(hermes_ho
     assert second.gateway.memory_rss_kib == 512 * 1024
     assert second.gateway.memory_pressure == "ok"
     assert "gateway_heartbeat" in second.health.failed_sources
+
+
+# --------------------------------------------------------------------------
+# gateway/dead_targets.json (gateway/dead_targets.py:47-58,75-86): per-profile
+# registry of confirmed-unreachable delivery targets
+# --------------------------------------------------------------------------
+
+
+def _write_dead_targets(home: Path, payload: object) -> Path:
+    directory = home / "gateway"
+    directory.mkdir(exist_ok=True)
+    path = directory / "dead_targets.json"
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def _dead(platform: str, chat_id: str, reason: str, age: float) -> dict[str, object]:
+    return {"platform": platform, "chat_id": chat_id, "reason": reason, "marked_at": NOW - age}
+
+
+def test_dead_targets_are_counted_by_platform_newest_first(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_dead_targets(
+        hermes_home,
+        {
+            "telegram:-100123": _dead("telegram", "-100123", "forbidden: bot was kicked", 7200),
+            "telegram:555": _dead("telegram", "555", "not_found: chat not found", 60),
+            "discord:9": _dead("discord", "9", "forbidden", 3600),
+            "junk": "not a mapping",
+        },
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.dead_target_count == 3
+    assert gateway.dead_target_platforms == {"telegram": 2, "discord": 1}
+    assert [(t.platform, t.age_seconds) for t in gateway.dead_targets] == [
+        ("telegram", pytest.approx(60.0)),
+        ("discord", pytest.approx(3600.0)),
+        ("telegram", pytest.approx(7200.0)),
+    ]
+    assert gateway.dead_targets[0].reason == "not_found: chat not found"
+
+
+def test_dead_targets_never_carry_the_chat_id(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_dead_targets(
+        hermes_home, {"telegram:SECRETCHAT": _dead("telegram", "SECRETCHAT", "", 5)}
+    )
+
+    state = _collect(hermes_home)
+
+    assert "SECRETCHAT" not in state.model_dump_json()
+
+
+def test_dead_target_list_and_platforms_are_bounded(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    entries = {f"p{i}:{i}": _dead(f"p{i}", str(i), "r" * 500, float(i)) for i in range(50)}
+    _write_dead_targets(hermes_home, entries)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.dead_target_count == 50
+    assert len(gateway.dead_targets) == 3
+    assert len(gateway.dead_target_platforms) == 8
+    assert all(len(t.reason) <= 80 for t in gateway.dead_targets)
+
+
+def test_dead_target_reason_is_redacted(hermes_home: Path):
+    secret = "sk-" + "B" * 40
+    _write_gateway_state(hermes_home)
+    _write_dead_targets(hermes_home, {"t:1": _dead("t", "1", f"forbidden {secret}", 5)})
+
+    gateway = _collect(hermes_home).gateway
+
+    assert secret not in gateway.dead_targets[0].reason
+
+
+def test_dead_targets_absent_file_is_zero(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.dead_target_count == 0
+    assert gateway.dead_targets == []
+
+
+def test_dead_targets_wrong_shapes_do_not_crash(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_dead_targets(
+        hermes_home,
+        {"a:1": {"platform": None, "reason": 7, "marked_at": "soon"}, "b:2": {}},
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.dead_target_count == 2
+    assert {t.platform for t in gateway.dead_targets} == {"unknown"}
+    assert all(t.age_seconds is None for t in gateway.dead_targets)
+
+
+def test_dead_targets_keep_last_good_when_the_file_turns_corrupt(hermes_home: Path):
+    from hermesd.collector import Collector
+    from tests.test_collector_gateway import _clock
+
+    _write_gateway_state(hermes_home)
+    path = _write_dead_targets(hermes_home, {"t:1": _dead("telegram", "1", "forbidden", 5)})
+    collector = Collector(hermes_home, pid_exists=lambda pid: pid == 4242, clock=_clock)
+    try:
+        first = collector.collect()
+        path.write_text("{torn")
+        second = collector.collect()
+    finally:
+        collector.close()
+
+    assert first.gateway.dead_target_count == 1
+    assert second.gateway.dead_target_count == 1
+    assert "dead_targets" in second.health.failed_sources
+    assert "gateway" not in second.health.failed_sources
+
+
+def test_dead_targets_are_read_from_the_selected_profile(profiled_hermes_home: Path):
+    """``get_hermes_home()/"gateway"/"dead_targets.json"`` (dead_targets.py:54): PROFILE."""
+    from hermesd.collector import Collector
+
+    _write_dead_targets(profiled_hermes_home, {"root:1": _dead("root", "1", "", 5)})
+    profile_home = profiled_hermes_home / "profiles" / "coding"
+    _write_dead_targets(
+        profile_home, {"a:1": _dead("a", "1", "", 5), "b:2": _dead("b", "2", "", 5)}
+    )
+
+    collector = Collector(profiled_hermes_home, profile_name="coding")
+    try:
+        state = collector.collect()
+    finally:
+        collector.close()
+
+    assert state.gateway.dead_target_count == 2
+
+
+# --------------------------------------------------------------------------
+# gateway/restart_loop.json (gateway/restart_loop_guard.py:36-105): the
+# auto-resume restart-loop breaker's boot chain
+# --------------------------------------------------------------------------
+
+
+def _write_restart_loop(home: Path, payload: object) -> Path:
+    directory = home / "gateway"
+    directory.mkdir(exist_ok=True)
+    path = directory / "restart_loop.json"
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def test_restart_loop_chain_below_the_threshold_is_not_tripped(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_restart_loop(hermes_home, {"boots": [NOW - 900, NOW - 200, NOW - 20]})
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.restart_loop_boots_recorded == 3
+    # NOW-900 is more than 300s before NOW-200: that gap ends the chain.
+    assert gateway.restart_loop_chain == 2
+    assert gateway.restart_loop_max_restarts == 3
+    assert gateway.restart_loop_tripped is False
+    assert gateway.restart_loop_last_boot_age_seconds == pytest.approx(20.0)
+
+
+def test_restart_loop_chain_at_the_threshold_is_tripped(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_restart_loop(hermes_home, {"boots": [NOW - 290, NOW - 150, NOW - 10]})
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.restart_loop_chain == 3
+    assert gateway.restart_loop_tripped is True
+
+
+def test_restart_loop_forgets_a_resolved_episode(hermes_home: Path):
+    """Real quiet (a gap wider than the chain gap before now) resets the chain."""
+    _write_gateway_state(hermes_home)
+    _write_restart_loop(hermes_home, {"boots": [NOW - 1300, NOW - 1200, NOW - 1100]})
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.restart_loop_boots_recorded == 3
+    assert gateway.restart_loop_chain == 0
+    assert gateway.restart_loop_tripped is False
+
+
+def test_restart_loop_future_boot_is_adjacent_not_a_break(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_restart_loop(hermes_home, {"boots": [NOW - 100, NOW - 50, NOW + 30]})
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.restart_loop_chain == 3
+    assert gateway.restart_loop_last_boot_age_seconds == 0.0
+
+
+def test_restart_loop_uses_the_configured_policy(hermes_home: Path):
+    import yaml
+
+    (hermes_home / "config.yaml").write_text(
+        yaml.dump({"gateway": {"restart_loop_guard": {"max_restarts": 2, "max_gap_seconds": 1000}}})
+    )
+    _write_gateway_state(hermes_home)
+    _write_restart_loop(hermes_home, {"boots": [NOW - 900, NOW - 20]})
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.restart_loop_max_restarts == 2
+    assert gateway.restart_loop_chain == 2
+    assert gateway.restart_loop_tripped is True
+
+
+def test_restart_loop_disabled_breaker_never_trips(hermes_home: Path):
+    import yaml
+
+    (hermes_home / "config.yaml").write_text(
+        yaml.dump({"gateway": {"restart_loop_guard": {"max_restarts": 0}}})
+    )
+    _write_gateway_state(hermes_home)
+    _write_restart_loop(hermes_home, {"boots": [NOW - 30, NOW - 20, NOW - 10]})
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.restart_loop_max_restarts == 0
+    assert gateway.restart_loop_tripped is False
+
+
+@pytest.mark.parametrize(
+    "guard",
+    [
+        {"max_restarts": "x", "window_seconds": "60", "max_gap_seconds": -5},
+        {"max_restarts": "3", "window_seconds": 0, "max_gap_seconds": 1.5},
+        "not a mapping",
+    ],
+)
+def test_restart_loop_policy_falls_back_to_upstream_defaults(hermes_home: Path, guard: object):
+    import yaml
+
+    (hermes_home / "config.yaml").write_text(yaml.dump({"gateway": {"restart_loop_guard": guard}}))
+    _write_gateway_state(hermes_home)
+    _write_restart_loop(hermes_home, {"boots": [NOW - 250, NOW - 120, NOW - 10]})
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.restart_loop_max_restarts == 3
+    assert gateway.restart_loop_tripped is True
+
+
+def test_restart_loop_ignores_junk_boots(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_restart_loop(hermes_home, {"boots": ["x", None, True, float("nan"), NOW - 10]})
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.restart_loop_boots_recorded == 1
+    assert gateway.restart_loop_chain == 1
+
+
+@pytest.mark.parametrize("payload", [{"boots": "bad"}, {}, {"boots": []}])
+def test_restart_loop_without_boots_records_nothing(hermes_home: Path, payload: object):
+    _write_gateway_state(hermes_home)
+    _write_restart_loop(hermes_home, payload)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.restart_loop_boots_recorded == 0
+    assert gateway.restart_loop_last_boot_age_seconds is None
+    assert gateway.restart_loop_tripped is False
+
+
+def test_restart_loop_is_read_from_the_selected_profile(profiled_hermes_home: Path):
+    """``get_hermes_home()/"gateway"/"restart_loop.json"`` (restart_loop_guard.py:36-37): PROFILE."""
+    import time
+
+    from hermesd.collector import Collector
+
+    now = time.time()
+    _write_restart_loop(profiled_hermes_home, {"boots": [now - 5]})
+    profile_home = profiled_hermes_home / "profiles" / "coding"
+    _write_restart_loop(profile_home, {"boots": [now - 30, now - 20, now - 10]})
+
+    collector = Collector(profiled_hermes_home, profile_name="coding")
+    try:
+        state = collector.collect()
+    finally:
+        collector.close()
+
+    assert state.gateway.restart_loop_boots_recorded == 3
+
+
+def test_restart_loop_keeps_last_good_when_the_file_is_torn(hermes_home: Path):
+    """``_save_boots`` is a plain write_text (restart_loop_guard.py:50-54): torn reads happen."""
+    from hermesd.collector import Collector
+    from tests.test_collector_gateway import _clock
+
+    _write_gateway_state(hermes_home)
+    path = _write_restart_loop(hermes_home, {"boots": [NOW - 290, NOW - 150, NOW - 10]})
+    collector = Collector(hermes_home, pid_exists=lambda pid: pid == 4242, clock=_clock)
+    try:
+        first = collector.collect()
+        path.write_text('{"boots": [17')
+        second = collector.collect()
+    finally:
+        collector.close()
+
+    assert first.gateway.restart_loop_tripped is True
+    assert second.gateway.restart_loop_tripped is True
+    assert "restart_loop" in second.health.failed_sources

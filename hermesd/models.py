@@ -182,6 +182,14 @@ class DeliveryObligationSummary(BaseModel):
     last_error: str = ""
 
 
+class DeadTargetSummary(BaseModel):
+    """One confirmed-unreachable delivery target. The chat id is never read out."""
+
+    platform: str = ""
+    reason: str = ""
+    age_seconds: float | None = None
+
+
 class GatewayState(BaseModel):
     pid: int = 0
     # Live and serving: the recorded ``gateway_state`` is ``running`` or ``degraded``
@@ -322,6 +330,20 @@ class GatewayState(BaseModel):
     pending_delivery_count: int = 0
     failed_delivery_count: int = 0
     pending_deliveries: list[DeliveryObligationSummary] = Field(default_factory=list)
+    # Dead delivery targets (gateway/dead_targets.json, per profile): chats the
+    # gateway stopped sending to until a send succeeds. Newest few only.
+    dead_target_count: int = 0
+    dead_target_platforms: dict[str, int] = Field(default_factory=dict)
+    dead_targets: list[DeadTargetSummary] = Field(default_factory=list)
+    # Restart-loop breaker (gateway/restart_loop.json, per profile): boots that
+    # found restart-interrupted sessions, and the chain ending now. Tripped means
+    # the next such boot skips auto-resume.
+    restart_loop_boots_recorded: int = 0
+    restart_loop_chain: int = 0
+    restart_loop_max_restarts: int = 0
+    restart_loop_chain_gap_seconds: float = 0.0
+    restart_loop_tripped: bool = False
+    restart_loop_last_boot_age_seconds: float | None = None
 
     @computed_field  # type: ignore[prop-decorator]
     @property

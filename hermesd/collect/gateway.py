@@ -10,6 +10,7 @@ writing or imports hermes-agent.
 from __future__ import annotations
 
 import contextlib
+import heapq
 import json
 import math
 import re
@@ -46,6 +47,7 @@ from hermesd.collect.sqlite_util import (
 from hermesd.file_cache import JsonMapping
 from hermesd.models import (
     ConfigSourceStamp,
+    DeadTargetSummary,
     DeliveryObligationSummary,
     ForensicFile,
     GatewayLoopHealth,
@@ -70,6 +72,17 @@ _MEMORY_PRESSURE_TIERS = (
     ("elevated", 128 * 1024, 0.15),
 )
 _MEMORY_SAMPLE_FRESH_SECONDS = 150.0
+# gateway/dead_targets.json: bounded display of an unbounded registry.
+_DEAD_TARGET_ROW_LIMIT = 3
+_DEAD_TARGET_PLATFORM_LIMIT = 8
+_DEAD_TARGET_PLATFORM_CHARS = 40
+_DEAD_TARGET_REASON_CHARS = 80
+# gateway/restart_loop.json defaults (gateway/restart_loop_guard.py:24-33); upstream
+# stores at most 50 boots, so a longer list is foreign and only its head is read.
+_RESTART_LOOP_MAX_RESTARTS = 3
+_RESTART_LOOP_WINDOW_SECONDS = 60
+_RESTART_LOOP_MAX_GAP_SECONDS = 300
+_RESTART_LOOP_BOOT_LIMIT = 200
 # Loop-tick witness probe (hermes_cli/gateway.py:363-424): one byte, one second.
 _LOOP_TICK_PROBE_TIMEOUT_SECONDS = 1.0
 # Never escalate on a single silent probe (hermes_cli/gateway.py
@@ -1233,3 +1246,178 @@ def _delivery_summary(row: dict[str, Any], now: float) -> DeliveryObligationSumm
         age_seconds=_age_seconds(timestamp or None, now),
         last_error=_excerpt(row.get("last_error") or "", _DELIVERY_ERROR_EXCERPT_CHARS),
     )
+
+
+# ---------------------------------------------------------------------------
+# Dead delivery targets (gateway/dead_targets.json)
+#
+# ``DeadTargetRegistry`` (gateway/dead_targets.py:47-58) persists a mapping of
+# ``platform:chat_id`` -> {platform, chat_id, reason[:200], marked_at} for chats
+# confirmed unreachable; delivery short-circuits them until a send succeeds and
+# ``clear`` drops the key (:75-100). The chat id is deliberately never surfaced.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _DeadTargetRows:
+    """Signature-cacheable facts from the registry; ages are derived per tick."""
+
+    count: int = 0
+    platforms: dict[str, int] = field(default_factory=dict)
+    # (platform, reason, marked_at epoch or None), newest first.
+    newest: list[tuple[str, str, float | None]] = field(default_factory=list)
+
+
+def _dead_target_rows(data: JsonMapping) -> _DeadTargetRows:
+    # Upstream keeps every mapping value, empty or not (dead_targets.py:55-57).
+    entries = [value for value in data.values() if isinstance(value, dict)]
+    platforms: dict[str, int] = {}
+    for info in entries:
+        platform = _dead_target_platform(info)
+        if platform not in platforms and len(platforms) >= _DEAD_TARGET_PLATFORM_LIMIT:
+            continue
+        platforms[platform] = platforms.get(platform, 0) + 1
+    stamped = [(info, _dead_target_marked_at(info)) for info in entries]
+    newest = heapq.nlargest(
+        _DEAD_TARGET_ROW_LIMIT,
+        stamped,
+        key=lambda item: item[1] if item[1] is not None else -math.inf,
+    )
+    return _DeadTargetRows(
+        count=len(entries),
+        platforms=platforms,
+        newest=[
+            (
+                _dead_target_platform(info),
+                _excerpt(info.get("reason") or "", _DEAD_TARGET_REASON_CHARS),
+                marked_at,
+            )
+            for info, marked_at in newest
+        ],
+    )
+
+
+def _dead_target_platform(info: dict[str, Any]) -> str:
+    platform = info.get("platform")
+    return (
+        _excerpt(platform, _DEAD_TARGET_PLATFORM_CHARS)
+        if isinstance(platform, str) and platform
+        else "unknown"
+    )
+
+
+def _dead_target_marked_at(info: dict[str, Any]) -> float | None:
+    raw = info.get("marked_at")
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        return None
+    value = float(raw)
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def _dead_target_fields(rows: _DeadTargetRows, now: float) -> dict[str, Any]:
+    return {
+        "dead_target_count": rows.count,
+        "dead_target_platforms": rows.platforms,
+        "dead_targets": [
+            DeadTargetSummary(
+                platform=platform, reason=reason, age_seconds=_age_seconds(marked_at, now)
+            )
+            for platform, reason, marked_at in rows.newest
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Restart-loop breaker (gateway/restart_loop.json)
+#
+# ``restart_loop_guard`` (gateway/restart_loop_guard.py) records one epoch per
+# boot that found restart-interrupted sessions; boots CHAIN while consecutive
+# gaps stay within ``max(1, window_seconds, max_gap_seconds)`` (:56-59, :62-77),
+# and a chain of ``max_restarts`` trips the breaker, which skips auto-resume for
+# that boot (:88-105). The file is written with a plain ``write_text`` (:50-54),
+# so a torn read is possible and falls back to last-good.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _RestartLoopPolicy:
+    max_restarts: int = _RESTART_LOOP_MAX_RESTARTS
+    window_seconds: int = _RESTART_LOOP_WINDOW_SECONDS
+    max_gap_seconds: int = _RESTART_LOOP_MAX_GAP_SECONDS
+
+    @property
+    def chain_gap(self) -> float:
+        """``_chain_gap`` (restart_loop_guard.py:56-59)."""
+        return float(max(1, self.window_seconds, self.max_gap_seconds))
+
+
+def _restart_loop_policy(cfg: JsonMapping) -> _RestartLoopPolicy:
+    """``gateway.restart_loop_guard`` as ``_restart_loop_guard_config`` reads it.
+
+    Mirrors gateway/run_shutdown.py:344-363: an ``int`` value is used (any value for
+    ``max_restarts``, where ``<= 0`` disables the breaker; only positive ones for
+    the two windows), anything else keeps the defaults (restart_loop_guard.py:24-31;
+    DEFAULT_CONFIG hermes_cli/config_defaults.py:2152).
+    """
+    section = _as_dict(_as_dict(cfg.get("gateway")).get("restart_loop_guard"))
+
+    def int_or(key: str, default: int, *, positive: bool) -> int:
+        value = section.get(key)
+        if isinstance(value, int) and (value > 0 or not positive):
+            return int(value)
+        return default
+
+    return _RestartLoopPolicy(
+        max_restarts=int_or("max_restarts", _RESTART_LOOP_MAX_RESTARTS, positive=False),
+        window_seconds=int_or("window_seconds", _RESTART_LOOP_WINDOW_SECONDS, positive=True),
+        max_gap_seconds=int_or("max_gap_seconds", _RESTART_LOOP_MAX_GAP_SECONDS, positive=True),
+    )
+
+
+def _restart_loop_boots(data: JsonMapping) -> list[float]:
+    """Recorded boot epochs; junk entries are dropped like ``_load_boots`` does."""
+    boots: list[float] = []
+    for raw in _as_list(data.get("boots"))[:_RESTART_LOOP_BOOT_LIMIT]:
+        if isinstance(raw, bool) or not isinstance(raw, int | float):
+            continue
+        value = float(raw)
+        if math.isfinite(value):
+            boots.append(value)
+    return boots
+
+
+def _restart_loop_chain(boots: list[float], now: float, gap: float) -> int:
+    """Length of ``_chain_ending_at(boots, now, gap)`` (restart_loop_guard.py:62-77).
+
+    A future boot (clock stepped back) is adjacent, not a break; the first gap
+    wider than ``gap`` walking back from now ends the chain, so a loop that went
+    quiet is forgotten exactly as upstream forgets it.
+    """
+    chain = 0
+    previous = now
+    for boot in sorted(boots, reverse=True):
+        if boot > now:
+            chain += 1
+            continue
+        if previous - boot > gap:
+            break
+        chain += 1
+        previous = boot
+    return chain
+
+
+def _restart_loop_fields(
+    data: JsonMapping, now: float, policy: _RestartLoopPolicy
+) -> dict[str, Any]:
+    boots = _restart_loop_boots(data)
+    chain = _restart_loop_chain(boots, now, policy.chain_gap)
+    return {
+        "restart_loop_boots_recorded": len(boots),
+        "restart_loop_chain": chain,
+        "restart_loop_max_restarts": policy.max_restarts,
+        "restart_loop_chain_gap_seconds": policy.chain_gap,
+        # ``is_restart_loop_tripped`` (restart_loop_guard.py:117-140): the verdict
+        # the next restart-interrupted boot would inherit, evaluated at now.
+        "restart_loop_tripped": policy.max_restarts > 0 and chain >= policy.max_restarts,
+        "restart_loop_last_boot_age_seconds": _age_seconds(max(boots), now) if boots else None,
+    }

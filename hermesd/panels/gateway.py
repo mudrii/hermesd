@@ -451,6 +451,29 @@ def _restart_storm_text(gw: GatewayState, theme: Theme) -> Text:
     return text
 
 
+def _restart_loop_text(gw: GatewayState, theme: Theme) -> Text:
+    """The auto-resume restart-loop breaker (gateway/restart_loop_guard.py).
+
+    Only boots that found restart-interrupted sessions are recorded; the chain is
+    evaluated at now, so a loop that went quiet reads as a zero chain.
+    """
+    text = Text("\n  Restart-loop breaker: ", style=theme.ui_label)
+    gap = fmt_age_seconds(gw.restart_loop_chain_gap_seconds)
+    cap = str(gw.restart_loop_max_restarts) if gw.restart_loop_max_restarts > 0 else "off"
+    text.append(
+        f"chain {gw.restart_loop_chain}/{cap} (gaps ≤ {gap})"
+        f"  last boot {fmt_age_seconds(gw.restart_loop_last_boot_age_seconds)} ago",
+        style=theme.banner_dim,
+    )
+    if gw.restart_loop_tripped:
+        text.append(
+            "\n    ⚠ TRIPPED — the next restart-interrupted boot skips auto-resume"
+            " (delete gateway/restart_loop.json if this is a false positive)",
+            style=theme.ui_warn,
+        )
+    return text
+
+
 def _dashboard_client_text(gw: GatewayState, theme: Theme) -> Text:
     """Web dashboard attachment from the marker file's mtime; absent means never."""
     text = Text("\n  Web client: ", style=theme.ui_label)
@@ -505,6 +528,10 @@ def _append_compact_warnings(lines: Text, state: DashboardState, theme: Theme) -
         warnings.append("⚠ suspected OOM")
     if gw.in_respawn_backoff:
         warnings.append("⚠ respawn backoff")
+    if gw.restart_loop_tripped:
+        warnings.append("⚠ restart loop")
+    if gw.dead_target_count:
+        warnings.append(f"⚠ {gw.dead_target_count} dead delivery target(s)")
     if gw.memory_pressure in _HIGH_MEMORY_PRESSURE:
         warnings.append(f"⚠ memory pressure {gw.memory_pressure}")
     if gw.update_pending_manual_serve_count:
@@ -533,6 +560,8 @@ def _liveness_text(gw: GatewayState, theme: Theme) -> Text:
     text.append_text(_memory_text(gw, theme))
     if gw.gateway_starts_recorded:
         text.append_text(_restart_storm_text(gw, theme))
+    if gw.restart_loop_boots_recorded:
+        text.append_text(_restart_loop_text(gw, theme))
     text.append_text(_dashboard_client_text(gw, theme))
     text.append("\n  Code: ", style=theme.ui_label)
     text.append(_text_or_dash(gw.code_version), style=theme.banner_text)
@@ -909,9 +938,34 @@ def _coverage_label(record: MigrationProfileRecord, recorded: bool, theme: Theme
     return Text("not served", style=theme.ui_warn)
 
 
+def _dead_targets_text(gw: GatewayState, theme: Theme) -> Text:
+    """Chats delivery stopped sending to (gateway/dead_targets.json); ids never shown."""
+    text = Text()
+    text.append(f"\nDead delivery targets: {gw.dead_target_count}", style=f"bold {theme.ui_warn}")
+    platforms = "  ".join(
+        f"{sanitize_terminal_text(name)} {count}"
+        for name, count in sorted(gw.dead_target_platforms.items())
+    )
+    text.append(f"  {platforms}", style=theme.ui_warn)
+    text.append(
+        "\n  skipped until a send to them succeeds again (bot kicked, chat deleted)",
+        style=theme.banner_dim,
+    )
+    for target in gw.dead_targets:
+        text.append(f"\n  {sanitize_terminal_text(target.platform)}", style=theme.ui_label)
+        text.append(f"  {_text_or_dash(target.reason)}", style=theme.banner_text)
+        if target.age_seconds is not None:
+            text.append(f"  {fmt_age_seconds(target.age_seconds)} ago", style=theme.banner_dim)
+    text.append("\n")
+    return text
+
+
 def _deliveries_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
+    sections: list[RenderableType] = []
+    if gw.dead_target_count:
+        sections.append(_dead_targets_text(gw, theme))
     if not gw.pending_deliveries:
-        return []
+        return sections
     header = Text()
     header.append("\nDelivery Obligations\n", style=f"bold {theme.ui_label}")
     header.append(
@@ -932,7 +986,7 @@ def _deliveries_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
             fmt_age_seconds(entry.age_seconds),
             _or_dash(entry.last_error),
         )
-    return [header, table]
+    return [*sections, header, table]
 
 
 def _append_drain(header: Text, gw: GatewayState, theme: Theme) -> None:
