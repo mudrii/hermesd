@@ -24,8 +24,8 @@ def test_collector_honors_small_positive_log_tail_limit(hermes_home: Path):
     from hermesd.collect.common import _read_tail_text
 
     log = hermes_home / "logs" / "agent.log"
-    log.write_text("abcdef")
-    collector = Collector(hermes_home, log_tail_bytes=1)
+    log.write_text("abcde\nf")
+    collector = Collector(hermes_home, log_tail_bytes=2)
     try:
         assert _read_tail_text(log, collector._log_tail_bytes) == "f"
     finally:

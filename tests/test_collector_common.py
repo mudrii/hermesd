@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import os
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO
 
 import pytest
 
-from hermesd.collect.common import _read_tail_text
+from hermesd.collect.common import _read_tail_text, _read_text_capped
 
 
 class _MutatingHandle:
@@ -67,7 +69,7 @@ def test_read_tail_text_bounded_when_file_grows_before_read(
     monkeypatch: pytest.MonkeyPatch,
 ):
     log = tmp_path / "agent.log"
-    log.write_bytes(b"a" * 100)
+    log.write_bytes(b"a" * 50 + b"\n" + b"a" * 49)
 
     def grow(path: Path) -> None:
         with path.open("ab") as extra:
@@ -76,7 +78,7 @@ def test_read_tail_text_bounded_when_file_grows_before_read(
     _mutate_before_read(monkeypatch, log, grow)
 
     result = _read_tail_text(log, 64)
-    assert result == "a" * 64
+    assert result == "a" * 49
     assert len(result.encode()) <= 64
 
 
@@ -113,14 +115,58 @@ def test_read_tail_text_at_max_bytes_returns_whole_file(tmp_path: Path):
     assert _read_tail_text(log, 64) == "x" * 64
 
 
-def test_read_tail_text_above_max_bytes_returns_tail(tmp_path: Path):
+def test_read_tail_text_above_max_bytes_drops_partial_first_line(tmp_path: Path):
+    log = tmp_path / "agent.log"
+    log.write_bytes(b"api_key=sk-" + b"x" * 40 + b"\nnext line\n")
+    # The window starts mid-line: the cut line's label is gone, so its tail
+    # (which may be a secret value) must not be shown.
+    assert _read_tail_text(log, 20) == "next line\n"
+
+
+def test_read_tail_text_window_without_newline_is_empty(tmp_path: Path):
     log = tmp_path / "agent.log"
     log.write_bytes(b"y" + b"x" * 64)
-    assert _read_tail_text(log, 64) == "x" * 64
+    assert _read_tail_text(log, 64) == ""
 
 
-def test_read_tail_text_partial_utf8_at_cut_boundary_is_replaced(tmp_path: Path):
+def test_read_tail_text_window_starting_on_line_boundary_keeps_first_line(tmp_path: Path):
+    log = tmp_path / "agent.log"
+    log.write_bytes(b"old\nfirst\nsecond\n")
+    assert _read_tail_text(log, len(b"first\nsecond\n")) == "first\nsecond\n"
+
+
+def test_read_tail_text_partial_utf8_at_cut_boundary_is_dropped(tmp_path: Path):
     log = tmp_path / "agent.log"
     # Cut lands on the second byte of the leading multi-byte character.
-    log.write_bytes("é".encode() + b"a" * 62)
-    assert _read_tail_text(log, 63) == "\ufffd" + "a" * 62
+    log.write_bytes("é".encode() + b"a\n" + b"b" * 60)
+    assert _read_tail_text(log, 63) == "b" * 60
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
+def test_text_readers_refuse_fifo_without_blocking(tmp_path: Path):
+    fifo = tmp_path / "agent.log"
+    os.mkfifo(fifo)
+    results: list[object] = []
+
+    def read_both() -> None:
+        results.append(_read_text_capped(fifo))
+        try:
+            _read_tail_text(fifo, 64)
+        except OSError:
+            results.append("refused")
+
+    reader = threading.Thread(target=read_both, daemon=True)
+    reader.start()
+    reader.join(timeout=5)
+    if reader.is_alive():  # pragma: no cover - only on regression
+        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        pytest.fail("reading a FIFO blocked")
+    assert results == ["", "refused"]
+
+
+def test_coerce_float_huge_int_is_zero():
+    from hermesd.collect.common import _coerce_float, _optional_epoch
+
+    assert _coerce_float(10**400) == 0.0
+    assert _coerce_float(-(10**400)) == 0.0
+    assert _optional_epoch(10**400) is None

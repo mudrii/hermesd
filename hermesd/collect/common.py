@@ -5,10 +5,12 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from stat import S_ISREG
+from typing import Any, BinaryIO
 
 # Upper bound on any plain-text file read whole (memory cards, manifests,
 # frontmatter, excerpts): ~/.hermes is untrusted input for a read-only viewer.
@@ -71,12 +73,28 @@ def _file_size(path: Path) -> int:
         return 0
 
 
+def _open_regular_file(path: Path) -> BinaryIO:
+    """Open path for binary reads, refusing FIFOs, devices and directories.
+
+    Opening a FIFO that has no writer blocks forever, which would hang the
+    collector thread; the type is checked before opening and confirmed on the
+    opened descriptor.
+    """
+    if not S_ISREG(os.stat(path).st_mode):
+        raise OSError(f"{path} is not a regular file")
+    handle = path.open("rb")
+    if not S_ISREG(os.fstat(handle.fileno()).st_mode):
+        handle.close()
+        raise OSError(f"{path} is not a regular file")
+    return handle
+
+
 def _read_text_capped(path: Path, root: Path | None = None) -> str:
     """Read at most _MAX_TEXT_READ_BYTES of a non-symlinked file under root."""
     if path.is_symlink() or (root is not None and not _path_resolves_under(path, root)):
         return ""
     try:
-        with path.open("rb") as handle:
+        with _open_regular_file(path) as handle:
             return handle.read(_MAX_TEXT_READ_BYTES).decode("utf-8", errors="replace")
     except OSError:
         return ""
@@ -103,13 +121,25 @@ def _exists_strict(path: Path) -> bool:
 
 
 def _read_tail_text(path: Path, max_bytes: int) -> str:
-    """Read at most the last max_bytes of path, decoded with replacement."""
-    with path.open("rb") as handle:
+    """Read at most the last max_bytes of path, decoded with replacement.
+
+    A window that starts mid-line drops that partial first line: its label
+    (``api_key=``) may be cut off, leaving a bare secret tail no redaction
+    rule can recognise. A window with no line break at all is dropped whole.
+    """
+    with _open_regular_file(path) as handle:
         handle.seek(0, 2)
         size = handle.tell()
-        handle.seek(max(0, size - max_bytes))
+        is_cut = size > max_bytes
+        # A cut window reads one byte early, so a window that opens exactly on
+        # a line start keeps that line (the extra byte is the "\n" before it).
+        start = size - max_bytes - 1 if is_cut else 0
+        handle.seek(start)
         # Bound the read so bytes appended after the size check are excluded.
-        return handle.read(size - handle.tell()).decode("utf-8", errors="replace")
+        data = handle.read(size - start)
+    if is_cut:
+        data = data.partition(b"\n")[2]
+    return data.decode("utf-8", errors="replace")
 
 
 def _mtime(path: Path) -> float | None:
@@ -251,7 +281,11 @@ def _coerce_float(value: object) -> float:
     if isinstance(value, bool):
         return float(value)
     if isinstance(value, int | float):
-        result = float(value)
+        try:
+            result = float(value)
+        except OverflowError:
+            # An int past the float range (JSON allows arbitrary precision).
+            return 0.0
         return result if math.isfinite(result) else 0.0
     if isinstance(value, str):
         try:
