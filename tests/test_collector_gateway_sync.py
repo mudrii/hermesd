@@ -13,12 +13,16 @@ import pytest
 
 from hermesd.models import GatewayLoopHealth
 from tests.test_collector_gateway import (
+    NOW,
     _armed_heartbeat,
     _collect,
     _collect_probed,
+    _iso,
+    _receipt,
     _write_gateway_state,
     _write_heartbeat_v2,
     _write_ledgers,
+    _write_receipt,
 )
 
 # --------------------------------------------------------------------------
@@ -161,6 +165,17 @@ def test_standalone_reason_ignores_non_string_values(hermes_home: Path, value: o
     assert gateway.multiplex_standalone_reason == ""
 
 
+def test_standalone_reason_of_a_replaced_writer_is_not_current(hermes_home: Path):
+    """A live launchd replacement cannot vouch for its predecessor's boot verdict."""
+    _write_gateway_state(hermes_home, pid=1111, multiplex_standalone_reason="old boot")
+    (hermes_home / "gateway.pid").write_text("4242")
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.running is True
+    assert gateway.multiplex_standalone_reason == ""
+
+
 def test_standalone_reason_is_redacted_and_bounded(hermes_home: Path):
     secret = "sk-" + "A" * 40
     _write_gateway_state(hermes_home, multiplex_standalone_reason=f"token {secret} " + "x" * 5000)
@@ -169,3 +184,125 @@ def test_standalone_reason_is_redacted_and_bounded(hermes_home: Path):
 
     assert secret not in gateway.multiplex_standalone_reason
     assert len(gateway.multiplex_standalone_reason) <= 800
+
+
+# --------------------------------------------------------------------------
+# update receipt: external fleet rows and the newer receipt keys
+# (hermes_cli/update_receipt.py:387-392; update_cmd_fleet.py:224-231)
+# --------------------------------------------------------------------------
+
+
+def test_external_fleet_row_on_another_build_is_not_code_skew(hermes_home: Path):
+    _write_gateway_state(hermes_home, code_sha="bbbb")
+    _write_receipt(
+        hermes_home,
+        _receipt(
+            fleet=[
+                {"profile": "default", "code_sha": "bbbb", "state": "current"},
+                {
+                    "profile": "lab",
+                    "code_sha": "zzzz",
+                    "state": "external",
+                    "code_root": "/opt/other-checkout",
+                },
+            ]
+        ),
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.runtime_code_skew is False
+    assert gateway.runtime_code_skew_source == "fleet"
+    assert gateway.update_fleet_states == {"current": 1, "external": 1}
+    assert gateway.update_fleet_external_roots == ["/opt/other-checkout"]
+
+
+def test_non_external_row_still_counts_as_skew_beside_an_external_one(hermes_home: Path):
+    _write_gateway_state(hermes_home, code_sha="bbbb")
+    _write_receipt(
+        hermes_home,
+        _receipt(
+            fleet=[
+                {"profile": "lab", "code_sha": "zzzz", "state": "external"},
+                {"profile": "coding", "code_sha": "aaaa", "state": "current"},
+            ]
+        ),
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.runtime_code_skew is True
+
+
+def test_external_roots_are_bounded_redacted_and_deduplicated(hermes_home: Path):
+    _write_gateway_state(hermes_home, code_sha="bbbb")
+    fleet: list[dict[str, object]] = [
+        {"profile": f"p{i}", "state": "external", "code_root": f"/opt/r{i}"} for i in range(20)
+    ]
+    fleet.append({"profile": "dup", "state": "external", "code_root": "/opt/r0"})
+    fleet.append({"profile": "junk", "state": "external", "code_root": 7})
+    _write_receipt(hermes_home, _receipt(fleet=fleet))
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.update_fleet_external_roots == ["/opt/r0", "/opt/r1", "/opt/r2", "/opt/r3"]
+
+
+def test_receipt_new_keys_are_surfaced(hermes_home: Path):
+    _write_gateway_state(hermes_home, code_sha="bbbb")
+    _write_receipt(
+        hermes_home,
+        _receipt(
+            post_swap_pid=92904,
+            pending_manual_serves=[{"kind": "serve", "pid": 1}, {"kind": "dashboard", "pid": 2}],
+            gateway_restart={"incomplete": False, "settled_from_live_fleet_at": _iso(NOW - 120)},
+            runtime_outcomes=[
+                {"kind": "gateway", "outcome": "restarted"},
+                {"kind": "dashboard", "outcome": "restarted"},
+                {"kind": "serve", "outcome": "unaccounted"},
+                "junk",
+            ],
+            skips=[
+                {"name": "desktop_serve", "reason": "owned by the app"},
+                {"name": "npm", "reason": "offline"},
+            ],
+        ),
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.update_post_swap_pid == 92904
+    assert gateway.update_pending_manual_serve_count == 2
+    assert gateway.update_settled_from_live_fleet_age_seconds == pytest.approx(120.0)
+    assert gateway.update_runtime_outcomes == {"restarted": 2, "unaccounted": 1}
+    assert gateway.update_skip_count == 2
+    assert gateway.update_skip_names == ["desktop_serve", "npm"]
+
+
+@pytest.mark.parametrize("pid", [True, 0, -3, "12", None, 1.5])
+def test_receipt_post_swap_pid_rejects_non_pids(hermes_home: Path, pid: object):
+    _write_gateway_state(hermes_home)
+    _write_receipt(hermes_home, _receipt(post_swap_pid=pid))
+
+    assert _collect(hermes_home).gateway.update_post_swap_pid is None
+
+
+def test_receipt_new_keys_tolerate_wrong_types(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_receipt(
+        hermes_home,
+        _receipt(
+            pending_manual_serves="bad",
+            gateway_restart=[1],
+            runtime_outcomes={"a": 1},
+            skips=[None, {"name": None}, {"name": "x" * 500}],
+        ),
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.update_pending_manual_serve_count == 0
+    assert gateway.update_settled_from_live_fleet_age_seconds is None
+    assert gateway.update_runtime_outcomes == {}
+    assert gateway.update_skip_count == 3
+    assert gateway.update_skip_names == ["x" * 60]

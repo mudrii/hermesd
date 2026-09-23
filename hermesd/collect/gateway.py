@@ -118,6 +118,17 @@ _UNFINISHED_OUTCOMES = frozenset({"failed", "partial", "running"})
 # The receipt's fleet matrix holds one row per profile. Cap the retained state
 # vocabulary so an untrusted file cannot grow the map; never cap the skew scan.
 _FLEET_STATE_KIND_LIMIT = 8
+# A fleet row serving a checkout this update did not touch (``EXTERNAL_STATE``,
+# hermes_cli/update_receipt.py:387-392). Upstream's skew reader skips it
+# (hermes_cli/update_cmd_fleet.py:224-231): another tree's SHA is not skew.
+_EXTERNAL_FLEET_STATE = "external"
+_EXTERNAL_ROOT_LIMIT = 4
+_RECEIPT_PATH_CHARS = 120
+# ``runtime_outcomes`` rows carry one of a small outcome vocabulary
+# (hermes_cli/update_inventory.py:365-380); cap it like the fleet states.
+_RUNTIME_OUTCOME_KIND_LIMIT = 8
+_SKIP_NAME_LIMIT = 3
+_SKIP_NAME_CHARS = 60
 # The multiplexer keys a served profile's adapter ``<profile>:<platform>``
 # (gateway/run_adapters.py:1048). Upstream validates that grammar
 # *unconditionally* before projecting a status key anywhere
@@ -659,6 +670,37 @@ class _UpdateReceipt:
     update_receipt_unfinished: bool = False
     update_fleet_states: dict[str, int] = field(default_factory=dict)
     update_fleet_runtime_count: int = 0
+    update_fleet_external_roots: list[str] = field(default_factory=list)
+    update_post_swap_pid: int | None = None
+    update_pending_manual_serve_count: int = 0
+    update_settled_from_live_fleet_age_seconds: float | None = None
+    update_runtime_outcomes: dict[str, int] = field(default_factory=dict)
+    update_skip_count: int = 0
+    update_skip_names: list[str] = field(default_factory=list)
+
+    def as_update(self) -> dict[str, Any]:
+        """The ``GatewayState`` fields this receipt owns, for ``model_copy(update=...)``."""
+        return {
+            "last_update_outcome": self.outcome,
+            "last_update_finished_age_seconds": self.finished_age_seconds,
+            "last_update_from_version": self.from_version,
+            "last_update_to_version": self.to_version,
+            "last_update_failed_step": self.failed_step,
+            "runtime_code_skew": self.runtime_code_skew,
+            "runtime_code_skew_source": self.runtime_code_skew_source,
+            "update_receipt_unfinished": self.update_receipt_unfinished,
+            "update_fleet_states": self.update_fleet_states,
+            "update_fleet_runtime_count": self.update_fleet_runtime_count,
+            "update_fleet_external_roots": self.update_fleet_external_roots,
+            "update_post_swap_pid": self.update_post_swap_pid,
+            "update_pending_manual_serve_count": self.update_pending_manual_serve_count,
+            "update_settled_from_live_fleet_age_seconds": (
+                self.update_settled_from_live_fleet_age_seconds
+            ),
+            "update_runtime_outcomes": self.update_runtime_outcomes,
+            "update_skip_count": self.update_skip_count,
+            "update_skip_names": self.update_skip_names,
+        }
 
 
 def _update_receipt_status(data: JsonMapping, now: float, code_sha: str) -> _UpdateReceipt:
@@ -667,6 +709,7 @@ def _update_receipt_status(data: JsonMapping, now: float, code_sha: str) -> _Upd
     unfinished = _receipt_looks_unfinished(data)
     fleet = _as_list(data.get("fleet"))
     evidence = _skew_evidence(fleet, data, code_sha, unfinished)
+    skips = _as_list(data.get("skips"))
     return _UpdateReceipt(
         outcome=str(data.get("outcome") or ""),
         finished_age_seconds=_age_seconds(_iso_to_epoch(data.get("finished_at")), now),
@@ -678,7 +721,71 @@ def _update_receipt_status(data: JsonMapping, now: float, code_sha: str) -> _Upd
         update_receipt_unfinished=unfinished,
         update_fleet_states=_fleet_state_counts(fleet),
         update_fleet_runtime_count=len(fleet),
+        update_fleet_external_roots=_external_fleet_roots(fleet),
+        # ``resume_update_receipt`` stamps the interpreter that finished the run
+        # after the code swap (hermes_cli/update_receipt.py:149-155).
+        update_post_swap_pid=_strict_pid(data.get("post_swap_pid")),
+        # Manual serve restarts still owed when the receipt was written
+        # (hermes_cli/update_receipt.py:201-203).
+        update_pending_manual_serve_count=len(_as_list(data.get("pending_manual_serves"))),
+        # ``settle_latest_receipt_fleet`` (hermes_cli/update_receipt.py:249-280)
+        # rewrites latest.json once a later check saw the whole fleet current.
+        update_settled_from_live_fleet_age_seconds=_age_seconds(
+            _iso_to_epoch(_as_dict(data.get("gateway_restart")).get("settled_from_live_fleet_at")),
+            now,
+        ),
+        update_runtime_outcomes=_capped_counts(
+            _as_list(data.get("runtime_outcomes")), "outcome", _RUNTIME_OUTCOME_KIND_LIMIT
+        ),
+        update_skip_count=len(skips),
+        update_skip_names=_skip_names(skips),
     )
+
+
+def _strict_pid(value: object) -> int | None:
+    """A machine-written pid: a real positive ``int`` or nothing (no bools, no strings)."""
+    return value if type(value) is int and value > 0 else None
+
+
+def _external_fleet_roots(fleet: list[object]) -> list[str]:
+    """Distinct ``code_root`` values of external rows, bounded and redacted."""
+    roots: list[str] = []
+    for entry in fleet:
+        info = _as_dict(entry)
+        root = info.get("code_root")
+        if info.get("state") != _EXTERNAL_FLEET_STATE or not isinstance(root, str) or not root:
+            continue
+        label = _excerpt(root, _RECEIPT_PATH_CHARS)
+        if label not in roots:
+            roots.append(label)
+            if len(roots) >= _EXTERNAL_ROOT_LIMIT:
+                break
+    return roots
+
+
+def _capped_counts(rows: list[object], key: str, limit: int) -> dict[str, int]:
+    """Counts of ``row[key]`` over mapping rows, with the vocabulary capped at ``limit``."""
+    counts: dict[str, int] = {}
+    for entry in rows:
+        info = _as_dict(entry)
+        if not info:
+            continue
+        value = str(info.get(key) or "unknown")
+        if value not in counts and len(counts) >= limit:
+            continue
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
+
+def _skip_names(skips: list[object]) -> list[str]:
+    names: list[str] = []
+    for entry in skips:
+        name = _as_dict(entry).get("name")
+        if isinstance(name, str) and name:
+            names.append(_excerpt(name, _SKIP_NAME_CHARS))
+            if len(names) >= _SKIP_NAME_LIMIT:
+                break
+    return names
 
 
 def _first_failed_step(steps: object) -> str:
@@ -731,9 +838,14 @@ def _skew_evidence(
 
 
 def _any_fleet_skew(fleet: list[object], code_sha: str) -> bool:
-    """A recorded ``stale`` state is skew even when its sha was never stamped."""
+    """A recorded ``stale`` state is skew even when its sha was never stamped.
+
+    An ``external`` row serves another checkout and is never skew, whatever its SHA
+    (``row_is_external``, hermes_cli/update_cmd_fleet.py:224-231).
+    """
     return any(
-        _as_dict(entry).get("state") == "stale" or _entry_sha_differs(entry, code_sha)
+        _as_dict(entry).get("state") != _EXTERNAL_FLEET_STATE
+        and (_as_dict(entry).get("state") == "stale" or _entry_sha_differs(entry, code_sha))
         for entry in fleet
     )
 

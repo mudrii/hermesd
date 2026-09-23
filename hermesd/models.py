@@ -293,6 +293,19 @@ class GatewayState(BaseModel):
     update_receipt_unfinished: bool = False
     update_fleet_states: dict[str, int] = Field(default_factory=dict)
     update_fleet_runtime_count: int = 0
+    # ``code_root`` of fleet rows in state ``external``: runtimes serving a checkout
+    # the update did not touch, never counted as skew. Bounded and redacted.
+    update_fleet_external_roots: list[str] = Field(default_factory=list)
+    # The interpreter that finished the run after the code swap, if it re-execed.
+    update_post_swap_pid: int | None = None
+    # Manual ``hermes serve``/``dashboard`` restarts the receipt still owed.
+    update_pending_manual_serve_count: int = 0
+    # Set once a later check saw the whole live fleet current and settled latest.json.
+    update_settled_from_live_fleet_age_seconds: float | None = None
+    # Per-runtime restart outcomes (restarted/stopped/failed/deferred/unaccounted).
+    update_runtime_outcomes: dict[str, int] = Field(default_factory=dict)
+    update_skip_count: int = 0
+    update_skip_names: list[str] = Field(default_factory=list)
     # Restart history and delivery obligations (state.db)
     gateway_incarnation_count: int = 0
     gateway_restarts_24h: int = 0

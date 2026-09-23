@@ -479,6 +479,8 @@ def _append_compact_warnings(lines: Text, state: DashboardState, theme: Theme) -
         warnings.append("⚠ suspected OOM")
     if gw.in_respawn_backoff:
         warnings.append("⚠ respawn backoff")
+    if gw.update_pending_manual_serve_count:
+        warnings.append(f"⚠ {gw.update_pending_manual_serve_count} manual serve restart(s) owed")
     if warnings:
         lines.append("\n  " + "  ".join(warnings), style=theme.ui_warn)
     if gw.pending_delivery_count or gw.failed_delivery_count:
@@ -619,6 +621,10 @@ def _updates_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
         f"  finished {fmt_age_seconds(gw.last_update_finished_age_seconds)} ago",
         style=theme.banner_dim,
     )
+    if gw.update_post_swap_pid is not None:
+        text.append(
+            f"  finished by post-swap pid {gw.update_post_swap_pid}", style=theme.banner_dim
+        )
     text.append("\n  Version: ", style=theme.ui_label)
     text.append(
         f"{_text_or_dash(gw.last_update_from_version)} → {_text_or_dash(gw.last_update_to_version)}",
@@ -631,7 +637,39 @@ def _updates_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
         )
     _append_fleet_evidence(text, gw, theme)
     _append_skew_verdict(text, gw, theme)
+    _append_receipt_followups(text, gw, theme)
     return [text]
+
+
+def _append_receipt_followups(text: Text, gw: GatewayState, theme: Theme) -> None:
+    """What the receipt recorded after the pull: restarts, owed serves, skips, settling."""
+    if gw.update_fleet_external_roots:
+        roots = ", ".join(sanitize_terminal_text(root) for root in gw.update_fleet_external_roots)
+        text.append(f"\n  External checkouts (not skew): {roots}", style=theme.banner_dim)
+    if gw.update_runtime_outcomes:
+        outcomes = "  ".join(
+            f"{sanitize_terminal_text(outcome)} {count}"
+            for outcome, count in sorted(gw.update_runtime_outcomes.items())
+        )
+        troubled = any(key in gw.update_runtime_outcomes for key in ("failed", "unaccounted"))
+        text.append(
+            f"\n  Runtime restarts: {outcomes}",
+            style=theme.ui_warn if troubled else theme.banner_dim,
+        )
+    if gw.update_pending_manual_serve_count:
+        text.append(
+            f"\n  ⚠ {gw.update_pending_manual_serve_count} manual serve restart(s) still owed"
+            " (relaunch `hermes serve` / `hermes dashboard`)",
+            style=theme.ui_warn,
+        )
+    if gw.update_skip_count:
+        names = ", ".join(sanitize_terminal_text(name) for name in gw.update_skip_names)
+        more = gw.update_skip_count - len(gw.update_skip_names)
+        suffix = f" (+{more} more)" if more > 0 else ""
+        text.append(f"\n  Skipped: {names or '—'}{suffix}", style=theme.banner_dim)
+    if gw.update_settled_from_live_fleet_age_seconds is not None:
+        age = fmt_age_seconds(gw.update_settled_from_live_fleet_age_seconds)
+        text.append(f"\n  settled from the live fleet {age} ago", style=theme.ui_ok)
 
 
 def _append_fleet_evidence(text: Text, gw: GatewayState, theme: Theme) -> None:

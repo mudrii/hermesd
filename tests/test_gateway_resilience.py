@@ -104,6 +104,8 @@ def test_corrupt_update_receipt_keeps_last_good_and_marks_source_failed(hermes_h
                     {"profile": "root", "code_sha": "stale-sha", "state": "stale"},
                     {"profile": "coding", "code_sha": None, "state": "unknown"},
                 ],
+                "pending_manual_serves": [{"kind": "serve", "pid": 9}],
+                "runtime_outcomes": [{"kind": "gateway", "outcome": "restarted"}],
             }
         )
     )
@@ -124,6 +126,8 @@ def test_corrupt_update_receipt_keeps_last_good_and_marks_source_failed(hermes_h
     assert second.gateway.update_receipt_unfinished is False
     assert second.gateway.update_fleet_runtime_count == 2
     assert second.gateway.update_fleet_states == {"stale": 1, "unknown": 1}
+    assert second.gateway.update_pending_manual_serve_count == 1
+    assert second.gateway.update_runtime_outcomes == {"restarted": 1}
     assert "update_receipt" in second.health.failed_sources
     c.close()
 

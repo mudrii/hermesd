@@ -490,6 +490,13 @@ _UPDATE_RECEIPT_FIELDS = (
     "update_receipt_unfinished",
     "update_fleet_states",
     "update_fleet_runtime_count",
+    "update_fleet_external_roots",
+    "update_post_swap_pid",
+    "update_pending_manual_serve_count",
+    "update_settled_from_live_fleet_age_seconds",
+    "update_runtime_outcomes",
+    "update_skip_count",
+    "update_skip_names",
 )
 _LEDGER_FIELDS = (
     "gateway_incarnation_count",
@@ -1828,20 +1835,7 @@ class Collector:
         last = self._last_good_by_source.get("update_receipt")
         data = self._read_liveness_json(path, bool(last is not None and last.last_update_outcome))
         receipt = _update_receipt_status(data, self._clock(), gateway.code_sha)
-        return gateway.model_copy(
-            update={
-                "last_update_outcome": receipt.outcome,
-                "last_update_finished_age_seconds": receipt.finished_age_seconds,
-                "last_update_from_version": receipt.from_version,
-                "last_update_to_version": receipt.to_version,
-                "last_update_failed_step": receipt.failed_step,
-                "runtime_code_skew": receipt.runtime_code_skew,
-                "runtime_code_skew_source": receipt.runtime_code_skew_source,
-                "update_receipt_unfinished": receipt.update_receipt_unfinished,
-                "update_fleet_states": receipt.update_fleet_states,
-                "update_fleet_runtime_count": receipt.update_fleet_runtime_count,
-            }
-        )
+        return gateway.model_copy(update=receipt.as_update())
 
     def _with_gateway_ledgers(self, gateway: GatewayState) -> GatewayState:
         last = self._last_good_by_source.get("gateway_ledgers")

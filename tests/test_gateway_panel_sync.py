@@ -151,3 +151,48 @@ def test_single_profile_standalone_reason_is_not_a_compact_warning() -> None:
 
     assert "standalone" not in compact
     assert "Standalone: only one profile exists" in detail
+
+
+# --------------------------------------------------------------------------
+# update receipt additions
+# --------------------------------------------------------------------------
+
+
+def test_updates_section_renders_the_newer_receipt_keys() -> None:
+    gateway = _LIVE.model_copy(
+        update={
+            "last_update_outcome": "success",
+            "runtime_code_skew_source": "fleet",
+            "update_fleet_runtime_count": 2,
+            "update_fleet_states": {"current": 1, "external": 1},
+            "update_fleet_external_roots": ["/opt/" + HOSTILE],
+            "update_post_swap_pid": 92904,
+            "update_pending_manual_serve_count": 2,
+            "update_settled_from_live_fleet_age_seconds": 120.0,
+            "update_runtime_outcomes": {"restarted": 2, "unaccounted": 1},
+            "update_skip_count": 4,
+            "update_skip_names": ["desktop_serve", "npm", HOSTILE],
+        }
+    )
+
+    detail = _render(gateway, detail=True)
+    compact = _render(gateway, detail=False)
+
+    assert "External checkouts (not skew): /opt/[/] boom" in detail
+    assert "\x1b[2J" not in detail
+    assert "finished by post-swap pid 92904" in detail
+    assert "2 manual serve restart(s) still owed" in detail
+    assert "settled from the live fleet 2m ago" in detail
+    assert "Runtime restarts: restarted 2  unaccounted 1" in detail
+    assert "Skipped: desktop_serve, npm, [/] boom" in detail
+    assert "(+1 more)" in detail
+    assert "⚠ 2 manual serve restart(s) owed" in compact
+
+
+def test_updates_section_omits_absent_receipt_keys() -> None:
+    gateway = _LIVE.model_copy(update={"last_update_outcome": "success"})
+
+    detail = _render(gateway, detail=True)
+
+    for absent in ("External checkouts", "post-swap", "manual serve", "settled", "Skipped"):
+        assert absent not in detail
