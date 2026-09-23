@@ -924,6 +924,27 @@ class ToolStats(BaseModel):
     call_count: int = 0
 
 
+class WorkerIdentity(StrEnum):
+    """Whether a recorded pid is still the process that was recorded.
+
+    Upstream records a start-time fingerprint beside the pid (kanban
+    ``worker_started_at``, ``hermes_cli/kanban_db_dispatch.py:361-413``; the
+    spawn ledger's ``create_time``, ``hermes_cli/process_identity.py:174-191``)
+    because pids are reused. A live pid whose observed start time disagrees is
+    ``REUSED`` — a stranger holds the number and the recorded process is gone.
+    """
+
+    # No pid recorded (or not a ledger entry): nothing to verify.
+    NONE = ""
+    LIVE = "live"
+    DEAD = "dead"
+    REUSED = "reused"
+    # Recorded as "unverified" upstream, unparseable, or unobservable here.
+    UNVERIFIED = "unverified"
+    # A pre-fingerprint row: only pid existence can be checked.
+    LEGACY = "legacy"
+
+
 class BackgroundProcessInfo(BaseModel):
     session_id: str
     command: str = ""
@@ -949,6 +970,14 @@ class BackgroundProcessInfo(BaseModel):
     # True when the recorded pid is still live (checked via the injected
     # pid_exists); False marks a stale ledger/registry entry.
     alive: bool = False
+    # Written by the ``process_identity`` source for spawn-ledger entries: the
+    # pid checked against its recorded ``create_time``, and the recorded
+    # spawner. ``orphaned`` is a live helper whose spawner is provably gone —
+    # the case upstream's startup sweep reaps
+    # (``hermes_cli/process_identity.py:325-360``).
+    identity: WorkerIdentity = WorkerIdentity.NONE
+    spawner_pid: int = 0
+    orphaned: bool = False
 
 
 class CheckpointInfo(BaseModel):
@@ -1973,12 +2002,60 @@ class LogStream(BaseModel):
     lines: list[LogLine] = Field(default_factory=list)
 
 
+class LogHealthCounter(BaseModel):
+    """One event class counted in an incrementally scanned log.
+
+    ``last_1h``/``last_24h`` count dated events: the line's own timestamp, the
+    nearest timestamp above it in the same file, or — for lines appended while
+    hermesd watches a log that carries no timestamps — the refresh that first
+    saw them. ``undated`` counts events found in the initial backfill of a log
+    with no usable timestamp, which cannot be placed in either window.
+    """
+
+    key: str
+    label: str
+    last_1h: int = 0
+    last_24h: int = 0
+    undated: int = 0
+    last_seen_age_seconds: float | None = None
+
+
+class LogSignatureCount(BaseModel):
+    """A repeated error signature (or MCP server name) with its 24h count."""
+
+    signature: str
+    last_24h: int = 0
+    undated: int = 0
+    last_seen_age_seconds: float | None = None
+
+
+class LogStreamHealth(BaseModel):
+    """Health counters for one log scanned incrementally (source ``log_health``).
+
+    Only appended bytes are read once a log has been caught up; the first sight
+    of a log scans at most a bounded backfill from its end, a chunk per
+    refresh, so ``backlog_bytes`` is non-zero while that catch-up is running and
+    counts cover only ``scanned_bytes`` of history.
+    """
+
+    stream: str
+    path: str = ""
+    size_bytes: int = 0
+    scanned_bytes: int = 0
+    backlog_bytes: int = 0
+    oldest_event_age_seconds: float | None = None
+    counters: list[LogHealthCounter] = Field(default_factory=list)
+    top: list[LogSignatureCount] = Field(default_factory=list)
+
+
 class LogState(BaseModel):
     agent_lines: list[LogLine] = Field(default_factory=list)
     gateway_lines: list[LogLine] = Field(default_factory=list)
     error_lines: list[LogLine] = Field(default_factory=list)
     cron_lines: list[LogLine] = Field(default_factory=list)
     streams: list[LogStream] = Field(default_factory=list)
+    # Written by its own source (``log_health``).
+    health: list[LogStreamHealth] = Field(default_factory=list)
 
 
 class ChannelPlatformInfo(BaseModel):
@@ -2035,6 +2112,11 @@ class KanbanTaskSummary(BaseModel):
     # configured kanban.failure_limit at collect time.
     breaker_limit: int = 0
     breaker_tripped: bool = False
+    # Spawn-time fingerprint of worker_pid as stored ("<epoch>|<start>", a
+    # legacy integer, "unverified", or "" for NULL), and the verdict the
+    # ``kanban_worker_identity`` source derives from it.
+    worker_started_at: str = ""
+    worker_identity: WorkerIdentity = WorkerIdentity.NONE
 
 
 class KanbanRunSummary(BaseModel):
@@ -2044,6 +2126,8 @@ class KanbanRunSummary(BaseModel):
     status: str = ""
     outcome: str = ""
     worker_pid: int = 0
+    worker_started_at: str = ""
+    worker_identity: WorkerIdentity = WorkerIdentity.NONE
     started_at: int = 0
     ended_at: int = 0
     error: str = ""
@@ -2100,6 +2184,9 @@ class KanbanState(BaseModel):
     board_count: int = 0
     current_board: str = ""
     stale_claim_count: int = 0
+    # Listed tasks and runs whose live worker pid now belongs to another
+    # process (``kanban_worker_identity`` source).
+    worker_pid_reused_count: int = 0
     boards: list[KanbanBoardSummary] = Field(default_factory=list)
     status_counts: dict[str, int] = Field(default_factory=dict)
     assignee_counts: dict[str, int] = Field(default_factory=dict)
@@ -2707,6 +2794,113 @@ class ProcessReceiptsState(BaseModel):
     receipts_truncated: bool = False
 
 
+class LogFileUsage(BaseModel):
+    """One file under ROOT ``logs/``: size, observed growth and rotation."""
+
+    name: str
+    size_bytes: int = 0
+    # Bytes per hour over the window this dashboard has observed (up to an
+    # hour); None until two samples a minute apart exist or after a shrink.
+    growth_bytes_per_hour: float | None = None
+    # Upstream attaches a RotatingFileHandler only to agent/errors/gateway/gui
+    # (``hermes_logging.py:241-244``); everything else grows without bound.
+    rotated_upstream: bool = False
+    unrotated_oversize: bool = False
+
+
+class CacheDirUsage(BaseModel):
+    name: str
+    size_bytes: int = 0
+    size_truncated: bool = False
+
+
+class DatabaseJournal(BaseModel):
+    """Journal mode of one Hermes database from header byte 18 (never opened)."""
+
+    name: str
+    size_bytes: int = 0
+    journal_mode: str = ""
+    error: str = ""
+
+
+class DiskUsageState(BaseModel):
+    """Disk footprint and retention of the Hermes home (source ``disk_usage``).
+
+    Directory totals come from bounded walks recomputed at most every few
+    minutes, so they lag the disk slightly; a ``*_truncated`` total is a lower
+    bound. ``pending_walks`` counts directories not yet walked because the
+    per-refresh walk budget ran out.
+    """
+
+    logs_dir_bytes: int = 0
+    log_file_count: int = 0
+    log_files: list[LogFileUsage] = Field(default_factory=list)
+    unrotated_oversize_count: int = 0
+    sessions_bytes: int = 0
+    sessions_truncated: bool = False
+    checkpoints_bytes: int = 0
+    checkpoints_truncated: bool = False
+    # ``checkpoints.enabled`` defaults to false and ``max_total_size_mb`` to 500
+    # (``tools/checkpoint_manager.py:1206-1221``); the doctor warns only when
+    # enabled and at or above the cap.
+    checkpoints_enabled: bool = False
+    checkpoints_cap_mb: int = 500
+    checkpoints_over_cap: bool = False
+    scratch_bytes: int = 0
+    scratch_truncated: bool = False
+    # cache/* dirs outside the pruned scratch/terminal at or above 1 GiB
+    # (``hermes_cli/doctor_state.py:168-190``).
+    cache_hogs: list[CacheDirUsage] = Field(default_factory=list)
+    state_db_wal_bytes: int = 0
+    # "ok", "note" (> 10 MB) or "warn" (> 50 MB), the doctor's thresholds
+    # (``hermes_cli/doctor_state.py:354-390``).
+    state_db_wal_verdict: str = "ok"
+    databases: list[DatabaseJournal] = Field(default_factory=list)
+    pending_walks: int = 0
+
+
+class PendingActionSubsystem(BaseModel):
+    """Writes staged for operator review under PROFILE ``pending/<subsystem>/``.
+
+    Upstream's write-approval gate stages a memory/skill write as one JSON
+    record per id (``tools/write_approval.py:64-86``) until it is approved or
+    discarded. Only the count and the oldest ``created_at`` are carried — the
+    staged payload is never read into state. ``unreadable_count`` records the
+    files upstream's own ``list_pending`` would skip; they are still counted
+    and aged by mtime.
+    """
+
+    subsystem: str
+    count: int = 0
+    oldest_age_seconds: float | None = None
+    unreadable_count: int = 0
+
+
+class StateSnapshotSummary(BaseModel):
+    """One snapshot under ROOT ``state-snapshots/``.
+
+    A ``dir`` is an upstream quick snapshot (``hermes_cli/backup.py:1237-1294``)
+    whose ``manifest.json`` names what the copy captured; a ``file`` is a loose
+    parked database grouped with its ``-wal``/``-shm``/``-journal`` sidecars.
+    ``size_bytes`` is measured on disk by a bounded walk (``size_truncated`` when
+    the bound cut it short); ``manifest_total_size`` is what upstream recorded.
+    A non-empty ``failed_dbs`` means the snapshot is missing databases upstream
+    tried and failed to copy, so it cannot restore them.
+    """
+
+    name: str
+    kind: Literal["dir", "file"] = "dir"
+    size_bytes: int = 0
+    size_truncated: bool = False
+    age_seconds: float | None = None
+    manifest_present: bool = False
+    label: str = ""
+    file_count: int = 0
+    manifest_total_size: int = 0
+    failed_dbs: list[str] = Field(default_factory=list)
+    oversized_skipped: list[str] = Field(default_factory=list)
+
+
 class OperationsState(BaseModel):
     dashboard_process_count: int = 0
     desktop_build_stamp: str = ""
@@ -2764,11 +2958,19 @@ class OperationsState(BaseModel):
     snapshot_count: int = 0
     snapshot_total_bytes: int = 0
     newest_snapshot_age_seconds: float | None = None
+    # Newest-first slice of the snapshots counted above, and how many of ALL
+    # counted snapshots carry a manifest with failed_dbs.
+    snapshots: list[StateSnapshotSummary] = Field(default_factory=list)
+    snapshot_failed_count: int = 0
     web_ui_build_hash: str = ""
     web_ui_built_age_seconds: float | None = None
     blocked_script_count: int = 0
     newest_blocked_script_age_seconds: float | None = None
     blocked_script_names: list[str] = Field(default_factory=list)
+    # Written by its own source (``pending_actions``): staged writes awaiting
+    # operator review, per subsystem.
+    pending_actions: list[PendingActionSubsystem] = Field(default_factory=list)
+    pending_action_total: int = 0
     # Written by its own source (``db_recovery``), so a corrupt repair ledger or
     # retired-WAL manifest degrades only this field and keeps its last-good value.
     db_recovery: DbRecoveryState = Field(default_factory=DbRecoveryState)
@@ -2909,6 +3111,15 @@ class RuntimeStatus(BaseModel):
     agent_running: bool = False
     last_activity_age_seconds: float | None = None
     banner: str = ""
+    # Global emergency stop (``hermes pause``): the ``ESTOP`` sentinel pauses
+    # NEW cron, kanban and gateway work; in-flight work keeps running
+    # (``agent/estop.py:1-8``). Written by its own ``estop`` source. A profile
+    # process honours its own home first, then the fleet root (``:33-50``);
+    # ``estop_scope`` says which sentinel was found.
+    estop_engaged: bool = False
+    estop_reason: str = ""
+    estop_age_seconds: float | None = None
+    estop_scope: str = ""
 
 
 class DashboardState(BaseModel):
@@ -2950,6 +3161,8 @@ class DashboardState(BaseModel):
     channels: ChannelDirectoryState = Field(default_factory=ChannelDirectoryState)
     kanban: KanbanState = Field(default_factory=KanbanState)
     operations: OperationsState = Field(default_factory=OperationsState)
+    # Disk footprint and retention (source ``disk_usage``), rendered in panel 12.
+    disk: DiskUsageState = Field(default_factory=DiskUsageState)
     skills_memory: SkillsMemory = Field(default_factory=SkillsMemory)
     integrations: IntegrationsState = Field(default_factory=IntegrationsState)
     mcp_cache: MCPSchemaCache = Field(default_factory=MCPSchemaCache)

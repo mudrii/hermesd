@@ -14,6 +14,7 @@ from hermesd.collector import (
     Collector,
     _latest_log_mtime,
 )
+from hermesd.models import SourceScope
 from tests.conftest import (
     _skip_if_root,
     _unreadable,
@@ -97,9 +98,43 @@ def test_collect_logs_discovers_shared_named_streams(hermes_home: Path):
     c.close()
 
 
-def test_collect_logs_discovers_audit_mcp_and_workspace_streams(hermes_home: Path):
+def test_collect_logs_reads_real_audit_trails_not_logs_audit_log(hermes_home: Path):
+    """No upstream code writes logs/audit.log; the real audit trails are the
+    skills hub log (tools/skills_hub.py:63,386-399) and the dashboard auth log
+    (hermes_cli/dashboard_auth/audit.py:48-53)."""
+    (hermes_home / "logs" / "audit.log").write_text("stale legacy audit line\n")
+    hub = hermes_home / "skills" / ".hub"
+    hub.mkdir(parents=True)
+    (hub / "audit.log").write_text(
+        "2026-07-11T17:43:46Z INSTALL fine-tuning official:builtin safe sha256:45f55cf6\n"
+    )
+    (hermes_home / "logs" / "dashboard-auth.log").write_text(
+        '{"ts":"2026-09-23T07:00:00+00:00","event":"login_failure","reason":"bad password"}\n'
+    )
+    (hermes_home / "logs" / "dashboard.error.log").write_text("Hermes Web UI failed to bind\n")
+    (hermes_home / "logs" / "dashboard-restart.log").write_text("restarting dashboard\n")
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    streams = {stream.name: stream for stream in state.logs.streams}
+    assert "audit" not in streams
+    assert "INSTALL fine-tuning" in streams["skills.audit"].lines[0].message
+    assert streams["skills.audit"].scope is SourceScope.PROFILE
+    assert "login_failure" in streams["auth.audit"].lines[0].message
+    assert streams["auth.audit"].scope is SourceScope.PROFILE
+    assert streams["dashboard.error"].lines[0].message == "Hermes Web UI failed to bind"
+    assert streams["dashboard.error"].scope is SourceScope.ROOT
+    assert streams["dashboard.restart"].lines[0].message == "restarting dashboard"
+    assert streams["dashboard.restart"].scope is SourceScope.PROFILE
+    assert "stale legacy audit line" not in state.model_dump_json()
+
+
+def test_collect_logs_discovers_mcp_and_workspace_streams(hermes_home: Path):
     extra_logs = {
-        "audit.log": ("audit", "audit entry"),
         "mcp-stderr.log": ("mcp.stderr", "mcp stderr entry"),
         "workspace.log": ("workspace", "workspace entry"),
         "workspace.error.log": ("workspace.error", "workspace error entry"),

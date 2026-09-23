@@ -296,7 +296,13 @@ def _kanban_task_from_row(row: dict[str, Any], *, failure_limit: int = 0) -> Kan
         # A breaker trips on failures: upstream increments the counter before it
         # compares, so a fresh task under a 0 limit is not "0/0 tripped".
         breaker_tripped=consecutive_failures >= max(breaker_limit, 1),
+        worker_started_at=_fingerprint_text(row.get("worker_started_at")),
     )
+
+
+def _fingerprint_text(value: object) -> str:
+    """``worker_started_at`` as stored: text fingerprint, legacy integer or ""."""
+    return "" if value is None else str(value)
 
 
 def _kanban_run_from_row(row: dict[str, Any]) -> KanbanRunSummary:
@@ -307,6 +313,7 @@ def _kanban_run_from_row(row: dict[str, Any]) -> KanbanRunSummary:
         status=str(row.get("status") or ""),
         outcome=str(row.get("outcome") or ""),
         worker_pid=_coerce_int(row.get("worker_pid")),
+        worker_started_at=_fingerprint_text(row.get("worker_started_at")),
         started_at=_coerce_int(row.get("started_at")),
         ended_at=_coerce_int(row.get("ended_at")),
         error=str(row.get("error") or ""),

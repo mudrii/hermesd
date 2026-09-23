@@ -6,7 +6,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from hermesd.models import DashboardState, KanbanState, KanbanTaskSummary
+from hermesd.models import DashboardState, KanbanState, KanbanTaskSummary, WorkerIdentity
 from hermesd.panels.formatting import escape_terminal_text as escape
 from hermesd.panels.formatting import fmt_age_seconds, sanitize_terminal_text, section_heading
 from hermesd.theme import Theme
@@ -43,6 +43,9 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         if kanban.stale_claim_count:
             lines.append("  Stale Claims: ", style=theme.ui_label)
             lines.append(f"{kanban.stale_claim_count}\n", style=theme.ui_warn)
+        if kanban.worker_pid_reused_count:
+            lines.append("  Reused worker PIDs: ", style=theme.ui_label)
+            lines.append(f"{kanban.worker_pid_reused_count}\n", style=theme.ui_warn)
         if kanban.notify_sub_count:
             lines.append("  Notify Subs: ", style=theme.ui_label)
             lines.append(f"{kanban.notify_sub_count}", style=theme.banner_text)
@@ -303,6 +306,22 @@ def _recent_runs_table(kanban: KanbanState, theme: Theme) -> Table:
     return runs
 
 
+# Suffixes for a worker pid whose identity is not a plain match. "legacy" rows
+# predate fingerprints and are not flagged: only their pid existence is known.
+_WORKER_IDENTITY_SUFFIX = {
+    WorkerIdentity.REUSED: " reused",
+    WorkerIdentity.DEAD: " ✗",
+    WorkerIdentity.UNVERIFIED: " ?",
+}
+
+
+def _worker_pid_label(pid: int, identity: WorkerIdentity) -> str:
+    """Worker pid with its identity verdict (``reused``: another process holds it)."""
+    if not pid:
+        return "—"
+    return f"{pid}{_WORKER_IDENTITY_SUFFIX.get(identity, '')}"
+
+
 def _task_table(tasks: list[KanbanTaskSummary], theme: Theme, *, now: float) -> Table:
     table = Table(box=None, show_header=True, padding=(0, 1))
     table.add_column("Task", style=theme.ui_accent)
@@ -329,7 +348,7 @@ def _task_table(tasks: list[KanbanTaskSummary], theme: Theme, *, now: float) -> 
             escape(task.task_id),
             escape(task.status),
             escape(task.assignee) if task.assignee else "—",
-            str(task.worker_pid) if task.worker_pid else "—",
+            _worker_pid_label(task.worker_pid, task.worker_identity),
             _age_label(task.last_heartbeat_at, now),
             failures,
             escape(task.branch_name) if task.branch_name else "—",
