@@ -10,7 +10,6 @@ and this project uses date-based versions in `YYYY.M.D` form.
 ### Fixed
 
 - **Verification evidence:** the Operations detail shows one line of each verification summary, capped at 120 characters. Before, one noisy run's full captured output could fill the view.
-
 - **Secret redaction:** log, config and error text now redacts passwords, passphrases, credentials, cookies, AWS/GCS signatures, Telegram/Discord/Slack webhook tokens carried in URL paths, and bare `sk-`/`ghp_`/JWT tokens. `Authorization: Bearer x` no longer leaves a stray `]`. Delivery errors, platform error messages, cron `last_error`/`last_delivery_error`, and delegation goals and errors are now redacted before they are clipped. A log tail that starts mid-line drops the partial first line, so the cut-off end of a secret can no longer appear without its label.
 - **Skills:** skills are found by `SKILL.md` at any depth, as upstream does. Flat skills and nested categories are counted, and directories without `SKILL.md` are no longer counted as skills. A `SKILL.md` that starts with a UTF-8 BOM shows its description.
 - **Plugins:** a broken plugin catalog cache no longer brings back the previous plugin list. Newly installed plugins appear, and catalog flags carry over by name.
