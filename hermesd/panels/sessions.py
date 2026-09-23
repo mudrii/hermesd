@@ -442,10 +442,12 @@ def _parse_session_filter(filter_query: str) -> SessionFilterCriteria:
         key = key.lower().strip()
         value = value.strip().lower()
         if key in {"message", "msg"}:
-            # With repeated message:/msg: tokens the last occurrence wins
-            # everywhere, mirroring extract_message_search_query (which feeds
-            # the message-search worker with the same final value).
-            fields["message"] = [value]
+            # With repeated message:/msg: tokens the last non-empty occurrence
+            # wins everywhere, mirroring extract_message_search_query (which
+            # feeds the message-search worker with the same final value). An
+            # empty value is an unfinished filter, not "match nothing".
+            if value:
+                fields["message"] = [value]
         elif key in {
             "id",
             "source",
@@ -486,7 +488,7 @@ def _sort_sessions(sessions: list[SessionInfo], session_sort: str) -> list[Sessi
         return sorted(
             sessions,
             key=lambda session: (
-                session.estimated_cost_usd,
+                _display_cost(session),
                 session.started_at,
                 session.session_id,
             ),
