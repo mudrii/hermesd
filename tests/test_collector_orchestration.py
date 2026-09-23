@@ -8,9 +8,13 @@ or guard keeps between passes.
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
 from pathlib import Path
 
-from hermesd.collector import Collector
+import pytest
+
+from hermesd.collector import _STATE_DB_SOURCES, Collector, _state_db_readout
 
 _SHA_NEW = "a" * 40
 _SHA_OLD = "b" * 40
@@ -61,3 +65,100 @@ def test_plugin_catalog_failure_keeps_the_fresh_plugin_inventory(
     assert by_name["weather"].catalog_update_available is True
     assert by_name["rain"].catalog_update_available is False
     assert second.skills_memory.plugin_catalog_update_count == 1
+
+
+def test_one_bad_state_db_table_fails_only_its_own_source(forensic_hermes_home: Path) -> None:
+    """A gateway_routing table missing entry_json fails gateway_routes alone.
+
+    Every state.db source shares one readout per pass. A broken table group
+    must be charged to the source that owns it, not to the five siblings read
+    from the same connection, and the readout must not be retried by each of
+    them in turn.
+    """
+    db_path = forensic_hermes_home / "state.db"
+    c = Collector(forensic_hermes_home, pid_exists=lambda pid: pid == 12345)
+    try:
+        first = c.collect()
+        assert first.session_coordination.route_total == 1
+
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(
+            "ALTER TABLE gateway_routing RENAME TO gateway_routing_old;"
+            "CREATE TABLE gateway_routing (scope TEXT, session_key TEXT, updated_at REAL);"
+        )
+        conn.commit()
+        conn.close()
+
+        readouts: list[object] = []
+        run_readout = c._db.run_readout
+
+        def counting_readout(fn):  # type: ignore[no-untyped-def]
+            readouts.append(fn)
+            return run_readout(fn)
+
+        c._db.run_readout = counting_readout  # type: ignore[method-assign]
+        second = c.collect()
+    finally:
+        c.close()
+
+    assert _STATE_DB_SOURCES & set(second.health.failed_sources) == {"gateway_routes"}
+    assert second.session_coordination.routes == first.session_coordination.routes
+    assert [lease.key for lease in second.session_coordination.leases] == [
+        lease.key for lease in first.session_coordination.leases
+    ]
+    assert second.operations.delegation_count == first.operations.delegation_count
+    assert len(readouts) == 1
+
+
+def test_a_bad_ledger_table_fails_only_gateway_ledgers(forensic_hermes_home: Path) -> None:
+    db_path = forensic_hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        "DROP TABLE delivery_obligations;CREATE TABLE delivery_obligations (obligation_id TEXT);"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Collector(forensic_hermes_home, pid_exists=lambda pid: pid == 12345)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert _STATE_DB_SOURCES & set(state.health.failed_sources) == {"gateway_ledgers"}
+    assert state.session_coordination.route_total == 1
+
+
+def test_an_unreadable_state_db_connection_raises_the_whole_readout() -> None:
+    """With every group failing, the readout raises so HermesDB can reconnect."""
+    conn = sqlite3.connect(":memory:")
+    conn.close()
+    with pytest.raises(sqlite3.ProgrammingError):
+        _state_db_readout(conn)
+
+
+def test_a_failed_state_db_readout_is_attempted_once_per_pass(
+    forensic_hermes_home: Path,
+) -> None:
+    c = Collector(forensic_hermes_home, pid_exists=lambda pid: pid == 12345)
+    try:
+        c.collect()
+        attempts: list[object] = []
+
+        def failing_readout(fn):  # type: ignore[no-untyped-def]
+            attempts.append(fn)
+            raise sqlite3.OperationalError("database disk image is malformed")
+
+        c._db.run_readout = failing_readout  # type: ignore[method-assign]
+        # Touch state.db so the mtime-keyed clean readout is not reused.
+        db_path = forensic_hermes_home / "state.db"
+        stat = db_path.stat()
+        os.utime(db_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+        second = c.collect()
+        third = c.collect()
+    finally:
+        c.close()
+
+    assert set(second.health.failed_sources) >= _STATE_DB_SOURCES
+    assert set(third.health.failed_sources) >= _STATE_DB_SOURCES
+    assert len(attempts) == 2

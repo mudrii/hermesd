@@ -2203,6 +2203,33 @@ def test_hygiene_rows_join_session_error_and_mark_suspension(hermes_home: Path) 
     assert hygiene["discord:9:1"].compression_failure_error == ""
 
 
+def test_hygiene_rows_join_the_error_of_a_hidden_session(hermes_home: Path) -> None:
+    """Bot Mode chats are born hidden, yet their hygiene streak is still live.
+
+    The join must read the unfiltered sessions table, like the route targets
+    do, or a hidden chat's recorded compression failure is lost.
+    """
+    conn = sqlite3.connect(hermes_home / "state.db")
+    create_state_db_tables(
+        conn, include_schema_version=False, include_v021_columns=True, include_session_key=True
+    )
+    create_session_coordination_tables(conn)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, session_key, compression_failure_error, "
+        "hidden) VALUES ('sess_bot', 'gateway', ?, 'telegram:77:1', 'summary model timeout', 1)",
+        (_COORD_NOW - 30,),
+    )
+    conn.execute("INSERT INTO gateway_hygiene_state VALUES ('telegram:77:1', 3)")
+    conn.commit()
+    conn.close()
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    assert state.sessions == []
+    (row,) = state.session_coordination.hygiene
+    assert row.compression_failure_error == "summary model timeout"
+
+
 def test_zero_streak_hygiene_rows_are_not_reported(hermes_home: Path) -> None:
     conn = _make_coordination_db(hermes_home)
     conn.execute("INSERT INTO gateway_hygiene_state VALUES ('telegram:42:7', 0)")

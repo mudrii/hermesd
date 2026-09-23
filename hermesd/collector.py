@@ -310,15 +310,55 @@ class _StateDbReadout:
     state: StateDbRead
     ledgers: _GatewayLedgerRows
     coordination: _SessionCoordinationRows
+    # sqlite errors keyed by the source that owns the failed table group: each
+    # source re-raises only its own, so one broken table cannot fail the others.
+    errors: Mapping[str, sqlite3.Error] = field(default_factory=dict)
+
+    def raise_for(self, source_name: str) -> None:
+        error = self.errors.get(source_name)
+        if error is not None:
+            raise error
+
+
+# Every source that reads its rows out of the shared state.db readout.
+_STATE_DB_SOURCES = frozenset(
+    {
+        "operations",
+        "gateway_ledgers",
+        "session_leases",
+        "gateway_hygiene",
+        "gateway_routes",
+        "generation_churn",
+    }
+)
+_EMPTY_STATE_DB_READ = StateDbRead(
+    goal_update={}, delegation_rows=[], delegation_counts={}, meta={}, schema_version=0
+)
 
 
 def _state_db_readout(conn: sqlite3.Connection) -> _StateDbReadout:
-    """Every state.db-backed source's raw rows, read from one connection."""
-    return _StateDbReadout(
-        state=_read_state_db_tables(conn),
-        ledgers=_read_gateway_ledger_rows(conn),
-        coordination=_read_session_coordination_rows(conn),
-    )
+    """Every state.db-backed source's raw rows, read from one connection.
+
+    Each table group is read independently; a failed group reads as empty and
+    its error is recorded for the owning source to raise.
+    """
+    errors: dict[str, sqlite3.Error] = {}
+    state = _EMPTY_STATE_DB_READ
+    ledgers = _GatewayLedgerRows()
+    try:
+        state = _read_state_db_tables(conn)
+    except sqlite3.Error as exc:
+        errors["operations"] = exc
+    try:
+        ledgers = _read_gateway_ledger_rows(conn)
+    except sqlite3.Error as exc:
+        errors["gateway_ledgers"] = exc
+    coordination = _read_session_coordination_rows(conn, errors)
+    if errors.keys() >= _STATE_DB_SOURCES:
+        # Nothing readable at all is a connection-level failure: raise it so
+        # HermesDB counts it toward its reconnect threshold.
+        raise next(iter(errors.values()))
+    return _StateDbReadout(state=state, ledgers=ledgers, coordination=coordination, errors=errors)
 
 
 # Fields each gateway sub-source owns, used to restore just that source's
@@ -751,6 +791,12 @@ class Collector:
         # state and the gateway ledgers so a pass snapshots the (large, WAL)
         # db only once.
         self._state_db_cache: tuple[int, _StateDbReadout] | None = None
+        # A readout that carried a group error (or failed outright) is reused
+        # only within the pass that read it, so each state.db source re-raises
+        # the same failure instead of re-reading the database, while the next
+        # pass retries.
+        self._collect_pass = 0
+        self._state_db_pass_readout: tuple[int, _StateDbReadout | sqlite3.Error] | None = None
         # kanban.db's shared WAL snapshots, keyed by source path: each entry is
         # (source mtime, path to read, temp-dir owner). One per database, so the
         # boards' own stores do not evict the root one.
@@ -785,6 +831,7 @@ class Collector:
             if self._closed:
                 raise RuntimeError("collector is closed")
             self._prune_stale_caches()
+            self._collect_pass += 1
             health = _CollectionHealth()
             session_rows = self._collect_session_rows(health)
             return self._build_dashboard_state(health, session_rows)
@@ -1202,7 +1249,7 @@ class Collector:
             _SourceSpec(
                 "session_coordination",
                 "gateway_hygiene",
-                lambda: self._with_gateway_hygiene(results["session_coordination"], session_rows),
+                lambda: self._with_gateway_hygiene(results["session_coordination"]),
                 lambda: results["session_coordination"],
                 fallback=lambda: self._last_source_fields(
                     "gateway_hygiene", results["session_coordination"], _HYGIENE_FIELDS
@@ -1773,6 +1820,7 @@ class Collector:
             if last is not None and last.gateway_incarnation_count:
                 raise RuntimeError("state.db gateway ledgers disappeared or became unsafe")
             return gateway
+        readout.raise_for("gateway_ledgers")
         return gateway.model_copy(update=_gateway_ledger_fields(readout.ledgers, self._clock()))
 
     def _collect_migration(self, gateway: GatewayState, *, gateway_fresh: bool) -> MigrationState:
@@ -2026,28 +2074,28 @@ class Collector:
             if last is not None and last.lease_total:
                 raise RuntimeError("state.db session leases disappeared or became unsafe")
             return coord
+        readout.raise_for("session_leases")
         return coord.model_copy(
             update=_session_lease_fields(
                 readout.coordination, now=self._clock(), pid_exists=self._pid_exists
             )
         )
 
-    def _with_gateway_hygiene(
-        self, coord: SessionCoordinationState, session_rows: list[dict[str, Any]]
-    ) -> SessionCoordinationState:
+    def _with_gateway_hygiene(self, coord: SessionCoordinationState) -> SessionCoordinationState:
         """Per-chat hygiene failure streaks (PROFILE ``state.db``, table
-        ``gateway_hygiene_state`` — ``hermes_state.py:160,178``). The raw
-        session rows join the recorded compression failure to each streak."""
+        ``gateway_hygiene_state`` — ``hermes_state.py:160,178``). The unfiltered
+        sessions table joins the recorded compression failure to each streak."""
         readout = self._read_state_db()
         if readout is None:
             last = self._last_good_by_source.get("gateway_hygiene")
             if last is not None and last.hygiene:
                 raise RuntimeError("state.db gateway hygiene disappeared or became unsafe")
             return coord
+        readout.raise_for("gateway_hygiene")
         return coord.model_copy(
             update=_hygiene_fields(
                 readout.coordination.hygiene_rows,
-                session_rows,
+                readout.coordination.hygiene_errors,
                 readout.coordination.hygiene_total,
             )
         )
@@ -2065,6 +2113,7 @@ class Collector:
             if last is not None and last.route_total:
                 raise RuntimeError("state.db gateway routes disappeared or became unsafe")
             return coord
+        readout.raise_for("gateway_routes")
         return coord.model_copy(
             update=_gateway_route_fields(
                 readout.coordination.routing_rows,
@@ -2093,6 +2142,7 @@ class Collector:
             if last is not None and last.generation_chat_total:
                 raise RuntimeError("state.db generations disappeared or became unsafe")
             return coord
+        readout.raise_for("generation_churn")
         rows = readout.coordination
         previous = self._last_generation_chat_count
         shrank = previous is not None and rows.generation_chat_total < previous
@@ -3059,6 +3109,7 @@ class Collector:
             ):
                 raise RuntimeError("state.db operations data disappeared or became unsafe")
             return operations
+        readout.raise_for("operations")
         db_path = self._paths.profile_path("state.db")
         update = _state_db_update(readout.state, now=self._clock(), pid_exists=self._pid_exists)
         update["state_db_size_bytes"] = _file_size(db_path)
@@ -3091,8 +3142,19 @@ class Collector:
         cached = self._state_db_cache
         if cached is not None and mtime is not None and cached[0] == mtime:
             return cached[1]
-        readout = self._db.run_readout(_state_db_readout)
-        if mtime is not None:
+        this_pass = self._state_db_pass_readout
+        if this_pass is not None and this_pass[0] == self._collect_pass:
+            if isinstance(this_pass[1], sqlite3.Error):
+                raise this_pass[1]
+            return this_pass[1]
+        try:
+            readout = self._db.run_readout(_state_db_readout)
+        except sqlite3.Error as exc:
+            self._state_db_pass_readout = (self._collect_pass, exc)
+            raise
+        if readout.errors or mtime is None:
+            self._state_db_pass_readout = (self._collect_pass, readout)
+        else:
             self._state_db_cache = (mtime, readout)
         return readout
 
