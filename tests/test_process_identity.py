@@ -208,6 +208,16 @@ def test_spawn_ledger_orphans_and_reused_pids(hermes_home: Path):
     assert "process_identity" not in state.health.failed_sources
 
 
+def test_ledger_entry_without_a_pid_gets_no_verdict(hermes_home: Path):
+    _write_ledger(
+        hermes_home,
+        [_ledger_entry(201, 301), {"pid": 0, "session_id": "pending-spawn", "purpose": "x"}],
+    )
+    state = _collect(hermes_home, alive={201, 301}, starts={201: _START, 301: _START - 1.2})
+    by_session = {process.session_id: process for process in state.background_processes}
+    assert by_session["pending-spawn"].identity is WorkerIdentity.NONE
+
+
 def test_legacy_processes_json_entries_get_no_ledger_verdict(hermes_home: Path):
     (hermes_home / "processes.json").write_text(
         json.dumps([{"session_id": "s1", "command": "sleep 1", "pid": 401}])

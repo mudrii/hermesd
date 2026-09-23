@@ -1173,9 +1173,8 @@ def _read_pending_actions(
     if not _safe_child_path(pending_root, home) or not pending_root.is_dir():
         return {"pending_actions": [], "pending_action_total": 0}
     for directory in sorted(islice(pending_root.iterdir(), _MAX_PENDING_SUBSYSTEMS)):
+        # The root is confined above, so a non-symlinked child dir stays under it.
         if directory.is_symlink() or not directory.is_dir():
-            continue
-        if not _path_resolves_under(directory, home):
             continue
         count = unreadable = 0
         oldest: float | None = None
