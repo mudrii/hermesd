@@ -142,6 +142,7 @@ from hermesd.collect.migration import (
 )
 from hermesd.collect.operations import (
     _BOUNDED_SCAN_LIMIT,
+    LogGrowthSamples,
     StateDbRead,
     TreeSizeCache,
     _checkpoint_prune_interval_seconds,
@@ -155,6 +156,8 @@ from hermesd.collect.operations import (
     _read_checkpoint_prune_marker,
     _read_corrupt_ledger_marker,
     _read_delegation_live_manifests,
+    _read_disk_usage,
+    _read_journal_mode,
     _read_pending_actions,
     _read_process_receipts,
     _read_projects_state,
@@ -265,6 +268,7 @@ from hermesd.models import (
     CuratorRun,
     DashboardState,
     DesktopPluginInfo,
+    DiskUsageState,
     GatewayLoopHealth,
     GatewayState,
     HealthSummary,
@@ -832,6 +836,8 @@ class Collector:
         # Bounded recursive directory sizes (state snapshots, disk usage),
         # memoized per directory signature with a TTL.
         self._tree_size_cache: TreeSizeCache = {}
+        # Per-file (observed-at, size) samples behind the log growth rates.
+        self._log_growth_samples: LogGrowthSamples = {}
         self._checkpoint_summary_cache: dict[
             str, tuple[tuple[int, ...], tuple[int, float | None, str]]
         ] = {}
@@ -1142,6 +1148,9 @@ class Collector:
                     "state_snapshots", results["operations"], _STATE_SNAPSHOT_FIELDS
                 ),
             ),
+            # Disk footprint and retention checks: bounded, cached walks of
+            # several stores, so a failure keeps the last-good readout.
+            _SourceSpec("disk", "disk_usage", self._collect_disk_usage, DiskUsageState),
             # Third writer of `operations`: an unreadable blocked-scripts dir
             # keeps the last-good counts rather than reporting a false zero.
             _SourceSpec(
@@ -3319,6 +3328,22 @@ class Collector:
                     lambda: _pending_record_created_at(path, home),
                 ),
             )
+        )
+
+    def _collect_disk_usage(self) -> DiskUsageState:
+        """Disk & retention readout (``hermes doctor``'s size checks, read-only)."""
+        return _read_disk_usage(
+            root_logs=self._paths.shared_path("logs"),
+            root_home=self._paths.root_home,
+            # profile_path() re-validates the profile home on every call.
+            profile_home=self._paths.profile_path(),
+            cfg=self._read_yaml_cached(),
+            now=self._clock(),
+            tree_cache=self._tree_size_cache,
+            log_samples=self._log_growth_samples,
+            journal_mode=lambda path: self._signature_cached(
+                "journal-mode", path, lambda: _read_journal_mode(path)
+            ),
         )
 
     def _with_state_snapshots(self, operations: OperationsState) -> OperationsState:

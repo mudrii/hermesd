@@ -48,11 +48,15 @@ from hermesd.collect.sqlite_util import (
 )
 from hermesd.models import (
     CHECKPOINT_PRUNE_INTERVAL_SECONDS,
+    CacheDirUsage,
+    DatabaseJournal,
     DelegationInfo,
     DelegationLiveManifest,
     DelegationLiveTask,
     DiscoveredRepoSummary,
+    DiskUsageState,
     GoalSummary,
+    LogFileUsage,
     OperationsState,
     PendingActionSubsystem,
     ProcessReceipt,
@@ -773,49 +777,66 @@ def _bounded_tree_bytes(directory: Path, max_entries: int | None = None) -> tupl
     limit = _TREE_WALK_MAX_ENTRIES if max_entries is None else max_entries
     total = 0
     visited = 0
-    stack = [directory]
+    stack = [str(directory)]
     while stack:
-        current = stack.pop()
         try:
-            children = list(islice(current.iterdir(), limit - visited + 1))
+            scan = os.scandir(stack.pop())
         except OSError:
             continue
-        for child in children:
-            if visited >= limit:
-                return total, True
-            visited += 1
-            if child.is_symlink():
-                continue
-            if child.is_dir():
-                stack.append(child)
-            elif child.is_file():
-                total += _file_size(child)
+        with scan as entries:
+            for entry in entries:
+                if visited >= limit:
+                    return total, True
+                visited += 1
+                try:
+                    if entry.is_symlink():
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+                    elif entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    continue
     return total, False
 
 
 def _cached_tree_bytes(
-    directory: Path, *, now: float, cache: TreeSizeCache | None
-) -> tuple[int, bool]:
-    """``_bounded_tree_bytes`` memoized on the directory's (mtime_ns, inode)
-    for at most ``_TREE_SIZE_CACHE_TTL_SECONDS``."""
+    directory: Path,
+    *,
+    now: float,
+    cache: TreeSizeCache | None,
+    min_interval: float = 0.0,
+    may_walk: bool = True,
+) -> tuple[int, bool, bool] | None:
+    """``_bounded_tree_bytes`` memoized per directory: ``(bytes, truncated, walked)``.
+
+    A cached total is reused while it is younger than
+    ``_TREE_SIZE_CACHE_TTL_SECONDS`` and either the directory's (mtime_ns,
+    inode) is unchanged or the total is younger than ``min_interval``. With
+    ``may_walk`` false a stale total is still returned (and None when there is
+    none), so a caller can spread expensive walks across refreshes.
+    """
     if cache is None:
-        return _bounded_tree_bytes(directory)
+        return (*_bounded_tree_bytes(directory), True)
     try:
         stat = directory.stat()
     except OSError:
-        return 0, False
+        return 0, False, False
     signature = (stat.st_mtime_ns, stat.st_ino)
     key = str(directory)
     cached = cache.get(key)
-    if (
-        cached is not None
-        and cached[0] == signature
-        and 0 <= now - cached[1] < _TREE_SIZE_CACHE_TTL_SECONDS
-    ):
-        return cached[2], cached[3]
+    if cached is not None:
+        age = now - cached[1]
+        fresh = 0 <= age < _TREE_SIZE_CACHE_TTL_SECONDS and (
+            cached[0] == signature or age < min_interval
+        )
+        if fresh or not may_walk:
+            return cached[2], cached[3], False
+    if not may_walk:
+        return None
     size, truncated = _bounded_tree_bytes(directory)
     cache[key] = (signature, now, size, truncated)
-    return size, truncated
+    return size, truncated, True
 
 
 def _snapshot_group_name(name: str) -> str:
@@ -878,7 +899,11 @@ def _read_state_snapshots(
             if entry.is_symlink() or not _path_resolves_under(entry, home):
                 continue
             if entry.is_dir():
-                size, truncated = _cached_tree_bytes(entry, now=now, cache=size_cache)
+                size, truncated, _ = _cached_tree_bytes(entry, now=now, cache=size_cache) or (
+                    0,
+                    False,
+                    False,
+                )
                 snapshots.append(
                     StateSnapshotSummary(
                         name=entry.name,
@@ -1178,3 +1203,252 @@ def _read_pending_actions(
         "pending_actions": subsystems,
         "pending_action_total": sum(entry.count for entry in subsystems),
     }
+
+
+# ── Disk & retention (source ``disk_usage``) ────────────────────────────────
+
+_MIB = 1024 * 1024
+# Files upstream attaches a RotatingFileHandler to (``hermes_logging.py:241-244``);
+# their numbered backups (``agent.log.1``) are part of the same rotation.
+_UPSTREAM_ROTATED_LOGS = frozenset({"agent.log", "errors.log", "gateway.log", "gui.log"})
+_UNROTATED_LOG_WARN_BYTES = 10 * _MIB
+_MAX_LOG_DIR_ENTRIES = 200
+_MAX_LOG_FILE_ROWS = 12
+# Growth samples: at most one a minute, an hour's worth kept per file.
+_LOG_GROWTH_SAMPLE_SECONDS = 60.0
+_LOG_GROWTH_WINDOW_SECONDS = 3600.0
+# doctor_state.py:168-170 — cache/ entries this big outside the pruned dirs warn.
+_CACHE_HOG_MIN_BYTES = 1 << 30
+_PRUNED_CACHE_DIRS = frozenset({"scratch", "terminal"})
+_MAX_CACHE_DIRS = 64
+# doctor_state.py:354-390 — WAL info above 10 MB, warning above 50 MB.
+_WAL_NOTE_BYTES = 10 * _MIB
+_WAL_WARN_BYTES = 50 * _MIB
+# Directory totals are re-walked at most this often even when their top
+# mtime changes (sessions/ churns constantly), and at most this many
+# directories are walked per refresh so one pass never pays for all of them.
+_DISK_WALK_MIN_INTERVAL_SECONDS = 300.0
+_DISK_WALKS_PER_PASS = 3
+_SQLITE_HEADER_MAGIC = b"SQLite format 3\x00"
+# The per-home databases doctor lists (``_QUICK_STATE_FILES`` ending in .db,
+# ``hermes_cli/backup.py:1121-1132``, via ``doctor_platform.py:39-45``).
+_KNOWN_DATABASES = (
+    "state.db",
+    "cron/executions.db",
+    "gateway/discord_message_recovery.db",
+    "projects.db",
+    "response_store.db",
+    "memory_store.db",
+    "verification_evidence.db",
+    "kanban.db",
+)
+
+# name -> [(observed-at, size)], oldest first.
+LogGrowthSamples = dict[str, list[tuple[float, int]]]
+
+
+def _read_journal_mode(path: Path) -> tuple[str, str]:
+    """``(mode, error)`` from SQLite header byte 18: 2 = WAL, 1 = rollback.
+
+    Mirrors ``hermes_cli/doctor_platform.py:64-81``: the file is opened for
+    reading only and just its first 20 bytes are read — never through SQLite,
+    which would create ``-wal``/``-shm`` sidecars beside the monitored file.
+    hermesd holds no POSIX lock on these files (its own SQLite reads use
+    ``immutable=1`` or a private snapshot), so closing this descriptor cannot
+    drop one.
+    """
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(20)
+    except OSError as exc:
+        return "", exc.strerror or type(exc).__name__
+    if not header:
+        return "", "file is empty"
+    if len(header) < 20 or not header.startswith(_SQLITE_HEADER_MAGIC):
+        return "", "file is not a database"
+    mode = {2: "wal", 1: "rollback"}.get(header[18])
+    if mode is None:
+        return "", f"unrecognized file-format version {header[18]}"
+    return mode, ""
+
+
+def _log_growth_per_hour(
+    samples: LogGrowthSamples, name: str, size: int, now: float
+) -> float | None:
+    """Record one size sample and return bytes/hour over the observed window."""
+    history = samples.setdefault(name, [])
+    if history and size < history[-1][1]:
+        history.clear()  # truncated or rotated: the old window means nothing
+    if not history or now - history[-1][0] >= _LOG_GROWTH_SAMPLE_SECONDS:
+        history.append((now, size))
+    while len(history) > 1 and now - history[0][0] > _LOG_GROWTH_WINDOW_SECONDS:
+        history.pop(0)
+    oldest_at, oldest_size = history[0]
+    elapsed = now - oldest_at
+    if elapsed < _LOG_GROWTH_SAMPLE_SECONDS:
+        return None
+    return (size - oldest_size) / elapsed * 3600.0
+
+
+def _rotated_upstream(name: str) -> bool:
+    base = name.rstrip("0123456789").removesuffix(".") if name[-1:].isdigit() else name
+    return base in _UPSTREAM_ROTATED_LOGS
+
+
+def _read_log_files(
+    logs_dir: Path, home: Path, *, now: float, samples: LogGrowthSamples
+) -> dict[str, Any]:
+    files: list[LogFileUsage] = []
+    total = 0
+    if _safe_child_path(logs_dir, home) and logs_dir.is_dir():
+        with os.scandir(logs_dir) as entries:
+            for entry in islice(entries, _MAX_LOG_DIR_ENTRIES):
+                try:
+                    if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                        continue
+                    size = entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    continue
+                total += size
+                rotated = _rotated_upstream(entry.name)
+                files.append(
+                    LogFileUsage(
+                        name=entry.name,
+                        size_bytes=size,
+                        growth_bytes_per_hour=_log_growth_per_hour(samples, entry.name, size, now),
+                        rotated_upstream=rotated,
+                        unrotated_oversize=not rotated and size > _UNROTATED_LOG_WARN_BYTES,
+                    )
+                )
+    seen = {entry.name for entry in files}
+    for name in [name for name in samples if name not in seen]:
+        del samples[name]
+    files.sort(key=lambda entry: entry.size_bytes, reverse=True)
+    return {
+        "logs_dir_bytes": total,
+        "log_file_count": len(files),
+        "log_files": files[:_MAX_LOG_FILE_ROWS],
+        "unrotated_oversize_count": sum(1 for entry in files if entry.unrotated_oversize),
+    }
+
+
+def _checkpoint_policy(cfg: Mapping[str, Any]) -> tuple[bool, int]:
+    """``checkpoints.enabled`` (default false) and ``max_total_size_mb`` (default
+    500), as ``checkpoint_footprint_notice`` reads them
+    (``tools/checkpoint_manager.py:1213-1221``)."""
+    section = _as_dict(cfg.get("checkpoints"))
+    raw_cap = section.get("max_total_size_mb")
+    cap = 500 if raw_cap is None else _coerce_int(raw_cap)
+    return _coerce_bool(section.get("enabled")), max(0, cap)
+
+
+def _wal_verdict(size: int) -> str:
+    if size > _WAL_WARN_BYTES:
+        return "warn"
+    if size > _WAL_NOTE_BYTES:
+        return "note"
+    return "ok"
+
+
+def _read_databases(
+    home: Path, journal_mode: Callable[[Path], tuple[str, str]]
+) -> list[DatabaseJournal]:
+    candidates = [(name, home / name) for name in _KNOWN_DATABASES]
+    boards = home / "kanban" / "boards"
+    if _safe_child_path(boards, home) and boards.is_dir():
+        for board in sorted(islice(boards.iterdir(), _BOUNDED_SCAN_LIMIT)):
+            candidates.append((f"kanban/boards/{board.name}/kanban.db", board / "kanban.db"))
+    databases: list[DatabaseJournal] = []
+    for name, path in candidates:
+        if path.is_symlink() or not _path_resolves_under(path, home) or not path.is_file():
+            continue
+        mode, error = journal_mode(path)
+        databases.append(
+            DatabaseJournal(name=name, size_bytes=_file_size(path), journal_mode=mode, error=error)
+        )
+    return databases
+
+
+def _read_disk_usage(
+    *,
+    root_logs: Path,
+    root_home: Path,
+    profile_home: Path,
+    cfg: Mapping[str, Any],
+    now: float,
+    tree_cache: TreeSizeCache,
+    log_samples: LogGrowthSamples,
+    journal_mode: Callable[[Path], tuple[str, str]] = _read_journal_mode,
+) -> DiskUsageState:
+    """Disk footprint and retention checks, mirroring ``hermes doctor``.
+
+    ROOT ``logs/`` (every unrotated stream hermesd tails lives there); PROFILE
+    ``sessions/``, ``checkpoints/``, ``cache/``, ``state.db-wal`` and the known
+    databases (upstream resolves all of them through ``get_hermes_home()``).
+    Directory walks are bounded, cached, re-walked at most every five minutes,
+    and at most ``_DISK_WALKS_PER_PASS`` of them run in one refresh.
+    """
+    budget = _DISK_WALKS_PER_PASS
+    pending = 0
+
+    def walk(directory: Path) -> tuple[int, bool]:
+        nonlocal budget, pending
+        if not _safe_child_path(directory, profile_home) or not directory.is_dir():
+            return 0, False
+        result = _cached_tree_bytes(
+            directory,
+            now=now,
+            cache=tree_cache,
+            min_interval=_DISK_WALK_MIN_INTERVAL_SECONDS,
+            may_walk=budget > 0,
+        )
+        if result is None:
+            pending += 1
+            return 0, False
+        size, truncated, walked = result
+        if walked:
+            budget -= 1
+        return size, truncated
+
+    sessions_bytes, sessions_truncated = walk(profile_home / "sessions")
+    checkpoints_bytes, checkpoints_truncated = walk(profile_home / "checkpoints")
+    cache_dir = profile_home / "cache"
+    scratch_bytes = 0
+    scratch_truncated = False
+    hogs: list[CacheDirUsage] = []
+    if _safe_child_path(cache_dir, profile_home) and cache_dir.is_dir():
+        for entry in sorted(islice(cache_dir.iterdir(), _MAX_CACHE_DIRS)):
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            size, truncated = walk(entry)
+            if entry.name == "scratch":
+                scratch_bytes, scratch_truncated = size, truncated
+            elif entry.name not in _PRUNED_CACHE_DIRS and size >= _CACHE_HOG_MIN_BYTES:
+                hogs.append(
+                    CacheDirUsage(name=entry.name, size_bytes=size, size_truncated=truncated)
+                )
+    hogs.sort(key=lambda hog: hog.size_bytes, reverse=True)
+    enabled, cap_mb = _checkpoint_policy(cfg)
+    wal_path = profile_home / "state.db-wal"
+    wal_bytes = (
+        _file_size(wal_path)
+        if not wal_path.is_symlink() and _path_resolves_under(wal_path, profile_home)
+        else 0
+    )
+    return DiskUsageState(
+        **_read_log_files(root_logs, root_home, now=now, samples=log_samples),
+        sessions_bytes=sessions_bytes,
+        sessions_truncated=sessions_truncated,
+        checkpoints_bytes=checkpoints_bytes,
+        checkpoints_truncated=checkpoints_truncated,
+        checkpoints_enabled=enabled,
+        checkpoints_cap_mb=cap_mb,
+        checkpoints_over_cap=enabled and cap_mb > 0 and checkpoints_bytes >= cap_mb * _MIB,
+        scratch_bytes=scratch_bytes,
+        scratch_truncated=scratch_truncated,
+        cache_hogs=hogs,
+        state_db_wal_bytes=wal_bytes,
+        state_db_wal_verdict=_wal_verdict(wal_bytes),
+        databases=_read_databases(profile_home, journal_mode),
+        pending_walks=pending,
+    )

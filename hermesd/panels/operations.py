@@ -18,9 +18,11 @@ from hermesd.models import (
     ApiRunReservation,
     ApiRunReservationsState,
     DashboardState,
+    DatabaseJournal,
     DbRecoveryState,
     DelegationInfo,
     DelegationLiveManifest,
+    DiskUsageState,
     HostedRoomState,
     HostedRoomSummary,
     OperationsState,
@@ -186,6 +188,10 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             f"{ops.pending_action_total} (oldest {fmt_age_seconds(oldest)})\n",
             style=theme.ui_warn,
         )
+    disk_warnings = _disk_warnings(state.disk)
+    if disk_warnings:
+        lines.append("  ⚠ Disk: ", style=theme.ui_warn)
+        lines.append(" · ".join(disk_warnings) + "\n", style=theme.ui_warn)
     if ops.snapshot_failed_count:
         lines.append("  ⚠ Snapshots: ", style=theme.ui_warn)
         lines.append(f"{ops.snapshot_failed_count} with failed DBs\n", style=theme.ui_warn)
@@ -278,6 +284,12 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
                     style=theme.banner_dim,
                 )
             )
+
+    if _disk_has_readout(state.disk):
+        sections.append(_heading("Disk & Retention", theme))
+        sections.append(_disk_table(ops, state.disk, theme))
+        if state.disk.log_files:
+            sections.append(_log_files_table(state.disk, theme))
 
     if ops.state_db_size_bytes or ops.state_db_schema_version:
         sections.append(_heading("State DB", theme))
@@ -921,6 +933,114 @@ def _delegation_procs_label(delegation: DelegationInfo) -> str:
     if delegation.unread_completion_count:
         parts.append(f"{delegation.unread_completion_count} unread")
     return " · ".join(parts) if parts else "—"
+
+
+def _disk_warnings(disk: DiskUsageState) -> list[str]:
+    """Compact one-liners for the disk checks that ``hermes doctor`` warns on."""
+    warnings: list[str] = []
+    if disk.unrotated_oversize_count:
+        plural = "s" if disk.unrotated_oversize_count != 1 else ""
+        warnings.append(f"{disk.unrotated_oversize_count} unrotated log{plural} > 10 MB")
+    if disk.state_db_wal_verdict == "warn":
+        warnings.append(f"WAL {_size_label(disk.state_db_wal_bytes)} (> 50 MB)")
+    if disk.checkpoints_over_cap:
+        warnings.append(f"checkpoints over {disk.checkpoints_cap_mb} MB cap")
+    if disk.cache_hogs:
+        warnings.append(f"{len(disk.cache_hogs)} cache dir(s) ≥ 1 GiB")
+    return warnings
+
+
+def _disk_has_readout(disk: DiskUsageState) -> bool:
+    return bool(
+        disk.log_files
+        or disk.sessions_bytes
+        or disk.checkpoints_bytes
+        or disk.scratch_bytes
+        or disk.cache_hogs
+        or disk.state_db_wal_bytes
+        or disk.databases
+    )
+
+
+def _approx_size(size_bytes: int, truncated: bool) -> str:
+    return f"≥{_size_label(size_bytes)}" if truncated else _size_label(size_bytes)
+
+
+def _disk_table(ops: OperationsState, disk: DiskUsageState, theme: Theme) -> Table:
+    table = Table(box=None, show_header=False, padding=(0, 2))
+    table.add_column("Key", style=theme.ui_label)
+    table.add_column("Value", style=theme.banner_text)
+    logs = f"{_size_label(disk.logs_dir_bytes)} in {disk.log_file_count} files"
+    if disk.unrotated_oversize_count:
+        logs += (
+            f" · [{theme.ui_warn}]{disk.unrotated_oversize_count} unrotated > 10 MB[/]"
+            " (upstream rotates only agent/errors/gateway/gui.log)"
+        )
+    table.add_row("Logs (root)", logs)
+    table.add_row("Sessions", _approx_size(disk.sessions_bytes, disk.sessions_truncated))
+    checkpoints = (
+        f"{_approx_size(disk.checkpoints_bytes, disk.checkpoints_truncated)} · "
+        f"cap {disk.checkpoints_cap_mb} MB · "
+        + ("enabled" if disk.checkpoints_enabled else "disabled")
+    )
+    if disk.checkpoints_over_cap:
+        checkpoints += f" · [{theme.ui_warn}]⚠ at or above the cap[/]"
+    table.add_row("Checkpoints", checkpoints)
+    if ops.snapshot_count:
+        table.add_row("State Snapshots", _size_label(ops.snapshot_total_bytes))
+    table.add_row(
+        "Scratch",
+        f"{_approx_size(disk.scratch_bytes, disk.scratch_truncated)} (pruned after idle)",
+    )
+    for hog in disk.cache_hogs:
+        table.add_row(
+            f"cache/{escape(hog.name)}",
+            f"[{theme.ui_warn}]⚠ {_approx_size(hog.size_bytes, hog.size_truncated)} "
+            "outside every pruner[/]",
+        )
+    wal = _size_label(disk.state_db_wal_bytes)
+    if disk.state_db_wal_verdict == "warn":
+        wal = f"[{theme.ui_warn}]⚠ {wal} (> 50 MB: missed checkpoints, or a live writer)[/]"
+    elif disk.state_db_wal_verdict == "note":
+        wal = f"{wal} (> 10 MB, normal for active sessions)"
+    table.add_row("state.db WAL", wal)
+    if disk.databases:
+        table.add_row("Journal Modes", _journal_modes_label(disk.databases))
+    if disk.pending_walks:
+        table.add_row("", f"[{theme.banner_dim}]{disk.pending_walks} dir(s) still being sized[/]")
+    return table
+
+
+def _journal_modes_label(databases: list[DatabaseJournal]) -> str:
+    parts = []
+    for db in databases:
+        mode = db.journal_mode or f"? ({db.error})"
+        parts.append(f"{escape(db.name)}: {escape(mode)}")
+    return " · ".join(parts)
+
+
+def _log_files_table(disk: DiskUsageState, theme: Theme) -> Table:
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("Log", style=theme.ui_accent)
+    table.add_column("Size", justify="right", style=theme.banner_text)
+    table.add_column("Growth/h", justify="right", style=theme.banner_text)
+    table.add_column("Rotation", style=theme.banner_dim)
+    for entry in disk.log_files:
+        growth = (
+            "—"
+            if entry.growth_bytes_per_hour is None
+            else _size_label(max(0, int(entry.growth_bytes_per_hour)))
+        )
+        if entry.rotated_upstream:
+            rotation = "rotated"
+        elif entry.unrotated_oversize:
+            rotation = f"[{theme.ui_warn}]⚠ unrotated[/]"
+        else:
+            rotation = "unrotated"
+        table.add_row(escape(entry.name), _size_label(entry.size_bytes), growth, rotation)
+    if disk.log_file_count > len(disk.log_files):
+        table.caption = _truncation_label(len(disk.log_files), disk.log_file_count)
+    return table
 
 
 def _snapshots_table(ops: OperationsState, theme: Theme) -> Table:

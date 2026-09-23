@@ -2402,6 +2402,71 @@ class ProcessReceiptsState(BaseModel):
     receipts_truncated: bool = False
 
 
+class LogFileUsage(BaseModel):
+    """One file under ROOT ``logs/``: size, observed growth and rotation."""
+
+    name: str
+    size_bytes: int = 0
+    # Bytes per hour over the window this dashboard has observed (up to an
+    # hour); None until two samples a minute apart exist or after a shrink.
+    growth_bytes_per_hour: float | None = None
+    # Upstream attaches a RotatingFileHandler only to agent/errors/gateway/gui
+    # (``hermes_logging.py:241-244``); everything else grows without bound.
+    rotated_upstream: bool = False
+    unrotated_oversize: bool = False
+
+
+class CacheDirUsage(BaseModel):
+    name: str
+    size_bytes: int = 0
+    size_truncated: bool = False
+
+
+class DatabaseJournal(BaseModel):
+    """Journal mode of one Hermes database from header byte 18 (never opened)."""
+
+    name: str
+    size_bytes: int = 0
+    journal_mode: str = ""
+    error: str = ""
+
+
+class DiskUsageState(BaseModel):
+    """Disk footprint and retention of the Hermes home (source ``disk_usage``).
+
+    Directory totals come from bounded walks recomputed at most every few
+    minutes, so they lag the disk slightly; a ``*_truncated`` total is a lower
+    bound. ``pending_walks`` counts directories not yet walked because the
+    per-refresh walk budget ran out.
+    """
+
+    logs_dir_bytes: int = 0
+    log_file_count: int = 0
+    log_files: list[LogFileUsage] = Field(default_factory=list)
+    unrotated_oversize_count: int = 0
+    sessions_bytes: int = 0
+    sessions_truncated: bool = False
+    checkpoints_bytes: int = 0
+    checkpoints_truncated: bool = False
+    # ``checkpoints.enabled`` defaults to false and ``max_total_size_mb`` to 500
+    # (``tools/checkpoint_manager.py:1206-1221``); the doctor warns only when
+    # enabled and at or above the cap.
+    checkpoints_enabled: bool = False
+    checkpoints_cap_mb: int = 500
+    checkpoints_over_cap: bool = False
+    scratch_bytes: int = 0
+    scratch_truncated: bool = False
+    # cache/* dirs outside the pruned scratch/terminal at or above 1 GiB
+    # (``hermes_cli/doctor_state.py:168-190``).
+    cache_hogs: list[CacheDirUsage] = Field(default_factory=list)
+    state_db_wal_bytes: int = 0
+    # "ok", "note" (> 10 MB) or "warn" (> 50 MB), the doctor's thresholds
+    # (``hermes_cli/doctor_state.py:354-390``).
+    state_db_wal_verdict: str = "ok"
+    databases: list[DatabaseJournal] = Field(default_factory=list)
+    pending_walks: int = 0
+
+
 class PendingActionSubsystem(BaseModel):
     """Writes staged for operator review under PROFILE ``pending/<subsystem>/``.
 
@@ -2675,6 +2740,8 @@ class DashboardState(BaseModel):
     channels: ChannelDirectoryState = Field(default_factory=ChannelDirectoryState)
     kanban: KanbanState = Field(default_factory=KanbanState)
     operations: OperationsState = Field(default_factory=OperationsState)
+    # Disk footprint and retention (source ``disk_usage``), rendered in panel 12.
+    disk: DiskUsageState = Field(default_factory=DiskUsageState)
     skills_memory: SkillsMemory = Field(default_factory=SkillsMemory)
     mcp_cache: MCPSchemaCache = Field(default_factory=MCPSchemaCache)
     skills_prompt: SkillsPromptSnapshot = Field(default_factory=SkillsPromptSnapshot)

@@ -1847,15 +1847,15 @@ def test_state_snapshot_entry_vanishing_mid_scan_is_not_an_error(
     nested = root / "snap-dir"
     nested.mkdir(parents=True)
     (nested / "kept.db").write_bytes(b"k" * 100)
-    racing_child = nested / "gone.db"
-    racing_child.write_bytes(b"g" * 10)
+    # A file vanishing inside a snapshot dir is covered by the walker's own
+    # test (test_disk_usage.py::test_walker_tolerates_entries_vanishing).
     racing_entry = root / "gone-file.db"
     racing_entry.write_bytes(b"x" * 10)
     original_is_file = Path.is_file
 
     def racing_is_file(path: Path) -> bool:
         result = original_is_file(path)
-        if path in (racing_child, racing_entry):
+        if path == racing_entry:
             path.unlink()  # deleted between the type check and the stat
         return result
 
