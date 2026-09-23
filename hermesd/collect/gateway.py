@@ -105,8 +105,10 @@ _DELIVERY_ERROR_EXCERPT_CHARS = 80
 _INCARNATION_SCAN_LIMIT = 500
 _OPEN_DELIVERY_LIMIT = 5
 # A recorded start_time is only usable as wall-clock when it lands inside this
-# window of now. The live gateway_state.json carries a monotonic-clock value
-# (178874708938, i.e. the year 7638), which must never be read as an epoch.
+# window of now. gateway_state.json's start_time is a PID-reuse fingerprint
+# (``_get_process_start_time``, gateway/status.py:139-156): clock ticks since
+# boot on Linux, psutil create_time in centiseconds elsewhere (178874708938,
+# i.e. the year 7638 read as seconds). Neither may ever be read as an epoch.
 _PLAUSIBLE_EPOCH_WINDOW_SECONDS = 50 * 365 * _DAY_SECONDS
 # Outcomes that mean the update never reached a clean finish. Upstream also
 # stamps a ``stop_reason`` on successful receipts, so that field alone is not
@@ -274,12 +276,18 @@ def _platform_status(
     state = str(info.get("state") or "unknown")
     retrying_since = str(info.get("retrying_since") or "")
     served = served_profiles or []
-    mirrors = _listener_mirror_urls(
-        name,
-        info,
-        state,
-        record_current=record_current,
-        served_profiles=served,
+    # Only the default profile's bare entry owns the shared listener; a
+    # namespaced ``<profile>:api_server`` key is never a mirror source upstream.
+    mirrors = (
+        {}
+        if profile
+        else _listener_mirror_urls(
+            name,
+            info,
+            state,
+            record_current=record_current,
+            served_profiles=served,
+        )
     )
     return PlatformStatus(
         name=name,
@@ -542,7 +550,7 @@ def _plausible_epoch(value: object, now: float) -> float | None:
 
     Accepts an ISO-8601 string or a numeric epoch, and rejects anything more
     than _PLAUSIBLE_EPOCH_WINDOW_SECONDS from `now` — hermes-agent records a
-    monotonic clock reading under the same ``start_time`` key.
+    process start-time fingerprint, not an epoch, under the same ``start_time`` key.
     """
     epoch = _iso_to_epoch(value)
     if epoch is None:
@@ -979,13 +987,18 @@ def _read_open_delivery_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     )
 
 
-def _gateway_ledger_fields(rows: _GatewayLedgerRows, now: float) -> dict[str, Any]:
+def _gateway_ledger_fields(
+    rows: _GatewayLedgerRows, now: float, *, running: bool = True
+) -> dict[str, Any]:
     starts = rows.incarnation_starts
     counts = rows.delivery_counts
+    # The newest incarnation's age is only an uptime while a gateway runs; a
+    # stopped gateway's last start would otherwise keep counting forever.
+    newest_start = max(starts) if starts and running else None
     return {
         "gateway_incarnation_count": rows.incarnation_count,
         "gateway_restarts_24h": sum(1 for start in starts if now - start <= _DAY_SECONDS),
-        "current_incarnation_uptime_seconds": _age_seconds(max(starts) if starts else None, now),
+        "current_incarnation_uptime_seconds": _age_seconds(newest_start, now),
         "pending_delivery_count": sum(counts.get(state) or 0 for state in _PENDING_DELIVERY_STATES),
         "failed_delivery_count": counts.get("failed") or 0,
         "pending_deliveries": [_delivery_summary(row, now) for row in rows.delivery_rows],

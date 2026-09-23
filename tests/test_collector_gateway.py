@@ -20,6 +20,8 @@ import yaml
 from hermesd.collect.gateway import (
     _INCARNATION_SCAN_LIMIT,
     _OPEN_DELIVERY_LIMIT,
+    _gateway_ledger_fields,
+    _GatewayLedgerRows,
     _listener_mirror_urls,
 )
 from hermesd.collector import (
@@ -1765,6 +1767,17 @@ def test_gateway_ledger_uptime_clamps_future_start(hermes_home: Path):
     assert gateway.current_incarnation_uptime_seconds == 0.0
 
 
+def test_gateway_ledger_uptime_is_none_while_gateway_stopped():
+    rows = _GatewayLedgerRows(incarnation_count=1, incarnation_starts=[NOW - 600])
+
+    stopped = _gateway_ledger_fields(rows, NOW, running=False)
+    running = _gateway_ledger_fields(rows, NOW, running=True)
+
+    assert stopped["current_incarnation_uptime_seconds"] is None
+    assert stopped["gateway_incarnation_count"] == 1
+    assert running["current_incarnation_uptime_seconds"] == pytest.approx(600.0)
+
+
 def test_goal_state_still_collected_alongside_gateway_ledgers(hermes_home: Path):
     _write_gateway_state(hermes_home)
     conn = sqlite3.connect(str(hermes_home / "state.db"))
@@ -3158,6 +3171,22 @@ def test_listener_base_mirrors_are_synthesized_for_served_profiles(hermes_home: 
     }
     # Not a port binder: never mirrored.
     assert platforms["telegram"].mirror_urls == {}
+
+
+def test_listener_base_mirrors_only_come_from_the_default_bare_entry(hermes_home: Path):
+    _write_gateway_state(
+        hermes_home,
+        served_profiles=["dev", "ops"],
+        platforms={
+            "dev:api_server": {"state": "connected", "listener_base": "http://127.0.0.1:8088"},
+        },
+    )
+
+    platform = _collect(hermes_home).gateway.platforms[0]
+
+    assert platform.profile == "dev"
+    assert platform.mirror_urls == {}
+    assert platform.mirror_urls_truncated is False
 
 
 def test_listener_base_mirrors_need_a_live_writer_and_a_serving_state(hermes_home: Path):
