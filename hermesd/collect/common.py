@@ -362,3 +362,14 @@ def _excerpt(value: object, cap: int) -> str:
 def _optional_int(value: object) -> int | None:
     """Coerce to int, preserving a genuine null (an exit code that never happened)."""
     return None if value is None else _coerce_int(value)
+
+
+def _printable_capped(value: object, cap: int) -> str:
+    """Printable, length-capped text safe to hand to a panel; "" for non-str.
+
+    Control characters are stripped here, in the collector: a panel escapes
+    markup but must not be the place an escape sequence is neutralised.
+    """
+    if not isinstance(value, str):
+        return ""
+    return "".join(char for char in value if char.isprintable())[:cap]

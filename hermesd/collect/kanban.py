@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from hermesd.collect.common import _coerce_int, _path_resolves_under
+from hermesd.collect.common import _coerce_int, _optional_int, _path_resolves_under
 from hermesd.collect.redaction import _redact_secret_url
 from hermesd.collect.sqlite_util import (
     _column_exists,
@@ -217,11 +217,6 @@ _ENRICHED_TASK_TEXT_COLUMNS = (
     "branch_name",
     "completion_contract",
 )
-
-
-def _optional_int(value: object) -> int | None:
-    """Coerce to int, preserving a genuine null (an unset max_retries column)."""
-    return None if value is None else _coerce_int(value)
 
 
 def _breaker_limit(max_retries: int | None, failure_limit: int) -> int:

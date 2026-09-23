@@ -46,6 +46,7 @@ from hermesd.collect.common import (
     _mtime,
     _optional_epoch,
     _path_resolves_under,
+    _printable_capped,
     _read_tail_text,
     _read_text_capped,
     _safe_capped_file,
@@ -617,14 +618,10 @@ def _read_blocked_scripts(root: Path, home: Path, *, now: float) -> dict[str, An
         "blocked_script_count": len(entries),
         "newest_blocked_script_age_seconds": max(0.0, now - newest) if newest else None,
         "blocked_script_names": [
-            _sanitized_file_label(name) for _, name in entries[:_BLOCKED_SCRIPT_NAME_LIMIT]
+            _printable_capped(name, _MAX_FILE_LABEL_CHARS)
+            for _, name in entries[:_BLOCKED_SCRIPT_NAME_LIMIT]
         ],
     }
-
-
-def _sanitized_file_label(name: str) -> str:
-    """Printable, length-capped file name safe to hand to a panel."""
-    return "".join(char for char in name if char.isprintable())[:_MAX_FILE_LABEL_CHARS]
 
 
 def _path_confirmed_gone(path: Path) -> bool:
@@ -2225,7 +2222,7 @@ class Collector:
                 continue
             rows.append(
                 TerminalBreadcrumb(
-                    terminal=_sanitized_file_label(entry.name),
+                    terminal=_printable_capped(entry.name, _MAX_FILE_LABEL_CHARS),
                     session_id=str(data.get("session_id") or ""),
                     cwd=str(data.get("cwd") or ""),
                     age_seconds=age,

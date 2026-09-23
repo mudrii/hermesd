@@ -192,3 +192,12 @@ def test_file_swapped_for_non_regular_after_type_check_is_refused(
     assert _read_text_capped(path) == ""
     with pytest.raises(OSError, match="not a regular file"):
         _read_tail_text(path, 64)
+
+
+def test_printable_capped_strips_controls_caps_and_rejects_non_str():
+    from hermesd.collect.common import _printable_capped
+
+    assert _printable_capped("ab\x1b[31mcd\nef", 6) == "ab[31m"
+    assert _printable_capped("abcdef", 3) == "abc"
+    assert _printable_capped(42, 10) == ""
+    assert _printable_capped(None, 10) == ""
