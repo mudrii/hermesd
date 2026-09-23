@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import shutil
 import sqlite3
 import time
 from pathlib import Path
@@ -100,7 +101,7 @@ def test_collect_kanban_stale_claim_counts_use_configured_ttl(hermes_home: Path)
     conn.execute(
         "INSERT INTO tasks (id, title, status, created_at, last_heartbeat_at) "
         "VALUES (?, ?, ?, ?, ?)",
-        ("beta-task", "Beta task", "done", 1, stale_heartbeat),
+        ("beta-task", "Beta task", "running", 1, stale_heartbeat),
     )
     conn.commit()
     conn.close()
@@ -150,11 +151,11 @@ def test_collect_kanban_stale_claims_counted_with_only_claim_expires_column(herm
     )
     conn.execute(
         "INSERT INTO tasks (id, title, status, created_at, claim_expires) VALUES (?, ?, ?, ?, ?)",
-        ("stale-task", "Stale task", "done", 1, 1),
+        ("stale-task", "Stale task", "running", 1, 1),
     )
     conn.execute(
         "INSERT INTO tasks (id, title, status, created_at, claim_expires) VALUES (?, ?, ?, ?, ?)",
-        ("live-task", "Live task", "done", 1, int(time.time()) + 3600),
+        ("live-task", "Live task", "running", 1, int(time.time()) + 3600),
     )
     conn.commit()
     conn.close()
@@ -178,12 +179,12 @@ def test_collect_kanban_stale_claims_counted_with_only_heartbeat_column(hermes_h
     conn.execute(
         "INSERT INTO tasks (id, title, status, created_at, last_heartbeat_at) "
         "VALUES (?, ?, ?, ?, ?)",
-        ("stale-task", "Stale task", "done", 1, now - 600),
+        ("stale-task", "Stale task", "running", 1, now - 600),
     )
     conn.execute(
         "INSERT INTO tasks (id, title, status, created_at, last_heartbeat_at) "
         "VALUES (?, ?, ?, ?, ?)",
-        ("live-task", "Live task", "done", 1, now - 10),
+        ("live-task", "Live task", "running", 1, now - 10),
     )
     conn.commit()
     conn.close()
@@ -193,6 +194,32 @@ def test_collect_kanban_stale_claims_counted_with_only_heartbeat_column(hermes_h
 
     assert state.kanban.boards[0].stale_claim_count == 1
     c.close()
+
+
+def test_collect_kanban_stale_claims_ignore_finished_tasks(hermes_home: Path):
+    """Upstream complete_task clears claim_expires but leaves last_heartbeat_at,
+    so a finished task's old heartbeat is history, not an abandoned claim."""
+    board_dir = hermes_home / "kanban" / "boards" / "alpha"
+    board_dir.mkdir(parents=True)
+    now = int(time.time())
+    conn = sqlite3.connect(str(board_dir / "kanban.db"))
+    create_kanban_db_tables(conn)
+    for task_id, status in (("done-task", "done"), ("todo-task", "todo"), ("run-task", "claimed")):
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at, last_heartbeat_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (task_id, task_id, status, 1, now - 3600),
+        )
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.kanban.boards[0].stale_claim_count == 1
 
 
 def test_collect_kanban_board_visibility_renders_from_collected_state(hermes_home: Path):
@@ -413,6 +440,37 @@ def test_collect_kanban_sidecar_free_wal_board_reads_without_writing_sidecars(
     assert state.kanban.notify_sub_count == 1
     boards = {board.slug: board for board in state.kanban.boards}
     assert boards["idle"].task_count == 1
+
+
+def test_deleted_board_releases_its_wal_snapshot(hermes_home: Path):
+    """A board removed from disk must not leave its temp WAL copy behind."""
+    board_dir = hermes_home / "kanban" / "boards" / "gone"
+    board_dir.mkdir(parents=True)
+    board_db = board_dir / "kanban.db"
+    writer = sqlite3.connect(str(board_db))
+    create_kanban_db_tables(writer)
+    assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    writer.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('t', 'Task', 'todo', 1)"
+    )
+    writer.commit()
+
+    c = Collector(hermes_home)
+    try:
+        c.collect()
+        snapshot = c._kanban_snapshots[board_db]
+        assert snapshot[2] is not None
+        snapshot_dir = Path(snapshot[2].name)
+        assert snapshot_dir.exists()
+
+        writer.close()
+        shutil.rmtree(board_dir)
+        c.collect()
+
+        assert board_db not in c._kanban_snapshots
+        assert not snapshot_dir.exists()
+    finally:
+        c.close()
 
 
 def test_collect_kanban_null_columns_coerced(populated_hermes_home: Path):
@@ -1476,6 +1534,31 @@ def test_read_kanban_notify_fields_without_required_columns_returns_empty():
         )
     finally:
         conn.close()
+
+
+def test_read_kanban_notify_fields_tolerates_missing_optional_columns():
+    """platform and notifier_profile are optional: a table without them still
+    yields the counts and backlog, with no platform rollup and no orphans."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE kanban_notify_subs (task_id TEXT, last_event_id INTEGER);
+        CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT);
+        INSERT INTO kanban_notify_subs VALUES ('t1', 0);
+        INSERT INTO task_events (task_id) VALUES ('t1');
+        """
+    )
+    try:
+        fields = kanban_module._read_kanban_notify_fields(conn, known_profiles=frozenset({"ops"}))
+    finally:
+        conn.close()
+
+    assert fields["notify_sub_count"] == 1
+    assert fields["notify_platform_counts"] == {}
+    assert fields["notify_backlog_total"] == 1
+    assert [sub.task_id for sub in fields["notify_backlog_subs"]] == ["t1"]
+    assert fields["notify_orphan_profile_count"] == 0
 
 
 def test_kanban_notify_orphan_list_is_capped_while_the_count_is_exact(hermes_home: Path):

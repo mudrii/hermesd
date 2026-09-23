@@ -47,6 +47,12 @@ _DEFAULT_CLAIM_TTL_SECONDS = 300
 # write; it is still read as the override it says it is.
 _DEFAULT_FAILURE_LIMIT = 2
 
+# Statuses a worker holds a claim in. Shared by the active-task list and the
+# stale-claim count: upstream complete_task clears claim_expires but leaves
+# last_heartbeat_at, so a finished task's old heartbeat is not a stale claim.
+_ACTIVE_TASK_STATUSES = ("in_progress", "running", "claimed")
+_ACTIVE_TASK_STATUS_SQL = ", ".join(f"'{status}'" for status in _ACTIVE_TASK_STATUSES)
+
 
 def _kanban_claim_ttl_seconds(cfg: dict[str, Any]) -> int:
     for key in ("claim_ttl_seconds", "worker_claim_ttl_seconds", "claim_timeout_seconds"):
@@ -76,7 +82,7 @@ def _read_kanban_state(
         active_rows = _query_rows(
             conn,
             "SELECT * FROM tasks "
-            "WHERE status IN ('in_progress', 'running', 'claimed') "
+            f"WHERE status IN ({_ACTIVE_TASK_STATUS_SQL}) "
             "OR current_run_id IS NOT NULL OR worker_pid IS NOT NULL "
             "ORDER BY COALESCE(last_heartbeat_at, started_at, created_at, 0) DESC LIMIT 10",
         )
@@ -175,8 +181,9 @@ def _stale_claim_count_from_tasks(
         return 0
     return _count_rows(
         conn,
-        "SELECT COUNT(*) FROM tasks WHERE "
-        + " OR ".join(f"({condition})" for condition in conditions),
+        f"SELECT COUNT(*) FROM tasks WHERE status IN ({_ACTIVE_TASK_STATUS_SQL}) AND ("
+        + " OR ".join(f"({condition})" for condition in conditions)
+        + ")",
     )
 
 
@@ -408,9 +415,16 @@ def _read_kanban_notify_fields(
     # Totals first, from aggregates over the whole table.
     sub_count = _count_rows(conn, "SELECT COUNT(*) FROM kanban_notify_subs")
     platform_counts: dict[str, int] = {}
-    for row in _query_rows(
-        conn, "SELECT platform, COUNT(*) AS subs FROM kanban_notify_subs GROUP BY platform"
-    ):
+    # platform and notifier_profile are optional columns: without one, its
+    # rollup is simply empty rather than a failed read.
+    platform_rows = (
+        _query_rows(
+            conn, "SELECT platform, COUNT(*) AS subs FROM kanban_notify_subs GROUP BY platform"
+        )
+        if "platform" in wanted
+        else []
+    )
+    for row in platform_rows:
         # Rolled up in Python so a non-ASCII platform lowercases the way
         # Python does, not the way SQLite's ASCII-only LOWER does.
         platform = str(row.get("platform") or "")
@@ -438,7 +452,7 @@ def _read_kanban_notify_fields(
         conn, f"SELECT COUNT(*) FROM kanban_notify_subs s WHERE {unseen_expr} > 0"
     )
     orphan_names: set[str] = set()
-    if known_profiles is not None:
+    if known_profiles is not None and "notifier_profile" in wanted:
         # Distinct stamps only: profile names are a handful, not one per sub.
         for row in _query_rows(conn, "SELECT DISTINCT notifier_profile FROM kanban_notify_subs"):
             profile = str(row.get("notifier_profile") or "").strip()
@@ -446,6 +460,7 @@ def _read_kanban_notify_fields(
                 orphan_names.add(profile)
     # The displayed slice: the worst backlogs, capped. Only these rows carry the
     # per-row correlated reads, so the cost is bounded by the cap, not the table.
+    tie_break = "s.task_id, s.platform" if "platform" in wanted else "s.task_id"
     backlog_subs = [
         _kanban_notify_from_row(row)
         for row in _query_rows(
@@ -453,7 +468,7 @@ def _read_kanban_notify_fields(
             f"SELECT {select_list}, {max_event_expr} AS max_event_id, "
             f"{unseen_expr} AS unseen_event_count "
             f"FROM kanban_notify_subs s WHERE {unseen_expr} > 0 "
-            f"ORDER BY unseen_event_count DESC, s.task_id, s.platform "
+            f"ORDER BY unseen_event_count DESC, {tie_break} "
             f"LIMIT {_NOTIFY_BACKLOG_SUB_LIMIT}",
         )
     ]

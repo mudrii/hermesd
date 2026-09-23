@@ -852,6 +852,10 @@ class Collector:
             for slug, summary in self._kanban_board_cache.items()
             if not _path_confirmed_gone(boards_dir / slug)
         }
+        for db_path in [path for path in self._kanban_snapshots if _path_confirmed_gone(path)]:
+            owner = self._kanban_snapshots.pop(db_path)[2]
+            if owner is not None:
+                owner.cleanup()
         self._derived_file_cache = {
             key: entry
             for key, entry in self._derived_file_cache.items()
