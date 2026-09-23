@@ -28,11 +28,11 @@ from hermesd.panels.formatting import (
     fmt_usd,
     sanitize_terminal_text,
     section_heading,
+    sparkline,
 )
 from hermesd.panels.formatting import (
     escape_terminal_text as escape,
 )
-from hermesd.panels.tokens import sparkline
 from hermesd.theme import Theme
 
 

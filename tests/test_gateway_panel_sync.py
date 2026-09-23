@@ -398,3 +398,29 @@ def test_restart_backlog_is_omitted_when_nothing_is_owed() -> None:
 
     assert "Restart Backlog" not in detail
     assert "Recent runs" not in detail
+
+
+def test_compact_warnings_fit_the_overview_row_ahead_of_the_directory_count() -> None:
+    """The wide overview gives the Gateway row two content lines: warnings win."""
+    from rich.console import Console
+
+    from hermesd.models import ChannelDirectoryState
+
+    dashboard = DashboardState(
+        gateway=GatewayState(
+            running=True,
+            pid=4242,
+            state="running",
+            multiplex_standalone_reason="profiles default and dev share TELEGRAM_BOT_TOKEN",
+        ),
+        channels=ChannelDirectoryState(platform_count=2),
+    )
+    console = Console(width=200, no_color=True)
+    lines = console.render_lines(
+        render_gateway(dashboard, Theme(), detail=False),
+        console.options.update(height=4),
+        pad=False,
+    )
+    visible = "\n".join("".join(segment.text for segment in line) for line in lines[:4])
+
+    assert "standalone (not multiplexing)" in visible

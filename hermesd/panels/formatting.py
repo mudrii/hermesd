@@ -134,3 +134,15 @@ def fmt_iso_timestamp(value: str | None) -> str:
     except ValueError:
         return value
     return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
+_SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(values: list[int]) -> str:
+    """One block per value, scaled to the largest; zero is always the lowest block."""
+    peak = max(values, default=0)
+    if peak <= 0:
+        return _SPARK_BLOCKS[0] * len(values)
+    top = len(_SPARK_BLOCKS) - 1
+    return "".join(_SPARK_BLOCKS[min(top, math.ceil(max(v, 0) / peak * top))] for v in values)

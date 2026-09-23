@@ -710,6 +710,7 @@ class DashboardApp:
                 log_sub_view,
                 filter_query,
                 body_height,
+                render_console.width,
             )
             if max_offset is not None and scroll_offset > max_offset:
                 scroll_offset = max_offset
@@ -740,6 +741,7 @@ class DashboardApp:
                     session_sort=session_sort,
                     session_message_match_ids=session_message_match_ids,
                     detail_height=body_height,
+                    detail_width=render_console.width,
                 )
 
             if detail_panel in _RENDERED_VIEWPORT_PANEL_NUMS:
@@ -1172,6 +1174,7 @@ def _detail_max_scroll_offset(
     log_sub_view: str,
     filter_query: str,
     detail_height: int,
+    detail_width: int | None = None,
 ) -> int | None:
     """Logs' max scroll offset for ``detail_height`` rows; None for other panels.
 
@@ -1181,7 +1184,9 @@ def _detail_max_scroll_offset(
     if panel_num == _LOG_PANEL_NUM:
         from hermesd.panels.logs import max_detail_scroll_offset
 
-        return max_detail_scroll_offset(state, log_sub_view, filter_query, detail_height)
+        return max_detail_scroll_offset(
+            state, log_sub_view, filter_query, detail_height, detail_width
+        )
     return None
 
 

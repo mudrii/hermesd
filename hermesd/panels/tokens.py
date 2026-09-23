@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 import rich.box
 from rich.console import Group, RenderableType
 from rich.panel import Panel
@@ -24,22 +22,13 @@ from hermesd.panels.formatting import (
     fmt_usd,
     sanitize_terminal_text,
     section_heading,
+    sparkline,
 )
 from hermesd.theme import Theme
 
 _DETAIL_MAX_SESSION_ROWS = 50
 _COMPACT_TOP_MODELS = 3
-_SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
 _TOP_SESSION_TITLE_CHARS = 32
-
-
-def sparkline(values: list[int]) -> str:
-    """One block per value, scaled to the largest; zero is always the lowest block."""
-    peak = max(values, default=0)
-    if peak <= 0:
-        return _SPARK_BLOCKS[0] * len(values)
-    top = len(_SPARK_BLOCKS) - 1
-    return "".join(_SPARK_BLOCKS[min(top, math.ceil(max(v, 0) / peak * top))] for v in values)
 
 
 def _fmt_cost(value: float, *, estimated: bool) -> str:

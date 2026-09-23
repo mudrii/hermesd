@@ -72,10 +72,12 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             if p.needs_attention:
                 lines.append("! ", style=f"bold {theme.ui_warn}")
             lines.append(" ")
+    # The wide overview gives this row two content lines, so warnings go
+    # straight under the status line and the directory count comes last.
+    _append_compact_warnings(lines, state, theme)
     if state.channels.platform_count:
         lines.append("\n  Directory: ", style=theme.ui_label)
         lines.append(f"{state.channels.platform_count} platforms", style=theme.banner_text)
-    _append_compact_warnings(lines, state, theme)
 
     return Panel(
         lines,

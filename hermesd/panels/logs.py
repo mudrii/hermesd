@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TypedDict
 
 import rich.box
+from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
@@ -48,6 +49,33 @@ def _resolve_log_view(
     return log_map, sub_view, unfiltered, _filter_log_lines(unfiltered, filter_query)
 
 
+# Columns the detail panel spends outside its text: the two box edges plus
+# two columns of horizontal padding on each side (padding=(1, 2) below).
+_DETAIL_CHROME_COLUMNS = 6
+
+
+def _tab_bar(log_map: dict[str, list[LogLine]], sub_view: str, theme: Theme) -> Text:
+    tab_bar = Text()
+    for name in log_map:
+        if name == sub_view:
+            tab_bar.append(f" [{name}] ", style=f"bold {theme.ui_accent}")
+        else:
+            tab_bar.append(f"  {name}  ", style=theme.banner_dim)
+    return tab_bar
+
+
+def _tab_bar_extra_rows(tab_bar: Text, detail_width: int | None) -> int:
+    """Rows the tab bar wraps onto beyond its first, at ``detail_width`` columns.
+
+    Measured with Rich's own wrapping, so the log window matches what renders.
+    Unknown width keeps the historical one-row assumption.
+    """
+    if detail_width is None:
+        return 0
+    inner = max(1, detail_width - _DETAIL_CHROME_COLUMNS)
+    return max(0, len(tab_bar.wrap(Console(width=inner), inner)) - 1)
+
+
 def _visible_line_count(detail_height: int | None, filter_query: str, extra_rows: int = 0) -> int:
     """Log lines that fit in ``detail_height`` rows (fixed default when unknown)."""
     if detail_height is None:
@@ -57,11 +85,16 @@ def _visible_line_count(detail_height: int | None, filter_query: str, extra_rows
 
 
 def max_detail_scroll_offset(
-    state: DashboardState, sub_view: str, filter_query: str, detail_height: int | None = None
+    state: DashboardState,
+    sub_view: str,
+    filter_query: str,
+    detail_height: int | None = None,
+    detail_width: int | None = None,
 ) -> int:
     """Effective max scroll offset for the logs detail view."""
-    _, sub_view, _, lines = _resolve_log_view(state, sub_view, filter_query)
+    log_map, sub_view, _, lines = _resolve_log_view(state, sub_view, filter_query)
     extra = 1 if _stream_health(state, sub_view) is not None else 0
+    extra += _tab_bar_extra_rows(_tab_bar(log_map, sub_view, Theme()), detail_width)
     return max(0, len(lines) - _visible_line_count(detail_height, filter_query, extra))
 
 
@@ -93,9 +126,12 @@ def render_logs(
     scroll_offset: int = 0,
     filter_query: str = "",
     detail_height: int | None = None,
+    detail_width: int | None = None,
 ) -> Panel:
     if detail:
-        return _render_detail(state, theme, sub_view, scroll_offset, filter_query, detail_height)
+        return _render_detail(
+            state, theme, sub_view, scroll_offset, filter_query, detail_height, detail_width
+        )
     return _render_compact(state, theme)
 
 
@@ -154,13 +190,16 @@ def _render_detail(
     scroll_offset: int,
     filter_query: str,
     detail_height: int | None,
+    detail_width: int | None = None,
 ) -> Panel:
     log_map, sub_view, unfiltered_lines, log_lines = _resolve_log_view(
         state, sub_view, filter_query
     )
     health = _stream_health(state, sub_view)
     total = len(log_lines)
-    window = _visible_line_count(detail_height, filter_query, 1 if health is not None else 0)
+    tab_bar = _tab_bar(log_map, sub_view, theme)
+    extra = (1 if health is not None else 0) + _tab_bar_extra_rows(tab_bar, detail_width)
+    window = _visible_line_count(detail_height, filter_query, extra)
     max_offset = max(0, total - window)
     # Clamp both ends: a negative offset would slice from the end of the list
     # and render an empty page with a negative line counter.
@@ -168,12 +207,6 @@ def _render_detail(
     visible_lines = log_lines[offset : offset + window]
 
     lines = Text()
-    tab_bar = Text()
-    for name in log_map:
-        if name == sub_view:
-            tab_bar.append(f" [{name}] ", style=f"bold {theme.ui_accent}")
-        else:
-            tab_bar.append(f"  {name}  ", style=theme.banner_dim)
     lines.append_text(tab_bar)
     lines.append("\n")
     lines.append(" Scope: ", style=theme.ui_label)
@@ -206,9 +239,12 @@ def _render_detail(
         empty_message = "  No matching log lines" if filter_query else "  No log lines"
         lines.append(empty_message, style=theme.banner_dim)
 
-    for log_line in visible_lines:
+    # Newlines go between lines, not after the last: a trailing one rendered an
+    # extra blank row, overflowing detail_height by one.
+    for index, log_line in enumerate(visible_lines):
+        if index:
+            lines.append("\n")
         lines.append_text(_log_line_text(log_line, theme))
-        lines.append("\n")
 
     return Panel(
         lines,

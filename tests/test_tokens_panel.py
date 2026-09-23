@@ -13,7 +13,8 @@ from hermesd.models import (
     TopSession,
     UsageAnalytics,
 )
-from hermesd.panels.tokens import render_tokens, sparkline
+from hermesd.panels.formatting import sparkline
+from hermesd.panels.tokens import render_tokens
 from hermesd.theme import Theme
 from tests.conftest import render_to_str
 
