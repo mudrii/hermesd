@@ -40,13 +40,16 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines = Text()
 
     if gw.running:
-        lines.append("  ● ", style=f"bold {theme.ui_ok}")
-        lines.append("Running", style=theme.banner_text)
+        dot, label = _serving_badge(gw, theme)
+        lines.append("  ● ", style=f"bold {dot}")
+        lines.append(label, style=theme.ui_warn if gw.degraded else theme.banner_text)
         lines.append("  PID:", style=theme.ui_label)
         lines.append(f"{gw.pid}", style=theme.ui_accent)
     else:
         lines.append("  ● ", style=f"bold {theme.ui_error}")
         lines.append("Stopped", style=theme.banner_text)
+        if gw.watchdog_exit_reason:
+            lines.append("  ⚠ watchdog exit", style=theme.ui_error)
     lines.append("  loop:", style=theme.ui_label)
     lines.append(gw.loop_health.value, style=_loop_style(gw.loop_health, theme))
     if gw.dashboard_client_attached:
@@ -92,6 +95,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     ]
     sections.extend(_ingress_section(state.gateway, theme))
     sections.extend(_updates_section(state.gateway, theme))
+    sections.extend(_restart_backlog_section(state.gateway, theme))
     sections.extend(_migration_section(state.migration, theme))
     sections.extend(_deliveries_section(state.gateway, theme))
 
@@ -110,6 +114,32 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         box=rich.box.HORIZONTALS,
         padding=(1, 2),
     )
+
+
+# Operator wording for the watchdog exit reasons, after upstream's own
+# ``_WATCHDOG_EXIT_REASONS`` table (hermes_cli/gateway.py:4207-4214).
+_WATCHDOG_EXIT_WORDING = {
+    "loop_liveness_watchdog": (
+        "event loop stopped dispatching; the liveness watchdog exited it for the supervisor"
+        " to restart"
+    ),
+    "shutdown_watchdog": "shutdown drain wedged; the shutdown watchdog forced the exit",
+}
+
+
+# Upstream's convergence command (``MIGRATE_COMMAND``, hermes_cli/gateway_migrate.py:38).
+_MIGRATE_COMMAND = "hermes gateway migrate --multiplex"
+# The boot guard's single-profile verdict (``SINGLE_PROFILE_REASON``,
+# hermes_cli/gateway_multiplex_mode.py:28): standalone because there is nothing to
+# multiplex, which is not worth a compact warning.
+_SINGLE_PROFILE_REASON = "only one profile exists (nothing to multiplex)"
+
+
+def _serving_badge(gw: GatewayState, theme: Theme) -> tuple[str, str]:
+    """Dot colour and label for a live gateway: ``degraded`` is serving, but a warning."""
+    if gw.degraded:
+        return theme.ui_warn, "Degraded"
+    return theme.ui_ok, "Running"
 
 
 def _platform_label(platform: PlatformStatus) -> str:
@@ -247,11 +277,27 @@ def _status_header(state: DashboardState, theme: Theme) -> Text:
     gw = state.gateway
     header = Text()
     if gw.running:
-        header.append("● ", style=f"bold {theme.ui_ok}")
-        header.append(f"Running  PID:{gw.pid}", style=theme.banner_text)
+        dot, label = _serving_badge(gw, theme)
+        header.append("● ", style=f"bold {dot}")
+        header.append(
+            f"{label}  PID:{gw.pid}", style=theme.ui_warn if gw.degraded else theme.banner_text
+        )
+        if gw.degraded:
+            header.append(
+                "  serving; a configured platform is parked or retrying", style=theme.ui_warn
+            )
     else:
         header.append("● ", style=f"bold {theme.ui_error}")
         header.append("Stopped", style=theme.banner_text)
+        if gw.watchdog_exit_reason:
+            header.append(
+                f"  ⚠ watchdog exit: {sanitize_terminal_text(gw.watchdog_exit_reason)}",
+                style=theme.ui_error,
+            )
+            header.append(
+                f"\n    {_WATCHDOG_EXIT_WORDING.get(gw.watchdog_exit_reason, '')}",
+                style=theme.banner_dim,
+            )
     if gw.hermes_version:
         header.append(
             f"\n  Hermes v{sanitize_terminal_text(gw.hermes_version)}",
@@ -273,6 +319,15 @@ def _status_header(state: DashboardState, theme: Theme) -> Text:
     if gw.drain_active:
         _append_drain(header, gw, theme)
     _append_served_profiles(header, gw, theme)
+    if gw.multiplex_standalone_reason:
+        header.append("\n  Standalone: ", style=theme.ui_warn)
+        header.append(
+            sanitize_terminal_text(gw.multiplex_standalone_reason), style=theme.banner_text
+        )
+        header.append(
+            f"\n    serves only the launching profile; fold every profile with `{_MIGRATE_COMMAND}`",
+            style=theme.banner_dim,
+        )
     if gw.scale_to_zero_idle_timeout_minutes:
         relay = " relay-only" if gw.scale_to_zero_relay_only else ""
         header.append(
@@ -346,6 +401,58 @@ def _witness_label(gw: GatewayState, theme: Theme) -> Text:
     return label
 
 
+# Pressure tiers upstream warns about (gateway/memory_status.py:16-26).
+_HIGH_MEMORY_PRESSURE = frozenset({"elevated", "critical"})
+
+
+def _kib_label(kib: int | None) -> str:
+    return "—" if kib is None else fmt_bytes(kib * 1024)
+
+
+def _memory_text(gw: GatewayState, theme: Theme) -> Text:
+    """The heartbeat's memory sample; absent (non-Linux gateway) renders nothing."""
+    if not gw.memory_pressure:
+        return Text()
+    text = Text("\n  Memory: ", style=theme.ui_label)
+    text.append(
+        f"gateway RSS {_kib_label(gw.memory_rss_kib)}"
+        f"  available {_kib_label(gw.memory_available_kib)} of {_kib_label(gw.memory_total_kib)}"
+        f"  swap {_kib_label(gw.memory_swap_used_kib)}  ",
+        style=theme.banner_dim,
+    )
+    style = {"critical": theme.ui_error, "elevated": theme.ui_warn, "ok": theme.ui_ok}.get(
+        gw.memory_pressure, theme.banner_dim
+    )
+    text.append(f"pressure {sanitize_terminal_text(gw.memory_pressure)}", style=style)
+    return text
+
+
+def _backend_groups_text(gw: GatewayState, theme: Theme) -> Text:
+    """Backend heartbeat rows per ``profile@host`` from state.db, newest first.
+
+    The count is every row that group ever registered (crashed rows only age out
+    upstream), so ``live`` — the newest beat within three refreshes — is the part
+    that describes now.
+    """
+    if not gw.gateway_backend_groups:
+        return Text()
+    text = Text("\n  Backends: ", style=theme.ui_label)
+    for index, group in enumerate(gw.gateway_backend_groups):
+        if index:
+            text.append("  ·  ", style=theme.banner_dim)
+        label = f"{_text_or_dash(group.profile)}@{_text_or_dash(group.host)} {group.backends}"
+        text.append(label, style=theme.banner_text)
+        if group.live:
+            text.append(" live", style=theme.ui_ok)
+        text.append(
+            f" (beat {fmt_age_seconds(group.last_heartbeat_age_seconds)} ago)",
+            style=theme.banner_dim,
+        )
+    if gw.gateway_backend_groups_truncated:
+        text.append("  more groups not shown", style=theme.ui_warn)
+    return text
+
+
 def _restart_storm_text(gw: GatewayState, theme: Theme) -> Text:
     """Start-ledger facts; an absent ledger is never rendered as zero restarts.
 
@@ -366,6 +473,29 @@ def _restart_storm_text(gw: GatewayState, theme: Theme) -> Text:
     if gw.in_respawn_backoff:
         text.append(
             "  ⚠ respawn backoff (the supervisor pauses between restarts)",
+            style=theme.ui_warn,
+        )
+    return text
+
+
+def _restart_loop_text(gw: GatewayState, theme: Theme) -> Text:
+    """The auto-resume restart-loop breaker (gateway/restart_loop_guard.py).
+
+    Only boots that found restart-interrupted sessions are recorded; the chain is
+    evaluated at now, so a loop that went quiet reads as a zero chain.
+    """
+    text = Text("\n  Restart-loop breaker: ", style=theme.ui_label)
+    gap = fmt_age_seconds(gw.restart_loop_chain_gap_seconds)
+    cap = str(gw.restart_loop_max_restarts) if gw.restart_loop_max_restarts > 0 else "off"
+    text.append(
+        f"chain {gw.restart_loop_chain}/{cap} (gaps ≤ {gap})"
+        f"  last boot {fmt_age_seconds(gw.restart_loop_last_boot_age_seconds)} ago",
+        style=theme.banner_dim,
+    )
+    if gw.restart_loop_tripped:
+        text.append(
+            "\n    ⚠ TRIPPED — the next restart-interrupted boot skips auto-resume"
+            " (delete gateway/restart_loop.json if this is a false positive)",
             style=theme.ui_warn,
         )
     return text
@@ -408,10 +538,12 @@ def _append_compact_warnings(lines: Text, state: DashboardState, theme: Theme) -
         warnings.append("⚠ update unfinished")
     if gw.runtime_code_skew:
         warnings.append("⚠ code skew")
-    # A manifest proves an attempt began, never that it finished: warn whenever one
-    # exists and the live artifacts do not verify the topology it aimed at.
+    # A manifest on disk marks an unfinished migration: warn whenever one exists and
+    # the live artifacts do not verify the topology it aimed at.
     if state.migration.manifest_present and not state.migration.migration_verified:
-        warnings.append("⚠ migration unverified")
+        warnings.append("⚠ migration unfinished")
+    if gw.multiplex_standalone_reason and gw.multiplex_standalone_reason != _SINGLE_PROFILE_REASON:
+        warnings.append("⚠ standalone (not multiplexing)")
     preserved = sum(1 for p in gw.platforms if p.ownership is PlatformOwnership.PRESERVED)
     if preserved:
         warnings.append(f"⚠ {preserved} platform record(s) outlived their writer")
@@ -423,6 +555,18 @@ def _append_compact_warnings(lines: Text, state: DashboardState, theme: Theme) -
         warnings.append("⚠ suspected OOM")
     if gw.in_respawn_backoff:
         warnings.append("⚠ respawn backoff")
+    if gw.restart_loop_tripped:
+        warnings.append("⚠ restart loop")
+    if gw.restart_notice_pending:
+        warnings.append("⚠ restart notice owed")
+    if gw.serve_restart_pending_count:
+        warnings.append(f"⚠ {gw.serve_restart_pending_count} manual serve restart(s) pending")
+    if gw.dead_target_count:
+        warnings.append(f"⚠ {gw.dead_target_count} dead delivery target(s)")
+    if gw.memory_pressure in _HIGH_MEMORY_PRESSURE:
+        warnings.append(f"⚠ memory pressure {gw.memory_pressure}")
+    if gw.update_pending_manual_serve_count:
+        warnings.append(f"⚠ {gw.update_pending_manual_serve_count} manual serve restart(s) owed")
     if warnings:
         lines.append("\n  " + "  ".join(warnings), style=theme.ui_warn)
     if gw.pending_delivery_count or gw.failed_delivery_count:
@@ -444,8 +588,12 @@ def _liveness_text(gw: GatewayState, theme: Theme) -> Text:
         style=theme.banner_dim,
     )
     text.append_text(_witness_label(gw, theme))
+    text.append_text(_memory_text(gw, theme))
+    text.append_text(_backend_groups_text(gw, theme))
     if gw.gateway_starts_recorded:
         text.append_text(_restart_storm_text(gw, theme))
+    if gw.restart_loop_boots_recorded:
+        text.append_text(_restart_loop_text(gw, theme))
     text.append_text(_dashboard_client_text(gw, theme))
     text.append("\n  Code: ", style=theme.ui_label)
     text.append(_text_or_dash(gw.code_version), style=theme.banner_text)
@@ -550,7 +698,12 @@ def _forensic_files_text(gw: GatewayState, theme: Theme) -> Text:
 
 
 def _updates_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
-    if not (gw.last_update_outcome or gw.runtime_code_skew or gw.runtime_code_skew_source):
+    if not (
+        gw.last_update_outcome
+        or gw.runtime_code_skew
+        or gw.runtime_code_skew_source
+        or gw.update_history_failed
+    ):
         return []
     text = Text()
     text.append("\nUpdates\n", style=f"bold {theme.ui_label}")
@@ -563,6 +716,10 @@ def _updates_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
         f"  finished {fmt_age_seconds(gw.last_update_finished_age_seconds)} ago",
         style=theme.banner_dim,
     )
+    if gw.update_post_swap_pid is not None:
+        text.append(
+            f"  finished by post-swap pid {gw.update_post_swap_pid}", style=theme.banner_dim
+        )
     text.append("\n  Version: ", style=theme.ui_label)
     text.append(
         f"{_text_or_dash(gw.last_update_from_version)} → {_text_or_dash(gw.last_update_to_version)}",
@@ -575,7 +732,97 @@ def _updates_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
         )
     _append_fleet_evidence(text, gw, theme)
     _append_skew_verdict(text, gw, theme)
+    _append_receipt_followups(text, gw, theme)
+    _append_update_failure_history(text, gw, theme)
     return [text]
+
+
+def _append_update_failure_history(text: Text, gw: GatewayState, theme: Theme) -> None:
+    """Archived runs that never finished cleanly, newest first; latest.json is one of them."""
+    if not gw.update_history_failed:
+        return
+    text.append(
+        f"\n  Recent runs: {gw.update_history_failed} of the last {gw.update_history_scanned}"
+        " did not finish cleanly",
+        style=theme.ui_warn,
+    )
+    for run in gw.update_failures:
+        step = f"  failed step {sanitize_terminal_text(run.failed_step)}" if run.failed_step else ""
+        text.append(
+            f"\n    {_text_or_dash(run.outcome)}  {fmt_age_seconds(run.finished_age_seconds)} ago{step}",
+            style=theme.banner_dim,
+        )
+
+
+def _restart_backlog_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
+    """Restarts still owed: a planned restart's home-channel notice, manual serves."""
+    if not (gw.restart_notice_pending or gw.serve_restart_pending_count):
+        return []
+    text = Text()
+    text.append("\nRestart Backlog\n", style=f"bold {theme.ui_label}")
+    if gw.restart_notice_pending:
+        via = " (via service)" if gw.restart_notice_via_service else ""
+        via += " (detached)" if gw.restart_notice_detached else ""
+        text.append(
+            f"  Planned restart {fmt_age_seconds(gw.restart_notice_requested_age_seconds)} ago{via}:"
+            " back-online notice still owed to home channels"
+            f" ({gw.restart_notice_delivered_count} delivered)\n",
+            style=theme.ui_warn,
+        )
+    if gw.serve_restart_pending_count:
+        stale = (
+            f"  ({gw.serve_restart_stale_count} stale record(s) for processes already gone)"
+            if gw.serve_restart_stale_count
+            else ""
+        )
+        more = "  (directory listing truncated)" if gw.serve_restart_scan_truncated else ""
+        text.append(
+            f"  Manual serve restarts owed: {gw.serve_restart_pending_count}{stale}{more}\n",
+            style=theme.ui_warn,
+        )
+        for obligation in gw.serve_restart_pending:
+            unverified = "" if obligation.verified else " (identity unverified)"
+            text.append(
+                f"    {_text_or_dash(obligation.kind)} {_text_or_dash(obligation.profile)}"
+                f" pid {obligation.pid}{unverified}\n",
+                style=theme.banner_dim,
+            )
+        text.append(
+            "    relaunch `hermes serve` / `hermes dashboard` to pick up the updated code\n",
+            style=theme.banner_dim,
+        )
+    return [text]
+
+
+def _append_receipt_followups(text: Text, gw: GatewayState, theme: Theme) -> None:
+    """What the receipt recorded after the pull: restarts, owed serves, skips, settling."""
+    if gw.update_fleet_external_roots:
+        roots = ", ".join(sanitize_terminal_text(root) for root in gw.update_fleet_external_roots)
+        text.append(f"\n  External checkouts (not skew): {roots}", style=theme.banner_dim)
+    if gw.update_runtime_outcomes:
+        outcomes = "  ".join(
+            f"{sanitize_terminal_text(outcome)} {count}"
+            for outcome, count in sorted(gw.update_runtime_outcomes.items())
+        )
+        troubled = any(key in gw.update_runtime_outcomes for key in ("failed", "unaccounted"))
+        text.append(
+            f"\n  Runtime restarts: {outcomes}",
+            style=theme.ui_warn if troubled else theme.banner_dim,
+        )
+    if gw.update_pending_manual_serve_count:
+        text.append(
+            f"\n  ⚠ {gw.update_pending_manual_serve_count} manual serve restart(s) still owed"
+            " (relaunch `hermes serve` / `hermes dashboard`)",
+            style=theme.ui_warn,
+        )
+    if gw.update_skip_count:
+        names = ", ".join(sanitize_terminal_text(name) for name in gw.update_skip_names)
+        more = gw.update_skip_count - len(gw.update_skip_names)
+        suffix = f" (+{more} more)" if more > 0 else ""
+        text.append(f"\n  Skipped: {names or '—'}{suffix}", style=theme.banner_dim)
+    if gw.update_settled_from_live_fleet_age_seconds is not None:
+        age = fmt_age_seconds(gw.update_settled_from_live_fleet_age_seconds)
+        text.append(f"\n  settled from the live fleet {age} ago", style=theme.ui_ok)
 
 
 def _append_fleet_evidence(text: Text, gw: GatewayState, theme: Theme) -> None:
@@ -611,16 +858,17 @@ def _append_skew_verdict(text: Text, gw: GatewayState, theme: Theme) -> None:
 def _migration_section(mig: MigrationState, theme: Theme) -> list[RenderableType]:
     """The multiplex-migration manifest, kept strictly separate from a success claim.
 
-    Upstream writes ``gateway_migration.json`` *before* it flips
-    ``gateway.multiplex_profiles`` and restarts the default gateway, and never
-    updates it afterwards, so the file records that an attempt began and nothing
-    about how it ended. This section therefore shows three separate things: the
-    recorded intent, the intermediate progress hermesd can re-read, and one verdict
-    that is only ever "multiplexed (verified)" when the live artifacts cover the
-    recorded set. The words "migrated" and "migration complete" are deliberately
-    absent from every branch.
+    Upstream writes ``gateway_migration.json`` once, before its first destructive
+    step, and deletes it only when the apply confirms the default gateway serves
+    every profile (``hermes_cli/gateway_migrate.py:967-973``) or the failed-apply
+    compensator restores a gateway. A manifest on disk therefore marks an
+    UNFINISHED migration that ``hermes gateway migrate --multiplex`` resumes. This
+    section shows three separate things: the recorded intent, the intermediate
+    progress hermesd can re-read, and one verdict that is only ever
+    "multiplexed (verified)" when the live artifacts cover the recorded set. The
+    words "migrated" and "migration complete" are deliberately absent.
     """
-    if not (mig.manifest_present or mig.multiplex_flag_on):
+    if not (mig.manifest_present or mig.multiplex_flag_on or mig.multiplex_flag_retired_off):
         return []
     text = Text()
     text.append("\nMultiplex Migration\n", style=f"bold {theme.ui_label}")
@@ -639,23 +887,21 @@ def _append_migration_verdict(text: Text, mig: MigrationState, theme: Theme) -> 
         text.append("  ● ", style=f"bold {theme.ui_ok}")
         text.append("multiplexed (verified)", style=theme.ui_ok)
         text.append(
-            "\n    against gateway.multiplex_profiles as recorded in config and the"
-            " live served-profile record\n",
+            "\n    the live served-profile record covers every recorded profile; the"
+            " manifest is still on disk (upstream removes it only when an apply"
+            " confirms convergence)\n",
             style=theme.banner_dim,
         )
         return
     if not mig.manifest_present:
-        # No manifest: never migrated, or rolled back — the two are indistinguishable
-        # because rollback deletes the file. Nothing here was ever an attempt.
-        text.append(
-            f"  multiplexing is on as recorded in config; {_migration_gap_sentence(mig)}\n",
-            style=theme.banner_dim,
-        )
+        # No manifest: never migrated, converged, or compensated — upstream deletes
+        # the file in the last two cases, so the three are indistinguishable.
+        text.append(f"  {_migration_gap_sentence(mig)}\n", style=theme.banner_dim)
         return
     text.append("  ⚠ ", style=f"bold {theme.ui_warn}")
-    text.append("migration unverified", style=theme.ui_warn)
+    text.append("migration unfinished", style=theme.ui_warn)
     text.append(
-        f"\n    not verified: {_migration_gap_sentence(mig)}\n",
+        f"\n    resume with `{_MIGRATE_COMMAND}`; not verified: {_migration_gap_sentence(mig)}\n",
         style=theme.banner_dim,
     )
 
@@ -667,8 +913,6 @@ def _migration_gap_sentence(mig: MigrationState) -> str:
         return "gateway_migration.json is present but unreadable"
     if gap is MigrationVerificationGap.MANIFEST_INVALID:
         return "the manifest schema is malformed or unsupported"
-    if gap is MigrationVerificationGap.FLAG_OFF:
-        return "gateway.multiplex_profiles is off as recorded in config"
     if gap is MigrationVerificationGap.GATEWAY_NOT_LIVE:
         return "the default gateway is not live"
     if gap is MigrationVerificationGap.SERVED_NOT_RECORDED:
@@ -683,12 +927,12 @@ def _migration_gap_sentence(mig: MigrationState) -> str:
         # profile names instead of escaping them.
         names = ", ".join(sanitize_terminal_text(name) for name in mig.unserved_profiles)
         return f"not in the live served set: {names}"
-    return "no migration manifest recorded"
+    return "no migration manifest recorded (none pending)"
 
 
 def _append_migration_intent(text: Text, mig: MigrationState, theme: Theme) -> None:
     """What the manifest recorded, with ``migrated_at`` labelled as a start."""
-    if not mig.manifest_parsed:
+    if mig.manifest_present and not mig.manifest_parsed:
         text.append(
             "  Recorded: gateway_migration.json could not be parsed this pass",
             style=theme.ui_warn,
@@ -706,15 +950,31 @@ def _append_migration_intent(text: Text, mig: MigrationState, theme: Theme) -> N
         )
         text.append(suffix, style=theme.banner_dim)
     text.append("\n  Config flag: ", style=theme.ui_label)
-    text.append(
-        f"gateway.multiplex_profiles {'on' if mig.multiplex_flag_on else 'off'}",
-        style=theme.banner_text,
+    text.append(_multiplex_flag_label(mig), style=theme.banner_text)
+    recorded = (
+        f" (manifest recorded {'on' if mig.flag_was else 'off'})" if mig.manifest_parsed else ""
     )
     text.append(
-        f" (manifest recorded {'on' if mig.flag_was else 'off'})"
-        " — as recorded in config, an env override is invisible here",
+        f"{recorded} — as recorded in config, an env override is invisible here",
         style=theme.banner_dim,
     )
+
+
+def _multiplex_flag_label(mig: MigrationState) -> str:
+    """The flag in upstream's multiplex-only vocabulary; ``false`` is no opt-out.
+
+    ``hermes_cli/gateway_multiplex_mode.py:161-191``: an explicit ``true`` is never
+    second-guessed, an unset key is the default (on) the gateway settles at boot,
+    and an explicit ``false`` is retired — logged and resolved like an unset key.
+    """
+    if mig.multiplex_flag_on:
+        return "gateway.multiplex_profiles true (explicit)"
+    if mig.multiplex_flag_retired_off:
+        return (
+            "gateway.multiplex_profiles false — retired / ignored: one gateway per host"
+            " serves every profile"
+        )
+    return "gateway.multiplex_profiles unset — default on, settled by the gateway at boot"
 
 
 def _append_migration_progress(text: Text, mig: MigrationState, theme: Theme) -> None:
@@ -773,9 +1033,34 @@ def _coverage_label(record: MigrationProfileRecord, recorded: bool, theme: Theme
     return Text("not served", style=theme.ui_warn)
 
 
+def _dead_targets_text(gw: GatewayState, theme: Theme) -> Text:
+    """Chats delivery stopped sending to (gateway/dead_targets.json); ids never shown."""
+    text = Text()
+    text.append(f"\nDead delivery targets: {gw.dead_target_count}", style=f"bold {theme.ui_warn}")
+    platforms = "  ".join(
+        f"{sanitize_terminal_text(name)} {count}"
+        for name, count in sorted(gw.dead_target_platforms.items())
+    )
+    text.append(f"  {platforms}", style=theme.ui_warn)
+    text.append(
+        "\n  skipped until a send to them succeeds again (bot kicked, chat deleted)",
+        style=theme.banner_dim,
+    )
+    for target in gw.dead_targets:
+        text.append(f"\n  {sanitize_terminal_text(target.platform)}", style=theme.ui_label)
+        text.append(f"  {_text_or_dash(target.reason)}", style=theme.banner_text)
+        if target.age_seconds is not None:
+            text.append(f"  {fmt_age_seconds(target.age_seconds)} ago", style=theme.banner_dim)
+    text.append("\n")
+    return text
+
+
 def _deliveries_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
+    sections: list[RenderableType] = []
+    if gw.dead_target_count:
+        sections.append(_dead_targets_text(gw, theme))
     if not gw.pending_deliveries:
-        return []
+        return sections
     header = Text()
     header.append("\nDelivery Obligations\n", style=f"bold {theme.ui_label}")
     header.append(
@@ -796,7 +1081,7 @@ def _deliveries_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
             fmt_age_seconds(entry.age_seconds),
             _or_dash(entry.last_error),
         )
-    return [header, table]
+    return [*sections, header, table]
 
 
 def _append_drain(header: Text, gw: GatewayState, theme: Theme) -> None:

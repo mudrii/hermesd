@@ -1,36 +1,39 @@
-"""``gateway_migration.json``: recorded migration intent, never proof of success.
+"""``gateway_migration.json``: the record of an UNFINISHED migration, never a success.
 
 Upstream is ``hermes_cli/gateway_migrate.py``. The manifest lives at
-``<DEFAULT profile home>/gateway_migration.json`` (``MANIFEST_NAME`` ``:25``,
-``_manifest_path`` ``:467-468``) — always the default home, never a secondary's —
-and ``_write_manifest`` (``:482-483``) writes it with a plain ``write_text``, so the
-write is **not atomic** and hermesd can observe a torn file.
+``<DEFAULT profile home>/gateway_migration.json`` (``MANIFEST_NAME`` ``:37``,
+``_manifest_path`` ``:741-742``, home from ``_default_home`` ``:212-214``) — always
+the default home, never a secondary's. ``_write_manifest`` (``:769-772``) writes it
+through ``atomic_json_write``, so a torn file is no longer an upstream shape; a
+malformed one is hand-edited or foreign and is still reported as present-but-unparsed.
 
-Shape (built at ``:528-533``; ``ProfileGateway.to_dict()`` at ``:55-59``)::
+Shape (built at ``:945-950``; ``ProfileGateway.to_dict()`` at ``:78-85``)::
 
     version: int = 1
     migrated_at: str   time.strftime("%Y-%m-%dT%H:%M:%S%z")  <- LOCAL time, and the
                                                                  offset has no colon
-    flag_was: bool     the gateway.multiplex_profiles value to restore
-    default: {profile, home, pid, service: {kind, system}|null}
+    flag_was: bool     the explicit gateway.multiplex_profiles opt-in before the run
+    default: {profile, home, pid, service: {kind, system}|null, services, ...}
     secondaries: [ {same shape} ]        <- standalone_secondaries only
 
-The load-bearing fact is *when* it is written: inside the per-secondary loop at
-``:543-544``, before ``_write_multiplex_flag`` (``:545``) and before
-``_restart_default`` (``:549``); rewritten byte-identically at ``:546``; and never
-touched again — neither the success path (``:553-557``) nor the unverified path
-(``:558-561``) writes it, and there is no ``completed``/``verified``/``outcome``
-field. So ``migrated_at`` means "the attempt began at", and a manifest on disk is
-indistinguishable between mid-flight, crashed after one secondary,
-applied-but-unverified and fully verified. ``rollback_migration`` (``:564-610``)
-deletes it on success, so absence means "never migrated OR successfully rolled
-back" — also indistinguishable.
+It is written once, before the first destructive step (``:953``, ahead of the flag
+write at ``:955`` and the restart at ``:958``), and never rewritten. It is deleted
+when the apply *confirms* the default gateway serves every profile (``:967-973``:
+"Manifest present == migration UNFINISHED") and when the failed-apply compensator
+brings one gateway back (``:1059``, ``:1087``). There is no ``--standalone`` command
+and no user-facing rollback any more (``:10-14``); re-running
+``hermes gateway migrate --multiplex`` resumes from the manifest. So a manifest on
+disk means "unfinished — resume", and absence means "never migrated, converged, or
+compensated" — indistinguishable.
 
-Everything here is therefore *recorded intent*. The verified verdict lives in
-``MigrationState.migration_verified`` and is computed only from artifacts hermesd
-can read. This module resolves no path at all: it takes already-loaded JSON, so a
-recorded ``home`` value can never become a filesystem target (upstream's rollback
-does build ``Path(rec["home"])`` from it, at ``:594``).
+The one exception is a manifest left behind by a run that never saw convergence
+confirmed while a later boot converged anyway: ``already_multiplexed`` (``:130-139``)
+then short-circuits without deleting it. The verified verdict is therefore computed
+only from artifacts hermesd can read (``MigrationState.migration_verified``), and a
+verified topology with a manifest still on disk is reported as exactly that.
+
+This module resolves no path at all: it takes already-loaded JSON, so a recorded
+``home`` value can never become a filesystem target.
 
 ``migrated_at`` is the only local-time stamp hermesd reads; every other source
 writes UTC (``Z`` or ``+00:00``). ``_iso_to_epoch`` still parses it because
@@ -63,21 +66,36 @@ _MANIFEST_SECONDARY_LIMIT = 32
 # A recorded home is display data only: collapse whitespace and cap the length like
 # every other string taken from an untrusted file.
 _RECORDED_HOME_CHARS = 200
+# Upstream's falsy config tokens (``_FALSY_STRINGS``, gateway/config.py:27); every
+# other string, recognised truthy or not, is an explicit opt-in.
+_FALSY_TOKENS = frozenset({"0", "false", "no", "off"})
+
+
+def _explicit_multiplex_flag(cfg: JsonMapping) -> bool | None:
+    """The operator's explicit ``gateway.multiplex_profiles`` as recorded in config.
+
+    Mirrors ``explicit_multiplex_flag`` (``hermes_cli/gateway_multiplex_mode.py:49-72``)
+    minus its ``GATEWAY_MULTIPLEX_PROFILES`` override, which hermesd cannot see: the
+    top-level alias wins whenever it is present, else the nested key; a string is a
+    token (``gateway/config.py:26-33``) and an unrecognised one counts as ``True``;
+    anything else is truthiness. ``None`` means unset — the default (on) that the
+    gateway settles at boot.
+    """
+    gateway_section = cfg.get("gateway")
+    value = cfg.get("multiplex_profiles")
+    if value is None and isinstance(gateway_section, dict):
+        value = gateway_section.get("multiplex_profiles")
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip().lower() not in _FALSY_TOKENS
+    return bool(value)
 
 
 def _multiplex_flag_on(cfg: JsonMapping) -> bool:
-    """``gateway.multiplex_profiles`` as recorded in config, mirroring upstream's reader.
-
-    ``_read_multiplex_flag`` (``gateway_migrate.py:203-215``) consults an environment
-    override hermesd cannot see, then returns ``cfg.get("multiplex_profiles") or
-    gateway_section.get("multiplex_profiles")`` — ORing a stale top-level alias with
-    the nested key. hermesd matches the *reader*, not ``_write_multiplex_flag``
-    (``:217-228``), which pops the alias, so a leftover top-level True still counts
-    as on. Because the env override is invisible from here, this value is only ever
-    reported "as recorded in config".
-    """
-    gateway_section = _as_dict(cfg.get("gateway"))
-    return bool(cfg.get("multiplex_profiles") or gateway_section.get("multiplex_profiles"))
+    """The explicit opt-in only, as upstream's ``_read_multiplex_flag`` reads it
+    (``gateway_migrate.py:335-340``)."""
+    return _explicit_multiplex_flag(cfg) is True
 
 
 def _recorded_home(value: object) -> str:
@@ -102,7 +120,7 @@ def _profile_record(
         home=_recorded_home(info.get("home")),
         service_kind=str(service.get("kind") or ""),
         # The manifest is machine-written with real booleans
-        # (``gateway_migrate.py:58,588``).
+        # (``_service_dict``, ``gateway_migrate.py:95-96``).
         service_system=_coerce_bool(service.get("system")),
         served=profile in covered,
     )
@@ -138,16 +156,21 @@ def _migration_state(
     """Recorded intent from ``manifest`` judged against the live gateway and config.
 
     ``manifest`` is the already-loaded file: an empty mapping means the file exists
-    but could not be parsed (a torn write), which is reported as present-and-unparsed
-    rather than as no migration at all.
+    but could not be parsed (hand-edited or foreign), which is reported as
+    present-and-unparsed rather than as no migration at all.
     """
-    flag_on = _multiplex_flag_on(cfg)
+    explicit_flag = _explicit_multiplex_flag(cfg)
+    flag_on = explicit_flag is True
+    # Retired: parsed, logged and resolved like an unset key at boot
+    # (hermes_cli/gateway_multiplex_mode.py:161-191, RETIRED_OPT_OUT_REASON :43-46).
+    retired_off = explicit_flag is False
     gateway_live = gateway.running
     served_recorded = gateway.served_profiles_recorded
     if not manifest:
         return MigrationState(
             manifest_present=True,
             multiplex_flag_on=flag_on,
+            multiplex_flag_retired_off=retired_off,
             default_gateway_live=gateway_live,
             served_recorded=served_recorded,
         )
@@ -170,6 +193,7 @@ def _migration_state(
         secondary_count=len(raw_secondaries),
         secondaries_truncated=len(raw_secondaries) > len(retained),
         multiplex_flag_on=flag_on,
+        multiplex_flag_retired_off=retired_off,
         default_gateway_live=gateway_live,
         served_recorded=served_recorded,
     )

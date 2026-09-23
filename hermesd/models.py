@@ -182,10 +182,62 @@ class DeliveryObligationSummary(BaseModel):
     last_error: str = ""
 
 
+class GatewayBackendGroup(BaseModel):
+    """``gateway_heartbeats`` rows for one (profile, host): how many backends ever
+    registered there, and how fresh the newest one is. ``live`` means the newest
+    beat is within three 60 s refreshes; crashed rows only age out upstream."""
+
+    profile: str = ""
+    host: str = ""
+    backends: int = 0
+    last_heartbeat_age_seconds: float | None = None
+    newest_start_age_seconds: float | None = None
+    live: bool = False
+
+
+class ServeRestartObligation(BaseModel):
+    """A manual ``hermes serve``/``dashboard`` an update could not restart.
+
+    ``verified`` is True when this host observed the recorded incarnation's start
+    time; False when the pid is alive but its identity could not be checked.
+    """
+
+    kind: str = ""
+    profile: str = ""
+    pid: int = 0
+    verified: bool = False
+
+
+class UpdateReceiptSummary(BaseModel):
+    """One archived update run that never reached a clean finish."""
+
+    outcome: str = ""
+    finished_age_seconds: float | None = None
+    failed_step: str = ""
+
+
+class DeadTargetSummary(BaseModel):
+    """One confirmed-unreachable delivery target. The chat id is never read out."""
+
+    platform: str = ""
+    reason: str = ""
+    age_seconds: float | None = None
+
+
 class GatewayState(BaseModel):
     pid: int = 0
+    # Live and serving: the recorded ``gateway_state`` is ``running`` or ``degraded``
+    # (upstream's ``_DRAINABLE_GATEWAY_STATES``, gateway/status.py:1207-1209) and the
+    # recorded or launchd PID is alive.
     running: bool = False
+    # The recorded ``gateway_state`` verbatim. ``degraded`` is a serving gateway with a
+    # parked platform (gateway/run_startup.py:56-59), not a stopped one.
     state: str = "unknown"
+    # A dead gateway whose last record is the watchdog's ``degraded`` stamp with an
+    # ``exit_reason`` in upstream's ``WATCHDOG_EXIT_REASONS`` (gateway/status.py:362-385):
+    # the loop stopped dispatching and the watchdog hard-exited it. Empty otherwise,
+    # including once the operator recorded ``desired_state: stopped``.
+    watchdog_exit_reason: str = ""
     platforms: list[PlatformStatus] = Field(default_factory=list)
     hermes_version: str = ""
     updates_behind: int = 0
@@ -206,11 +258,25 @@ class GatewayState(BaseModel):
     # distinguishable from "no live record" — while ``served_profiles`` still keeps
     # the names a dead gateway left behind, as preserved rather than current.
     served_profiles_recorded: bool = False
+    # Why the live gateway stayed standalone instead of multiplexing: the boot
+    # guard's reason, persisted by ``record_multiplex_decision``
+    # (hermes_cli/gateway_multiplex_mode.py:194-199) and cleared on any other
+    # verdict. Redacted and capped; empty unless the state-file writer is live.
+    multiplex_standalone_reason: str = ""
     scale_to_zero_idle_timeout_minutes: int = 0
     scale_to_zero_relay_only: bool = False
     # Event-loop liveness (state/gateway.heartbeat)
     heartbeat_age_seconds: float | None = None
     loop_health: GatewayLoopHealth = GatewayLoopHealth.UNKNOWN
+    # The heartbeat's ``mem`` block in KiB (Linux-only upstream, absent elsewhere):
+    # gateway RSS, system MemTotal/MemAvailable and swap in use. ``memory_pressure``
+    # is upstream's tier (ok/elevated/critical) for a fresh sample, "unknown" for a
+    # stale or malformed one, and empty when no block was written.
+    memory_rss_kib: int | None = None
+    memory_total_kib: int | None = None
+    memory_available_kib: int | None = None
+    memory_swap_used_kib: int | None = None
+    memory_pressure: str = ""
     # Witness armed on the heartbeat that produced loop_health: True when the
     # payload advertised ``loop_tick_socket`` truthy, False when it wrote the key
     # with any other value (the witness could not be armed), and None when the
@@ -278,6 +344,19 @@ class GatewayState(BaseModel):
     update_receipt_unfinished: bool = False
     update_fleet_states: dict[str, int] = Field(default_factory=dict)
     update_fleet_runtime_count: int = 0
+    # ``code_root`` of fleet rows in state ``external``: runtimes serving a checkout
+    # the update did not touch, never counted as skew. Bounded and redacted.
+    update_fleet_external_roots: list[str] = Field(default_factory=list)
+    # The interpreter that finished the run after the code swap, if it re-execed.
+    update_post_swap_pid: int | None = None
+    # Manual ``hermes serve``/``dashboard`` restarts the receipt still owed.
+    update_pending_manual_serve_count: int = 0
+    # Set once a later check saw the whole live fleet current and settled latest.json.
+    update_settled_from_live_fleet_age_seconds: float | None = None
+    # Per-runtime restart outcomes (restarted/stopped/failed/deferred/unaccounted).
+    update_runtime_outcomes: dict[str, int] = Field(default_factory=dict)
+    update_skip_count: int = 0
+    update_skip_names: list[str] = Field(default_factory=list)
     # Restart history and delivery obligations (state.db)
     gateway_incarnation_count: int = 0
     gateway_restarts_24h: int = 0
@@ -285,25 +364,67 @@ class GatewayState(BaseModel):
     pending_delivery_count: int = 0
     failed_delivery_count: int = 0
     pending_deliveries: list[DeliveryObligationSummary] = Field(default_factory=list)
+    # Backend heartbeats (state.db gateway_heartbeats) grouped by profile and host,
+    # newest beat first and bounded.
+    gateway_backend_groups: list[GatewayBackendGroup] = Field(default_factory=list)
+    gateway_backend_groups_truncated: bool = False
+    # Planned-restart back-online notice still owed to home channels
+    # (.restart_pending.json, per profile). Pending is not "not restarted": the
+    # file outlives the restart until every home channel was notified.
+    restart_notice_pending: bool = False
+    restart_notice_requested_age_seconds: float | None = None
+    restart_notice_via_service: bool = False
+    restart_notice_detached: bool = False
+    restart_notice_delivered_count: int = 0
+    # Manual serve restarts an update still owes (serve_restart_pending/, per
+    # profile); only incarnations not provably gone are counted.
+    serve_restart_pending_count: int = 0
+    serve_restart_stale_count: int = 0
+    serve_restart_pending: list[ServeRestartObligation] = Field(default_factory=list)
+    serve_restart_scan_truncated: bool = False
+    # Archived update receipts (logs/update_receipts/update_*.json): how many of
+    # the newest runs were read, how many never finished cleanly, the newest few.
+    update_history_scanned: int = 0
+    update_history_failed: int = 0
+    update_failures: list[UpdateReceiptSummary] = Field(default_factory=list)
+    # Dead delivery targets (gateway/dead_targets.json, per profile): chats the
+    # gateway stopped sending to until a send succeeds. Newest few only.
+    dead_target_count: int = 0
+    dead_target_platforms: dict[str, int] = Field(default_factory=dict)
+    dead_targets: list[DeadTargetSummary] = Field(default_factory=list)
+    # Restart-loop breaker (gateway/restart_loop.json, per profile): boots that
+    # found restart-interrupted sessions, and the chain ending now. Tripped means
+    # the next such boot skips auto-resume.
+    restart_loop_boots_recorded: int = 0
+    restart_loop_chain: int = 0
+    restart_loop_max_restarts: int = 0
+    restart_loop_chain_gap_seconds: float = 0.0
+    restart_loop_tripped: bool = False
+    restart_loop_last_boot_age_seconds: float | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def degraded(self) -> bool:
+        """Serving, but a configured platform is parked or retrying."""
+        return self.running and self.state == "degraded"
 
 
 class MigrationVerificationGap(StrEnum):
     """Which clause of the verified predicate hermesd could not satisfy.
 
     ``NONE`` is the only value that licenses a "multiplexed (verified)" claim.
-    Every other value names *missing evidence*, never an outcome: upstream writes
-    the manifest before it flips the multiplex flag and restarts the default
-    gateway, and never updates it afterwards, so the file cannot tell a migration
-    still in flight from one that was applied and never verified — and neither can
-    hermesd. ``NO_MANIFEST`` is likewise ambiguous: rollback deletes the manifest on
-    success, so absence means "never migrated OR successfully rolled back".
+    Every other value names *missing evidence*, never an outcome. Convergence is
+    TOPOLOGY, not a config flag (``hermes_cli/gateway_migrate.py:1-8,130-139``), so
+    the multiplex flag is not a clause: an explicit ``false`` is retired and ignored
+    at boot. ``NO_MANIFEST`` is ambiguous: upstream deletes the manifest on confirmed
+    convergence and after a successful compensation, so absence means "never
+    migrated, converged, or compensated".
     """
 
     NONE = ""
     NO_MANIFEST = "no_manifest"
     MANIFEST_UNREADABLE = "manifest_unreadable"
     MANIFEST_INVALID = "manifest_invalid"
-    FLAG_OFF = "flag_off"
     GATEWAY_NOT_LIVE = "gateway_not_live"
     SERVED_NOT_RECORDED = "served_not_recorded"
     PROFILES_UNSERVED = "profiles_unserved"
@@ -313,9 +434,8 @@ class MigrationVerificationGap(StrEnum):
 class MigrationProfileRecord(BaseModel):
     """One profile's standalone-gateway footprint as recorded in the manifest.
 
-    ``home`` is display data that hermesd never resolves: upstream's rollback builds
-    ``Path(rec["home"])`` straight from this file (``gateway_migrate.py:594``), and
-    an untrusted manifest must not be able to steer a hermesd read. ``served`` is
+    ``home`` is display data that hermesd never resolves: an untrusted manifest must
+    not be able to steer a hermesd read. ``served`` is
     coverage by the *live* default gateway's recorded ``served_profiles``, so it is
     always False when nothing live was recorded.
     """
@@ -329,7 +449,7 @@ class MigrationProfileRecord(BaseModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def service_label(self) -> str:
-        """Upstream's own ``ProfileGateway.service_label()`` wording (``:48-52``)."""
+        """Upstream's ``_service_label`` wording (``gateway_migrate.py:88-92``)."""
         if not self.service_kind:
             return "none"
         if self.service_kind == "systemd":
@@ -338,30 +458,33 @@ class MigrationProfileRecord(BaseModel):
 
 
 class MigrationState(BaseModel):
-    """``gateway_migration.json``: recorded intent, progress, and one verified verdict.
+    """``gateway_migration.json``: an unfinished migration, its progress, one verdict.
 
-    Three things are kept apart on purpose, because the manifest conflates them:
+    Three things are kept apart on purpose:
 
     * **recorded intent** — the manifest contents. ``migrated_at`` means "the attempt
-      began at": upstream builds the dict and writes it *inside* the per-secondary
-      loop (``gateway_migrate.py:528-544``), before ``_write_multiplex_flag``
-      (``:545``) and before ``_restart_default`` (``:549``), rewrites it
-      byte-identically at ``:546``, and then never touches it again on either the
-      verified (``:553-557``) or the unverified (``:558-561``) path. There is no
-      ``completed``/``verified``/``outcome`` field, so the file is a start marker.
+      began at": upstream writes the dict once, before the first destructive step
+      (``gateway_migrate.py:945-953``), and never rewrites it. It deletes the file
+      when the apply confirms the default gateway serves every profile
+      (``:967-973``) and after a successful compensation (``:1059``, ``:1087``), so a
+      manifest on disk means the migration is UNFINISHED; re-running
+      ``hermes gateway migrate --multiplex`` resumes from it.
     * **intermediate progress** — ``flag_flipped``, ``default_gateway_live``,
       ``served_recorded`` and each record's ``served``: re-read every pass, and each
       one true of a migration that crashed halfway.
     * **verified current topology** — ``migration_verified``, derived from a
-      predicate over artifacts hermesd can actually read.
+      predicate over artifacts hermesd can actually read. A verified topology can
+      still leave a manifest behind (``already_multiplexed`` short-circuits without
+      deleting it, ``:130-139``).
 
-    ``multiplex_flag_on`` mirrors upstream's *reader* (``:203-215``), which ORs a
-    stale top-level ``multiplex_profiles`` alias with ``gateway.multiplex_profiles``
-    after an environment override hermesd cannot see — so every verdict built on it
-    is labelled "as recorded in config".
+    ``multiplex_flag_on`` is the explicit opt-in as upstream's
+    ``explicit_multiplex_flag`` reads it (``gateway_multiplex_mode.py:49-72``), minus
+    an environment override hermesd cannot see — so it is labelled "as recorded in
+    config". ``multiplex_flag_retired_off`` is an explicit ``false``, which is retired:
+    parsed, logged and resolved like an unset key (``:161-191``).
 
     Known limit: upstream verifies against every profile in its plan
-    (``expected = {p.name for p in plan.profiles}``, ``:551-552``), which includes
+    (``expected = {p.name for p in plan.profiles}``, ``:967``), which includes
     profiles that never had a standalone gateway and so are *not* in the manifest.
     hermesd can only see the manifest, so its expected set is a subset of upstream's
     and its verdict is correspondingly weaker.
@@ -369,8 +492,8 @@ class MigrationState(BaseModel):
 
     # Recorded intent (the manifest, never rewritten after the attempt began)
     manifest_present: bool = False
-    # A present manifest hermesd could not parse: upstream writes it with a plain
-    # write_text, so a torn file is observable mid-write. Distinct from absent.
+    # A present manifest hermesd could not parse (upstream writes it atomically, so
+    # this is a hand-edited or foreign file). Distinct from absent.
     manifest_parsed: bool = False
     # Parsed JSON can still be an unsupported or malformed migration schema.
     # Its intent remains displayable, but it cannot license a verified verdict.
@@ -385,6 +508,7 @@ class MigrationState(BaseModel):
     secondaries_truncated: bool = False
     # Intermediate progress, re-read every pass
     multiplex_flag_on: bool = False
+    multiplex_flag_retired_off: bool = False
     default_gateway_live: bool = False
     served_recorded: bool = False
 
@@ -421,8 +545,6 @@ class MigrationState(BaseModel):
             return MigrationVerificationGap.MANIFEST_UNREADABLE
         if not self.manifest_schema_valid:
             return MigrationVerificationGap.MANIFEST_INVALID
-        if not self.multiplex_flag_on:
-            return MigrationVerificationGap.FLAG_OFF
         if not self.default_gateway_live:
             return MigrationVerificationGap.GATEWAY_NOT_LIVE
         if not self.served_recorded:

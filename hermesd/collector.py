@@ -126,25 +126,40 @@ from hermesd.collect.curator import (
 from hermesd.collect.desktop_plugins import read_desktop_plugins
 from hermesd.collect.gateway import (
     _LOOP_TICK_SILENCE_STRIKES,
+    _claims_serving,
     _config_generation,
     _config_stale,
     _dashboard_client_status,
+    _dead_target_fields,
+    _dead_target_rows,
     _default_loop_tick_probe,
     _gateway_ledger_fields,
     _gateway_start_epoch,
     _GatewayLedgerRows,
     _heartbeat_liveness,
+    _heartbeat_memory,
     _lifecycle_status,
     _loop_tick_probe_plan,
     _loop_tick_verdict,
+    _multiplex_standalone_reason,
     _platform_status,
     _read_exit_diag,
     _read_forensic_companions,
     _read_gateway_ledger_rows,
     _read_start_storm,
+    _receipt_history_row,
     _record_writer,
     _respawn_storm_policy,
+    _restart_loop_fields,
+    _restart_loop_policy,
+    _restart_notice_fields,
+    _serve_obligation_fields,
+    _serve_obligation_paths,
+    _serve_obligation_row,
+    _update_history_fields,
+    _update_history_paths,
     _update_receipt_status,
+    _watchdog_exit_reason,
 )
 from hermesd.collect.hosted_rooms import _read_hosted_rooms
 from hermesd.collect.integrations import (
@@ -425,7 +440,15 @@ def _state_db_readout(conn: sqlite3.Connection) -> _StateDbReadout:
 
 # Fields each gateway sub-source owns, used to restore just that source's
 # values from the last good state when it fails.
-_HEARTBEAT_FIELDS = ("heartbeat_age_seconds", "loop_health")
+_HEARTBEAT_FIELDS = (
+    "heartbeat_age_seconds",
+    "loop_health",
+    "memory_rss_kib",
+    "memory_total_kib",
+    "memory_available_kib",
+    "memory_swap_used_kib",
+    "memory_pressure",
+)
 # The probe refines the same verdict the heartbeat ages into, plus the armed stamp.
 _LOOP_TICK_FIELDS = ("loop_health", "loop_tick_armed")
 # Upper bound on runtime/active_sessions.json entries turned into surfaces. Each
@@ -586,6 +609,36 @@ _UPDATE_RECEIPT_FIELDS = (
     "update_receipt_unfinished",
     "update_fleet_states",
     "update_fleet_runtime_count",
+    "update_fleet_external_roots",
+    "update_post_swap_pid",
+    "update_pending_manual_serve_count",
+    "update_settled_from_live_fleet_age_seconds",
+    "update_runtime_outcomes",
+    "update_skip_count",
+    "update_skip_names",
+)
+_RESTART_NOTICE_FIELDS = (
+    "restart_notice_pending",
+    "restart_notice_requested_age_seconds",
+    "restart_notice_via_service",
+    "restart_notice_detached",
+    "restart_notice_delivered_count",
+)
+_SERVE_OBLIGATION_FIELDS = (
+    "serve_restart_pending_count",
+    "serve_restart_stale_count",
+    "serve_restart_pending",
+    "serve_restart_scan_truncated",
+)
+_UPDATE_HISTORY_FIELDS = ("update_history_scanned", "update_history_failed", "update_failures")
+_DEAD_TARGET_FIELDS = ("dead_target_count", "dead_target_platforms", "dead_targets")
+_RESTART_LOOP_FIELDS = (
+    "restart_loop_boots_recorded",
+    "restart_loop_chain",
+    "restart_loop_max_restarts",
+    "restart_loop_chain_gap_seconds",
+    "restart_loop_tripped",
+    "restart_loop_last_boot_age_seconds",
 )
 _LEDGER_FIELDS = (
     "gateway_incarnation_count",
@@ -594,6 +647,8 @@ _LEDGER_FIELDS = (
     "pending_delivery_count",
     "failed_delivery_count",
     "pending_deliveries",
+    "gateway_backend_groups",
+    "gateway_backend_groups_truncated",
 )
 
 
@@ -1124,9 +1179,54 @@ class Collector:
                     "gateway_ledgers", results["gateway"], _LEDGER_FIELDS
                 ),
             ),
-            # Own source_name so a torn gateway_migration.json (upstream writes it
-            # with a plain write_text) degrades only the migration verdict and keeps
-            # its own last-good value, leaving the gateway beside it fresh.
+            _SourceSpec(
+                "gateway",
+                "dead_targets",
+                lambda: self._with_dead_targets(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "dead_targets", results["gateway"], _DEAD_TARGET_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "gateway",
+                "restart_loop",
+                lambda: self._with_restart_loop(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "restart_loop", results["gateway"], _RESTART_LOOP_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "gateway",
+                "restart_pending",
+                lambda: self._with_restart_notice(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "restart_pending", results["gateway"], _RESTART_NOTICE_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "gateway",
+                "serve_restart_pending",
+                lambda: self._with_serve_obligations(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "serve_restart_pending", results["gateway"], _SERVE_OBLIGATION_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "gateway",
+                "update_receipt_history",
+                lambda: self._with_update_history(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "update_receipt_history", results["gateway"], _UPDATE_HISTORY_FIELDS
+                ),
+            ),
+            # Own source_name so a malformed gateway_migration.json (upstream writes
+            # it atomically, so hand-edited or foreign) degrades only the migration
+            # verdict and keeps its own last-good value, leaving the gateway fresh.
             _SourceSpec(
                 "migration",
                 "migration",
@@ -1832,7 +1932,8 @@ class Collector:
         # would signal a process group or every process the user owns.
         recorded_pid = writer.pid or 0
         pid = recorded_pid
-        running = data.get("gateway_state") == "running"
+        recorded_state = str(data.get("gateway_state") or "unknown")
+        running = _claims_serving(recorded_state)
         recorded_writer_live = False
         # The PID in gateway_state.json can be stale if launchd restarted
         # the gateway. A replacement PID proves a process is running, but it does
@@ -1899,7 +2000,8 @@ class Collector:
             exit_reason=str(data.get("exit_reason") or ""),
             pid=pid,
             running=running,
-            state=str(data.get("gateway_state") or "unknown"),
+            state=recorded_state,
+            watchdog_exit_reason=_watchdog_exit_reason(data, running=running),
             platforms=platforms,
             hermes_version=version,
             updates_behind=behind,
@@ -1915,6 +2017,9 @@ class Collector:
             drain_suppress_notification=_coerce_bool(drain_request.get("suppress_notification")),
             served_profiles=served_names,
             served_profiles_recorded=served_recorded,
+            multiplex_standalone_reason=_multiplex_standalone_reason(
+                data, record_current=recorded_writer_live
+            ),
             scale_to_zero_idle_timeout_minutes=_coerce_int(scale_cfg.get("idle_timeout_minutes")),
             scale_to_zero_relay_only=_scale_to_zero_relay_only(scale_cfg, platforms),
         )
@@ -1957,9 +2062,15 @@ class Collector:
             data,
             file_mtime,
             self._clock(),
-            running=gateway.state == "running",
+            running=_claims_serving(gateway.state),
         )
-        return gateway.model_copy(update={"heartbeat_age_seconds": age, "loop_health": health})
+        return gateway.model_copy(
+            update={
+                "heartbeat_age_seconds": age,
+                "loop_health": health,
+                **_heartbeat_memory(data, age).as_update(),
+            }
+        )
 
     def _probed_loop_tick(self, pid: int, tcp_port: int | None) -> bool | None:
         return _default_loop_tick_probe(pid, tcp_port, self._paths.root_home)
@@ -1983,7 +2094,7 @@ class Collector:
         plan = _loop_tick_probe_plan(
             heartbeat,
             gateway.pid,
-            running=gateway.state == "running",
+            running=_claims_serving(gateway.state),
         )
         if plan is None:
             self._loop_tick_silent_strikes = 0
@@ -2089,20 +2200,7 @@ class Collector:
         last = self._last_good_by_source.get("update_receipt")
         data = self._read_liveness_json(path, bool(last is not None and last.last_update_outcome))
         receipt = _update_receipt_status(data, self._clock(), gateway.code_sha)
-        return gateway.model_copy(
-            update={
-                "last_update_outcome": receipt.outcome,
-                "last_update_finished_age_seconds": receipt.finished_age_seconds,
-                "last_update_from_version": receipt.from_version,
-                "last_update_to_version": receipt.to_version,
-                "last_update_failed_step": receipt.failed_step,
-                "runtime_code_skew": receipt.runtime_code_skew,
-                "runtime_code_skew_source": receipt.runtime_code_skew_source,
-                "update_receipt_unfinished": receipt.update_receipt_unfinished,
-                "update_fleet_states": receipt.update_fleet_states,
-                "update_fleet_runtime_count": receipt.update_fleet_runtime_count,
-            }
-        )
+        return gateway.model_copy(update=receipt.as_update())
 
     def _with_gateway_ledgers(self, gateway: GatewayState) -> GatewayState:
         last = self._last_good_by_source.get("gateway_ledgers")
@@ -2117,19 +2215,115 @@ class Collector:
             update=_gateway_ledger_fields(readout.ledgers, self._clock(), running=gateway.running)
         )
 
+    def _with_dead_targets(self, gateway: GatewayState) -> GatewayState:
+        """Confirmed-unreachable delivery targets from ``gateway/dead_targets.json``.
+
+        PROFILE-scoped: ``DeadTargetRegistry`` stores it at
+        ``get_hermes_home()/"gateway"/"dead_targets.json"``
+        (``gateway/dead_targets.py:54``), "a per-profile JSON file". The registry is
+        unbounded upstream, so the counts and newest rows are memoized by file
+        signature and only the ages are recomputed per tick.
+        """
+        path = self._paths.profile_path("gateway", "dead_targets.json")
+        last = self._last_good_by_source.get("dead_targets")
+        data = self._read_liveness_json(path, bool(last is not None and last.dead_target_count))
+        rows = self._signature_cached("dead_targets", path, lambda: _dead_target_rows(data))
+        return gateway.model_copy(update=_dead_target_fields(rows, self._clock()))
+
+    def _with_restart_loop(self, gateway: GatewayState) -> GatewayState:
+        """The auto-resume restart-loop breaker's boot chain, evaluated at now.
+
+        PROFILE-scoped: ``get_hermes_home()/"gateway"/"restart_loop.json"``
+        (``gateway/restart_loop_guard.py:36-37``). The policy is
+        ``gateway.restart_loop_guard`` from the root ``config.yaml``, like the other
+        gateway launch inputs (``gateway/run_shutdown.py:344-363``).
+        """
+        path = self._paths.profile_path("gateway", "restart_loop.json")
+        last = self._last_good_by_source.get("restart_loop")
+        data = self._read_liveness_json(
+            path, bool(last is not None and last.restart_loop_boots_recorded)
+        )
+        policy = _restart_loop_policy(self._read_yaml_cached())
+        return gateway.model_copy(update=_restart_loop_fields(data, self._clock(), policy))
+
+    def _with_restart_notice(self, gateway: GatewayState) -> GatewayState:
+        """The planned-restart back-online notice still owed (``.restart_pending.json``).
+
+        PROFILE-scoped: ``_hermes_home / ".restart_pending.json"`` where
+        ``_hermes_home = get_hermes_home()`` (``gateway/run.py:1585-1586,1602``).
+        """
+        path = self._paths.profile_path(".restart_pending.json")
+        last = self._last_good_by_source.get("restart_pending")
+        data = self._read_liveness_json(
+            path, bool(last is not None and last.restart_notice_pending)
+        )
+        return gateway.model_copy(update=_restart_notice_fields(data, self._clock()))
+
+    def _with_serve_obligations(self, gateway: GatewayState) -> GatewayState:
+        """Manual serve restarts an update still owes (``serve_restart_pending/``).
+
+        PROFILE-scoped: ``get_hermes_home()/"serve_restart_pending"``
+        (``hermes_cli/update_serve_obligations.py:40,91``). Each record is judged
+        like upstream's ``_pid_alive_matches``: a pid that is gone or now belongs to
+        another process is not owed; one whose identity cannot be checked still is.
+        """
+        directory = self._paths.profile_path("serve_restart_pending")
+        root = self._paths.root_home
+        paths, truncated = _serve_obligation_paths(directory, root)
+        rows = [
+            row
+            for path in paths
+            if _safe_child_path(path, root)
+            and (row := _serve_obligation_row(self._read_json_cached(path))) is not None
+        ]
+        pids = sorted({row[2] for row in rows})
+        observed = self._process_start_times(pids) if pids else {}
+        return gateway.model_copy(
+            update=_serve_obligation_fields(
+                rows,
+                lambda pid, created: _surface_liveness(pid, created, observed, self._pid_exists),
+                truncated=truncated,
+            )
+        )
+
+    def _with_update_history(self, gateway: GatewayState) -> GatewayState:
+        """Failures among the newest archived update receipts.
+
+        ROOT-scoped beside ``latest.json`` (the ``update_receipt`` source), so the
+        history and the latest run always describe the same home; upstream writes
+        both under ``get_hermes_home()/"logs"/"update_receipts"``
+        (``hermes_cli/update_receipt.py:120-122``). Memoized by the directory's
+        signature: archived receipts are never rewritten, only added and pruned.
+        """
+        directory = self._paths.shared_path("logs", "update_receipts")
+        root = self._paths.root_home
+
+        def read_rows() -> list[tuple[str, float | None, str, bool]]:
+            rows = []
+            for path in _update_history_paths(directory, root):
+                if not _safe_child_path(path, root):
+                    continue
+                data = self._read_json_cached(path)
+                if data and not self._file_cache.last_read_was_stale(path):
+                    rows.append(_receipt_history_row(data))
+            return rows
+
+        rows = self._signature_cached("update_history", directory, read_rows)
+        return gateway.model_copy(update=_update_history_fields(rows, self._clock()))
+
     def _collect_migration(self, gateway: GatewayState, *, gateway_fresh: bool) -> MigrationState:
         """Read ``gateway_migration.json`` and judge it against the live artifacts.
 
         ROOT-scoped: upstream anchors the manifest at the *default* profile home
-        (``hermes_cli/gateway_migrate.py:467-468``), never a secondary's, so a
+        (``hermes_cli/gateway_migrate.py:741-742``), never a secondary's, so a
         served profile has no copy of its own to read.
 
         Presence is checked separately from parseability because the two carry
-        different meanings: absent is "never migrated OR successfully rolled back",
-        while present-but-unparseable is a torn ``write_text`` mid-flight. A file
-        that was readable and then vanished or turned unsafe *raises*, so the source
-        is marked failed and its last-good verdict stays on display instead of
-        silently reporting "no migration".
+        different meanings: absent is "never migrated, converged, or compensated",
+        present means an unfinished migration, and present-but-unparseable is a
+        hand-edited or foreign file (upstream writes it atomically). A file that was
+        readable and then vanished or turned unsafe fails the source for one pass
+        (see ``_present_or_confirmed_absent``) before the absence is accepted.
         """
         if not gateway_fresh:
             raise RuntimeError("gateway dependency is stale; keeping last-good migration verdict")

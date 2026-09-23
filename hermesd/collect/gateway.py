@@ -10,13 +10,16 @@ writing or imports hermes-agent.
 from __future__ import annotations
 
 import contextlib
+import heapq
 import json
 import math
+import os
 import re
 import socket
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -46,11 +49,16 @@ from hermesd.collect.sqlite_util import (
 from hermesd.file_cache import JsonMapping
 from hermesd.models import (
     ConfigSourceStamp,
+    DeadTargetSummary,
     DeliveryObligationSummary,
     ForensicFile,
+    GatewayBackendGroup,
     GatewayLoopHealth,
     PlatformOwnership,
     PlatformStatus,
+    ProcessLiveness,
+    ServeRestartObligation,
+    UpdateReceiptSummary,
 )
 
 # The gateway watchdog rewrites state/gateway.heartbeat every 30s: three missed
@@ -60,6 +68,35 @@ from hermesd.models import (
 # nothing witnessed the loop and a long-silent file may just be a stopped gateway.
 _HEARTBEAT_TICKING_SECONDS = 90.0
 _HEARTBEAT_STALE_SECONDS = 300.0
+# Memory pressure tiers on system MemAvailable, worst first, copied from
+# gateway/memory_status.py:16-26 (``critical`` doubles as the lifecycle ledger's
+# OOM-suspicion heuristic). A sample older than the fresh TTL (:28-30) keeps its
+# numbers but classifies as "unknown", so a dead gateway's last gasp never reads
+# as a live critical.
+_MEMORY_PRESSURE_TIERS = (
+    ("critical", 64 * 1024, 0.05),
+    ("elevated", 128 * 1024, 0.15),
+)
+_MEMORY_SAMPLE_FRESH_SECONDS = 150.0
+# gateway/dead_targets.json: bounded display of an unbounded registry.
+_DEAD_TARGET_ROW_LIMIT = 3
+_DEAD_TARGET_PLATFORM_LIMIT = 8
+_DEAD_TARGET_PLATFORM_CHARS = 40
+_DEAD_TARGET_REASON_CHARS = 80
+# gateway/restart_loop.json defaults (gateway/restart_loop_guard.py:24-33); upstream
+# stores at most 50 boots, so a longer list is foreign and only its head is read.
+_RESTART_LOOP_MAX_RESTARTS = 3
+_RESTART_LOOP_WINDOW_SECONDS = 60
+_RESTART_LOOP_MAX_GAP_SECONDS = 300
+_RESTART_LOOP_BOOT_LIMIT = 200
+# serve_restart_pending/: one file per owed manual serve; bound the listing.
+_SERVE_OBLIGATION_SCAN_LIMIT = 64
+_SERVE_OBLIGATION_ROW_LIMIT = 5
+# logs/update_receipts/: upstream keeps 20 archived runs; read only the newest.
+_ARCHIVED_RECEIPT_RE = re.compile(r"update_\d{8}_\d{6}_\d+\.json")
+_UPDATE_HISTORY_LIST_LIMIT = 64
+_UPDATE_HISTORY_SCAN_LIMIT = 10
+_UPDATE_FAILURE_LIMIT = 3
 # Loop-tick witness probe (hermes_cli/gateway.py:363-424): one byte, one second.
 _LOOP_TICK_PROBE_TIMEOUT_SECONDS = 1.0
 # Never escalate on a single silent probe (hermes_cli/gateway.py
@@ -105,6 +142,14 @@ _DELIVERY_ERROR_EXCERPT_CHARS = 80
 # newest incarnations matter for uptime and the 24h restart count.
 _INCARNATION_SCAN_LIMIT = 500
 _OPEN_DELIVERY_LIMIT = 5
+# ``gateway_heartbeats`` holds one row per backend process (serve or gateway),
+# keyed ``<profile>@<host>:<pid>:<nonce>`` and refreshed every 60 s by default
+# (tui_gateway/session_reaper.py:380-445); crashed rows only age out. Group by
+# (profile, host), newest first, and call a group live when its newest beat is
+# within three refreshes.
+_BACKEND_GROUP_LIMIT = 8
+_BACKEND_LIVE_SECONDS = 180.0
+_BACKEND_LABEL_CHARS = 64
 # A recorded start_time is only usable as wall-clock when it lands inside this
 # window of now. gateway_state.json's start_time is a PID-reuse fingerprint
 # (``_get_process_start_time``, gateway/status.py:139-156): clock ticks since
@@ -118,6 +163,17 @@ _UNFINISHED_OUTCOMES = frozenset({"failed", "partial", "running"})
 # The receipt's fleet matrix holds one row per profile. Cap the retained state
 # vocabulary so an untrusted file cannot grow the map; never cap the skew scan.
 _FLEET_STATE_KIND_LIMIT = 8
+# A fleet row serving a checkout this update did not touch (``EXTERNAL_STATE``,
+# hermes_cli/update_receipt.py:387-392). Upstream's skew reader skips it
+# (hermes_cli/update_cmd_fleet.py:224-231): another tree's SHA is not skew.
+_EXTERNAL_FLEET_STATE = "external"
+_EXTERNAL_ROOT_LIMIT = 4
+_RECEIPT_PATH_CHARS = 120
+# ``runtime_outcomes`` rows carry one of a small outcome vocabulary
+# (hermes_cli/update_inventory.py:365-380); cap it like the fleet states.
+_RUNTIME_OUTCOME_KIND_LIMIT = 8
+_SKIP_NAME_LIMIT = 3
+_SKIP_NAME_CHARS = 60
 # The multiplexer keys a served profile's adapter ``<profile>:<platform>``
 # (gateway/run_adapters.py:1048). Upstream validates that grammar
 # *unconditionally* before projecting a status key anywhere
@@ -136,6 +192,51 @@ _INGRESS_SUPPRESSED_STATES = frozenset({"fatal", "disconnected", "stopped"})
 # unrecognised or missing state are refused, so neither may publish a callback
 # URL hermesd synthesized for a secondary profile.
 _MIRROR_SERVING_STATES = frozenset({"connected", "connecting", "retrying"})
+# Recorded gateway states that mean "live and serving" once the PID is alive:
+# upstream's ``_DRAINABLE_GATEWAY_STATES`` (gateway/status.py:1207-1209).
+# ``degraded`` is stamped by ``_serving_state`` when a platform is parked
+# (gateway/run_startup.py:56-59) and by the out-of-loop watchdogs right before
+# they hard-exit (gateway/shutdown_watchdog.py:148-163).
+_SERVING_GATEWAY_STATES = frozenset({"running", "degraded"})
+# ``exit_reason`` values the watchdogs stamp beside ``degraded``
+# (``WATCHDOG_EXIT_REASONS``, gateway/status.py:362-364).
+_WATCHDOG_EXIT_REASONS = frozenset({"loop_liveness_watchdog", "shutdown_watchdog"})
+
+
+# The boot guard's reason can name several profiles and a remedy; keep the whole
+# sentence but never an unbounded one from an untrusted file.
+_STANDALONE_REASON_CHARS = 800
+
+
+def _multiplex_standalone_reason(data: JsonMapping, *, record_current: bool) -> str:
+    """The recorded standalone reason, only while its writer is live.
+
+    Upstream prints it only for a running gateway (hermes_cli/gateway.py:1542-1549,
+    5046, 5054); a dead writer's reason describes a boot that is over.
+    """
+    raw = data.get("multiplex_standalone_reason")
+    if not record_current or not isinstance(raw, str):
+        return ""
+    return _excerpt(raw, _STANDALONE_REASON_CHARS)
+
+
+def _claims_serving(state: str) -> bool:
+    """Whether the recorded ``gateway_state`` claims a serving gateway (PID not checked)."""
+    return state in _SERVING_GATEWAY_STATES
+
+
+def _watchdog_exit_reason(data: JsonMapping, *, running: bool) -> str:
+    """The watchdog's exit reason for a dead degraded record, else ``""``.
+
+    Mirrors ``retained_gateway_state`` (gateway/status.py:367-385): only while the
+    operator has not recorded ``desired_state: stopped``.
+    """
+    if running or data.get("gateway_state") != "degraded":
+        return ""
+    if data.get("desired_state") == "stopped":
+        return ""
+    reason = data.get("exit_reason")
+    return reason if isinstance(reason, str) and reason in _WATCHDOG_EXIT_REASONS else ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,6 +426,64 @@ def _heartbeat_liveness(
     # A long-silent heartbeat is only "wedged" while the gateway claims to run;
     # otherwise it is just an old file left by a stopped gateway.
     return age, GatewayLoopHealth.WEDGED if running else GatewayLoopHealth.STALE
+
+
+@dataclass(frozen=True, slots=True)
+class _HeartbeatMemory:
+    """The heartbeat's ``mem`` block (KiB) and its pressure tier.
+
+    ``sample_memory`` (gateway/lifecycle_ledger.py:64-74) is Linux-only and
+    returns ``{}`` elsewhere, and the heartbeat writer embeds it only when
+    non-empty (gateway/shutdown_watchdog.py:208-210): no block means "not
+    sampled" and ``pressure`` stays empty rather than claiming "ok".
+    """
+
+    rss_kib: int | None = None
+    total_kib: int | None = None
+    available_kib: int | None = None
+    swap_used_kib: int | None = None
+    pressure: str = ""
+
+    def as_update(self) -> dict[str, Any]:
+        return {
+            "memory_rss_kib": self.rss_kib,
+            "memory_total_kib": self.total_kib,
+            "memory_available_kib": self.available_kib,
+            "memory_swap_used_kib": self.swap_used_kib,
+            "memory_pressure": self.pressure,
+        }
+
+
+def _nonneg_kib(value: object) -> int | None:
+    """A non-negative ``int`` (bools rejected), as upstream's ``_nonneg_int``."""
+    return value if type(value) is int and value >= 0 else None
+
+
+def _memory_pressure(available: int | None, total: int | None) -> str:
+    """``classify_pressure`` (gateway/memory_status.py:50-60)."""
+    if available is None:
+        return "unknown"
+    fraction = available / total if total else None
+    for level, kib_floor, fraction_floor in _MEMORY_PRESSURE_TIERS:
+        if available < kib_floor or (fraction is not None and fraction < fraction_floor):
+            return level
+    return "ok"
+
+
+def _heartbeat_memory(data: JsonMapping, age_seconds: float | None) -> _HeartbeatMemory:
+    mem = data.get("mem") if data else None
+    if not isinstance(mem, dict):
+        return _HeartbeatMemory()
+    available = _nonneg_kib(mem.get("mem_available_kib"))
+    total = _nonneg_kib(mem.get("mem_total_kib"))
+    fresh = age_seconds is not None and age_seconds <= _MEMORY_SAMPLE_FRESH_SECONDS
+    return _HeartbeatMemory(
+        rss_kib=_nonneg_kib(mem.get("rss_kib")),
+        total_kib=total,
+        available_kib=available,
+        swap_used_kib=_nonneg_kib(mem.get("swap_used_kib")),
+        pressure=_memory_pressure(available, total) if fresh else "unknown",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +773,37 @@ class _UpdateReceipt:
     update_receipt_unfinished: bool = False
     update_fleet_states: dict[str, int] = field(default_factory=dict)
     update_fleet_runtime_count: int = 0
+    update_fleet_external_roots: list[str] = field(default_factory=list)
+    update_post_swap_pid: int | None = None
+    update_pending_manual_serve_count: int = 0
+    update_settled_from_live_fleet_age_seconds: float | None = None
+    update_runtime_outcomes: dict[str, int] = field(default_factory=dict)
+    update_skip_count: int = 0
+    update_skip_names: list[str] = field(default_factory=list)
+
+    def as_update(self) -> dict[str, Any]:
+        """The ``GatewayState`` fields this receipt owns, for ``model_copy(update=...)``."""
+        return {
+            "last_update_outcome": self.outcome,
+            "last_update_finished_age_seconds": self.finished_age_seconds,
+            "last_update_from_version": self.from_version,
+            "last_update_to_version": self.to_version,
+            "last_update_failed_step": self.failed_step,
+            "runtime_code_skew": self.runtime_code_skew,
+            "runtime_code_skew_source": self.runtime_code_skew_source,
+            "update_receipt_unfinished": self.update_receipt_unfinished,
+            "update_fleet_states": self.update_fleet_states,
+            "update_fleet_runtime_count": self.update_fleet_runtime_count,
+            "update_fleet_external_roots": self.update_fleet_external_roots,
+            "update_post_swap_pid": self.update_post_swap_pid,
+            "update_pending_manual_serve_count": self.update_pending_manual_serve_count,
+            "update_settled_from_live_fleet_age_seconds": (
+                self.update_settled_from_live_fleet_age_seconds
+            ),
+            "update_runtime_outcomes": self.update_runtime_outcomes,
+            "update_skip_count": self.update_skip_count,
+            "update_skip_names": self.update_skip_names,
+        }
 
 
 def _update_receipt_status(data: JsonMapping, now: float, code_sha: str) -> _UpdateReceipt:
@@ -622,6 +812,7 @@ def _update_receipt_status(data: JsonMapping, now: float, code_sha: str) -> _Upd
     unfinished = _receipt_looks_unfinished(data)
     fleet = _as_list(data.get("fleet"))
     evidence = _skew_evidence(fleet, data, code_sha, unfinished)
+    skips = _as_list(data.get("skips"))
     return _UpdateReceipt(
         outcome=str(data.get("outcome") or ""),
         finished_age_seconds=_age_seconds(_iso_to_epoch(data.get("finished_at")), now),
@@ -633,7 +824,71 @@ def _update_receipt_status(data: JsonMapping, now: float, code_sha: str) -> _Upd
         update_receipt_unfinished=unfinished,
         update_fleet_states=_fleet_state_counts(fleet),
         update_fleet_runtime_count=len(fleet),
+        update_fleet_external_roots=_external_fleet_roots(fleet),
+        # ``resume_update_receipt`` stamps the interpreter that finished the run
+        # after the code swap (hermes_cli/update_receipt.py:149-155).
+        update_post_swap_pid=_strict_pid(data.get("post_swap_pid")),
+        # Manual serve restarts still owed when the receipt was written
+        # (hermes_cli/update_receipt.py:201-203).
+        update_pending_manual_serve_count=len(_as_list(data.get("pending_manual_serves"))),
+        # ``settle_latest_receipt_fleet`` (hermes_cli/update_receipt.py:249-280)
+        # rewrites latest.json once a later check saw the whole fleet current.
+        update_settled_from_live_fleet_age_seconds=_age_seconds(
+            _iso_to_epoch(_as_dict(data.get("gateway_restart")).get("settled_from_live_fleet_at")),
+            now,
+        ),
+        update_runtime_outcomes=_capped_counts(
+            _as_list(data.get("runtime_outcomes")), "outcome", _RUNTIME_OUTCOME_KIND_LIMIT
+        ),
+        update_skip_count=len(skips),
+        update_skip_names=_skip_names(skips),
     )
+
+
+def _strict_pid(value: object) -> int | None:
+    """A machine-written pid: a real positive ``int`` or nothing (no bools, no strings)."""
+    return value if type(value) is int and value > 0 else None
+
+
+def _external_fleet_roots(fleet: list[object]) -> list[str]:
+    """Distinct ``code_root`` values of external rows, bounded and redacted."""
+    roots: list[str] = []
+    for entry in fleet:
+        info = _as_dict(entry)
+        root = info.get("code_root")
+        if info.get("state") != _EXTERNAL_FLEET_STATE or not isinstance(root, str) or not root:
+            continue
+        label = _excerpt(root, _RECEIPT_PATH_CHARS)
+        if label not in roots:
+            roots.append(label)
+            if len(roots) >= _EXTERNAL_ROOT_LIMIT:
+                break
+    return roots
+
+
+def _capped_counts(rows: list[object], key: str, limit: int) -> dict[str, int]:
+    """Counts of ``row[key]`` over mapping rows, with the vocabulary capped at ``limit``."""
+    counts: dict[str, int] = {}
+    for entry in rows:
+        info = _as_dict(entry)
+        if not info:
+            continue
+        value = str(info.get(key) or "unknown")
+        if value not in counts and len(counts) >= limit:
+            continue
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
+
+def _skip_names(skips: list[object]) -> list[str]:
+    names: list[str] = []
+    for entry in skips:
+        name = _as_dict(entry).get("name")
+        if isinstance(name, str) and name:
+            names.append(_excerpt(name, _SKIP_NAME_CHARS))
+            if len(names) >= _SKIP_NAME_LIMIT:
+                break
+    return names
 
 
 def _first_failed_step(steps: object) -> str:
@@ -686,9 +941,14 @@ def _skew_evidence(
 
 
 def _any_fleet_skew(fleet: list[object], code_sha: str) -> bool:
-    """A recorded ``stale`` state is skew even when its sha was never stamped."""
+    """A recorded ``stale`` state is skew even when its sha was never stamped.
+
+    An ``external`` row serves another checkout and is never skew, whatever its SHA
+    (``row_is_external``, hermes_cli/update_cmd_fleet.py:224-231).
+    """
     return any(
-        _as_dict(entry).get("state") == "stale" or _entry_sha_differs(entry, code_sha)
+        _as_dict(entry).get("state") != _EXTERNAL_FLEET_STATE
+        and (_as_dict(entry).get("state") == "stale" or _entry_sha_differs(entry, code_sha))
         for entry in fleet
     )
 
@@ -938,6 +1198,7 @@ class _GatewayLedgerRows:
     incarnation_starts: list[float] = field(default_factory=list)
     delivery_counts: dict[str, int] = field(default_factory=dict)
     delivery_rows: list[dict[str, Any]] = field(default_factory=list)
+    backend_groups: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _read_gateway_ledger_rows(conn: sqlite3.Connection) -> _GatewayLedgerRows:
@@ -947,6 +1208,36 @@ def _read_gateway_ledger_rows(conn: sqlite3.Connection) -> _GatewayLedgerRows:
         incarnation_starts=_read_incarnation_starts(conn),
         delivery_counts=_read_delivery_counts(conn),
         delivery_rows=_read_open_delivery_rows(conn),
+        backend_groups=_read_backend_groups(conn),
+    )
+
+
+def _read_backend_groups(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Backend heartbeat rows per (profile, host), newest beat first; one extra row
+    is fetched so a cut list can say so."""
+    if not _table_exists(conn, "gateway_heartbeats"):
+        return []
+    return _query_rows(
+        conn,
+        "SELECT COALESCE(profile, '') AS profile, COALESCE(host, '') AS host, "
+        "COUNT(*) AS backends, MAX(last_heartbeat) AS last_heartbeat, "
+        "MAX(started_at) AS started_at "
+        "FROM gateway_heartbeats GROUP BY 1, 2 "
+        f"ORDER BY MAX(last_heartbeat) IS NULL, MAX(last_heartbeat) DESC LIMIT {_BACKEND_GROUP_LIMIT + 1}",
+    )
+
+
+def _backend_group(row: dict[str, Any], now: float) -> GatewayBackendGroup:
+    beat = _coerce_float(row.get("last_heartbeat") or 0.0)
+    started = _coerce_float(row.get("started_at") or 0.0)
+    beat_age = _age_seconds(beat or None, now)
+    return GatewayBackendGroup(
+        profile=_excerpt(row.get("profile") or "", _BACKEND_LABEL_CHARS),
+        host=_excerpt(row.get("host") or "", _BACKEND_LABEL_CHARS),
+        backends=_coerce_int(row.get("backends") or 0),
+        last_heartbeat_age_seconds=beat_age,
+        newest_start_age_seconds=_age_seconds(started or None, now),
+        live=beat_age is not None and beat_age <= _BACKEND_LIVE_SECONDS,
     )
 
 
@@ -996,6 +1287,10 @@ def _gateway_ledger_fields(
         "pending_delivery_count": sum(counts.get(state) or 0 for state in _PENDING_DELIVERY_STATES),
         "failed_delivery_count": counts.get("failed") or 0,
         "pending_deliveries": [_delivery_summary(row, now) for row in rows.delivery_rows],
+        "gateway_backend_groups": [
+            _backend_group(row, now) for row in rows.backend_groups[:_BACKEND_GROUP_LIMIT]
+        ],
+        "gateway_backend_groups_truncated": len(rows.backend_groups) > _BACKEND_GROUP_LIMIT,
     }
 
 
@@ -1008,3 +1303,330 @@ def _delivery_summary(row: dict[str, Any], now: float) -> DeliveryObligationSumm
         age_seconds=_age_seconds(timestamp or None, now),
         last_error=_excerpt(row.get("last_error") or "", _DELIVERY_ERROR_EXCERPT_CHARS),
     )
+
+
+# ---------------------------------------------------------------------------
+# Dead delivery targets (gateway/dead_targets.json)
+#
+# ``DeadTargetRegistry`` (gateway/dead_targets.py:47-58) persists a mapping of
+# ``platform:chat_id`` -> {platform, chat_id, reason[:200], marked_at} for chats
+# confirmed unreachable; delivery short-circuits them until a send succeeds and
+# ``clear`` drops the key (:75-100). The chat id is deliberately never surfaced.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _DeadTargetRows:
+    """Signature-cacheable facts from the registry; ages are derived per tick."""
+
+    count: int = 0
+    platforms: dict[str, int] = field(default_factory=dict)
+    # (platform, reason, marked_at epoch or None), newest first.
+    newest: list[tuple[str, str, float | None]] = field(default_factory=list)
+
+
+def _dead_target_rows(data: JsonMapping) -> _DeadTargetRows:
+    # Upstream keeps every mapping value, empty or not (dead_targets.py:55-57).
+    entries = [value for value in data.values() if isinstance(value, dict)]
+    platforms: dict[str, int] = {}
+    for info in entries:
+        platform = _dead_target_platform(info)
+        if platform not in platforms and len(platforms) >= _DEAD_TARGET_PLATFORM_LIMIT:
+            continue
+        platforms[platform] = platforms.get(platform, 0) + 1
+    stamped = [(info, _dead_target_marked_at(info)) for info in entries]
+    newest = heapq.nlargest(
+        _DEAD_TARGET_ROW_LIMIT,
+        stamped,
+        key=lambda item: item[1] if item[1] is not None else -math.inf,
+    )
+    return _DeadTargetRows(
+        count=len(entries),
+        platforms=platforms,
+        newest=[
+            (
+                _dead_target_platform(info),
+                _excerpt(info.get("reason") or "", _DEAD_TARGET_REASON_CHARS),
+                marked_at,
+            )
+            for info, marked_at in newest
+        ],
+    )
+
+
+def _dead_target_platform(info: dict[str, Any]) -> str:
+    platform = info.get("platform")
+    return (
+        _excerpt(platform, _DEAD_TARGET_PLATFORM_CHARS)
+        if isinstance(platform, str) and platform
+        else "unknown"
+    )
+
+
+def _dead_target_marked_at(info: dict[str, Any]) -> float | None:
+    raw = info.get("marked_at")
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        return None
+    value = float(raw)
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def _dead_target_fields(rows: _DeadTargetRows, now: float) -> dict[str, Any]:
+    return {
+        "dead_target_count": rows.count,
+        "dead_target_platforms": rows.platforms,
+        "dead_targets": [
+            DeadTargetSummary(
+                platform=platform, reason=reason, age_seconds=_age_seconds(marked_at, now)
+            )
+            for platform, reason, marked_at in rows.newest
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Restart-loop breaker (gateway/restart_loop.json)
+#
+# ``restart_loop_guard`` (gateway/restart_loop_guard.py) records one epoch per
+# boot that found restart-interrupted sessions; boots CHAIN while consecutive
+# gaps stay within ``max(1, window_seconds, max_gap_seconds)`` (:56-59, :62-77),
+# and a chain of ``max_restarts`` trips the breaker, which skips auto-resume for
+# that boot (:88-105). The file is written with a plain ``write_text`` (:50-54),
+# so a torn read is possible and falls back to last-good.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _RestartLoopPolicy:
+    max_restarts: int = _RESTART_LOOP_MAX_RESTARTS
+    window_seconds: int = _RESTART_LOOP_WINDOW_SECONDS
+    max_gap_seconds: int = _RESTART_LOOP_MAX_GAP_SECONDS
+
+    @property
+    def chain_gap(self) -> float:
+        """``_chain_gap`` (restart_loop_guard.py:56-59)."""
+        return float(max(1, self.window_seconds, self.max_gap_seconds))
+
+
+def _restart_loop_policy(cfg: JsonMapping) -> _RestartLoopPolicy:
+    """``gateway.restart_loop_guard`` as ``_restart_loop_guard_config`` reads it.
+
+    Mirrors gateway/run_shutdown.py:344-363: an ``int`` value is used (any value for
+    ``max_restarts``, where ``<= 0`` disables the breaker; only positive ones for
+    the two windows), anything else keeps the defaults (restart_loop_guard.py:24-31;
+    DEFAULT_CONFIG hermes_cli/config_defaults.py:2152).
+    """
+    section = _as_dict(_as_dict(cfg.get("gateway")).get("restart_loop_guard"))
+
+    def int_or(key: str, default: int, *, positive: bool) -> int:
+        value = section.get(key)
+        if isinstance(value, int) and (value > 0 or not positive):
+            return int(value)
+        return default
+
+    return _RestartLoopPolicy(
+        max_restarts=int_or("max_restarts", _RESTART_LOOP_MAX_RESTARTS, positive=False),
+        window_seconds=int_or("window_seconds", _RESTART_LOOP_WINDOW_SECONDS, positive=True),
+        max_gap_seconds=int_or("max_gap_seconds", _RESTART_LOOP_MAX_GAP_SECONDS, positive=True),
+    )
+
+
+def _restart_loop_boots(data: JsonMapping) -> list[float]:
+    """Recorded boot epochs; junk entries are dropped like ``_load_boots`` does."""
+    boots: list[float] = []
+    for raw in _as_list(data.get("boots"))[:_RESTART_LOOP_BOOT_LIMIT]:
+        if isinstance(raw, bool) or not isinstance(raw, int | float):
+            continue
+        value = float(raw)
+        if math.isfinite(value):
+            boots.append(value)
+    return boots
+
+
+def _restart_loop_chain(boots: list[float], now: float, gap: float) -> int:
+    """Length of ``_chain_ending_at(boots, now, gap)`` (restart_loop_guard.py:62-77).
+
+    A future boot (clock stepped back) is adjacent, not a break; the first gap
+    wider than ``gap`` walking back from now ends the chain, so a loop that went
+    quiet is forgotten exactly as upstream forgets it.
+    """
+    chain = 0
+    previous = now
+    for boot in sorted(boots, reverse=True):
+        if boot > now:
+            chain += 1
+            continue
+        if previous - boot > gap:
+            break
+        chain += 1
+        previous = boot
+    return chain
+
+
+def _restart_loop_fields(
+    data: JsonMapping, now: float, policy: _RestartLoopPolicy
+) -> dict[str, Any]:
+    boots = _restart_loop_boots(data)
+    chain = _restart_loop_chain(boots, now, policy.chain_gap)
+    return {
+        "restart_loop_boots_recorded": len(boots),
+        "restart_loop_chain": chain,
+        "restart_loop_max_restarts": policy.max_restarts,
+        "restart_loop_chain_gap_seconds": policy.chain_gap,
+        # ``is_restart_loop_tripped`` (restart_loop_guard.py:117-140): the verdict
+        # the next restart-interrupted boot would inherit, evaluated at now.
+        "restart_loop_tripped": policy.max_restarts > 0 and chain >= policy.max_restarts,
+        "restart_loop_last_boot_age_seconds": _age_seconds(max(boots), now) if boots else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Planned-restart notice (.restart_pending.json)
+#
+# Written at shutdown for a restart that no chat asked for (``requested_at``,
+# ``via_service``, ``detached``; gateway/run_shutdown.py:2054-2064), then replayed
+# by the next boot and on every platform reconnect, recording each home channel
+# reached in ``delivered_targets`` and unlinking the file only once every owed
+# home got its back-online notice (gateway/run_notifications.py:936-972). A file
+# on disk therefore means "a planned restart's notice is still owed", not "the
+# restart has not happened". ``.restart_last_processed.json`` is unrelated: it is
+# the Telegram /restart redelivery dedup marker (gateway/slash_commands.py:565-569).
+# ---------------------------------------------------------------------------
+
+
+def _restart_notice_fields(data: JsonMapping, now: float) -> dict[str, Any]:
+    raw_requested = data.get("requested_at")
+    requested = (
+        float(raw_requested)
+        if isinstance(raw_requested, int | float) and not isinstance(raw_requested, bool)
+        else None
+    )
+    return {
+        "restart_notice_pending": bool(data),
+        "restart_notice_requested_age_seconds": _age_seconds(requested, now),
+        "restart_notice_via_service": data.get("via_service") is True,
+        "restart_notice_detached": data.get("detached") is True,
+        "restart_notice_delivered_count": len(_as_list(data.get("delivered_targets"))),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Manual serve restart obligations (serve_restart_pending/<pid>-<hex>.json)
+#
+# ``defer_manual_serve`` files one immutable ``{kind, profile, pid, create_time}``
+# per manual ``hermes serve``/``dashboard`` incarnation an update could not
+# restart (hermes_cli/update_serve_obligations.py:40-58); the CLI drops a file
+# once its ``(pid, create_time)`` is provably gone (:91-99). Only incarnations
+# that are not provably gone are owed.
+# ---------------------------------------------------------------------------
+
+
+def _serve_obligation_paths(directory: Path, root: Path) -> tuple[list[Path], bool]:
+    """``*.json`` entries of the obligation directory, bounded; symlinks never followed."""
+    if not _safe_child_path(directory, root) or not directory.is_dir():
+        return [], False
+    paths: list[Path] = []
+    truncated = False
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            if len(paths) >= _SERVE_OBLIGATION_SCAN_LIMIT:
+                truncated = True
+                break
+            paths.append(Path(entry.path))
+    return sorted(paths), truncated
+
+
+def _serve_obligation_row(data: JsonMapping) -> tuple[str, str, int, float] | None:
+    """``(kind, profile, pid, create_time)`` for a well-formed record, else None."""
+    pid = data.get("pid")
+    created = data.get("create_time")
+    if type(pid) is not int or pid <= 0:
+        return None
+    if isinstance(created, bool) or not isinstance(created, int | float):
+        return None
+    if not math.isfinite(float(created)) or created <= 0:
+        return None
+    return (
+        _excerpt(data.get("kind") or "unknown", _BACKEND_LABEL_CHARS),
+        _excerpt(data.get("profile") or "unknown", _BACKEND_LABEL_CHARS),
+        pid,
+        float(created),
+    )
+
+
+def _serve_obligation_fields(
+    rows: list[tuple[str, str, int, float]],
+    liveness: Callable[[int, float], ProcessLiveness],
+    *,
+    truncated: bool,
+) -> dict[str, Any]:
+    pending: list[ServeRestartObligation] = []
+    stale = 0
+    for kind, profile, pid, created in rows:
+        verdict = liveness(pid, created)
+        if verdict is ProcessLiveness.DEAD:
+            stale += 1
+            continue
+        pending.append(
+            ServeRestartObligation(
+                kind=kind, profile=profile, pid=pid, verified=verdict is ProcessLiveness.LIVE
+            )
+        )
+    return {
+        "serve_restart_pending_count": len(pending),
+        "serve_restart_stale_count": stale,
+        "serve_restart_pending": pending[:_SERVE_OBLIGATION_ROW_LIMIT],
+        "serve_restart_scan_truncated": truncated,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Update receipt history (logs/update_receipts/update_<stamp>_<pid>.json)
+#
+# ``finalize_update_receipt`` archives one file per run beside latest.json and
+# prunes to the newest 20 per home (hermes_cli/update_receipt.py:21,206-211,
+# 241-246). Only the newest few are read, newest first by the stamped name.
+# ---------------------------------------------------------------------------
+
+
+def _update_history_paths(directory: Path, root: Path) -> list[Path]:
+    """The newest archived receipts by stamped name, bounded at both steps."""
+    if not _safe_child_path(directory, root) or not directory.is_dir():
+        return []
+    names: list[str] = []
+    with os.scandir(directory) as entries:
+        for entry in islice(entries, _UPDATE_HISTORY_LIST_LIMIT):
+            if _ARCHIVED_RECEIPT_RE.fullmatch(entry.name):
+                names.append(entry.name)
+    newest = sorted(names, reverse=True)[:_UPDATE_HISTORY_SCAN_LIMIT]
+    return [directory / name for name in newest]
+
+
+def _receipt_history_row(data: JsonMapping) -> tuple[str, float | None, str, bool]:
+    """``(outcome, finished_at epoch, failed step, unfinished)`` for one archived run."""
+    return (
+        _excerpt(data.get("outcome") or "", _SKIP_NAME_CHARS),
+        _iso_to_epoch(data.get("finished_at")),
+        _excerpt(_first_failed_step(data.get("steps")), _SKIP_NAME_CHARS),
+        _receipt_looks_unfinished(data),
+    )
+
+
+def _update_history_fields(
+    rows: list[tuple[str, float | None, str, bool]], now: float
+) -> dict[str, Any]:
+    failures = [row for row in rows if row[3]]
+    return {
+        "update_history_scanned": len(rows),
+        "update_history_failed": len(failures),
+        "update_failures": [
+            UpdateReceiptSummary(
+                outcome=outcome,
+                finished_age_seconds=_age_seconds(finished, now),
+                failed_step=step,
+            )
+            for outcome, finished, step, _unfinished in failures[:_UPDATE_FAILURE_LIMIT]
+        ],
+    }
