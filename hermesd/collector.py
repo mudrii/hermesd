@@ -1906,11 +1906,7 @@ class Collector:
                 pass
             except tomllib.TOMLDecodeError:
                 pass
-        behind = 0
-        update_check = self._read_json_cached(self._paths.shared_path(".update_check"))
-        if update_check:
-            behind = _coerce_int(update_check.get("behind"))
-        return version, behind
+        return version, self._collect_version_behind()
 
     def _read_context_lengths(self) -> dict[str, int]:
         path = self._paths.shared_path("context_length_cache.yaml")
@@ -4440,10 +4436,14 @@ class Collector:
         return redacted
 
     def _collect_version_behind(self) -> int:
+        """Commits behind upstream from ``.update_check``.
+
+        The single reader for both ``GatewayState.updates_behind`` and
+        ``DashboardState.version_behind``: the gateway copy exists only when
+        gateway_state.json does, so the panels fall back to this one.
+        """
         data = self._read_json_cached(self._paths.shared_path(".update_check"))
-        if data:
-            return _coerce_int(data.get("behind"))
-        return 0
+        return _coerce_int(data.get("behind"))
 
     def _collect_skin(self) -> str:
         cfg = self._read_yaml_reporting_stale()
