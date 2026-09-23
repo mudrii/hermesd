@@ -9,6 +9,7 @@ from hermesd.models import (
     CronIncident,
     CronJob,
     CronJobExecutionStats,
+    CronModelSource,
     CronState,
     CronTickerHealth,
     DashboardState,
@@ -1096,24 +1097,37 @@ def test_cron_compact_hides_fire_forward_line_when_none() -> None:
     assert "Fire forward" not in text
 
 
-def test_cron_detail_shows_model_snapshot_only_when_unpinned() -> None:
-    """Operators must see which model an unpinned job will actually run: the
-    creation-time snapshot (``cron/jobs.py:1600-1630``)."""
-    unpinned = CronJob(
-        job_id="j1",
-        name="unpinned",
-        model="",
-        model_snapshot="hermes-default-large",
-        provider="",
-        provider_snapshot="openai",
-    )
-    pinned = CronJob(job_id="j2", name="pinned", model="gpt-9", provider="openai")
-    state = DashboardState(cron=CronState(job_count=2, jobs=[unpinned, pinned]))
-    text = render_to_str(render_cron(state, Theme(), detail=True), no_color=True)
-    assert "model hermes-default-large (unpinned snapshot)" in text
-    assert "provider openai (unpinned snapshot)" in text
-    # The pinned job's explicit pin is never described as a snapshot.
-    assert pinned.model not in text or "gpt-9 (unpinned" not in text
+def test_cron_detail_labels_the_effective_model_by_its_source() -> None:
+    """A pin is labelled pinned; an unpinned job says which config axis it
+    follows at fire time (``cron/scheduler.py:1561-1590``)."""
+    jobs = [
+        CronJob(
+            job_id="j1",
+            name="pinned-job",
+            model="gpt-9",
+            provider="openai",
+            effective_model="gpt-9",
+            model_source=CronModelSource.PINNED,
+        ),
+        CronJob(
+            job_id="j2",
+            name="fleet-job",
+            effective_model="fleet",
+            model_source=CronModelSource.CRON_DEFAULT,
+        ),
+        CronJob(
+            job_id="j3",
+            name="main-job",
+            effective_model="grok",
+            model_source=CronModelSource.MAIN_MODEL,
+        ),
+    ]
+    state = DashboardState(cron=CronState(job_count=3, jobs=jobs))
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=200, no_color=True)
+    assert "model gpt-9 via openai (pinned)" in text
+    assert "model fleet (cron.model default)" in text
+    assert "model grok (follows main model)" in text
+    assert "snapshot" not in text
 
 
 def test_cron_detail_labels_detected_incident_as_no_delivered_failure_ping() -> None:

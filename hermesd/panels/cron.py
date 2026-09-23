@@ -12,6 +12,7 @@ from hermesd.models import (
     CronFireClaimState,
     CronJob,
     CronJobExecutionStats,
+    CronModelSource,
     CronState,
     CronTickerHealth,
     DashboardState,
@@ -457,12 +458,15 @@ def _job_flags_line(j: CronJob, theme: Theme) -> Text | None:
         parts.append(f"delivery: {sanitize_terminal_text(j.last_delivery_error[:80])}")
     if j.preflight_alerted:
         parts.append("config-block alert sent (alert-once)")
-    if not j.model and j.model_snapshot:
-        # An unpinned job runs whatever the snapshot resolved at creation; the
-        # panel would otherwise let an operator assume a pin that is not there.
-        parts.append(f"model {sanitize_terminal_text(j.model_snapshot)} (unpinned snapshot)")
-    if not j.provider and j.provider_snapshot:
-        parts.append(f"provider {sanitize_terminal_text(j.provider_snapshot)} (unpinned snapshot)")
+    if j.effective_model and j.model_source is not None:
+        # An unpinned job follows config at fire time; naming the axis keeps an
+        # operator from assuming a pin that is not there.
+        via = (
+            f" via {j.provider}" if j.model_source == CronModelSource.PINNED and j.provider else ""
+        )
+        parts.append(
+            sanitize_terminal_text(f"model {j.effective_model}{via} ({j.model_source.value})")
+        )
     if j.dispatch_lateness_seconds is not None:
         parts.append(_dispatch_flag(j))
     if j.repeat_completed or j.repeat_times is not None:

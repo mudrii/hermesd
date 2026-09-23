@@ -79,6 +79,7 @@ from hermesd.collect.cron import (
     _cron_job_dispatch,
     _cron_job_fire_claim,
     _cron_job_fire_error,
+    _cron_job_model,
     _cron_job_paused,
     _cron_job_pending_slot,
     _cron_job_repeat,
@@ -2630,6 +2631,7 @@ class Collector:
                 )
                 pending_slot_at, pending_slot_age = _cron_job_pending_slot(j, now=now)
                 fire_error, fire_error_age = _cron_job_fire_error(j, now=now)
+                effective_model, model_source = _cron_job_model(j, cfg)
                 jobs.append(
                     CronJob(
                         job_id=str(j.get("id") or ""),
@@ -2669,8 +2671,8 @@ class Collector:
                         last_fire_error=fire_error,
                         last_fire_error_age_seconds=fire_error_age,
                         preflight_alerted=_coerce_bool(j.get("preflight_alerted")),
-                        model_snapshot=str(j.get("model_snapshot") or ""),
-                        provider_snapshot=str(j.get("provider_snapshot") or ""),
+                        effective_model=effective_model,
+                        model_source=model_source,
                     )
                 )
 

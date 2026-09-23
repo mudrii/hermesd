@@ -45,6 +45,7 @@ from hermesd.models import (
     CronFireClaimState,
     CronIncident,
     CronJobExecutionStats,
+    CronModelSource,
     CronTickerHealth,
     LogLine,
 )
@@ -937,6 +938,36 @@ def _cron_job_paused(job: dict[str, Any]) -> tuple[bool, str]:
     raw_paused_at = job.get("paused_at")
     paused_at_set = raw_paused_at is not None and str(raw_paused_at).strip() != ""
     return paused_at_set or bool(reason), reason
+
+
+def _cron_job_model(
+    job: dict[str, Any], cfg: Mapping[str, Any]
+) -> tuple[str, CronModelSource | None]:
+    """The model the next fire resolves to and the axis it came from.
+
+    Mirrors ``_load_cron_job_config`` (``cron/scheduler.py:1561-1590``): a
+    per-job model is the pin; otherwise ``cron.model`` (the fleet default), then
+    the main ``model:`` (shorthand string, or the dict's ``default``/``model``/
+    ``name``). ``pinned`` is not stored (``cron/jobs.py:1900-1914``) and the
+    retired ``model_snapshot`` keys are ignored upstream, so they are here too.
+    The ``HERMES_MODEL`` env fallback is the scheduler's process env, which
+    hermesd cannot see, so an otherwise unconfigured job reads as unresolved.
+    """
+    if _coerce_bool(job.get("no_agent")):
+        return "", None
+    pinned = str(job.get("model") or "").strip()
+    if pinned:
+        return pinned, CronModelSource.PINNED
+    fleet = str(_as_dict(cfg.get("cron")).get("model") or "").strip()
+    if fleet:
+        return fleet, CronModelSource.CRON_DEFAULT
+    model_cfg = cfg.get("model") or {}
+    if isinstance(model_cfg, dict):
+        main = model_cfg.get("default") or model_cfg.get("model") or model_cfg.get("name")
+    else:
+        main = model_cfg
+    main_text = str(main or "").strip()
+    return (main_text, CronModelSource.MAIN_MODEL) if main_text else ("", None)
 
 
 def _cron_job_repeat(job: dict[str, Any]) -> tuple[int | None, int]:

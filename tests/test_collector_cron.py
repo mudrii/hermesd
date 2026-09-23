@@ -27,7 +27,7 @@ from hermesd.collector import (
     _delivery_target_label,
     _latest_cron_output_excerpt,
 )
-from hermesd.models import CronFireClaimState, CronState, CronTickerHealth
+from hermesd.models import CronFireClaimState, CronModelSource, CronState, CronTickerHealth
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
 from tests.conftest import (
@@ -2855,28 +2855,65 @@ def test_collect_cron_preflight_alerted_flag(hermes_home: Path):
     assert by_id["job-quiet"].preflight_alerted is False
 
 
-def test_collect_cron_snapshots_record_unpinned_resolution(hermes_home: Path):
-    """Snapshots capture creation-time resolution for unpinned axes only
-    (``cron/jobs.py:1600-1630``, written at ``:1770-1771``); a pinned job records
-    neither, and an older agent writes no keys at all."""
+@pytest.mark.parametrize(
+    ("config", "job", "expected_model", "expected_source"),
+    [
+        # A per-job model is the pin: it wins over both config axes.
+        (
+            {"cron": {"model": "fleet"}, "model": {"default": "main"}},
+            {"model": "gpt-9", "provider": "openai"},
+            "gpt-9",
+            CronModelSource.PINNED,
+        ),
+        # Unpinned: cron.model (the fleet default) beats the main model.
+        (
+            {"cron": {"model": " fleet "}, "model": {"default": "main"}},
+            {"model": None},
+            "fleet",
+            CronModelSource.CRON_DEFAULT,
+        ),
+        # Unpinned, no fleet default: the main agent model at fire time.
+        ({"model": {"default": "main"}}, {"model": ""}, "main", CronModelSource.MAIN_MODEL),
+        # ``model: <name>`` shorthand and the dict's model/name fallbacks.
+        ({"model": "shorthand"}, {}, "shorthand", CronModelSource.MAIN_MODEL),
+        ({"model": {"model": "alias"}}, {}, "alias", CronModelSource.MAIN_MODEL),
+        ({"model": {"name": "named"}}, {}, "named", CronModelSource.MAIN_MODEL),
+        # Nothing configured anywhere: upstream refuses to run the job.
+        ({}, {}, "", None),
+        # A script-only job never reaches a model.
+        ({"model": {"default": "main"}}, {"no_agent": True}, "", None),
+    ],
+)
+def test_collect_cron_resolves_the_effective_model_like_the_scheduler(
+    hermes_home: Path,
+    config: dict,
+    job: dict,
+    expected_model: str,
+    expected_source: CronModelSource | None,
+):
+    """Unpinned jobs follow the main model at fire time; resolution is per-job
+    model > ``cron.model`` > main ``model:`` (``cron/scheduler.py:1561-1590``)."""
+    (hermes_home / "config.yaml").write_text(yaml.dump(config))
+    _write_jobs_json(hermes_home, [{"id": "job-1", "name": "One", **job}])
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    (collected,) = state.cron.jobs
+    assert collected.effective_model == expected_model
+    assert collected.model_source == expected_source
+
+
+def test_collect_cron_ignores_legacy_model_snapshots(hermes_home: Path):
+    """Upstream dropped ``model_snapshot``/``provider_snapshot``: a legacy
+    jobs.json that still carries them runs the main model, not the snapshot."""
+    (hermes_home / "config.yaml").write_text(yaml.dump({"model": {"default": "main"}}))
     _write_jobs_json(
         hermes_home,
-        [
-            {
-                "id": "job-unpinned",
-                "name": "Unpinned",
-                "model": None,
-                "provider": None,
-                "model_snapshot": "hermes-default-large",
-                "provider_snapshot": "openai",
-            },
-            {
-                "id": "job-pinned",
-                "name": "Pinned",
-                "model": "gpt-9",
-                "provider": "openai",
-            },
-        ],
+        [{"id": "job-1", "model": None, "model_snapshot": "stale", "provider_snapshot": "old"}],
     )
 
     c = Collector(hermes_home)
@@ -2885,15 +2922,9 @@ def test_collect_cron_snapshots_record_unpinned_resolution(hermes_home: Path):
     finally:
         c.close()
 
-    by_id = {job.job_id: job for job in state.cron.jobs}
-    unpinned = by_id["job-unpinned"]
-    assert unpinned.model == ""
-    assert unpinned.model_snapshot == "hermes-default-large"
-    assert unpinned.provider_snapshot == "openai"
-    pinned = by_id["job-pinned"]
-    assert pinned.model == "gpt-9"
-    assert pinned.model_snapshot == ""
-    assert pinned.provider_snapshot == ""
+    (collected,) = state.cron.jobs
+    assert collected.effective_model == "main"
+    assert "model_snapshot" not in collected.model_dump()
 
 
 def test_collect_cron_delivery_statuses_do_not_fold_into_error(hermes_home: Path):

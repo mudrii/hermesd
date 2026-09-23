@@ -915,6 +915,14 @@ class CheckpointInfo(BaseModel):
     last_checkpoint_at: float | None = None
 
 
+class CronModelSource(StrEnum):
+    """Which axis resolved a cron job's model, in upstream's precedence order."""
+
+    PINNED = "pinned"
+    CRON_DEFAULT = "cron.model default"
+    MAIN_MODEL = "follows main model"
+
+
 class CronJob(BaseModel):
     job_id: str = ""
     name: str = ""
@@ -939,10 +947,15 @@ class CronJob(BaseModel):
     repeat_times: int | None = None
     repeat_completed: int = 0
     no_agent: bool = False
-    # Explicit inference pins from jobs.json. Empty means unpinned, which is the
-    # condition under which upstream records a resolution snapshot instead.
+    # Explicit inference pins from jobs.json. Empty means unpinned: the job
+    # follows ``cron.model`` or the main model at fire time.
     model: str = ""
     provider: str = ""
+    # The model the next fire resolves to, and which axis it came from
+    # (``_load_cron_job_config``, ``cron/scheduler.py:1561-1590``). "" / None for
+    # a no-agent job or when nothing is configured (upstream refuses to run).
+    effective_model: str = ""
+    model_source: CronModelSource | None = None
     # ``fire_claim`` (``cron/jobs.py:2588-2608``): the dispatch lease, refreshed
     # every 60 s against a 300 s TTL. ``fire_claim_state`` is derived from the
     # claim age in the collector; both are None/"" when no usable claim exists.
@@ -961,11 +974,6 @@ class CronJob(BaseModel):
     # ``preflight_alerted`` (``cron/jobs.py:2190-2198``): upstream's alert-once
     # dedup marker for a config-blocked job.
     preflight_alerted: bool = False
-    # Creation-time resolution snapshots for unpinned axes
-    # (``cron/jobs.py:1600-1630``). Empty means pinned, no-agent, or unrecorded
-    # (older agent) — the snapshot is what the job will actually run.
-    model_snapshot: str = ""
-    provider_snapshot: str = ""
 
 
 class CronTickerHealth(StrEnum):
