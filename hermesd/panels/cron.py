@@ -58,8 +58,10 @@ _LAST_STATUS_STYLES = {
     "blocked_config": "ui_warn",
 }
 
-# Incident lifecycle is detected -> alerted -> closed (``cron/incidents.py:1-9``):
-# ``alerted`` is set only when a failure ping actually left the process
+# Incident lifecycle is detected -> alerted -> resolved | closed
+# (``cron/incidents.py:1-9,32``): ``resolved`` is automatic after a successful
+# run and re-opens on a repeat of the same error; ``closed`` is the operator's
+# ack. ``alerted`` is set only when a failure ping actually left the process
 # (``cron/scheduler.py:2745-2746``). An open row still in ``detected`` therefore
 # records no *delivered* failure ping — but that alone does not prove the alert
 # delivery path is broken, because upstream also leaves the row in ``detected``
@@ -486,7 +488,11 @@ def _job_flags_line(j: CronJob, theme: Theme) -> Text | None:
 
 def _executions_sections(executions: CronExecutionsState, theme: Theme) -> list[RenderableType]:
     """Recent-execution and open-incident tables, or a single 'no data' line."""
-    if not executions.recent and not executions.open_incidents:
+    if (
+        not executions.recent
+        and not executions.open_incidents
+        and not executions.resolved_incident_count
+    ):
         return [Text("\n  No execution history\n", style=theme.banner_dim)]
     sections: list[RenderableType] = []
     retention = _retention_line(executions, theme)
@@ -505,6 +511,15 @@ def _executions_sections(executions: CronExecutionsState, theme: Theme) -> list[
         )
         sections.append(_incidents_table(executions, theme))
         sections.append(Text(f"{_INCIDENT_ACK_NOTE}\n", style=theme.banner_dim))
+    if executions.resolved_incident_count:
+        sections.append(
+            Text(
+                f"\n  Resolved incidents: {executions.resolved_incident_count} "
+                f"({executions.resolved_24h_count} in the last 24h) — the job recovered;"
+                " the same error again re-opens and re-alerts.\n",
+                style=theme.banner_dim,
+            )
+        )
     return sections
 
 
@@ -620,6 +635,7 @@ def _incidents_table(executions: CronExecutionsState, theme: Theme) -> Table:
     table.add_column("Type", style=theme.ui_label)
     table.add_column("First", style=theme.banner_dim)
     table.add_column("Last", style=theme.banner_dim)
+    table.add_column("Last alert", style=theme.banner_dim)
     table.add_column("Error", style=theme.ui_error)
 
     for incident in executions.open_incidents:
@@ -633,6 +649,11 @@ def _incidents_table(executions: CronExecutionsState, theme: Theme) -> Table:
             escape(incident.failure_type) or "—",
             fmt_age_seconds(incident.first_seen_age_seconds),
             fmt_age_seconds(incident.last_seen_age_seconds),
+            (
+                f"{fmt_age_seconds(incident.alerted_age_seconds)} ago"
+                if incident.alerted_age_seconds is not None
+                else "—"
+            ),
             escape(incident.error_excerpt) if incident.error_excerpt else "—",
         )
     return table

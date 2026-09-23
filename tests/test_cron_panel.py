@@ -1231,3 +1231,44 @@ def test_cron_compact_hides_unacked_when_it_cannot_differ() -> None:
     text = render_to_str(render_cron(state, Theme()), width=100, no_color=True)
     assert "Incidents: 2 open" in text
     assert "unacked" not in text
+
+
+def test_cron_detail_shows_last_alert_age_and_resolved_counts() -> None:
+    """``alerted_at`` is restamped on every delivered ping
+    (``cron/incidents.py:196-212``), so it renders as the last alert's age; the
+    auto-``resolved`` rows are summarised apart from the open ones."""
+    incident = CronIncident(
+        incident_id="i1",
+        job_id="j1",
+        job_name="nightly",
+        state="alerted",
+        failure_type="timeout",
+        first_seen_age_seconds=7200.0,
+        last_seen_age_seconds=600.0,
+        alerted_age_seconds=300.0,
+        error_excerpt="boom",
+    )
+    state = DashboardState(
+        cron_executions=CronExecutionsState(
+            db_present=True,
+            open_incident_count=1,
+            unacked_incident_count=1,
+            open_incidents=[incident],
+            resolved_incident_count=4,
+            resolved_24h_count=2,
+        )
+    )
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=200, no_color=True)
+    assert "Last alert" in text
+    assert "5m ago" in text
+    assert "Resolved incidents: 4 (2 in the last 24h" in text
+
+
+def test_cron_detail_shows_resolved_counts_without_open_incidents() -> None:
+    state = DashboardState(
+        cron_executions=CronExecutionsState(
+            db_present=True, resolved_incident_count=1, resolved_24h_count=1
+        )
+    )
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=200, no_color=True)
+    assert "Resolved incidents: 1 (1 in the last 24h" in text

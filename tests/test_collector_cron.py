@@ -1821,6 +1821,76 @@ def test_collect_cron_incidents_absent_table_reports_zero(hermes_home: Path):
     assert state.cron_executions.open_incidents == []
 
 
+def _incidents_db_with_alerted_at(home: Path) -> sqlite3.Connection:
+    """executions.db with the ``alerted_at`` column upstream adds in place
+    (``cron/incidents.py:83,90``)."""
+    conn = sqlite3.connect(str(home / "cron" / "executions.db"))
+    create_cron_executions_tables(conn)
+    conn.execute("ALTER TABLE cron_incidents ADD COLUMN alerted_at TEXT")
+    return conn
+
+
+def _insert_incident(
+    conn: sqlite3.Connection,
+    incident_id: str,
+    state: str,
+    *,
+    closed_at: str | None = None,
+    alerted_at: str | None = None,
+) -> None:
+    conn.execute(
+        "INSERT INTO cron_incidents (id, job_id, error_sig, state, failure_type, "
+        "first_seen_at, last_seen_at, acked_at, closed_at, error, output_file, alerted_at) "
+        "VALUES (?, 'job-1', ?, ?, 'script', ?, ?, NULL, ?, 'boom', NULL, ?)",
+        (incident_id, incident_id, state, iso_ago(7200), iso_ago(600), closed_at, alerted_at),
+    )
+
+
+def test_collect_cron_incidents_resolved_state_is_not_open(hermes_home: Path):
+    """``resolved`` (job recovered, ``cron/incidents.py:32,248``) is not open; it
+    is counted apart, with the ones resolved inside the last 24h."""
+    conn = _incidents_db_with_alerted_at(hermes_home)
+    _insert_incident(conn, "inc_open", "alerted", alerted_at=iso_ago(300))
+    _insert_incident(conn, "inc_resolved_recent", "resolved", closed_at=iso_ago(3600))
+    _insert_incident(conn, "inc_resolved_old", "resolved", closed_at=iso_ago(3 * 86400))
+    # Upstream always stamps closed_at on resolve; a row without it is still
+    # resolved by state and must never leak into the open set.
+    _insert_incident(conn, "inc_resolved_unstamped", "resolved")
+    _insert_incident(conn, "inc_closed", "closed", closed_at=iso_ago(60))
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    executions = state.cron_executions
+    assert executions.open_incident_count == 1
+    assert [incident.incident_id for incident in executions.open_incidents] == ["inc_open"]
+    assert executions.resolved_incident_count == 3
+    assert executions.resolved_24h_count == 1
+    (incident,) = executions.open_incidents
+    assert incident.alerted_age_seconds == pytest.approx(300, abs=30)
+
+
+def test_collect_cron_incidents_without_alerted_at_column_read_as_unalerted(
+    hermes_home: Path, sample_cron_executions_db: Path
+):
+    """A ledger created before the alert-once gate has no ``alerted_at``."""
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "cron_executions" not in state.health.failed_sources
+    assert state.cron_executions.open_incidents
+    assert all(i.alerted_age_seconds is None for i in state.cron_executions.open_incidents)
+    assert state.cron_executions.resolved_incident_count == 0
+
+
 def test_collect_cron_reads_new_jobs_json_keys(hermes_home: Path):
     _write_jobs_json(
         hermes_home,

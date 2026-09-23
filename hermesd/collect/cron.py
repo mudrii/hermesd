@@ -589,6 +589,7 @@ def _incident_from_row(
             _iso_to_epoch(str(row.get("first_seen_at") or "")), now
         ),
         last_seen_age_seconds=_age_seconds(_iso_to_epoch(str(row.get("last_seen_at") or "")), now),
+        alerted_age_seconds=_age_seconds(_iso_to_epoch(str(row.get("alerted_at") or "")), now),
         error_excerpt=_cron_error_excerpt(str(row.get("error") or "")),
     )
 
@@ -598,32 +599,54 @@ def _read_cron_incidents(
     job_names: Mapping[str, str],
     *,
     now: float,
-) -> tuple[int, int, list[CronIncident]]:
-    """Open/unacked incident counts plus the latest few open incidents.
+) -> dict[str, Any]:
+    """Open/unacked/resolved incident counts plus the latest few open incidents.
 
     A missing cron_incidents table (older agents) reads as zeros; operational
     read errors propagate so the source fails to its last-good value.
     """
     if not _table_exists(conn, "cron_incidents"):
-        return 0, 0, []
-    # Lifecycle is detected -> alerted -> closed, and ``acked_at`` is written only
-    # by the closing transition, together with ``closed_at``
-    # (``cron/incidents.py:172-203``): upstream has no acknowledge-without-close.
-    # So for data this schema produces, every open incident is unacked — the
-    # separate counter is kept because a foreign/newer schema may diverge.
-    open_clause = "WHERE COALESCE(state, '') != 'closed' AND closed_at IS NULL"
+        return {}
+    # Lifecycle is detected -> alerted -> resolved | closed
+    # (``INCIDENT_STATES``, ``cron/incidents.py:32``). ``resolved`` is the
+    # automatic transition after a successful run and stamps ``closed_at``
+    # (``:233-248``); a repeat of the same error re-opens it as ``detected``
+    # (``:151-181``). ``closed`` is the operator's ack, and ``acked_at`` is
+    # written only by that transition, together with ``closed_at`` (``:196-230``):
+    # upstream has no acknowledge-without-close. So for data this schema
+    # produces, every open incident is unacked — the separate counter is kept
+    # because a foreign/newer schema may diverge. Open is filtered on state as
+    # well as ``closed_at`` so a resolved row can never read as open.
+    open_clause = "WHERE COALESCE(state, '') NOT IN ('closed', 'resolved') AND closed_at IS NULL"
     open_count = _count_rows(conn, f"SELECT COUNT(*) FROM cron_incidents {open_clause}")
     unacked_count = _count_rows(
         conn,
         f"SELECT COUNT(*) FROM cron_incidents {open_clause} AND acked_at IS NULL",
     )
+    # ``alerted_at`` was added in place for older ledgers (``:83,90``).
+    columns = {str(row[1] or "") for row in conn.execute("PRAGMA table_info(cron_incidents)")}
+    alerted = "alerted_at" if "alerted_at" in columns else "NULL AS alerted_at"
     rows = _query_rows(
         conn,
-        "SELECT id, job_id, state, failure_type, first_seen_at, last_seen_at, error "
+        f"SELECT id, job_id, state, failure_type, first_seen_at, last_seen_at, {alerted}, error "
         f"FROM cron_incidents {open_clause} ORDER BY last_seen_at DESC, id DESC "
         f"LIMIT {_INCIDENTS_LIMIT}",
     )
-    return open_count, unacked_count, [_incident_from_row(row, job_names, now=now) for row in rows]
+    conn.create_function("hermes_epoch", 1, _memo_iso_to_epoch, deterministic=True)
+    resolved = _query_rows(
+        conn,
+        "SELECT COUNT(*) AS total, "
+        "SUM(CASE WHEN hermes_epoch(closed_at) >= ? THEN 1 ELSE 0 END) AS recent "
+        "FROM cron_incidents WHERE state = 'resolved'",
+        (now - _EXECUTIONS_WINDOW_SECONDS,),
+    )[0]
+    return {
+        "open_incident_count": open_count,
+        "unacked_incident_count": unacked_count,
+        "open_incidents": [_incident_from_row(row, job_names, now=now) for row in rows],
+        "resolved_incident_count": int(resolved.get("total") or 0),
+        "resolved_24h_count": int(resolved.get("recent") or 0),
+    }
 
 
 def _read_cron_executions_state(
@@ -647,7 +670,7 @@ def _read_cron_executions_state(
         window_rows = _execution_window_rows(conn, now=now, columns=columns)
         delivery_rows = _execution_delivery_rows(conn, now=now, columns=columns)
         last_rows = _last_execution_rows(conn, columns=columns)
-        open_count, unacked_count, incidents = _read_cron_incidents(conn, job_names, now=now)
+        incidents = _read_cron_incidents(conn, job_names, now=now)
         return CronExecutionsState(
             db_present=True,
             job_stats=_job_execution_stats(
@@ -657,9 +680,7 @@ def _read_cron_executions_state(
                 delivery_tracked="delivery_outcome" in columns,
             ),
             recent=[_execution_from_row(row, job_names, now=now) for row in recent_rows],
-            open_incident_count=open_count,
-            unacked_incident_count=unacked_count,
-            open_incidents=incidents,
+            **incidents,
             **_execution_retention_fields(conn, now=now, columns=columns),
         )
 

@@ -1050,6 +1050,10 @@ class CronIncident(BaseModel):
     failure_type: str = ""
     first_seen_age_seconds: float | None = None
     last_seen_age_seconds: float | None = None
+    # Age of the latest delivered failure ping: upstream restamps ``alerted_at``
+    # on every alert, including cooldown reminders (``cron/incidents.py:196-212``).
+    # None when no ping was delivered or the ledger predates the column.
+    alerted_age_seconds: float | None = None
     error_excerpt: str = ""
 
 
@@ -1060,6 +1064,10 @@ class CronExecutionsState(BaseModel):
     open_incident_count: int = 0
     unacked_incident_count: int = 0
     open_incidents: list[CronIncident] = Field(default_factory=list)
+    # ``resolved`` = the job ran OK after the failure; a repeat of the same error
+    # re-opens it (``cron/incidents.py:32,151-181,233-248``). Not open, not acked.
+    resolved_incident_count: int = 0
+    resolved_24h_count: int = 0
     # Retention. Upstream prunes terminal history to a fixed record cap, so every
     # aggregate above describes *recorded* attempts rather than every attempt that
     # happened. ``retention_cap`` is 0 when the table could not be read, which is
