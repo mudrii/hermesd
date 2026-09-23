@@ -58,21 +58,48 @@ def test_collect_config_preserves_last_good_mapping_on_non_mapping_yaml(hermes_h
     c.close()
 
 
-def test_collect_config_personality_fallback(hermes_home: Path):
-    """When active_personality is unset, pick first from personalities dict."""
-    cfg = hermes_home / "config.yaml"
-    cfg.write_text(
-        yaml.dump(
+@pytest.mark.parametrize(
+    ("cfg", "expected"),
+    [
+        # display.personality is the only selection upstream persists
+        # (hermes_cli/personality.py:1-7,127-131); a built-in name resolves.
+        ({"display": {"personality": "technical"}}, "technical"),
+        # Names are normalized (strip + lower) before the lookup.
+        ({"display": {"personality": "  Technical "}}, "technical"),
+        # User-defined personalities under agent.personalities and the root
+        # personalities block both count (available_personalities, :86-96).
+        (
+            {"display": {"personality": "mine"}, "agent": {"personalities": {"mine": "x"}}},
+            "mine",
+        ),
+        ({"display": {"personality": "rootp"}, "personalities": {"rootp": "x"}}, "rootp"),
+        # An unknown name is no overlay at all (active_personality_name, :112-115).
+        ({"display": {"personality": "ghost"}}, ""),
+        # Neutral spellings mean "none".
+        ({"display": {"personality": "default"}}, ""),
+        # agent.active_personality is never written upstream, and the first
+        # agent.personalities key is not a selection.
+        (
             {
-                "model": {"default": "gpt-5.4"},
-                "agent": {"personalities": {"pirate": "arrr"}},
-            }
-        )
-    )
+                "agent": {
+                    "active_personality": "pirate",
+                    "personalities": {"surfer": "dude"},
+                }
+            },
+            "",
+        ),
+    ],
+)
+def test_collect_config_personality_follows_display_personality(
+    hermes_home: Path, cfg: dict, expected: str
+):
+    (hermes_home / "config.yaml").write_text(yaml.dump(cfg))
     c = Collector(hermes_home)
-    state = c.collect()
-    assert state.config.personality == "pirate"
-    c.close()
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+    assert state.config.personality == expected
 
 
 def test_collect_config_tool_gateway_routes(hermes_home: Path, monkeypatch):

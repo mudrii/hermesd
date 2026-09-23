@@ -31,6 +31,7 @@ from hermesd.models import (
     CronRecoveryState,
     CronState,
     CronUsageState,
+    CuratorLedgerAction,
     CuratorRun,
     DashboardState,
     DbRecoveryState,
@@ -38,6 +39,7 @@ from hermesd.models import (
     DelegationLiveManifest,
     DelegationLiveTask,
     DiscoveredRepoSummary,
+    DuplicatePlatformCredential,
     ForensicFile,
     GatewayHygieneState,
     GatewayRouteState,
@@ -46,6 +48,7 @@ from hermesd.models import (
     HookInfo,
     HostedRoomState,
     HostedRoomSummary,
+    IntegrationsState,
     KanbanBoardSummary,
     KanbanNotifySubSummary,
     KanbanRunSummary,
@@ -60,17 +63,21 @@ from hermesd.models import (
     MCPServerInfo,
     MemoryOverview,
     ModelCacheSummary,
+    ModelCooldown,
     ModelUsage,
     OperationsState,
+    PairingPlatformSummary,
     PlatformStatus,
     PluginInfo,
     PRMonitorSummary,
     ProcessReceipt,
     ProcessReceiptsState,
+    ProfileRouteSummary,
     ProfilesState,
     ProfileSummary,
     ProjectSummary,
     ProviderInfo,
+    RateLimitHold,
     RetiredWalGeneration,
     SessionCoordinationState,
     SessionInfo,
@@ -446,7 +453,7 @@ def _state_for(panel_num: int) -> DashboardState:
                         auth_type=INJECT,
                         source=INJECT,
                         last_status=INJECT,
-                        cooldown_remaining=INJECT,
+                        model_cooldowns=[ModelCooldown(model=INJECT, remaining_seconds=60)],
                         expires_at=INJECT,
                         last_refresh=INJECT,
                     )
@@ -480,7 +487,15 @@ def _state_for(panel_num: int) -> DashboardState:
                 ],
                 skills=[SkillInfo(name=INJECT, category="dev", description=INJECT)],
             ),
-            config=ConfigSummary(mcp_server_count=2, mcp_server_names=[INJECT, "cached-server"]),
+            config=ConfigSummary(
+                mcp_server_count=2,
+                mcp_server_names=[INJECT, "cached-server"],
+                profile_routes=[
+                    ProfileRouteSummary(
+                        name=INJECT, platform=INJECT, profile=INJECT, bot_profile=INJECT
+                    )
+                ],
+            ),
             mcp_cache=MCPSchemaCache(
                 mcp_cache_present=True,
                 mcp_cached_server_count=1,
@@ -500,6 +515,15 @@ def _state_for(panel_num: int) -> DashboardState:
                 prompted_skill_count=1,
                 prompt_snapshot_age_seconds=120.0,
             ),
+            integrations=IntegrationsState(
+                pairing_platforms=[PairingPlatformSummary(platform=INJECT, pending_count=1)],
+                webhook_subscriptions_present=True,
+                webhook_route_names=[INJECT],
+                shared_metrics_present=True,
+                shared_metrics_outbox_by_state={INJECT: 1},
+                shared_metrics_consent_marks={INJECT: INJECT},
+                rate_limit_holds=[RateLimitHold(name=INJECT, remaining_seconds=60)],
+            ),
         )
     if panel_num == 8:  # Logs
         line = LogLine(
@@ -516,6 +540,9 @@ def _state_for(panel_num: int) -> DashboardState:
             profiles=ProfilesState(
                 profile_count=1,
                 profiles=[ProfileSummary(name=INJECT, session_count=1, soul_excerpt=INJECT)],
+                duplicate_platform_credentials=[
+                    DuplicatePlatformCredential(key=INJECT, platform=INJECT, profiles=[INJECT])
+                ],
             ),
         )
     if panel_num == 10:  # Memory
@@ -754,6 +781,9 @@ def _state_for(panel_num: int) -> DashboardState:
                 scheduler_state_present=True,
                 scheduler_last_run_at=INJECT,
                 scheduler_last_report_path=INJECT,
+                ledger_recent=[
+                    CuratorLedgerAction(ts=INJECT, actor=INJECT, action=INJECT, skill=INJECT)
+                ],
             ),
         )
     raise AssertionError(f"no state builder for panel {panel_num}")

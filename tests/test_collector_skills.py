@@ -127,6 +127,28 @@ def test_collect_memory_learning_summary(hermes_home: Path):
     c.close()
 
 
+def test_collect_memory_counts_learn_created_skills_as_learned_not_agent(hermes_home: Path):
+    # record_created stamps created_by="learn" for a foreground /learn create
+    # (tools/skill_usage.py:518-529): a learning signal, not the curator opt-in.
+    (hermes_home / "skills" / ".usage.json").write_text(
+        json.dumps(
+            {
+                "taught": {"use_count": 1, "created_by": "learn"},
+                "curated": {"use_count": 1, "created_by": "agent"},
+                "installed": {"use_count": 1, "created_by": "installed"},
+            }
+        )
+    )
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.memory.learned_skill_count == 2
+    assert state.memory.agent_created_skill_count == 1
+
+
 def test_collect_skills_and_memory_visibility_render_from_collected_state(hermes_home: Path):
     (hermes_home / "auth.json").write_text(
         json.dumps(

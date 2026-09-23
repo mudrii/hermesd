@@ -155,7 +155,7 @@ def test_collect_credential_pools_redacts_secrets(populated_hermes_home: Path):
     assert pools["openai-codex"].request_count == 42
     assert pools["anthropic"].source == "env:ANTHROPIC_API_KEY"
     assert pools["anthropic"].last_status == "rate_limited"
-    assert pools["anthropic"].cooldown_remaining == "58m"
+    assert pools["anthropic"].cooldown_remaining_seconds is None
     assert pools["anthropic"].token_present is True
     assert "sk-live-secret" not in repr(state.skills_memory.credential_pools)
     assert "sk-ant-secret" not in repr(state.skills_memory.credential_pools)

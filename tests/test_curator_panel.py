@@ -259,3 +259,76 @@ def test_curator_detail_marks_overdue_and_caps_windows() -> None:
     text = _render(_curator_state(skill_windows=[overdue]), detail=True)
 
     assert "due" in text
+
+
+def _plain(state: DashboardState, detail: bool) -> str:
+    return render_to_str(render_curator(state, Theme(), detail=detail), width=160, no_color=True)
+
+
+def _activity_run(**overrides: object) -> CuratorRun:
+    from hermesd.models import CuratorLedgerAction
+
+    fields: dict[str, object] = {
+        "scheduler_state_present": True,
+        "last_run_duration_seconds": 3.2,
+        "suppressed_count": 12,
+        "ledger_present": True,
+        "ledger_recent": [
+            CuratorLedgerAction(
+                ts="2026-09-16T20:34:45+00:00",
+                actor="curator",
+                action="archive",
+                skill="[red]xurl[/]",
+            ),
+            CuratorLedgerAction(ts="", actor="user", action="restore", skill=""),
+        ],
+        "run_claim_present": True,
+        "run_claim_pid": 4242,
+        "run_claim_age_seconds": 120.0,
+        "run_claim_live": True,
+    }
+    fields.update(overrides)
+    return CuratorRun(**fields)
+
+
+def test_curator_compact_marks_a_live_run_claim() -> None:
+    text = _plain(DashboardState(curator=_activity_run()), detail=False)
+    assert "Running: pid 4242 (2m)" in text
+
+    idle = _plain(DashboardState(curator=_activity_run(run_claim_live=False)), detail=False)
+    assert "Running" not in idle
+
+
+def test_curator_detail_shows_activity_section() -> None:
+    text = _plain(DashboardState(curator=_activity_run()), detail=True)
+
+    assert re.search(r"Last Duration\s+3\.2s", text)
+    assert "Activity" in text
+    assert re.search(r"Suppressed\s+12 built-in", text)
+    assert re.search(r"Run claim\s+live — pid 4242, 2m old", text)
+    assert "Recent ledger" in text
+    assert "[red]xurl[/]" in text
+    assert "restore" in text
+
+
+def test_curator_detail_labels_a_stale_run_claim() -> None:
+    stale = _activity_run(run_claim_live=False, run_claim_age_seconds=7200.0)
+    text = _plain(DashboardState(curator=stale), detail=True)
+    assert "stale — pid 4242, 2h old" in text
+
+    no_pid = _activity_run(run_claim_live=False, run_claim_pid=None)
+    assert "stale — pid ?, 2m old" in _plain(DashboardState(curator=no_pid), detail=True)
+
+
+def test_curator_detail_hides_activity_when_nothing_recorded() -> None:
+    run = CuratorRun(scheduler_state_present=True)
+    text = _plain(DashboardState(curator=run), detail=True)
+    assert "Activity" not in text
+    assert re.search(r"Last Duration\s+—", text)
+
+
+def test_curator_detail_shows_activity_with_a_run_report() -> None:
+    run = _RUN.model_copy(update={"suppressed_count": 1})
+    text = _plain(DashboardState(curator=run), detail=True)
+    assert re.search(r"Suppressed\s+1 built-in", text)
+    assert re.search(r"Run claim\s+none", text)

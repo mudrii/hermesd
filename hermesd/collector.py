@@ -57,17 +57,26 @@ from hermesd.collect.common import (
 )
 from hermesd.collect.config import (
     _CONFIG_BACKUP_ENTRY_LIMIT,
+    _active_model_cooldowns,
+    _active_personality_name,
     _channel_capabilities,
     _config_agent_limits,
     _config_backup_groups,
     _credential_auth_type,
+    _credential_cooldown_remaining,
     _credential_expiry,
+    _doctor_config_findings,
+    _duplicate_platform_credentials,
+    _env_platform_credential_keys,
+    _integration_flags,
     _mcp_tool_filter_summary,
     _moa_config_summary,
     _platform_family_label,
+    _pool_entries,
     _provider_free_tier,
     _provider_model_label,
     _provider_routing_summary,
+    _read_env_text,
     _scale_to_zero_relay_only,
     _select_pool_entry,
     _stale_alias_count,
@@ -104,10 +113,15 @@ from hermesd.collect.cron import (
     _tail_latest_cron_output,
 )
 from hermesd.collect.curator import (
+    _CURATOR_CLAIM_STALE_SECONDS,
+    _LEDGER_TAIL_BYTES,
+    _claim_pid,
     _curator_thresholds,
     _curator_with_scheduler_state,
+    _ledger_recent,
     _skill_curation_hygiene,
     _state_transition_label,
+    _suppressed_count,
 )
 from hermesd.collect.desktop_plugins import read_desktop_plugins
 from hermesd.collect.gateway import (
@@ -133,6 +147,15 @@ from hermesd.collect.gateway import (
     _update_receipt_status,
 )
 from hermesd.collect.hosted_rooms import _read_hosted_rooms
+from hermesd.collect.integrations import (
+    PAIRING_SUFFIXES,
+    RATE_LIMIT_NAMES,
+    pairing_platforms,
+    pairing_summary,
+    rate_limit_hold,
+    shared_metrics_readout,
+    webhook_summary,
+)
 from hermesd.collect.kanban import (
     _kanban_claim_ttl_seconds,
     _read_kanban_board_summary,
@@ -281,6 +304,7 @@ from hermesd.models import (
     GatewayState,
     HealthSummary,
     HookInfo,
+    IntegrationsState,
     KanbanBoardSummary,
     KanbanState,
     LogLine,
@@ -404,6 +428,42 @@ _PLUGIN_LIMIT = 200
 # The desktop inventory enriches SkillsMemory through an independent health
 # source so a transient root listing failure cannot blank agent integrations.
 _DESKTOP_PLUGIN_FIELDS = ("desktop_plugins", "desktop_plugin_scan_truncated")
+# skills/.hub — the fields the `skills_hub` source owns on SkillsMemory.
+_SKILLS_HUB_FIELDS = ("hub_lock_present", "hub_installed_count", "hub_quarantine_count")
+# skills/.hub/quarantine/ listing bound: one entry per quarantined skill.
+_HUB_QUARANTINE_LIST_LIMIT = 1000
+# Each integration store's fields on IntegrationsState, restored per source.
+_PAIRING_FIELDS = ("pairing_platforms",)
+_WEBHOOK_SUBSCRIPTION_FIELDS = (
+    "webhook_subscriptions_present",
+    "webhook_subscription_count",
+    "webhook_enabled_count",
+    "webhook_route_names",
+)
+_SHARED_METRICS_FIELDS = (
+    "shared_metrics_present",
+    "shared_metrics_counter_rows",
+    "shared_metrics_pending_periods",
+    "shared_metrics_outbox_by_state",
+    "shared_metrics_outbox_error_count",
+    "shared_metrics_consent_marks",
+)
+_RATE_LIMIT_FIELDS = ("rate_limit_holds",)
+# Pairing store listing bounds: files examined, platforms summarized.
+_PAIRING_DIR_ENTRY_LIMIT = 400
+_PAIRING_PLATFORM_LIMIT = 40
+# The `profile_credentials` source's field on ProfilesState.
+_PROFILE_CREDENTIAL_FIELDS = ("duplicate_platform_credentials",)
+# The `curator_activity` source's fields on CuratorRun.
+_CURATOR_ACTIVITY_FIELDS = (
+    "suppressed_count",
+    "ledger_present",
+    "ledger_recent",
+    "run_claim_present",
+    "run_claim_pid",
+    "run_claim_age_seconds",
+    "run_claim_live",
+)
 # backups/config/ scan — the fields the config-backups source owns on
 # ConfigSummary, so its last-good fallback restores exactly those.
 _CONFIG_BACKUP_FIELDS = (
@@ -844,6 +904,9 @@ class Collector:
         # MEMORY.md / USER.md / SOUL.md is not re-read on every tick.
         self._derived_file_cache: dict[str, tuple[tuple[str, int, int] | None, Any]] = {}
         self._kanban_board_errors: list[str] = []
+        # telemetry/shared_metrics/metrics.sqlite3 readout keyed on the db+WAL
+        # signature, so an idle store is not re-queried every refresh.
+        self._shared_metrics_cache: tuple[_DbSourceSignature, dict[str, Any]] | None = None
         # Session-row-derived values, one entry per derived name: the rows
         # list itself (compared by identity), then (local date, entry-specific
         # deps) — see _derived_from_rows.
@@ -1273,6 +1336,55 @@ class Collector:
                 lambda: results["skills_memory"],
                 fallback=lambda: self._last_plugin_catalog(results["skills_memory"]),
             ),
+            _SourceSpec(
+                "skills_memory",
+                "skills_hub",
+                lambda: self._with_skills_hub(results["skills_memory"]),
+                lambda: results["skills_memory"],
+                fallback=lambda: self._last_source_fields(
+                    "skills_hub", results["skills_memory"], _SKILLS_HUB_FIELDS
+                ),
+            ),
+            # Four stores enrich `integrations`, each failing (and falling back)
+            # on its own so one corrupt store cannot blank the others.
+            _SourceSpec(
+                "integrations",
+                "pairing",
+                lambda: self._with_pairing(results.get("integrations") or IntegrationsState()),
+                IntegrationsState,
+                fallback=lambda: self._last_source_fields(
+                    "pairing",
+                    results.get("integrations") or IntegrationsState(),
+                    _PAIRING_FIELDS,
+                ),
+            ),
+            _SourceSpec(
+                "integrations",
+                "webhook_subscriptions",
+                lambda: self._with_webhook_subscriptions(results["integrations"]),
+                lambda: results["integrations"],
+                fallback=lambda: self._last_source_fields(
+                    "webhook_subscriptions", results["integrations"], _WEBHOOK_SUBSCRIPTION_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "integrations",
+                "shared_metrics",
+                lambda: self._with_shared_metrics(results["integrations"]),
+                lambda: results["integrations"],
+                fallback=lambda: self._last_source_fields(
+                    "shared_metrics", results["integrations"], _SHARED_METRICS_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "integrations",
+                "rate_limits",
+                lambda: self._with_rate_limits(results["integrations"]),
+                lambda: results["integrations"],
+                fallback=lambda: self._last_source_fields(
+                    "rate_limits", results["integrations"], _RATE_LIMIT_FIELDS
+                ),
+            ),
             _SourceSpec("mcp_cache", "mcp_cache", self._collect_mcp_cache, MCPSchemaCache),
             _SourceSpec(
                 "skills_prompt",
@@ -1282,12 +1394,30 @@ class Collector:
             ),
             _SourceSpec("memory", "memory", self._collect_memory, MemoryOverview),
             _SourceSpec("profiles", "profiles", self._collect_profiles, ProfilesState),
+            _SourceSpec(
+                "profiles",
+                "profile_credentials",
+                lambda: self._with_profile_credentials(results["profiles"]),
+                lambda: results["profiles"],
+                fallback=lambda: self._last_source_fields(
+                    "profile_credentials", results["profiles"], _PROFILE_CREDENTIAL_FIELDS
+                ),
+            ),
             _SourceSpec("logs", "logs", self._collect_logs, LogState),
             _SourceSpec("version_behind", "version_check", self._collect_version_behind, int),
             # Without a last good read the fallback is the shipped skin name,
             # not the "" that the str default factory would yield.
             _SourceSpec("active_skin", "skin", self._collect_skin, str, fallback=self._last_skin),
             _SourceSpec("curator", "curator", self._collect_curator, CuratorRun),
+            _SourceSpec(
+                "curator",
+                "curator_activity",
+                lambda: self._with_curator_activity(results["curator"]),
+                lambda: results["curator"],
+                fallback=lambda: self._last_source_fields(
+                    "curator_activity", results["curator"], _CURATOR_ACTIVITY_FIELDS
+                ),
+            ),
             _SourceSpec(
                 "model_usage",
                 "model_usage",
@@ -2504,11 +2634,6 @@ class Collector:
         auxiliary_cfg = _as_dict(cfg.get("auxiliary"))
         moa_cfg = _as_dict(cfg.get("moa"))
         moa_summary = _moa_config_summary(moa_cfg)
-        personality = str(agent_cfg.get("active_personality") or "")
-        if not personality:
-            personalities = _as_dict(agent_cfg.get("personalities"))
-            if personalities:
-                personality = str(next(iter(personalities)))
         dashboard_auth_provider = str(
             dashboard_cfg.get("auth_provider")
             or dashboard_cfg.get("auth")
@@ -2519,7 +2644,7 @@ class Collector:
             # bare .get(key, default) would fail the whole config source.
             model=str(model_cfg.get("default") or ""),
             provider=str(model_cfg.get("provider") or ""),
-            personality=personality,
+            personality=_active_personality_name(cfg),
             max_turns=_coerce_int(agent_cfg.get("max_turns")),
             compression_threshold=_coerce_float(comp_cfg.get("threshold")),
             reasoning_effort=str(agent_cfg.get("reasoning_effort") or ""),
@@ -2575,6 +2700,8 @@ class Collector:
             moa_save_traces=bool(moa_cfg.get("save_traces")),
             moa_trace_dir=str(moa_cfg.get("trace_dir") or ""),
             **_config_agent_limits(cfg),
+            **_integration_flags(cfg),
+            **_doctor_config_findings(cfg),
         )
 
     def _with_config_backups(self, current: ConfigSummary) -> ConfigSummary:
@@ -3665,6 +3792,65 @@ class Collector:
             curator_cfg,
         ).model_copy(update=overlay)
 
+    def _with_curator_activity(self, current: CuratorRun) -> CuratorRun:
+        """Suppression list, ledger tail and run claim beside the curator state.
+
+        All three resolve through ``get_hermes_home()/"skills"`` upstream —
+        ``tools/skill_usage.py:194-207`` (``.curator_suppressed``),
+        ``tools/skill_ledger.py:79-84`` (``.curator_ledger.jsonl``) and
+        ``agent/curator.py:1119-1141`` (``.locks/curator-run``, the pid of an
+        ``O_EXCL`` claim taken over after an hour) — so they are PROFILE-scoped.
+        """
+        skills = self._paths.profile_path("skills")
+        root = self._paths.root_home
+        suppressed = skills / ".curator_suppressed"
+        ledger = skills / ".curator_ledger.jsonl"
+        claim = skills / ".locks" / "curator-run"
+        for path in (suppressed, ledger, claim):
+            if not _safe_or_absent_child_path(path, root):
+                raise RuntimeError(f"unsafe curator file: {path.name}")
+        suppressed_count = (
+            self._signature_cached(
+                "curator_suppressed",
+                suppressed,
+                lambda: _suppressed_count(self._text_reader(suppressed, root)),
+            )
+            if _exists_strict(suppressed)
+            else 0
+        )
+        ledger_present = _exists_strict(ledger)
+        recent = (
+            self._signature_cached(
+                "curator_ledger",
+                ledger,
+                lambda: _ledger_recent(_read_tail_text(ledger, _LEDGER_TAIL_BYTES)),
+            )
+            if ledger_present
+            else ()
+        )
+        claim_pid: int | None = None
+        claim_age: float | None = None
+        claim_present = _exists_strict(claim)
+        if claim_present:
+            claim_pid = _claim_pid(self._text_reader(claim, root)[:32])
+            claim_age = _age_seconds(_mtime(claim), self._clock())
+        return current.model_copy(
+            update={
+                "suppressed_count": suppressed_count,
+                "ledger_present": ledger_present,
+                "ledger_recent": list(recent),
+                "run_claim_present": claim_present,
+                "run_claim_pid": claim_pid,
+                "run_claim_age_seconds": claim_age,
+                "run_claim_live": (
+                    claim_pid is not None
+                    and claim_age is not None
+                    and claim_age <= _CURATOR_CLAIM_STALE_SECONDS
+                    and self._process_alive(claim_pid)
+                ),
+            }
+        )
+
     def _collect_model_caches(self) -> list[ModelCacheSummary]:
         cache_names = [
             "models_dev_cache.json",
@@ -3908,6 +4094,131 @@ class Collector:
                 "desktop_plugin_scan_truncated": truncated,
             }
         )
+
+    def _with_skills_hub(self, current: SkillsMemory) -> SkillsMemory:
+        """Hub-installed and quarantined skill counts, as ``hermes doctor`` reports them.
+
+        ``tools/skills_hub.py:59-62`` resolves ``skills/.hub/lock.json`` and
+        ``skills/.hub/quarantine/`` under ``get_hermes_home()`` (PROFILE);
+        ``hermes_cli/doctor_state.py:452-464`` counts ``installed`` entries and
+        quarantined directories. Names inside the lock are not surfaced.
+        """
+        hub = self._paths.profile_path("skills", ".hub")
+        root = self._paths.root_home
+        lock = hub / "lock.json"
+        quarantine = hub / "quarantine"
+        for path in (lock, quarantine):
+            if not _safe_or_absent_child_path(path, root):
+                raise RuntimeError(f"unsafe skills hub path: {path.name}")
+        lock_present = _exists_strict(lock)
+        installed = (
+            len(_as_dict(self._read_json_reporting_stale(lock).get("installed")))
+            if lock_present
+            else 0
+        )
+        quarantined = 0
+        if _exists_strict(quarantine) and quarantine.is_dir():
+            quarantined = sum(
+                1
+                for entry in islice(quarantine.iterdir(), _HUB_QUARANTINE_LIST_LIMIT)
+                if entry.is_dir() and not entry.is_symlink()
+            )
+        return current.model_copy(
+            update={
+                "hub_lock_present": lock_present,
+                "hub_installed_count": installed,
+                "hub_quarantine_count": quarantined,
+            }
+        )
+
+    def _pairing_dir(self) -> Path:
+        """``get_hermes_dir("platforms/pairing", "pairing")`` (``hermes_constants.py:376-388``).
+
+        A populated legacy ``pairing/`` wins; an empty one never shadows
+        ``platforms/pairing/``. Both are PROFILE-scoped (``gateway/pairing.py:58-59``).
+        """
+        legacy = self._paths.profile_path("pairing")
+        modern = self._paths.profile_path("platforms", "pairing")
+        for path in (legacy, modern):
+            if not _safe_or_absent_child_path(path, self._paths.root_home):
+                raise RuntimeError(f"unsafe pairing directory: {path.name}")
+        if _exists_strict(legacy) and legacy.is_dir() and any(islice(legacy.iterdir(), 1)):
+            return legacy
+        return modern
+
+    def _with_pairing(self, current: IntegrationsState) -> IntegrationsState:
+        """Per-platform live pending and approved counts; codes and ids stay unread."""
+        directory = self._pairing_dir()
+        if not _exists_strict(directory) or not directory.is_dir():
+            return current.model_copy(update={"pairing_platforms": []})
+        files = {
+            entry.name
+            for entry in islice(directory.iterdir(), _PAIRING_DIR_ENTRY_LIMIT)
+            if entry.is_file() and not entry.is_symlink()
+        }
+        now = self._clock()
+        summaries = []
+        for platform in pairing_platforms(sorted(files))[:_PAIRING_PLATFORM_LIMIT]:
+            stores = []
+            for suffix in PAIRING_SUFFIXES:
+                name = f"{platform}{suffix}"
+                stores.append(
+                    self._read_json_reporting_stale(directory / name) if name in files else {}
+                )
+            summaries.append(pairing_summary(platform, stores[0], stores[1], now=now))
+        return current.model_copy(update={"pairing_platforms": summaries})
+
+    def _with_webhook_subscriptions(self, current: IntegrationsState) -> IntegrationsState:
+        """Route names and enabled counts (``hermes_cli/webhook.py:18-35``, PROFILE)."""
+        path = self._paths.profile_path("webhook_subscriptions.json")
+        if not _safe_or_absent_child_path(path, self._paths.root_home):
+            raise RuntimeError("unsafe webhook_subscriptions.json")
+        present = _exists_strict(path)
+        subscriptions = self._read_json_reporting_stale(path) if present else {}
+        return current.model_copy(
+            update={"webhook_subscriptions_present": present, **webhook_summary(subscriptions)}
+        )
+
+    def _with_shared_metrics(self, current: IntegrationsState) -> IntegrationsState:
+        """Counts over ``telemetry/shared_metrics/metrics.sqlite3`` (PROFILE).
+
+        ``SharedMetricsStore`` roots at ``get_hermes_home()/"telemetry"/
+        "shared_metrics"`` (``hermes_cli/observability/shared_metrics.py:171-176``).
+        The readout is reused until the db or its WAL changes.
+        """
+        path = self._paths.profile_path("telemetry", "shared_metrics", "metrics.sqlite3")
+        if not _safe_or_absent_child_path(path, self._paths.root_home):
+            raise RuntimeError("unsafe shared metrics database")
+        if not _exists_strict(path):
+            self._shared_metrics_cache = None
+            empty = IntegrationsState()
+            return current.model_copy(
+                update={name: getattr(empty, name) for name in _SHARED_METRICS_FIELDS}
+            )
+        signature = _db_source_signature(path)
+        cached = self._shared_metrics_cache
+        if cached is not None and signature is not None and cached[0] == signature:
+            readout = cached[1]
+        else:
+            with _connect_readonly_sqlite(path) as conn:
+                readout = shared_metrics_readout(conn)
+            self._shared_metrics_cache = (signature, readout) if signature is not None else None
+        return current.model_copy(update={"shared_metrics_present": True, **readout})
+
+    def _with_rate_limits(self, current: IntegrationsState) -> IntegrationsState:
+        """Active provider holds from ``rate_limits/*.json`` (``agent/nous_rate_guard.py:37-46``)."""
+        now = self._clock()
+        holds = []
+        for name in RATE_LIMIT_NAMES:
+            path = self._paths.profile_path("rate_limits", f"{name}.json")
+            if not _safe_or_absent_child_path(path, self._paths.root_home):
+                raise RuntimeError(f"unsafe rate limit file: {path.name}")
+            if not _exists_strict(path):
+                continue
+            hold = rate_limit_hold(name, self._read_json_reporting_stale(path), now=now)
+            if hold is not None:
+                holds.append(hold)
+        return current.model_copy(update={"rate_limit_holds": holds})
 
     def _with_plugin_catalog(self, current: SkillsMemory) -> SkillsMemory:
         """Flag catalog drift, catalog removals and unmanaged installs.
@@ -4300,8 +4611,10 @@ class Collector:
 
         providers_section = _as_dict(data.get("providers"))
         entries = []
+        now = self._clock()
         for name, raw_entry in sorted(_as_dict(data.get("credential_pool")).items()):
             entry = _select_pool_entry(raw_entry)
+            pool_entries = _pool_entries(raw_entry)
             provider_entry = _as_dict(providers_section.get(name))
             entries.append(
                 CredentialPoolEntry(
@@ -4311,7 +4624,15 @@ class Collector:
                     source=str(entry.get("source") or ""),
                     last_status=str(entry.get("last_status") or entry.get("status") or ""),
                     request_count=_coerce_int(entry.get("request_count") or entry.get("requests")),
-                    cooldown_remaining=str(entry.get("cooldown_remaining") or ""),
+                    cooldown_remaining_seconds=_credential_cooldown_remaining(
+                        entry,
+                        sole_credential=sum(
+                            1 for item in pool_entries if item.get("last_status") != "dead"
+                        )
+                        <= 1,
+                        now=now,
+                    ),
+                    model_cooldowns=_active_model_cooldowns(pool_entries, now=now),
                     priority=_coerce_int(entry.get("priority")),
                     token_present=_has_secret_material(entry)
                     or _has_secret_material(provider_entry),
@@ -4459,6 +4780,44 @@ class Collector:
             skill_count=_count_skills(skills_path) if skills_safe else 0,
             db_size_bytes=_file_size(db_path) if db_safe else 0,
             soul_excerpt=(self._cached_soul_excerpt(soul_path, profile_home) if soul_safe else ""),
+            config_present=(profile_home / "config.yaml").exists(),
+            env_present=(profile_home / ".env").exists(),
+        )
+
+    def _with_profile_credentials(self, current: ProfilesState) -> ProfilesState:
+        """Platform credential key names held by more than one profile's .env.
+
+        ``hermes doctor`` names duplicates across the default home and every
+        named profile (``hermes_cli/doctor_state.py:576-581`` via
+        ``gateway_migrate.duplicate_credential_findings``, ``:434-443``); the
+        default profile's ``.env`` is the root one. Only key names leave the
+        read: values are checked for blankness and dropped. A symlinked ``.env``
+        is skipped rather than followed.
+        """
+        root = self._paths.root_home
+        homes = [("default", root)]
+        homes.extend(
+            (profile.name, self._paths.shared_path("profiles", profile.name))
+            for profile in current.profiles
+        )
+        holders: list[tuple[str, frozenset[str]]] = []
+        for name, home in homes:
+            env_path = home / ".env"
+            if env_path.is_symlink() or not _exists_strict(env_path):
+                continue
+            if not _path_resolves_under(env_path, root):
+                raise RuntimeError(f"unsafe .env for profile {name}")
+            holders.append((name, self._cached_env_credential_keys(env_path)))
+        return current.model_copy(
+            update={"duplicate_platform_credentials": _duplicate_platform_credentials(holders)}
+        )
+
+    def _cached_env_credential_keys(self, env_path: Path) -> frozenset[str]:
+        """Key names only are cached — the value set never outlives the read."""
+        return self._signature_cached(
+            "env_credential_keys",
+            env_path,
+            lambda: _env_platform_credential_keys(_read_env_text(env_path)),
         )
 
     def _last_profile_exists(self, name: str) -> bool:

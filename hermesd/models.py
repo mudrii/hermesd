@@ -1359,6 +1359,18 @@ class ConfigBackupGroup(BaseModel):
     newest_age_seconds: float | None = None
 
 
+class ProfileRouteSummary(BaseModel):
+    """One gateway.profile_routes rule — which discriminators it uses, never their ids."""
+
+    name: str = ""
+    platform: str = ""
+    profile: str = ""
+    enabled: bool = True
+    bot_profile: str = ""
+    # Subset of guild_id/chat_id/thread_id/user_id the rule matches on.
+    discriminators: list[str] = Field(default_factory=list)
+
+
 class ConfigSummary(BaseModel):
     model: str = ""
     provider: str = ""
@@ -1453,6 +1465,29 @@ class ConfigSummary(BaseModel):
     config_backups_present: bool = False
     config_backup_groups: list[ConfigBackupGroup] = Field(default_factory=list)
     config_backup_groups_truncated: bool = False
+    # Integration switches read from config.yaml — flags and names only.
+    # platforms.webhook.enabled (hermes_cli/webhook.py:42-55).
+    webhook_platform_enabled: bool = False
+    # profile_routes, root key first then gateway.profile_routes
+    # (gateway/config_loader.py:93,106-126; gateway/profile_routing.py:133-171).
+    profile_routes: list[ProfileRouteSummary] = Field(default_factory=list)
+    # Entries upstream's parser skips (no platform/profile, or a null/empty
+    # user_id) — counted, never rendered as routes.
+    profile_routes_skipped: int = 0
+    # monitoring.* (hermes_cli/config_defaults.py:2038-2060): nothing is sent
+    # until export is enabled with an endpoint; the endpoint URL itself is not
+    # surfaced (presence only).
+    monitoring_health_export_enabled: bool = False
+    monitoring_otlp_enabled: bool = False
+    monitoring_otlp_endpoint_configured: bool = False
+    # The bundled observability/langfuse plugin passes the plugins.enabled /
+    # plugins.disabled gate (hermes_cli/tools_config_post_setup.py:279-291).
+    langfuse_plugin_enabled: bool = False
+    # Doctor parity (hermes_cli/doctor_config.py:341-361,405-430), from the file
+    # alone: root-level string provider/base_url that belong under model:, and
+    # legacy custom_providers list entries with no providers: twin.
+    stale_root_keys: list[str] = Field(default_factory=list)
+    legacy_custom_provider_labels: list[str] = Field(default_factory=list)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -1482,6 +1517,13 @@ class ProviderInfo(BaseModel):
     free_tier: bool = False
 
 
+class ModelCooldown(BaseModel):
+    """One model a pooled credential is benched for (model name only)."""
+
+    model: str
+    remaining_seconds: float = 0.0
+
+
 class CredentialPoolEntry(BaseModel):
     name: str
     label: str = ""
@@ -1489,7 +1531,11 @@ class CredentialPoolEntry(BaseModel):
     source: str = ""
     last_status: str = ""
     request_count: int = 0
-    cooldown_remaining: str = ""
+    # Seconds the representative entry stays benched after an exhaustion
+    # (agent/credential_pool.py:468-480); None when it is not cooling down.
+    cooldown_remaining_seconds: float | None = None
+    # Active per-model cooldowns merged across the provider's entries.
+    model_cooldowns: list[ModelCooldown] = Field(default_factory=list)
     priority: int = 0
     token_present: bool = False
     expires_at: str = ""
@@ -1689,6 +1735,55 @@ class SkillsMemory(BaseModel):
     plugin_catalog_cache_age_seconds: float | None = None
     plugin_catalog_update_count: int = 0
     plugin_catalog_removed_count: int = 0
+    # `skills_hub` source: skills/.hub/lock.json installed entries and
+    # skills/.hub/quarantine/ directories (tools/skills_hub.py:59-62,295-344;
+    # the counts `hermes doctor` reports, hermes_cli/doctor_state.py:452-464).
+    hub_lock_present: bool = False
+    hub_installed_count: int = 0
+    hub_quarantine_count: int = 0
+
+
+class PairingPlatformSummary(BaseModel):
+    """One platform's pairing store: counts and the newest approval time only.
+
+    Pending entries hold hashed one-time codes and approved entries hold user
+    ids and names; none of that leaves the collector.
+    """
+
+    platform: str
+    pending_count: int = 0
+    approved_count: int = 0
+    newest_approved_age_seconds: float | None = None
+
+
+class RateLimitHold(BaseModel):
+    """An active ``rate_limits/<name>.json`` hold (agent/nous_rate_guard.py:36-86)."""
+
+    name: str
+    remaining_seconds: float = 0.0
+    recorded_age_seconds: float | None = None
+
+
+class IntegrationsState(BaseModel):
+    """Runtime integration stores, each written by its own health source."""
+
+    # `pairing`: platforms/pairing/<platform>-{pending,approved}.json.
+    pairing_platforms: list[PairingPlatformSummary] = Field(default_factory=list)
+    # `webhook_subscriptions`: webhook_subscriptions.json route names and flags.
+    webhook_subscriptions_present: bool = False
+    webhook_subscription_count: int = 0
+    webhook_enabled_count: int = 0
+    webhook_route_names: list[str] = Field(default_factory=list)
+    # `shared_metrics`: telemetry/shared_metrics/metrics.sqlite3 bookkeeping.
+    shared_metrics_present: bool = False
+    shared_metrics_counter_rows: int = 0
+    shared_metrics_pending_periods: int = 0
+    shared_metrics_outbox_by_state: dict[str, int] = Field(default_factory=dict)
+    shared_metrics_outbox_error_count: int = 0
+    # consent_marks name -> stamp ("obs", "data").
+    shared_metrics_consent_marks: dict[str, str] = Field(default_factory=dict)
+    # `rate_limits`: active provider rate-limit holds.
+    rate_limit_holds: list[RateLimitHold] = Field(default_factory=list)
 
 
 class ToolsetAvailability(BaseModel):
@@ -1816,11 +1911,30 @@ class ProfileSummary(BaseModel):
     skill_count: int = 0
     db_size_bytes: int = 0
     soul_excerpt: str = ""
+    # The file checks `hermes doctor` runs per profile
+    # (hermes_cli/doctor_state.py:560-565): "⚠ missing config", "no .env".
+    config_present: bool = False
+    env_present: bool = False
+
+
+class DuplicatePlatformCredential(BaseModel):
+    """A platform credential key NAME set in more than one profile's .env.
+
+    Values are never read into the model or compared: the same name in two
+    profiles is the shape of upstream's duplicate-credential finding
+    (hermes_cli/gateway_migrate.py:403-431), not proof the tokens are equal.
+    """
+
+    key: str
+    platform: str = ""
+    profiles: list[str] = Field(default_factory=list)
 
 
 class ProfilesState(BaseModel):
     profile_count: int = 0
     profiles: list[ProfileSummary] = Field(default_factory=list)
+    # `profile_credentials` source: root .env ("default") and profiles/*/.env.
+    duplicate_platform_credentials: list[DuplicatePlatformCredential] = Field(default_factory=list)
 
 
 class LogLine(BaseModel):
@@ -2713,6 +2827,15 @@ class SkillCurationWindow(BaseModel):
     days_until_archive: float | None = None
 
 
+class CuratorLedgerAction(BaseModel):
+    """One skills/.curator_ledger.jsonl row, without its file manifests."""
+
+    ts: str = ""
+    actor: str = ""
+    action: str = ""
+    skill: str = ""
+
+
 class CuratorRun(BaseModel):
     run_present: bool = False
     stamp: str = ""
@@ -2755,6 +2878,21 @@ class CuratorRun(BaseModel):
     # Display-bounded slice of the per-skill windows, soonest deadline first;
     # managed_skill_count is the complete number.
     skill_windows: list[SkillCurationWindow] = Field(default_factory=list)
+    # skills/.curator_state last_run_duration_seconds (agent/curator.py:45,949).
+    last_run_duration_seconds: float | None = None
+    # `curator_activity` source: skills/.curator_suppressed (built-ins the
+    # curator pruned), the tail of skills/.curator_ledger.jsonl, and the
+    # skills/.locks/curator-run claim (agent/curator.py:1116-1141).
+    suppressed_count: int = 0
+    ledger_present: bool = False
+    # Newest first, display-bounded; actor/action/skill/timestamp only.
+    ledger_recent: list[CuratorLedgerAction] = Field(default_factory=list)
+    run_claim_present: bool = False
+    run_claim_pid: int | None = None
+    run_claim_age_seconds: float | None = None
+    # A claim is a live run only while its pid is alive and it is younger than
+    # upstream's one-hour takeover window.
+    run_claim_live: bool = False
 
 
 class HealthSummary(BaseModel):
@@ -2813,6 +2951,7 @@ class DashboardState(BaseModel):
     kanban: KanbanState = Field(default_factory=KanbanState)
     operations: OperationsState = Field(default_factory=OperationsState)
     skills_memory: SkillsMemory = Field(default_factory=SkillsMemory)
+    integrations: IntegrationsState = Field(default_factory=IntegrationsState)
     mcp_cache: MCPSchemaCache = Field(default_factory=MCPSchemaCache)
     skills_prompt: SkillsPromptSnapshot = Field(default_factory=SkillsPromptSnapshot)
     memory: MemoryOverview = Field(default_factory=MemoryOverview)

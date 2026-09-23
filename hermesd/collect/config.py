@@ -2,14 +2,38 @@
 
 from __future__ import annotations
 
+import math
+import re
 from collections.abc import Iterable
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
-from hermesd.collect.common import _age_seconds, _as_dict, _as_list, _coerce_bool, _coerce_int
-from hermesd.collect.plugins import plugin_name_set
-from hermesd.collect.redaction import _API_KEY_FIELD_NAMES, _OAUTH_FIELD_NAMES
-from hermesd.models import ConfigBackupGroup, ConfigBackupKind, PlatformStatus
+from hermesd.collect.common import (
+    _MAX_TEXT_READ_BYTES,
+    _age_seconds,
+    _as_dict,
+    _as_list,
+    _coerce_bool,
+    _coerce_int,
+    _iso_to_epoch,
+    _open_regular_file,
+)
+from hermesd.collect.plugins import PLUGIN_KIND_STANDALONE, gate_plugin, plugin_name_set
+from hermesd.collect.redaction import (
+    _API_KEY_FIELD_NAMES,
+    _OAUTH_FIELD_NAMES,
+    _redact_secret_url,
+)
+from hermesd.models import (
+    ConfigBackupGroup,
+    ConfigBackupKind,
+    DuplicatePlatformCredential,
+    ModelCooldown,
+    PlatformStatus,
+    PluginActivation,
+    ProfileRouteSummary,
+)
 
 # Upper bound on name lists surfaced from config/cache mappings.
 _MAX_LISTED_NAMES = 20
@@ -51,6 +75,270 @@ def _config_agent_limits(cfg: dict[str, Any]) -> dict[str, Any]:
         "logging_level": _plain_str(_as_dict(cfg.get("logging")).get("level")),
         "network_proxy_configured": _proxy_configured(_as_dict(cfg.get("network"))),
     }
+
+
+# Built-in personality names, ``BUILTIN_PERSONALITIES`` in
+# ``hermes_cli/personality.py:19-34`` (names only; the prompts are upstream's).
+_BUILTIN_PERSONALITY_NAMES = frozenset(
+    {
+        "helpful",
+        "concise",
+        "technical",
+        "creative",
+        "teacher",
+        "kawaii",
+        "catgirl",
+        "pirate",
+        "shakespeare",
+        "surfer",
+        "noir",
+        "uwu",
+        "philosopher",
+        "hype",
+    }
+)
+# ``NEUTRAL_PERSONALITY_NAMES`` (``hermes_cli/personality.py:16``).
+_NEUTRAL_PERSONALITY_NAMES = frozenset({"", "none", "default", "neutral"})
+
+
+def _normalize_personality_name(value: object) -> str:
+    name = str(value or "").strip().lower()
+    return "" if name in _NEUTRAL_PERSONALITY_NAMES else name
+
+
+def _active_personality_name(cfg: dict[str, Any]) -> str:
+    """The selected personality, as ``active_personality_name`` resolves it.
+
+    ``display.personality`` holds the selection (the only sanctioned write path,
+    ``persist_personality`` at ``hermes_cli/personality.py:127-131``); it counts
+    only when it names a known personality — a built-in, a root
+    ``personalities`` entry or an ``agent.personalities`` entry
+    (``available_personalities``, ``:86-96``). Anything else is no overlay.
+    """
+    name = _normalize_personality_name(_as_dict(cfg.get("display")).get("personality"))
+    if not name:
+        return ""
+    known = set(_BUILTIN_PERSONALITY_NAMES)
+    for user in (cfg.get("personalities"), _as_dict(cfg.get("agent")).get("personalities")):
+        known.update(_normalize_personality_name(key) for key in _as_dict(user))
+    return name if name in known else ""
+
+
+# ``PROFILE_ID_RE`` (``hermes_constants.py:283``) and ``_RESERVED_NAMES``
+# (``hermes_cli/profiles.py:151``); ``default`` is always valid.
+_PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_RESERVED_PROFILE_NAMES = frozenset({"hermes", "test", "tmp", "root", "sudo"})
+_ROUTE_DISCRIMINATORS = ("guild_id", "chat_id", "thread_id", "user_id")
+
+
+def _route_profile_name(value: object) -> str | None:
+    """``normalize_profile_name`` + ``validate_profile_name`` (``profiles.py:235-270``)."""
+    stripped = str(value).strip()
+    if not stripped:
+        return None
+    if stripped.casefold() == "default":
+        return "default"
+    name = stripped.lower()
+    if not _PROFILE_ID_RE.match(name) or name in _RESERVED_PROFILE_NAMES:
+        return None
+    return name
+
+
+def _route_id_present(value: object) -> bool:
+    """Whether ``_coerce_route_id`` leaves a truthy discriminator (``:110-131``)."""
+    return value is not None and str(value) != ""
+
+
+def _profile_routes(cfg: dict[str, Any]) -> tuple[list[ProfileRouteSummary], int]:
+    """The routes ``parse_profile_routes`` keeps, most-specific first, and a skip count.
+
+    The list comes from the root ``profile_routes`` key, else
+    ``gateway.profile_routes`` (``gateway/config_loader.py:93,117-121``); only a
+    list is accepted. Discriminator *names* are reported, never the chat, guild
+    or user ids themselves (``gateway/profile_routing.py:133-171``).
+    """
+    raw = cfg.get("profile_routes")
+    if raw is None:
+        raw = _as_dict(cfg.get("gateway")).get("profile_routes")
+    if not isinstance(raw, list):
+        return [], 0
+    routes: list[ProfileRouteSummary] = []
+    skipped = 0
+    for entry in raw:
+        if not isinstance(entry, dict):
+            skipped += 1
+            continue
+        platform = entry.get("platform") or ""
+        profile = _route_profile_name(entry.get("profile") or "")
+        user_id = entry.get("user_id")
+        if (
+            not platform
+            or profile is None
+            or ("user_id" in entry and (user_id is None or not str(user_id).strip()))
+        ):
+            skipped += 1
+            continue
+        bot_profile = str(entry.get("bot_profile") or "").strip()
+        routes.append(
+            ProfileRouteSummary(
+                name=str(entry.get("name") or ""),
+                platform=str(platform),
+                profile=profile,
+                enabled=entry.get("enabled", True) is not False,
+                bot_profile="" if bot_profile == "default" else bot_profile,
+                discriminators=[
+                    key for key in _ROUTE_DISCRIMINATORS if _route_id_present(entry.get(key))
+                ],
+            )
+        )
+    routes.sort(key=_route_specificity, reverse=True)
+    return routes, skipped
+
+
+def _route_specificity(route: ProfileRouteSummary) -> int:
+    """``ProfileRoute.specificity``: guild 2, chat 4, thread 8, user 16."""
+    weights = {"guild_id": 2, "chat_id": 4, "thread_id": 8, "user_id": 16}
+    return sum(weights[key] for key in route.discriminators)
+
+
+def _integration_flags(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Monitoring, webhook and Langfuse switches — flags only, never endpoints."""
+    monitoring = _as_dict(cfg.get("monitoring"))
+    otlp = _as_dict(_as_dict(monitoring.get("export")).get("otlp"))
+    plugins = _as_dict(cfg.get("plugins"))
+    langfuse = gate_plugin(
+        key="observability/langfuse",
+        name="langfuse",
+        kind=PLUGIN_KIND_STANDALONE,
+        enabled=plugin_name_set(plugins.get("enabled")),
+        disabled=plugin_name_set(plugins.get("disabled")),
+    )
+    routes, skipped = _profile_routes(cfg)
+    return {
+        "webhook_platform_enabled": bool(
+            _as_dict(_as_dict(cfg.get("platforms")).get("webhook")).get("enabled")
+        ),
+        "profile_routes": routes,
+        "profile_routes_skipped": skipped,
+        "monitoring_health_export_enabled": bool(
+            _as_dict(monitoring.get("gateway_health_export")).get("enabled")
+        ),
+        "monitoring_otlp_enabled": bool(otlp.get("enabled")),
+        "monitoring_otlp_endpoint_configured": bool(str(otlp.get("endpoint") or "").strip()),
+        "langfuse_plugin_enabled": langfuse.activation is PluginActivation.ENABLED,
+    }
+
+
+def _endpoint_url(entry: dict[str, Any]) -> str:
+    """``_endpoint_url`` (``hermes_cli/doctor_config.py:398-401``)."""
+    url = entry.get("api") or entry.get("base_url") or entry.get("url") or ""
+    return str(url).strip().rstrip("/").lower()
+
+
+def _doctor_config_findings(cfg: dict[str, Any]) -> dict[str, Any]:
+    """The raw-file drift checks ``hermes doctor`` runs that need nothing but the file.
+
+    ``_drift_stale_root_keys`` (``hermes_cli/doctor_config.py:341-361``): string
+    root ``provider``/``base_url``. ``_drift_legacy_custom_providers``
+    (``:405-430``): ``custom_providers`` list entries whose endpoint has no
+    ``providers:`` twin. Labels are the entry name, else its URL redacted.
+    """
+    stale = [key for key in ("provider", "base_url") if isinstance(cfg.get(key), str)]
+    legacy = cfg.get("custom_providers")
+    labels: list[str] = []
+    if isinstance(legacy, list):
+        providers = cfg.get("providers")
+        twins = {
+            _endpoint_url(entry)
+            for entry in (providers.values() if isinstance(providers, dict) else ())
+            if isinstance(entry, dict)
+        }
+        for entry in legacy:
+            if not isinstance(entry, dict):
+                continue
+            url = _endpoint_url(entry)
+            if not url or url in twins:
+                continue
+            labels.append(str(entry.get("name") or "").strip() or _redact_secret_url(url))
+    return {
+        "stale_root_keys": stale,
+        "legacy_custom_provider_labels": labels[:_MAX_LISTED_NAMES],
+    }
+
+
+# Built-in platform credential env keys and the platform each makes an adapter
+# connect as: ``credential_env_keys`` (``hermes_cli/profile_channels.py:
+# 167-193``) over ``_ENV_ENABLE_CREDENTIALS`` and the ``_Cred`` steps in
+# ``gateway/config_env.py:38-58,507-640``, filtered to the credential suffixes.
+# Plugin-registered platforms are not included (their keys live in a runtime
+# registry hermesd cannot import).
+_PLATFORM_CREDENTIAL_KEYS: dict[str, str] = {
+    "TELEGRAM_BOT_TOKEN": "telegram",
+    "DISCORD_BOT_TOKEN": "discord",
+    "SLACK_BOT_TOKEN": "slack",
+    "WHATSAPP_CLOUD_ACCESS_TOKEN": "whatsapp_cloud",
+    "MATTERMOST_TOKEN": "mattermost",
+    "MATRIX_ACCESS_TOKEN": "matrix",
+    "MATRIX_PASSWORD": "matrix",
+    "HASS_TOKEN": "homeassistant",
+    "EMAIL_PASSWORD": "email",
+    "TWILIO_ACCOUNT_SID": "sms",
+    "DINGTALK_CLIENT_ID": "dingtalk",
+    "DINGTALK_CLIENT_SECRET": "dingtalk",
+    "FEISHU_APP_ID": "feishu",
+    "FEISHU_APP_SECRET": "feishu",
+    "WECOM_BOT_ID": "wecom",
+    "WECOM_SECRET": "wecom",
+    "WECOM_CALLBACK_CORP_SECRET": "wecom_callback",
+    "WEIXIN_TOKEN": "weixin",
+    "BLUEBUBBLES_PASSWORD": "bluebubbles",
+    "QQ_APP_ID": "qqbot",
+    "QQ_CLIENT_SECRET": "qqbot",
+    "YUANBAO_APP_ID": "yuanbao",
+    "YUANBAO_APP_KEY": "yuanbao",
+    "YUANBAO_APP_SECRET": "yuanbao",
+}
+_ENV_ASSIGNMENT_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
+
+
+def _env_platform_credential_keys(text: str) -> frozenset[str]:
+    """Platform credential key NAMES with a non-blank assignment in a .env text.
+
+    Mirrors ``_env_values`` (``hermes_cli/profile_channels.py:196-207``): only
+    non-blank assignments count. The assigned value is inspected for emptiness
+    and discarded on the spot — it is never returned, stored or compared.
+    """
+    keys: set[str] = set()
+    for raw_line in text.splitlines():
+        match = _ENV_ASSIGNMENT_RE.match(raw_line.strip())
+        if match is None or match.group(1) not in _PLATFORM_CREDENTIAL_KEYS:
+            continue
+        if match.group(2).split(" #", 1)[0].strip().strip("'\"").strip():
+            keys.add(match.group(1))
+    return frozenset(keys)
+
+
+def _read_env_text(path: Path) -> str:
+    """A capped .env read that raises on an unreadable file instead of reading as empty."""
+    with _open_regular_file(path) as handle:
+        return handle.read(_MAX_TEXT_READ_BYTES).decode("utf-8-sig", errors="replace")
+
+
+def _duplicate_platform_credentials(
+    holders: list[tuple[str, frozenset[str]]],
+) -> list[DuplicatePlatformCredential]:
+    """Keys held by two or more profiles, profiles in collection order."""
+    owners: dict[str, list[str]] = {}
+    for profile, keys in holders:
+        for key in keys:
+            owners.setdefault(key, []).append(profile)
+    return [
+        DuplicatePlatformCredential(
+            key=key, platform=_PLATFORM_CREDENTIAL_KEYS[key], profiles=profiles
+        )
+        for key, profiles in sorted(owners.items())
+        if len(profiles) > 1
+    ]
 
 
 def _coerce_session_cap(value: object) -> int | None:
@@ -389,6 +677,106 @@ def _select_pool_entry(raw_entry: object) -> dict[str, Any]:
             key=lambda pair: (_coerce_int(pair[1].get("priority")), pair[0]),
         )[1]
     return _as_dict(raw_entry)
+
+
+def _pool_entries(raw_entry: object) -> list[dict[str, Any]]:
+    """Every non-empty entry of a credential_pool value (list or legacy dict)."""
+    items = raw_entry if isinstance(raw_entry, list) else [raw_entry]
+    return [entry for entry in (_as_dict(item) for item in items) if entry]
+
+
+def _absolute_timestamp(value: object) -> float | None:
+    """``_parse_absolute_timestamp`` (``agent/credential_pool.py:402-424``).
+
+    Epoch seconds, epoch milliseconds (anything past 1e12) or ISO-8601; a
+    non-positive number is no timestamp at all.
+    """
+    if isinstance(value, bool) or value is None or value == "":
+        return None
+    if isinstance(value, int | float):
+        numeric = float(value)
+        if numeric <= 0 or not math.isfinite(numeric):
+            return None
+        return numeric / 1000.0 if numeric > 1_000_000_000_000 else numeric
+    if isinstance(value, str):
+        try:
+            numeric = float(value.strip())
+        except ValueError:
+            return _iso_to_epoch(value)
+        return _absolute_timestamp(numeric) if math.isfinite(numeric) else None
+    return None
+
+
+# Cooldown TTLs, ``agent/credential_pool.py:133-139`` and ``:143,149``.
+_EXHAUSTED_TTL_401_SECONDS = 5 * 60
+_EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60
+_EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS = 60
+_FAILURE_REASON_BILLING = "billing"
+_FAILURE_REASON_BILLING_UNVERIFIED = "billing_unverified"
+
+
+def _exhausted_ttl(error_code: int, *, sole_credential: bool, failure_reason: str) -> int:
+    """``_exhausted_ttl`` (``agent/credential_pool.py:372-398``).
+
+    429 and the catch-all default share the one-hour bench upstream, so a single
+    constant covers both here.
+    """
+    if error_code == 401:
+        return _EXHAUSTED_TTL_401_SECONDS
+    base = _EXHAUSTED_TTL_DEFAULT_SECONDS
+    if failure_reason == _FAILURE_REASON_BILLING_UNVERIFIED and error_code != 402:
+        return min(base, _EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS)
+    is_billing = error_code == 402 or failure_reason == _FAILURE_REASON_BILLING
+    if sole_credential and not is_billing:
+        return min(base, _EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS)
+    return base
+
+
+def _credential_cooldown_remaining(
+    entry: dict[str, Any], *, sole_credential: bool, now: float
+) -> float | None:
+    """Seconds an exhausted credential stays benched, as ``_exhausted_until`` decides.
+
+    ``agent/credential_pool.py:468-480``: only ``last_status == "exhausted"`` is
+    benched; the provider's ``last_error_reset_at`` wins, else
+    ``last_status_at`` plus the TTL for the recorded error. ``sole_credential``
+    mirrors ``_is_sole_credential`` (``:1064-1066``): at most one non-dead entry.
+    """
+    if str(entry.get("last_status") or "") != "exhausted":
+        return None
+    until = _absolute_timestamp(entry.get("last_error_reset_at"))
+    if until is None:
+        status_at = _absolute_timestamp(entry.get("last_status_at"))
+        if status_at is None:
+            return None
+        until = status_at + _exhausted_ttl(
+            _coerce_int(entry.get("last_error_code")),
+            sole_credential=sole_credential,
+            failure_reason=str(entry.get("failure_reason") or ""),
+        )
+    remaining = until - now
+    return remaining if remaining > 0 else None
+
+
+def _active_model_cooldowns(entries: list[dict[str, Any]], *, now: float) -> list[ModelCooldown]:
+    """Per-model cooldowns still running, merged across a provider's entries.
+
+    ``merge_model_cooldowns`` / ``model_cooldown_until``
+    (``agent/credential_pool_model_cooldowns.py:22-44``): the latest reset per
+    model wins, and only numeric resets still in the future are active. Model
+    names only; the values are epochs, not secrets.
+    """
+    merged: dict[str, float] = {}
+    for entry in entries:
+        for model, until in _as_dict(entry.get("model_cooldowns")).items():
+            if isinstance(until, bool) or not isinstance(until, int | float):
+                continue
+            merged[str(model)] = max(float(until), merged.get(str(model), 0.0))
+    return [
+        ModelCooldown(model=model, remaining_seconds=until - now)
+        for model, until in sorted(merged.items())
+        if until > now
+    ][:_MAX_LISTED_NAMES]
 
 
 def _credential_auth_type(entry: dict[str, Any], provider_entry: dict[str, Any]) -> str:
