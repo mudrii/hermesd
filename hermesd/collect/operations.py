@@ -144,8 +144,16 @@ def _goal_state_update(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-_DELEGATION_TERMINAL_STATES = ("completed", "error", "failed", "cancelled")
-_DELEGATION_FAILED_STATES = ("error", "failed")
+# Upstream's live set (``tools/async_delegation.py:68`` ``_LIVE_STATES``): a row
+# in any other state is finished. Only ``running``/``finalizing`` are persisted
+# (``:151``, recovery at ``:251``), ``stalling`` is in-memory, but all three are
+# read as live so a future persisted ``stalling`` is not miscounted.
+_DELEGATION_LIVE_STATES = ("running", "stalling", "finalizing")
+# Every persisted non-success terminal state: the child's own ``error``/
+# ``failed``/``timeout``/``interrupted`` status (``_persist_completion`` stores
+# ``event["status"]``, ``:188-195``), the stall finalization ``stalled``
+# (``:894,927``) and the abandoned-owner recovery ``unknown`` (``:274``).
+_DELEGATION_FAILED_STATES = ("error", "failed", "timeout", "stalled", "unknown", "interrupted")
 # Width of a delegation goal / error excerpt; the JSON payloads themselves are
 # bounded by ``_json_object_capped``.
 _DELEGATION_TEXT_MAX_CHARS = 80
@@ -224,13 +232,13 @@ def _delegation_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 def _delegation_counts(conn: sqlite3.Connection) -> dict[str, int]:
     if not _table_exists(conn, "async_delegations"):
         return {}
-    terminal = ", ".join(f"'{state}'" for state in _DELEGATION_TERMINAL_STATES)
+    live = ", ".join(f"'{state}'" for state in _DELEGATION_LIVE_STATES)
     failed = ", ".join(f"'{state}'" for state in _DELEGATION_FAILED_STATES)
     return {
         "delegation_count": _table_count_or_zero(conn, "async_delegations"),
         "delegation_running_count": _count_rows(
             conn,
-            f"SELECT COUNT(*) FROM async_delegations WHERE COALESCE(state, '') NOT IN ({terminal})",
+            f"SELECT COUNT(*) FROM async_delegations WHERE COALESCE(state, '') IN ({live})",
         ),
         "delegation_failed_count": _count_rows(
             conn,

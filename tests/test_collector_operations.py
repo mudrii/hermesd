@@ -1244,6 +1244,42 @@ def test_delegations_happy_path(hermes_home: Path, sample_db: Path):
     assert failed.duration_seconds is not None and failed.duration_seconds > 0
 
 
+def test_delegation_counts_follow_upstream_live_and_failed_states(hermes_home: Path):
+    """Active is upstream's _LIVE_STATES only (tools/async_delegation.py:68);
+    every persisted non-success terminal state counts as failed — including
+    the ``unknown`` written by abandoned-owner recovery (:274), the ``stalled``
+    stall finalization (:894,927) and a child's own ``timeout``/``interrupted``."""
+    conn = _open_state_db(hermes_home)
+    create_async_delegations_table(conn)
+    states = {
+        "running": "pending",
+        "stalling": "pending",
+        "finalizing": "pending",
+        "completed": "delivered",
+        "cancelled": "delivered",
+        "error": "pending",
+        "failed": "delivered",
+        "timeout": "delivered",
+        "stalled": "pending",
+        "unknown": "pending",
+        "interrupted": "delivered",
+    }
+    for index, (state, delivery) in enumerate(states.items()):
+        insert_delegation(
+            conn,
+            f"deleg_{state}",
+            state=state,
+            delivery_state=delivery,
+            dispatched_at=1775791400.0 + index,
+        )
+    conn.commit()
+    conn.close()
+    ops = _collect_ops(hermes_home).operations
+    assert ops.delegation_count == len(states)
+    assert ops.delegation_running_count == 3
+    assert ops.delegation_failed_count == 6
+
+
 def test_delegation_owner_alive_uses_injected_pid_exists(hermes_home: Path, sample_db: Path):
     ops = _collect_ops(hermes_home, pid_exists=lambda pid: False).operations
     assert all(not d.owner_alive for d in ops.delegations)
