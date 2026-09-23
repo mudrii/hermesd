@@ -651,7 +651,8 @@ def _receipt_looks_unfinished(data: JsonMapping) -> bool:
     """
     exit_code = data.get("exit_code")
     outcome = data.get("outcome")
-    if exit_code not in (0, None) or outcome in _UNFINISHED_OUTCOMES:
+    unfinished_outcome = isinstance(outcome, str) and outcome in _UNFINISHED_OUTCOMES
+    if exit_code not in (0, None) or unfinished_outcome:
         return True
     if _as_dict(data.get("gateway_restart")).get("incomplete"):
         return True

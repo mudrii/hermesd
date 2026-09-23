@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from hermesd.collect.common import _age_seconds, _as_dict, _as_list, _coerce_bool, _coerce_int
+from hermesd.collect.plugins import plugin_name_set
 from hermesd.collect.redaction import _API_KEY_FIELD_NAMES, _OAUTH_FIELD_NAMES
 from hermesd.models import ConfigBackupGroup, ConfigBackupKind, PlatformStatus
 
@@ -40,8 +41,8 @@ def _config_agent_limits(cfg: dict[str, Any]) -> dict[str, Any]:
         "updates_backup_keep": _coerce_int(updates.get("backup_keep")),
         "mcp_server_count": len(mcp_names),
         "mcp_server_names": mcp_names[:_MAX_LISTED_NAMES],
-        "plugin_enabled_count": _name_list_count(plugins.get("enabled")),
-        "plugin_disabled_count": _name_list_count(plugins.get("disabled")),
+        "plugin_enabled_count": len(plugin_name_set(plugins.get("enabled"))),
+        "plugin_disabled_count": len(plugin_name_set(plugins.get("disabled"))),
         "tool_loop_warnings_enabled": bool(guardrails.get("warnings_enabled")),
         "tool_loop_hard_stop_enabled": bool(guardrails.get("hard_stop_enabled")),
         "max_concurrent_sessions": resolve_max_concurrent_sessions(cfg),
@@ -120,11 +121,6 @@ def resolve_max_live_sessions(cfg: dict[str, Any]) -> int:
         if isinstance(gateway_cfg, dict):
             raw = gateway_cfg.get("max_live_sessions")
     return _coerce_session_cap(raw) or 0
-
-
-def _name_list_count(value: object) -> int:
-    """Length of a plugins.enabled/disabled name list; other shapes count as none."""
-    return len(value) if isinstance(value, list) else 0
 
 
 def _pre_update_backup_mode(value: object) -> str:
@@ -272,7 +268,7 @@ def _moa_config_summary(cfg: dict[str, Any]) -> dict[str, Any]:
     presets = _as_dict(cfg.get("presets"))
     default_preset = str(cfg.get("default_preset") or "")
     if not default_preset and presets:
-        default_preset = next(iter(presets))
+        default_preset = str(next(iter(presets)))
     active_preset = str(cfg.get("active_preset") or "")
     selected_preset = _as_dict(presets.get(active_preset) or presets.get(default_preset))
     if not selected_preset and not presets:

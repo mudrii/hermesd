@@ -180,7 +180,8 @@ def _cron_suggestion_count(cron_dir: Path) -> int:
         if path.is_symlink() or not _path_resolves_under(path, cron_dir.parent):
             continue
         if path.is_file():
-            with contextlib.suppress(json.JSONDecodeError):
+            # Nesting deep enough to exhaust the decoder is just more junk.
+            with contextlib.suppress(json.JSONDecodeError, RecursionError):
                 data = json.loads(_read_text_capped(path, cron_dir.parent))
                 total += _suggestion_count_from_data(data)
         elif path.is_dir():
@@ -801,7 +802,9 @@ def _claim_owner_pid(claim: dict[str, Any], hostname: str) -> int | None:
     ``HERMES_MACHINE_ID`` or an unparseable owner never shortens the TTL.
     """
     parts = str(claim.get("by") or "").split(":")
-    if len(parts) < 2 or not parts[1].isdigit() or parts[0] != hostname:
+    # isdigit() alone admits "²" and other digits int() refuses.
+    pid_text = parts[1] if len(parts) >= 2 else ""
+    if not (pid_text.isascii() and pid_text.isdigit()) or parts[0] != hostname:
         return None
     return int(parts[1])
 

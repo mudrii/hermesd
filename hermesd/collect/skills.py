@@ -80,7 +80,11 @@ def _cache_number(value: object) -> float | None:
     mirroring its type test, including the parts that look like bugs.
     """
     if isinstance(value, int | float):
-        return float(value)
+        try:
+            return float(value)
+        except OverflowError:
+            # A JSON integer past float range; upstream's arithmetic raises too.
+            return None
     return None
 
 
@@ -328,8 +332,9 @@ def _learned_skill_names(skills_dir: Path) -> list[str]:
 
 
 def _skill_frontmatter(path: Path, root: Path | None = None) -> dict[str, Any]:
-    with contextlib.suppress(yaml.YAMLError):
-        lines = _read_text_capped(path, root).splitlines()
+    # Nesting deep enough to exhaust the YAML composer is just more junk.
+    with contextlib.suppress(yaml.YAMLError, RecursionError):
+        lines = _read_text_capped(path, root).removeprefix("﻿").splitlines()
         if not lines or lines[0].strip() != "---":
             return {}
         frontmatter: list[str] = []
