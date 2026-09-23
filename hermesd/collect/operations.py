@@ -21,6 +21,7 @@ from hermesd.collect.common import (
     _coerce_bool,
     _coerce_float,
     _coerce_int,
+    _excerpt,
     _exists_strict,
     _iso_to_epoch,
     _json_object_capped,
@@ -259,10 +260,11 @@ def _delegation_from_row(
         dispatched_at=dispatched_at,
         completed_at=completed_at,
         duration_seconds=_delegation_duration(dispatched_at, completed_at, now),
-        goal=_clip_single_line(str(task.get("goal") or "")),
+        goal=_excerpt(task.get("goal") or "", _DELEGATION_TEXT_MAX_CHARS),
         result_status=str(result.get("status") or ""),
-        error_excerpt=_clip_single_line(
-            str(result.get("error") or "") or str(result.get("summary") or "")
+        error_excerpt=_excerpt(
+            str(result.get("error") or "") or str(result.get("summary") or ""),
+            _DELEGATION_TEXT_MAX_CHARS,
         ),
         owner_alive=bool(owner_pid) and pid_exists(owner_pid),
         handed_off_count=handed_off,
@@ -308,10 +310,6 @@ def _first_delegation_result(result_object: dict[str, Any]) -> dict[str, Any]:
     if results and isinstance(results[0], dict):
         return results[0]
     return {}
-
-
-def _clip_single_line(value: str) -> str:
-    return " ".join(value.split())[:_DELEGATION_TEXT_MAX_CHARS]
 
 
 def _state_meta_entries(conn: sqlite3.Connection) -> dict[str, str]:
@@ -566,7 +564,7 @@ def _live_task_from_entry(
     tail = log_tail(run_dir / log_name, home)
     return DelegationLiveTask(
         index=index,
-        goal=_redact_secret_text(_clip_single_line(str(entry.get("goal") or ""))),
+        goal=_excerpt(entry.get("goal") or "", _DELEGATION_TEXT_MAX_CHARS),
         status=str(entry.get("status") or ""),
         exit_reason=str(entry.get("exit_reason") or ""),
         log_name=log_name if tail else "",

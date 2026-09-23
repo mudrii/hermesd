@@ -27,6 +27,7 @@ from hermesd.collect.common import (
     _coerce_bool,
     _coerce_float,
     _coerce_int,
+    _excerpt,
     _file_size,
     _iso_to_epoch,
     _mtime,
@@ -291,7 +292,7 @@ def _platform_status(
         state=state,
         updated_at=str(info.get("updated_at") or ""),
         error_code=str(info.get("error_code") or ""),
-        error_message=str(info.get("error_message") or ""),
+        error_message=_redact_secret_text(str(info.get("error_message") or "")),
         needs_attention=_coerce_bool(info.get("needs_attention")),
         retrying_since=retrying_since,
         retrying_since_age_seconds=_age_seconds(_iso_to_epoch(retrying_since), now),
@@ -997,10 +998,5 @@ def _delivery_summary(row: dict[str, Any], now: float) -> DeliveryObligationSumm
         state=str(row.get("state") or ""),
         attempts=_coerce_int(row.get("attempts") or 0),
         age_seconds=_age_seconds(timestamp or None, now),
-        last_error=_error_excerpt(row.get("last_error") or ""),
+        last_error=_excerpt(row.get("last_error") or "", _DELIVERY_ERROR_EXCERPT_CHARS),
     )
-
-
-def _error_excerpt(value: object) -> str:
-    """Collapse whitespace and cap an untrusted error string to a cell-sized excerpt."""
-    return " ".join(str(value).split())[:_DELIVERY_ERROR_EXCERPT_CHARS]
