@@ -1153,6 +1153,37 @@ class CronDeliveryQueueState(BaseModel):
     recent_failures: list[CronDeliveryFailure] = Field(default_factory=list)
 
 
+class CronBotChatReceipt(BaseModel):
+    """A deferred Bot Chat send needing attention; its ``content`` is never kept."""
+
+    receipt_id: str = ""
+    job_name: str = ""
+    status: str = ""
+    for_failure: bool = False
+    # From the receipt file's mtime: upstream records no timestamp.
+    age_seconds: float | None = None
+    error_excerpt: str = ""
+
+
+class CronBotChatState(BaseModel):
+    """``cron/bot_chat_pending/<key>.json`` deferred Bot Chat receipts.
+
+    Statuses (``cron/bot_chat_delivery.py:60-150``): ``queued`` and ``claimed``
+    are unsettled — a persisted claim never expires, so an old ``claimed`` is a
+    send that may never finish; ``ambiguous`` errored after the claim;
+    ``settled``/``transferred``/``suppressed`` are done. Upstream never prunes
+    the directory, so the scan is capped (``scan_truncated``).
+    """
+
+    present: bool = False
+    status_counts: dict[str, int] = Field(default_factory=dict)
+    unsettled_count: int = 0
+    oldest_unsettled_age_seconds: float | None = None
+    attention: list[CronBotChatReceipt] = Field(default_factory=list)
+    unreadable_count: int = 0
+    scan_truncated: bool = False
+
+
 class CronState(BaseModel):
     last_tick_ago_seconds: float | None = None
     ticker_heartbeat_age_seconds: float | None = None
@@ -2704,6 +2735,7 @@ class DashboardState(BaseModel):
     cron_executions: CronExecutionsState = Field(default_factory=CronExecutionsState)
     cron_usage: CronUsageState = Field(default_factory=CronUsageState)
     cron_deliveries: CronDeliveryQueueState = Field(default_factory=CronDeliveryQueueState)
+    cron_bot_chat: CronBotChatState = Field(default_factory=CronBotChatState)
     channels: ChannelDirectoryState = Field(default_factory=ChannelDirectoryState)
     kanban: KanbanState = Field(default_factory=KanbanState)
     operations: OperationsState = Field(default_factory=OperationsState)

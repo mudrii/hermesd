@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -283,3 +285,123 @@ def test_delivery_queue_unsafe_path_fails_and_keeps_last_good(hermes_home: Path,
     assert first.cron_deliveries.pending_count == 1
     assert "cron_deliveries" in second.health.failed_sources
     assert second.cron_deliveries.pending_count == 1
+
+
+def _bot_chat_receipt(home: Path, key: str, status: str, *, age: float, **fields: object) -> Path:
+    """One deferred Bot Chat receipt as ``defer`` writes it
+    (``cron/bot_chat_delivery.py:60-82``); no timestamp is recorded."""
+    root = home / "cron" / "bot_chat_pending"
+    root.mkdir(exist_ok=True)
+    record = {
+        "id": key,
+        "status": status,
+        "job": {"id": f"job-{key}", "name": f"Job {key}"},
+        "content": f"private body {key}",
+        "profile": "",
+        "home": str(home),
+        "sequence": 1,
+    }
+    record.update(fields)
+    path = root / f"{key}.json"
+    path.write_text(json.dumps(record))
+    stamp = time.time() - age
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_bot_chat_pending_counts_statuses_and_unsettled_age(hermes_home: Path, tmp_path: Path):
+    _bot_chat_receipt(hermes_home, "q1", "queued", age=3600)
+    _bot_chat_receipt(hermes_home, "c1", "claimed", age=7200)
+    _bot_chat_receipt(
+        hermes_home,
+        "a1",
+        "ambiguous",
+        age=60,
+        for_failure=True,
+        error="RuntimeError: token=abcdef1234567890abcdef\nsecond",
+    )
+    _bot_chat_receipt(hermes_home, "s1", "settled", age=10)
+    _bot_chat_receipt(hermes_home, "t1", "transferred", age=10)
+    _bot_chat_receipt(hermes_home, "x1", "suppressed", age=10)
+    root = hermes_home / "cron" / "bot_chat_pending"
+    (root / "torn.json").write_text("{not json")
+    (root / "list.json").write_text("[1, 2]")
+    (root / ".lock").write_text("")
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"status": "queued"}))
+    (root / "link.json").symlink_to(outside)
+
+    c = Collector(hermes_home)
+    try:
+        c.collect()
+        state = c.collect()  # second pass reuses the per-file parse cache
+    finally:
+        c.close()
+
+    bot = state.cron_bot_chat
+    assert "cron_bot_chat_pending" not in state.health.failed_sources
+    assert bot.present is True
+    assert bot.status_counts == {
+        "ambiguous": 1,
+        "claimed": 1,
+        "queued": 1,
+        "settled": 1,
+        "suppressed": 1,
+        "transferred": 1,
+    }
+    assert bot.unsettled_count == 2
+    assert bot.oldest_unsettled_age_seconds == pytest.approx(7200, abs=30)
+    assert bot.unreadable_count == 3
+    assert bot.scan_truncated is False
+    assert [r.receipt_id for r in bot.attention] == ["a1", "c1"]
+    ambiguous = bot.attention[0]
+    assert ambiguous.job_name == "Job a1"
+    assert ambiguous.for_failure is True
+    assert ambiguous.age_seconds == pytest.approx(60, abs=30)
+    assert ambiguous.error_excerpt.startswith("RuntimeError: token=")
+    assert "abcdef1234567890" not in ambiguous.error_excerpt
+    assert "private body" not in bot.model_dump_json()
+
+
+def test_bot_chat_pending_scan_is_bounded(hermes_home: Path, monkeypatch):
+    monkeypatch.setattr(cron_module, "_BOT_CHAT_SCAN_LIMIT", 2)
+    for key in ("a", "b", "c"):
+        _bot_chat_receipt(hermes_home, key, "settled", age=10)
+
+    bot = _collect(hermes_home).cron_bot_chat
+
+    assert bot.scan_truncated is True
+    assert sum(bot.status_counts.values()) <= 2
+
+
+def test_bot_chat_pending_oversize_receipt_is_unreadable(hermes_home: Path, monkeypatch):
+    monkeypatch.setattr(cron_module, "_BOT_CHAT_RECORD_MAX_BYTES", 64)
+    _bot_chat_receipt(hermes_home, "big", "queued", age=10, content="x" * 200)
+
+    bot = _collect(hermes_home).cron_bot_chat
+
+    assert bot.unreadable_count == 1
+    assert bot.status_counts == {}
+
+
+def test_bot_chat_pending_absent_reads_as_not_present(hermes_home: Path):
+    state = _collect(hermes_home)
+    assert state.cron_bot_chat.present is False
+    assert "cron_bot_chat_pending" not in state.health.failed_sources
+
+
+def test_bot_chat_pending_escaping_dir_fails_and_keeps_last_good(hermes_home: Path, tmp_path: Path):
+    _bot_chat_receipt(hermes_home, "q1", "queued", age=60)
+    c = Collector(hermes_home)
+    try:
+        first = c.collect()
+        root = hermes_home / "cron" / "bot_chat_pending"
+        moved = tmp_path / "moved"
+        root.rename(moved)
+        root.symlink_to(moved)
+        second = c.collect()
+    finally:
+        c.close()
+    assert first.cron_bot_chat.unsettled_count == 1
+    assert "cron_bot_chat_pending" in second.health.failed_sources
+    assert second.cron_bot_chat.unsettled_count == 1

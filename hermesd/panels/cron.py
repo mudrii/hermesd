@@ -7,6 +7,8 @@ from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import (
+    CronBotChatReceipt,
+    CronBotChatState,
     CronDeliveryFailure,
     CronDeliveryQueueState,
     CronExecution,
@@ -169,6 +171,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             style=theme.ui_error,
         )
     lines.append_text(_delivery_queue_compact(state.cron_deliveries, theme))
+    lines.append_text(_bot_chat_compact(state.cron_bot_chat, theme))
     if executions.open_incident_count:
         lines.append("  Incidents: ", style=theme.ui_label)
         # ``acked_at`` is written only together with ``closed_at`` upstream, so an
@@ -246,6 +249,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
 
     sections.extend(_executions_sections(executions, theme))
     sections.extend(_delivery_queue_sections(state.cron_deliveries, theme))
+    sections.extend(_bot_chat_sections(state.cron_bot_chat, theme))
     sections.extend(_usage_sections(state.cron_usage, theme))
 
     return Panel(
@@ -747,6 +751,64 @@ def _delivery_queue_sections(queue: CronDeliveryQueueState, theme: Theme) -> lis
         body,
     ]
     sections.extend(_delivery_failure_line(failure, theme) for failure in queue.recent_failures)
+    return sections
+
+
+def _bot_chat_compact(bot: CronBotChatState, theme: Theme) -> Text:
+    """One warning line while deferred Bot Chat sends are unsettled or ambiguous."""
+    line = Text()
+    ambiguous = bot.status_counts.get("ambiguous", 0)
+    parts = []
+    if bot.unsettled_count:
+        oldest = fmt_age_seconds(bot.oldest_unsettled_age_seconds)
+        parts.append(f"{bot.unsettled_count} unsettled (oldest {oldest})")
+    if ambiguous:
+        parts.append(f"{ambiguous} ambiguous")
+    if parts:
+        line.append(f"  ⚠ Bot Chat deferred: {'  '.join(parts)}\n", style=theme.ui_warn)
+    return line
+
+
+def _bot_chat_receipt_line(receipt: CronBotChatReceipt, theme: Theme) -> Text:
+    line = Text("  ")
+    label = f"{receipt.job_name} {receipt.receipt_id}" if receipt.job_name else receipt.receipt_id
+    label += f" {receipt.status}"
+    if receipt.for_failure:
+        label += " (failure notice)"
+    line.append(sanitize_terminal_text(label), style=theme.ui_label)
+    line.append(f" {_fmt_error_age(receipt.age_seconds)}", style=theme.banner_dim)
+    if receipt.error_excerpt:
+        line.append(f": {sanitize_terminal_text(receipt.error_excerpt)}", style=theme.ui_error)
+    line.append("\n")
+    return line
+
+
+def _bot_chat_sections(bot: CronBotChatState, theme: Theme) -> list[RenderableType]:
+    """Receipt status counts and the claimed/ambiguous receipts, newest first.
+
+    Receipts carry no timestamp upstream, so every age here is the file's mtime.
+    """
+    if not bot.present:
+        return []
+    body = Text("  ")
+    counts = "  ".join(f"{status} {count}" for status, count in bot.status_counts.items())
+    body.append(sanitize_terminal_text(counts) or "empty", style=theme.banner_text)
+    if bot.unreadable_count:
+        body.append(f"  {bot.unreadable_count} unreadable", style=theme.ui_warn)
+    if bot.scan_truncated:
+        body.append("  (listing capped — counts are partial)", style=theme.ui_warn)
+    if bot.unsettled_count:
+        body.append(
+            f"\n  ⚠ {bot.unsettled_count} unsettled, oldest "
+            f"{fmt_age_seconds(bot.oldest_unsettled_age_seconds)} — a claim never expires",
+            style=theme.ui_warn,
+        )
+    body.append("\n")
+    sections: list[RenderableType] = [
+        section_heading("Deferred Bot Chat (bot_chat_pending)", theme),
+        body,
+    ]
+    sections.extend(_bot_chat_receipt_line(receipt, theme) for receipt in bot.attention)
     return sections
 
 

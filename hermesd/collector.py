@@ -73,6 +73,8 @@ from hermesd.collect.config import (
     _stale_alias_count,
 )
 from hermesd.collect.cron import (
+    _BotChatReceipt,
+    _BotChatSignature,
     _chronos_configured,
     _cron_catch_up_occurrences,
     _cron_catch_up_policy,
@@ -92,6 +94,7 @@ from hermesd.collect.cron import (
     _delivery_target_label,
     _latest_cron_output_excerpt,
     _latest_cron_output_file,
+    _read_cron_bot_chat,
     _read_cron_delivery_queue,
     _read_cron_executions_state,
     _read_usage_audit_records,
@@ -260,6 +263,7 @@ from hermesd.models import (
     CheckpointInfo,
     ConfigSummary,
     CredentialPoolEntry,
+    CronBotChatState,
     CronDeliveryQueueState,
     CronExecutionsState,
     CronJob,
@@ -798,6 +802,8 @@ class Collector:
         self._last_generation_chat_count: int | None = None
         self._log_stream_cache: dict[str, tuple[float | None, int, LogStream]] = {}
         # Keyed by (output root, job id): a job id may itself contain ':'.
+        # Per-receipt parse cache for cron/bot_chat_pending/, by file signature.
+        self._bot_chat_cache: dict[str, tuple[_BotChatSignature, _BotChatReceipt | None]] = {}
         self._cron_excerpt_cache: dict[
             tuple[Path, str],
             tuple[
@@ -1109,6 +1115,12 @@ class Collector:
                 "cron_deliveries",
                 self._collect_cron_deliveries,
                 CronDeliveryQueueState,
+            ),
+            _SourceSpec(
+                "cron_bot_chat",
+                "cron_bot_chat_pending",
+                self._collect_cron_bot_chat,
+                CronBotChatState,
             ),
             _SourceSpec(
                 "channels",
@@ -2782,6 +2794,20 @@ class Collector:
         if not _safe_child_path(db_path, self._paths.root_home) or not db_path.is_file():
             raise RuntimeError("cron/deliveries.db replaced by unsafe path")
         return _read_cron_delivery_queue(db_path, now=self._clock())
+
+    def _collect_cron_bot_chat(self) -> CronBotChatState:
+        """Deferred Bot Chat receipts under ``cron/bot_chat_pending/``.
+
+        Upstream writes ``get_hermes_home()/cron/bot_chat_pending/<key>.json``
+        (``_root``/``defer``, ``cron/bot_chat_delivery.py:24-25,60-82``) and
+        never prunes it; read from the root store with the rest of ``cron``.
+        """
+        root_dir = self._paths.shared_path("cron", "bot_chat_pending")
+        if not _exists_strict(root_dir):
+            return CronBotChatState()
+        if not _safe_child_path(root_dir, self._paths.root_home) or not root_dir.is_dir():
+            raise RuntimeError("cron/bot_chat_pending escapes the Hermes home")
+        return _read_cron_bot_chat(root_dir, now=self._clock(), cache=self._bot_chat_cache)
 
     def _collect_channels(self, gateway: GatewayState) -> ChannelDirectoryState:
         directory = self._read_json_reporting_stale(

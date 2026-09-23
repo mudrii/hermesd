@@ -26,6 +26,7 @@ from hermesd.collect.common import (
     _file_size,
     _iso_to_epoch,
     _mtime,
+    _open_regular_file,
     _optional_int,
     _path_resolves_under,
     _read_tail_text,
@@ -43,6 +44,8 @@ from hermesd.collect.sqlite_util import (
     _table_exists,
 )
 from hermesd.models import (
+    CronBotChatReceipt,
+    CronBotChatState,
     CronDeliveryFailure,
     CronDeliveryQueueState,
     CronExecution,
@@ -1218,4 +1221,122 @@ def _read_cron_delivery_queue(db_path: Path, *, now: float) -> CronDeliveryQueue
             )
             for row in rows
         ],
+    )
+
+
+# ``cron/bot_chat_pending/`` is never pruned upstream, so the listing is capped;
+# a receipt embeds the whole cron output as ``content``, so one past the byte
+# cap is counted unreadable instead of parsed.
+_BOT_CHAT_SCAN_LIMIT = 2000
+_BOT_CHAT_RECORD_MAX_BYTES = 1024 * 1024
+_BOT_CHAT_UNSETTLED_STATUSES = ("queued", "claimed")
+_BOT_CHAT_ATTENTION_STATUSES = ("ambiguous", "claimed")
+_BOT_CHAT_ATTENTION_LIMIT = 5
+_BOT_CHAT_STATUS_KIND_LIMIT = 8
+
+_BotChatSignature = tuple[int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _BotChatReceipt:
+    """The fields hermesd keeps from one receipt; ``content`` is dropped."""
+
+    receipt_id: str
+    status: str
+    job_name: str
+    for_failure: bool
+    error_excerpt: str
+
+
+def _read_bot_chat_receipt(path: Path) -> _BotChatReceipt | None:
+    """Parse one receipt, or None when it is oversize, torn or not an object.
+
+    Upstream keeps unreadable receipts as evidence and skips them
+    (``_records``, ``cron/bot_chat_delivery.py:38-55``); so does hermesd.
+    """
+    with _open_regular_file(path) as handle:
+        raw = handle.read(_BOT_CHAT_RECORD_MAX_BYTES + 1)
+    if len(raw) > _BOT_CHAT_RECORD_MAX_BYTES:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    job = _as_dict(data.get("job"))
+    return _BotChatReceipt(
+        receipt_id=str(data.get("id") or path.stem)[:_EXCERPT_MAX_CHARS],
+        status=str(data.get("status") or "")[:_EXCERPT_MAX_CHARS],
+        job_name=str(job.get("name") or job.get("id") or "")[:_EXCERPT_MAX_CHARS],
+        for_failure=_coerce_bool(data.get("for_failure")),
+        error_excerpt=_cron_error_excerpt(str(data.get("error") or "")),
+    )
+
+
+def _read_cron_bot_chat(
+    root_dir: Path,
+    *,
+    now: float,
+    cache: dict[str, tuple[_BotChatSignature, _BotChatReceipt | None]],
+) -> CronBotChatState:
+    """Status counts, the unsettled backlog and receipts needing attention.
+
+    ``cache`` maps a receipt name to its last parse, keyed by (mtime_ns, size,
+    inode), and is rewritten to the files seen this scan. The caller confines
+    ``root_dir``; a listing error propagates so the source keeps its last-good.
+    """
+    entries = list(islice(root_dir.iterdir(), _BOT_CHAT_SCAN_LIMIT + 1))
+    truncated = len(entries) > _BOT_CHAT_SCAN_LIMIT
+    counts: dict[str, int] = {}
+    unreadable = 0
+    oldest_unsettled: float | None = None
+    attention: list[tuple[float, _BotChatReceipt]] = []
+    seen: dict[str, tuple[_BotChatSignature, _BotChatReceipt | None]] = {}
+    for path in entries[:_BOT_CHAT_SCAN_LIMIT]:
+        if path.suffix != ".json":
+            continue
+        try:
+            stat = path.lstat()
+            signature = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+            cached = cache.get(path.name)
+            if cached is not None and cached[0] == signature:
+                receipt = cached[1]
+            else:
+                receipt = None if path.is_symlink() else _read_bot_chat_receipt(path)
+        except OSError:
+            unreadable += 1
+            continue
+        seen[path.name] = (signature, receipt)
+        if receipt is None:
+            unreadable += 1
+            continue
+        if receipt.status in counts or len(counts) < _BOT_CHAT_STATUS_KIND_LIMIT:
+            counts[receipt.status] = counts.get(receipt.status, 0) + 1
+        age = max(0.0, now - stat.st_mtime)
+        if receipt.status in _BOT_CHAT_UNSETTLED_STATUSES:
+            oldest_unsettled = age if oldest_unsettled is None else max(oldest_unsettled, age)
+        if receipt.status in _BOT_CHAT_ATTENTION_STATUSES:
+            attention.append((age, receipt))
+    cache.clear()
+    cache.update(seen)
+    attention.sort(key=lambda item: (item[0], item[1].receipt_id))
+    return CronBotChatState(
+        present=True,
+        status_counts=dict(sorted(counts.items())),
+        unsettled_count=sum(counts.get(status, 0) for status in _BOT_CHAT_UNSETTLED_STATUSES),
+        oldest_unsettled_age_seconds=oldest_unsettled,
+        attention=[
+            CronBotChatReceipt(
+                receipt_id=receipt.receipt_id,
+                job_name=receipt.job_name,
+                status=receipt.status,
+                for_failure=receipt.for_failure,
+                age_seconds=age,
+                error_excerpt=receipt.error_excerpt,
+            )
+            for age, receipt in attention[:_BOT_CHAT_ATTENTION_LIMIT]
+        ],
+        unreadable_count=unreadable,
+        scan_truncated=truncated,
     )

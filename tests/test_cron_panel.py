@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from hermesd.models import (
+    CronBotChatReceipt,
+    CronBotChatState,
     CronDeliveryFailure,
     CronDeliveryQueueState,
     CronExecution,
@@ -1386,3 +1388,41 @@ def test_cron_panel_hides_an_idle_delivery_queue_from_compact() -> None:
         render_cron(DashboardState(cron_deliveries=queue), Theme()), no_color=True
     )
     assert "Delivery queue" not in compact
+
+
+def test_cron_panel_shows_deferred_bot_chat_receipts() -> None:
+    bot = CronBotChatState(
+        present=True,
+        status_counts={"ambiguous": 1, "claimed": 1, "queued": 1, "settled": 40},
+        unsettled_count=2,
+        oldest_unsettled_age_seconds=7200.0,
+        unreadable_count=1,
+        scan_truncated=True,
+        attention=[
+            CronBotChatReceipt(
+                receipt_id="a1",
+                job_name="nightly",
+                status="ambiguous",
+                for_failure=True,
+                age_seconds=60.0,
+                error_excerpt="RuntimeError: token=[REDACTED]",
+            ),
+            CronBotChatReceipt(receipt_id="c1", job_name="", status="claimed", age_seconds=7200.0),
+        ],
+    )
+    state = DashboardState(cron_bot_chat=bot)
+    compact = render_to_str(render_cron(state, Theme()), no_color=True)
+    assert "Bot Chat deferred: 2 unsettled (oldest 2h)  1 ambiguous" in compact
+    detail = render_to_str(render_cron(state, Theme(), detail=True), width=220, no_color=True)
+    assert "Deferred Bot Chat (bot_chat_pending)" in detail
+    assert "ambiguous 1  claimed 1  queued 1  settled 40" in detail
+    assert "1 unreadable" in detail
+    assert "listing capped" in detail
+    assert "nightly a1 ambiguous (failure notice) 1m ago: RuntimeError: token=[REDACTED]" in detail
+    assert "c1 claimed 2h ago" in detail
+
+
+def test_cron_panel_hides_settled_bot_chat_from_compact() -> None:
+    bot = CronBotChatState(present=True, status_counts={"settled": 3})
+    compact = render_to_str(render_cron(DashboardState(cron_bot_chat=bot), Theme()), no_color=True)
+    assert "Bot Chat" not in compact
