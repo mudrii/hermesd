@@ -61,7 +61,7 @@ hermesd/
                   hosted_rooms, api_runs, desktop_plugins)
   defaults.py     Shared refresh-rate and log-tail-bytes defaults
   db.py           Read-only SQLite with PRAGMA data_version caching
-  file_cache.py   mtime-keyed JSON/YAML cache
+  file_cache.py   (mtime, size, inode)-keyed JSON/YAML cache
   models.py       Pydantic models for DashboardState
   paths.py        Profile-scoped path resolution
   theme.py        Skin/color system (inherits from hermes config.yaml)
@@ -99,7 +99,7 @@ Canonical contributor workflow lives in [`CONTRIBUTING.md`](CONTRIBUTING.md). Th
 3. Populate them in the matching `collect/*.py` reader and wire it into `collector.py`. Resolve every path through `shared_path()`/`profile_path()` per [`.codex/rules/source-ownership.md`](.codex/rules/source-ownership.md), and add the new `source_name` to that file's ownership table (a test enforces it).
 4. Render in `panels/*.py` (both `_render_compact` and `_render_detail`).
 5. Make tests pass with the minimum change; refactor while green.
-6. Update `app.py` layout if adding new panels; add a `_render_*_panel(ctx: PanelRenderContext)` wrapper in `panels/__init__.py`, register it in `_RENDERERS` and `PANEL_NAMES`, then add its panel number to `_WIDE_LAYOUT_SPEC`, `_COMPACT_LAYOUT_SPEC`, and `_TALL_NARROW_LAYOUT_SPEC` in `app.py` as needed.
+6. Update `app.py` layout if adding new panels; add a `_render_*_panel(ctx: PanelRenderContext)` wrapper in `panels/__init__.py`, register it in `_RENDERERS` and `PANEL_NAMES`, then add its panel number to `_WIDE_LAYOUT_SPEC`, `_COMPACT_LAYOUT_SPEC`, `_REDUCED_LAYOUT_SPEC`, and `_TALL_NARROW_LAYOUT_SPEC` in `app.py` as needed.
 7. Update `CHANGELOG.md` for user-visible changes.
 
 See also:

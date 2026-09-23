@@ -7,6 +7,55 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Secret redaction:** log, config and error text now redacts passwords, passphrases, credentials, cookies, AWS/GCS signatures, Telegram/Discord/Slack webhook tokens carried in URL paths, and bare `sk-`/`ghp_`/JWT tokens. `Authorization: Bearer x` no longer leaves a stray `]`. Delivery errors, platform error messages, cron `last_error`/`last_delivery_error`, and delegation goals and errors are now redacted before they are clipped. A log tail that starts mid-line drops the partial first line, so the cut-off end of a secret can no longer appear without its label.
+- **Skills:** skills are found by `SKILL.md` at any depth, as upstream does. Flat skills and nested categories are counted, and directories without `SKILL.md` are no longer counted as skills. A `SKILL.md` that starts with a UTF-8 BOM shows its description.
+- **Plugins:** a broken plugin catalog cache no longer brings back the previous plugin list. Newly installed plugins appear, and catalog flags carry over by name.
+- **state.db:** one malformed table now fails only the source that reads it. Before, it failed six sources and forced repeated reconnects.
+- **Deleted files:** a file that is deleted after a good read, such as `response_store.db`, `projects.db`, `kanban.db` or `gateway_migration.json`, is reported failed for one refresh and then accepted as absent. Before, it stayed failed until restart.
+- **Kanban:** the stale-claim count only includes active tasks, not finished ones. Notify subscriptions on older schemas without `notifier_profile`/`platform` columns no longer fail the source. Temporary WAL copies of deleted boards are cleaned up.
+- **Gateway:** a stopped gateway no longer shows a growing incarnation uptime. A malformed `gateway.pid` (a bool, a list or an overflowing number) no longer reports a running gateway as pid 1. A profile-namespaced `api_server`/`webhook` entry no longer invents mirror URLs.
+- **Malformed input:** a source no longer fails on any of these:
+  - a junk session `ended_at` or `title`
+  - an oversized number
+  - a list or dict update outcome
+  - a non-ASCII fire-claim pid
+  - deeply nested JSON or YAML
+  - a non-string MoA preset key
+  - a non-mapping `config.yaml`
+
+  A corrupt `jobs.json`, `channel_directory.json` or `spawn-ledger.json` now marks its source stale instead of staying green.
+- **Filesystem safety:**
+  - A FIFO in place of a config or log file no longer hangs hermesd.
+  - `--snapshot` against an unreadable Hermes home reports an error instead of printing a traceback.
+  - On case-insensitive filesystems, `--snapshot-file` refuses paths that alias the Hermes home.
+  - Hooks, checkpoints, `.drain_request.json`, dashboard manifests and profile log streams are confined to their home.
+- **Caching:** the file cache and SQLite change keys use (mtime, size, inode), so a rewrite with the same timestamp on a coarse-timestamp filesystem is picked up. WAL snapshots detect a concurrent checkpoint and retry, and no longer copy `-shm`.
+- **Bounded scans:** cron output, curator run and MoA trace scans are limited on every refresh. Files that disappear during a scan are skipped.
+- **Terminals:** the terminal breadcrumb list shows the most recent terminals, not the first names alphabetically. Hidden (Bot Mode) chats show their compression-failure reason.
+- **Scrolling:** every detail view except Logs scrolls with `j`/`k`/`g`/`G`. That includes Tokens, Tools, Profiles, Memory, Kanban and Curator, whose content was previously cut off. The Logs window fills the terminal height.
+- **Snapshots:** `--snapshot-panel N` prints the full detail when piped. Before, it was cut at 48 lines.
+- **Layout:** the overview picks its layout from each layout's minimum height. The wide grid needs 34 rows, the compact grid 26, and shorter terminals get a new reduced two-per-row grid, so panels are no longer drawn as empty borders.
+- **Input:**
+  - `r2` refreshes and then opens panel 2.
+  - Application-mode arrows, F1–F4 and Alt+key no longer exit a detail view.
+  - `Esc` closes the help overlay first.
+  - `j`/`k` do nothing in the overview.
+- **Sessions:** the `cost` sort follows the displayed Cost column. An empty `msg:` filter no longer hides every session.
+- **Display:** untrusted bracketed text no longer shows a stray backslash (`\[x]`) in the Gateway, Curator, Cron and Tokens panels.
+- **CLI:**
+  - `--refresh-rate` is capped at 86400.
+  - Error messages name the problem and the valid values.
+  - `--snapshot-panel 00` works like `0`.
+  - An empty `--hermes-home` or `--snapshot-file` is rejected.
+
+### Changed
+
+- Ages of a day or more display as `Nd` in every panel, instead of `NNh` in some. Non-finite ages display as `—`, and Gateway KB sizes show one decimal.
+- The installed smoke script no longer relies on `assert`, so it still checks under `python -O`.
+- Reader helpers are shared through `hermesd/collect/common.py`. Dead code paths are removed: skills windowing, the test-only renderers, and the retry loop in `db.py` that always had exactly one target.
+
 ## [2026.9.13] - 2026-09-13
 
 This release includes all changes since the published

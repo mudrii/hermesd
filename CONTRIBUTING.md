@@ -86,7 +86,7 @@ This project uses **TDD/ATDD** — write the failing test first, then the smalle
 3. Collect the data in the matching `hermesd/collect/*.py` reader, wired in via `hermesd/collector.py`
 4. Register in `hermesd/panels/__init__.py`: add a `_render_your_panel(ctx: PanelRenderContext)` wrapper, add it to `_RENDERERS`, and add the label to `PANEL_NAMES`
 5. Add tests in `tests/test_your_panel.py`
-6. Update the overview layout specs in `hermesd/app.py` (`_WIDE_LAYOUT_SPEC`, `_COMPACT_LAYOUT_SPEC`, `_TALL_NARROW_LAYOUT_SPEC`) if the new panel needs overview placement
+6. Update the overview layout specs in `hermesd/app.py` (`_WIDE_LAYOUT_SPEC`, `_COMPACT_LAYOUT_SPEC`, `_REDUCED_LAYOUT_SPEC`, `_TALL_NARROW_LAYOUT_SPEC`) if the new panel needs overview placement
 
 ## Adding Data to an Existing Panel
 
@@ -111,7 +111,7 @@ uv run pytest tests/ -x --tb=short
 Test categories:
 - `test_models.py` — Pydantic model construction
 - `test_db_extended.py` / `test_db_null_tolerance.py` — SQLite reader, WAL snapshotting, caching, NULL coalescing (including a static guard against `.get(col, default)` on rows)
-- `test_file_cache.py` — mtime-keyed JSON/YAML cache
+- `test_file_cache.py` — (mtime, size, inode)-keyed JSON/YAML cache
 - `test_collector.py` — `Collector` construction, `collect()` orchestration, health/fallback, available tools
 - `test_collector_<source>.py` — per-domain collector readers: `sessions`, `cron`, `kanban`, `skills`, `gateway`, `operations`, `config`, `logs`, `migration`, `hosted_rooms`, `api_runs`, `common`, plus `profiles` (profile-scoped collection)
 - `test_desktop_plugins.py` / `test_plugin_*.py` (`activation`, `catalog_cache`, `manifest_formats`, `provenance`) — desktop and agent plugin inventory
