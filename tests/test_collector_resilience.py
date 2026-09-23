@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import stat
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -22,8 +24,20 @@ import yaml
 
 import hermesd.collect.sessions as sessions_module
 import hermesd.collector as collector_module
+from hermesd.collect.plugins import PLUGIN_KIND_STANDALONE
 from hermesd.collector import Collector
-from hermesd.models import ConfigSummary
+from hermesd.models import ConfigSummary, DashboardState
+from tests.conftest import (
+    create_session_coordination_tables,
+    create_state_db_tables,
+    insert_gateway_route,
+)
+from tests.test_collector_api_runs import _build_populated_db as build_runs_db
+from tests.test_collector_hosted_rooms import _build_populated_db as build_shared_state_db
+from tests.test_collector_operations import (
+    create_projects_db_tables,
+    create_verification_evidence_db_tables,
+)
 
 _UTF8_CONTINUATION_RANGE = range(0x80, 0xC0)
 
@@ -694,3 +708,379 @@ def test_hygiene_last_good_restores_the_total_with_the_rows(
         assert second.session_coordination.hygiene_total == first.session_coordination.hygiene_total
     finally:
         c.close()
+
+
+# ── Files that vanish or turn into escaping symlinks after a good read ─────
+
+
+def _sqlite_file(path: Path, build: Callable[[sqlite3.Connection], None]) -> None:
+    conn = sqlite3.connect(str(path))
+    try:
+        build(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _setup_migration(home: Path) -> None:
+    (home / "gateway_migration.json").write_text(
+        json.dumps({"version": 1, "migrated_at": "2026-09-01T00:00:00Z", "secondaries": []})
+    )
+
+
+def _setup_kanban_current(home: Path) -> None:
+    (home / "kanban").mkdir(exist_ok=True)
+    (home / "kanban" / "current").write_text("root")
+
+
+def _setup_response_store(home: Path) -> None:
+    _sqlite_file(
+        home / "response_store.db", lambda conn: conn.execute("CREATE TABLE conversations (id)")
+    )
+
+
+def _setup_verification(home: Path) -> None:
+    _sqlite_file(home / "verification_evidence.db", create_verification_evidence_db_tables)
+
+
+def _setup_projects(home: Path) -> None:
+    _sqlite_file(home / "projects.db", create_projects_db_tables)
+
+
+def _setup_hosted_rooms(home: Path) -> None:
+    build_shared_state_db(home / "shared-state.db")
+
+
+def _setup_api_runs(home: Path) -> None:
+    build_runs_db(home / "runs_idempotency.db")
+
+
+def _setup_moa(home: Path) -> None:
+    (home / "moa-traces").mkdir()
+    (home / "moa-traces" / "sess_moa.jsonl").write_text('{"event": "aggregate"}\n')
+
+
+def _setup_coordination_db(home: Path) -> None:
+    def build(conn: sqlite3.Connection) -> None:
+        create_state_db_tables(conn)
+        create_session_coordination_tables(conn)
+        insert_gateway_route(conn, "telegram:1", {"session_id": "s1"}, time.time())
+
+    _sqlite_file(home / "state.db", build)
+
+
+def _no_setup(home: Path) -> None:
+    return None
+
+
+@dataclass(frozen=True)
+class _GuardedFile:
+    """One previously-read file, the source it feeds, and the value it owns."""
+
+    source: str
+    relpath: str
+    setup: Callable[[Path], None]
+    value: Callable[[DashboardState], object]
+
+
+_GUARDED_FILES = [
+    _GuardedFile(
+        "migration",
+        "gateway_migration.json",
+        _setup_migration,
+        lambda s: s.migration.manifest_present,
+    ),
+    _GuardedFile(
+        "kanban", "kanban.db", _no_setup, lambda s: (s.kanban.db_present, s.kanban.task_count)
+    ),
+    _GuardedFile(
+        "kanban", "kanban/current", _setup_kanban_current, lambda s: s.kanban.current_board
+    ),
+    _GuardedFile(
+        "operations",
+        "response_store.db",
+        _setup_response_store,
+        lambda s: s.operations.response_store_present,
+    ),
+    _GuardedFile(
+        "operations",
+        "verification_evidence.db",
+        _setup_verification,
+        lambda s: s.operations.verification_db_present,
+    ),
+    _GuardedFile(
+        "operations", "projects.db", _setup_projects, lambda s: s.operations.projects_db_present
+    ),
+    _GuardedFile(
+        "hosted_rooms",
+        "shared-state.db",
+        _setup_hosted_rooms,
+        lambda s: s.operations.hosted_rooms.db_present,
+    ),
+    _GuardedFile(
+        "api_runs",
+        "runs_idempotency.db",
+        _setup_api_runs,
+        lambda s: s.operations.api_runs.db_present,
+    ),
+    _GuardedFile("operations", "moa-traces", _setup_moa, lambda s: s.operations.moa_trace_count),
+    _GuardedFile(
+        "gateway_routes", "state.db", _no_setup, lambda s: s.session_coordination.route_total
+    ),
+]
+
+
+def _remove(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+@pytest.mark.parametrize("case", _GUARDED_FILES, ids=lambda case: case.relpath)
+def test_deleted_file_fails_once_then_its_absence_is_accepted(
+    forensic_hermes_home: Path, case: _GuardedFile
+) -> None:
+    """A vanished file keeps last-good for one pass, then reads as gone.
+
+    The first absent pass may be a mid-rewrite race, so the source fails and
+    keeps its prior values; a second consecutive absent pass is a deletion,
+    and the source must stop reporting itself failed.
+    """
+    case.setup(forensic_hermes_home)
+    c = Collector(forensic_hermes_home, pid_exists=lambda pid: pid == 12345)
+    try:
+        first = c.collect()
+        assert case.source not in first.health.failed_sources
+        good = case.value(first)
+        assert good
+
+        _remove(forensic_hermes_home / case.relpath)
+        second = c.collect()
+        assert case.source in second.health.failed_sources
+        assert "disappeared" in second.health.errors[case.source]
+        assert case.value(second) == good
+
+        third = c.collect()
+        assert case.source not in third.health.failed_sources
+        assert case.value(third) != good
+    finally:
+        c.close()
+
+
+def test_a_reappearing_file_resets_the_absence_count(hermes_home: Path) -> None:
+    """Absence is counted in *consecutive* passes: a file that comes back
+    between two absent passes restarts the count instead of being accepted."""
+    _setup_response_store(hermes_home)
+    db_path = hermes_home / "response_store.db"
+    c = Collector(hermes_home)
+    try:
+        assert c.collect().operations.response_store_present
+        db_path.rename(hermes_home / "response_store.db.moved")
+        assert "operations" in c.collect().health.failed_sources
+        (hermes_home / "response_store.db.moved").rename(db_path)
+        assert "operations" not in c.collect().health.failed_sources
+        db_path.unlink()
+        again = c.collect()
+    finally:
+        c.close()
+
+    assert "operations" in again.health.failed_sources
+    assert again.operations.response_store_present is True
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        *_GUARDED_FILES,
+        _GuardedFile("gateway", "gateway_state.json", _no_setup, lambda s: s.gateway.code_version),
+        _GuardedFile(
+            "gateway_heartbeat",
+            "state/gateway.heartbeat",
+            _no_setup,
+            lambda s: s.gateway.loop_health,
+        ),
+    ],
+    ids=lambda case: case.relpath,
+)
+def test_file_replaced_by_an_escaping_symlink_keeps_failing_with_last_good(
+    forensic_hermes_home: Path, tmp_path: Path, case: _GuardedFile
+) -> None:
+    """A symlink out of the home is refused on every pass, never accepted."""
+    case.setup(forensic_hermes_home)
+    c = Collector(forensic_hermes_home, pid_exists=lambda pid: pid == 12345)
+    try:
+        first = c.collect()
+        assert case.source not in first.health.failed_sources
+        good = case.value(first)
+
+        target = forensic_hermes_home / case.relpath
+        outside = tmp_path / "outside" / target.name
+        outside.parent.mkdir()
+        target.rename(outside)
+        target.symlink_to(outside, target_is_directory=outside.is_dir())
+        second = c.collect()
+        third = c.collect()
+    finally:
+        c.close()
+
+    for state in (second, third):
+        assert case.source in state.health.failed_sources
+        assert case.value(state) == good
+
+
+@pytest.mark.parametrize(
+    ("relpath", "setup", "source", "value", "empty"),
+    [
+        (
+            "kanban/current",
+            _setup_kanban_current,
+            "kanban",
+            lambda s: s.kanban.current_board,
+            "",
+        ),
+        (
+            "shared-state.db",
+            _setup_hosted_rooms,
+            "hosted_rooms",
+            lambda s: s.operations.hosted_rooms.db_present,
+            False,
+        ),
+        (
+            "runs_idempotency.db",
+            _setup_api_runs,
+            "api_runs",
+            lambda s: s.operations.api_runs.db_present,
+            False,
+        ),
+        (
+            "moa-traces",
+            _setup_moa,
+            "operations",
+            lambda s: s.operations.moa_trace_count,
+            0,
+        ),
+        (
+            "state.db",
+            _setup_coordination_db,
+            "gateway_routes",
+            lambda s: s.session_coordination.route_total,
+            0,
+        ),
+    ],
+    ids=["kanban-current", "shared-state", "runs-idempotency", "moa-traces", "state-db"],
+)
+def test_escaping_symlink_without_a_good_read_reads_as_absent(
+    hermes_home: Path,
+    tmp_path: Path,
+    relpath: str,
+    setup: Callable[[Path], None],
+    source: str,
+    value: Callable[[DashboardState], object],
+    empty: object,
+) -> None:
+    """Never having read the file, a symlinked one is simply not there."""
+    setup(hermes_home)
+    target = hermes_home / relpath
+    outside = tmp_path / "outside" / target.name
+    outside.parent.mkdir()
+    target.rename(outside)
+    target.symlink_to(outside)
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert source not in state.health.failed_sources
+    assert value(state) == empty
+
+
+def test_unreadable_current_board_after_a_good_read_keeps_last_good(hermes_home: Path) -> None:
+    _setup_kanban_current(hermes_home)
+    current = hermes_home / "kanban" / "current"
+    c = Collector(hermes_home)
+    try:
+        assert c.collect().kanban.current_board == "root"
+        current.unlink()
+        current.mkdir()  # opening a directory raises IsADirectoryError, not absence
+        second = c.collect()
+        third = c.collect()
+    finally:
+        c.close()
+
+    for state in (second, third):
+        assert "kanban" in state.health.failed_sources
+        assert state.kanban.current_board == "root"
+
+
+def test_symlinked_terminal_breadcrumb_is_never_read(hermes_home: Path, tmp_path: Path) -> None:
+    outside = tmp_path / "outside-breadcrumb"
+    outside.write_text(json.dumps({"session_id": "SENTINEL_OUTSIDE", "ts": time.time()}))
+    directory = hermes_home / "terminal-sessions"
+    directory.mkdir()
+    (directory / "tty-evil").symlink_to(outside)
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.terminal_sessions.count == 0
+    assert "SENTINEL_OUTSIDE" not in state.model_dump_json()
+
+
+def test_symlinked_board_kanban_db_is_never_read(sample_kanban_db: Path, tmp_path: Path) -> None:
+    home = sample_kanban_db.parent
+    outside = tmp_path / "outside-kanban.db"
+    shutil.copy(sample_kanban_db, outside)
+    board = home / "kanban" / "boards" / "evil"
+    board.mkdir(parents=True)
+    (board / "kanban.db").symlink_to(outside)
+
+    c = Collector(home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "evil" not in {summary.slug for summary in state.kanban.boards}
+
+
+def test_symlinked_hook_manifest_is_never_read(hermes_home: Path, tmp_path: Path) -> None:
+    outside = tmp_path / "HOOK.yaml"
+    outside.write_text("name: SENTINEL_OUTSIDE\nevents: [agent:start]\n")
+    hook = hermes_home / "hooks" / "evil"
+    hook.mkdir(parents=True)
+    (hook / "handler.py").write_text("def handle(event): pass\n")
+    (hook / "HOOK.yaml").symlink_to(outside)
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.skills_memory.hooks == []
+    assert "SENTINEL_OUTSIDE" not in state.model_dump_json()
+
+
+def test_symlinked_plugin_init_is_never_read(hermes_home: Path, tmp_path: Path) -> None:
+    """An ``__init__.py`` symlinked out of the home must not steer kind detection."""
+    outside = tmp_path / "__init__.py"
+    outside.write_text("class SentinelMemoryProvider(MemoryProvider):\n    pass\n")
+    plugin = hermes_home / "plugins" / "evil"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text("name: evil\nversion: 1.0.0\n")
+    (plugin / "__init__.py").symlink_to(outside)
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    (evil,) = state.skills_memory.plugins
+    assert evil.kind == PLUGIN_KIND_STANDALONE

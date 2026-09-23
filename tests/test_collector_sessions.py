@@ -439,6 +439,32 @@ def test_session_ended_detection(hermes_home: Path):
     c.close()
 
 
+def test_junk_ended_at_and_title_coerce_without_freezing_sessions(hermes_home: Path):
+    """SQLite columns are untyped: text in ended_at or a number in title must
+    coerce, not fail validation and pin the whole sessions list to last-good."""
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    create_state_db_tables(conn)
+    now = time.time()
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, ended_at, title) VALUES (?, ?, ?, ?, ?)",
+        ("sess_junk", "cli", now - 3600, "not-a-time", 42),
+    )
+    conn.commit()
+    conn.close()
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "session_models" not in state.health.failed_sources
+    (session,) = state.sessions
+    assert session.ended_at == 0.0
+    assert session.title == "42"
+    assert session.is_active is False
+
+
 def test_token_analytics_windows_use_injected_clock(hermes_home: Path):
     fake_now = 1_000_000.0
     db_path = hermes_home / "state.db"
@@ -2219,6 +2245,33 @@ def test_hygiene_rows_join_session_error_and_mark_suspension(hermes_home: Path) 
     assert hygiene["discord:9:1"].compression_failure_error == ""
 
 
+def test_hygiene_rows_join_the_error_of_a_hidden_session(hermes_home: Path) -> None:
+    """Bot Mode chats are born hidden, yet their hygiene streak is still live.
+
+    The join must read the unfiltered sessions table, like the route targets
+    do, or a hidden chat's recorded compression failure is lost.
+    """
+    conn = sqlite3.connect(hermes_home / "state.db")
+    create_state_db_tables(
+        conn, include_schema_version=False, include_v021_columns=True, include_session_key=True
+    )
+    create_session_coordination_tables(conn)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, session_key, compression_failure_error, "
+        "hidden) VALUES ('sess_bot', 'gateway', ?, 'telegram:77:1', 'summary model timeout', 1)",
+        (_COORD_NOW - 30,),
+    )
+    conn.execute("INSERT INTO gateway_hygiene_state VALUES ('telegram:77:1', 3)")
+    conn.commit()
+    conn.close()
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    assert state.sessions == []
+    (row,) = state.session_coordination.hygiene
+    assert row.compression_failure_error == "summary model timeout"
+
+
 def test_zero_streak_hygiene_rows_are_not_reported(hermes_home: Path) -> None:
     conn = _make_coordination_db(hermes_home)
     conn.execute("INSERT INTO gateway_hygiene_state VALUES ('telegram:42:7', 0)")
@@ -2665,6 +2718,24 @@ def test_terminal_breadcrumb_rows_are_bounded(hermes_home: Path) -> None:
     c.close()
     assert state.terminal_sessions.count == 15
     assert len(state.terminal_sessions.sessions) == 12
+
+
+def test_terminal_breadcrumb_rows_keep_the_newest_not_the_first_named(hermes_home: Path) -> None:
+    """The bounded row list is the most recent terminals, newest first, even
+    when the newest breadcrumbs sort last by file name."""
+    directory = hermes_home / "terminal-sessions"
+    for i in range(15):
+        _write_breadcrumb(
+            directory,
+            f"tty-{i:02d}",
+            {"session_id": f"s{i}", "cwd": "/r", "ts": _COORD_NOW - 60 * (15 - i)},
+        )
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    assert [row.session_id for row in state.terminal_sessions.sessions] == [
+        f"s{i}" for i in range(14, 2, -1)
+    ]
 
 
 # ── Item 10: joinable session chip ──────────────────────────────────────────

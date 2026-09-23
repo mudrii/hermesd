@@ -48,6 +48,7 @@ from hermesd.collect.common import (
     _read_text_capped,
     _safe_capped_file,
     _safe_child_path,
+    _safe_mtime,
     _safe_or_absent_child_path,
     _today_epoch,
 )
@@ -137,6 +138,7 @@ from hermesd.collect.migration import (
     _migration_state,
 )
 from hermesd.collect.operations import (
+    _BOUNDED_SCAN_LIMIT,
     StateDbRead,
     _checkpoint_prune_interval_seconds,
     _count_delegation_live_logs,
@@ -311,15 +313,55 @@ class _StateDbReadout:
     state: StateDbRead
     ledgers: _GatewayLedgerRows
     coordination: _SessionCoordinationRows
+    # sqlite errors keyed by the source that owns the failed table group: each
+    # source re-raises only its own, so one broken table cannot fail the others.
+    errors: Mapping[str, sqlite3.Error] = field(default_factory=dict)
+
+    def raise_for(self, source_name: str) -> None:
+        error = self.errors.get(source_name)
+        if error is not None:
+            raise error
+
+
+# Every source that reads its rows out of the shared state.db readout.
+_STATE_DB_SOURCES = frozenset(
+    {
+        "operations",
+        "gateway_ledgers",
+        "session_leases",
+        "gateway_hygiene",
+        "gateway_routes",
+        "generation_churn",
+    }
+)
+_EMPTY_STATE_DB_READ = StateDbRead(
+    goal_update={}, delegation_rows=[], delegation_counts={}, meta={}, schema_version=0
+)
 
 
 def _state_db_readout(conn: sqlite3.Connection) -> _StateDbReadout:
-    """Every state.db-backed source's raw rows, read from one connection."""
-    return _StateDbReadout(
-        state=_read_state_db_tables(conn),
-        ledgers=_read_gateway_ledger_rows(conn),
-        coordination=_read_session_coordination_rows(conn),
-    )
+    """Every state.db-backed source's raw rows, read from one connection.
+
+    Each table group is read independently; a failed group reads as empty and
+    its error is recorded for the owning source to raise.
+    """
+    errors: dict[str, sqlite3.Error] = {}
+    state = _EMPTY_STATE_DB_READ
+    ledgers = _GatewayLedgerRows()
+    try:
+        state = _read_state_db_tables(conn)
+    except sqlite3.Error as exc:
+        errors["operations"] = exc
+    try:
+        ledgers = _read_gateway_ledger_rows(conn)
+    except sqlite3.Error as exc:
+        errors["gateway_ledgers"] = exc
+    coordination = _read_session_coordination_rows(conn, errors)
+    if errors.keys() >= _STATE_DB_SOURCES:
+        # Nothing readable at all is a connection-level failure: raise it so
+        # HermesDB counts it toward its reconnect threshold.
+        raise next(iter(errors.values()))
+    return _StateDbReadout(state=state, ledgers=ledgers, coordination=coordination, errors=errors)
 
 
 # Fields each gateway sub-source owns, used to restore just that source's
@@ -349,15 +391,17 @@ _CONFIG_BACKUP_FIELDS = (
     "config_backup_groups_truncated",
 )
 # The catalog-cache enrichment owns these SkillsMemory fields plus the flags it
-# stamps onto the plugin rows, so its last-good fallback restores both.
+# stamps onto the plugin rows. The rows themselves belong to the skills source,
+# so its last-good fallback restores these fields and re-stamps the flags by
+# plugin name onto the freshly discovered list (see _last_plugin_catalog).
 _PLUGIN_CATALOG_FIELDS = (
-    "plugins",
     "plugin_catalog_cache_present",
     "plugin_catalog_cache_usable",
     "plugin_catalog_cache_age_seconds",
     "plugin_catalog_update_count",
     "plugin_catalog_removed_count",
 )
+_PLUGIN_CATALOG_FLAGS = ("catalog_update_available", "catalog_removed", "catalog_removed_reason")
 # cache/blocked-scripts/ scan bounds and the fields the source owns.
 _BLOCKED_SCRIPT_SCAN_LIMIT = 200
 _BLOCKED_SCRIPT_NAME_LIMIT = 3
@@ -468,6 +512,11 @@ _GENERATION_FIELDS = (
 _TERMINAL_SESSION_SCAN_LIMIT = 200
 _TERMINAL_SESSION_ROW_LIMIT = 12
 _TERMINAL_SESSION_WINDOW_SECONDS = 24 * 60 * 60
+# A file read successfully and then found missing fails its source on the
+# first absent pass (keeping last-good: it may be mid-rewrite), and the absence
+# is accepted as the new state after this many consecutive absent passes, so an
+# intentionally deleted file cannot keep its source failed forever.
+_ABSENCE_CONFIRM_PASSES = 2
 # Bucket for the time-dependent part of derived-cache keys: sliding 7d/30d
 # window cutoffs recompute at most this often when nothing else changed
 # (matches the 60s cutoff bucketing in db.py's model-usage reads).
@@ -737,8 +786,9 @@ class Collector:
         # the table recovers — instead of a silent "fewer chats than last tick".
         self._last_generation_chat_count: int | None = None
         self._log_stream_cache: dict[str, tuple[float | None, int, LogStream]] = {}
+        # Keyed by (output root, job id): a job id may itself contain ':'.
         self._cron_excerpt_cache: dict[
-            str,
+            tuple[Path, str],
             tuple[
                 tuple[str, int, int] | tuple[str, float | None],
                 tuple[str, bool, str, float | None],
@@ -750,6 +800,15 @@ class Collector:
         # state and the gateway ledgers so a pass snapshots the (large, WAL)
         # db only once.
         self._state_db_cache: tuple[int, _StateDbReadout] | None = None
+        # Consecutive passes each previously-read file has been found absent,
+        # keyed by its label — see _present_or_confirmed_absent.
+        self._absent_passes: dict[str, int] = {}
+        # A readout that carried a group error (or failed outright) is reused
+        # only within the pass that read it, so each state.db source re-raises
+        # the same failure instead of re-reading the database, while the next
+        # pass retries.
+        self._collect_pass = 0
+        self._state_db_pass_readout: tuple[int, _StateDbReadout | sqlite3.Error] | None = None
         # kanban.db's shared WAL snapshots, keyed by source path: each entry is
         # (source mtime, path to read, temp-dir owner). One per database, so the
         # boards' own stores do not evict the root one.
@@ -762,10 +821,10 @@ class Collector:
         # MEMORY.md / USER.md / SOUL.md is not re-read on every tick.
         self._derived_file_cache: dict[str, tuple[tuple[str, int, int] | None, Any]] = {}
         self._kanban_board_errors: list[str] = []
-        # Session-row-derived values, one entry per derived name, keyed on
-        # (rows identity, local date, entry-specific deps) — see
-        # _derived_from_rows.
-        self._derived_cache: dict[str, tuple[tuple[object, ...], Any]] = {}
+        # Session-row-derived values, one entry per derived name: the rows
+        # list itself (compared by identity), then (local date, entry-specific
+        # deps) — see _derived_from_rows.
+        self._derived_cache: dict[str, tuple[list[dict[str, Any]], tuple[object, ...], Any]] = {}
         self._closed = False
         # Set by close() before it queues for _lock; an in-flight collect pass
         # checks it between sources and stops doing new work.
@@ -784,6 +843,7 @@ class Collector:
             if self._closed:
                 raise RuntimeError("collector is closed")
             self._prune_stale_caches()
+            self._collect_pass += 1
             health = _CollectionHealth()
             session_rows = self._collect_session_rows(health)
             return self._build_dashboard_state(health, session_rows)
@@ -796,6 +856,10 @@ class Collector:
             for slug, summary in self._kanban_board_cache.items()
             if not _path_confirmed_gone(boards_dir / slug)
         }
+        for db_path in [path for path in self._kanban_snapshots if _path_confirmed_gone(path)]:
+            owner = self._kanban_snapshots.pop(db_path)[2]
+            if owner is not None:
+                owner.cleanup()
         self._derived_file_cache = {
             key: entry
             for key, entry in self._derived_file_cache.items()
@@ -804,7 +868,7 @@ class Collector:
         self._cron_excerpt_cache = {
             key: entry
             for key, entry in self._cron_excerpt_cache.items()
-            if not _path_confirmed_gone(Path(key.rsplit(":", 1)[0]) / key.rsplit(":", 1)[1])
+            if not _path_confirmed_gone(key[0] / key[1])
         }
 
     def _build_dashboard_state(
@@ -1150,9 +1214,7 @@ class Collector:
                 "plugin_catalog",
                 lambda: self._with_plugin_catalog(results["skills_memory"]),
                 lambda: results["skills_memory"],
-                fallback=lambda: self._last_source_fields(
-                    "plugin_catalog", results["skills_memory"], _PLUGIN_CATALOG_FIELDS
-                ),
+                fallback=lambda: self._last_plugin_catalog(results["skills_memory"]),
             ),
             _SourceSpec("mcp_cache", "mcp_cache", self._collect_mcp_cache, MCPSchemaCache),
             _SourceSpec(
@@ -1203,7 +1265,7 @@ class Collector:
             _SourceSpec(
                 "session_coordination",
                 "gateway_hygiene",
-                lambda: self._with_gateway_hygiene(results["session_coordination"], session_rows),
+                lambda: self._with_gateway_hygiene(results["session_coordination"]),
                 lambda: results["session_coordination"],
                 fallback=lambda: self._last_source_fields(
                     "gateway_hygiene", results["session_coordination"], _HYGIENE_FIELDS
@@ -1316,6 +1378,22 @@ class Collector:
             return current
         return current.model_copy(update={name: getattr(last, name) for name in fields})
 
+    def _last_plugin_catalog(self, current: SkillsMemory) -> SkillsMemory:
+        """Restore the catalog verdicts onto the current plugin rows, by name."""
+        restored = self._last_source_fields("plugin_catalog", current, _PLUGIN_CATALOG_FIELDS)
+        last: SkillsMemory | None = self._last_good_by_source.get("plugin_catalog")
+        if last is None:
+            return restored
+        flags = {
+            plugin.name: {name: getattr(plugin, name) for name in _PLUGIN_CATALOG_FLAGS}
+            for plugin in last.plugins
+        }
+        plugins = [
+            plugin.model_copy(update=flags[plugin.name]) if plugin.name in flags else plugin
+            for plugin in current.plugins
+        ]
+        return restored.model_copy(update={"plugins": plugins})
+
     def _fresh_session_rows(
         self,
         rows: list[dict[str, Any]],
@@ -1340,21 +1418,23 @@ class Collector:
         deps: tuple[object, ...] = (),
     ) -> T:
         # HermesDB returns the same cached list object while data_version is
-        # unchanged, so row identity is a cheap invalidation key (the collector
-        # holds the list alive via _last_session_rows, so the id cannot be
-        # recycled). The local date is part of every key because "today"
+        # unchanged, so row identity is a cheap invalidation key. The entry
+        # holds the list itself and compares with `is`: an id() alone can be
+        # recycled by a later list once the one it named is freed (an entry
+        # left behind by a stale pass outlives _last_session_rows' reference).
+        # The local date is part of every key because "today"
         # aggregates shift at midnight; deps carry the entry-specific
         # dependencies (config file signatures, time buckets for the sliding
         # windows) so a change there recomputes only the entries that consume
         # it instead of invalidating the whole cache.
-        key = (id(rows), _local_date(self._clock()), deps)
+        key = (_local_date(self._clock()), deps)
         cached = self._derived_cache.get(name)
-        if cached is not None and cached[0] == key:
+        if cached is not None and cached[0] is rows and cached[1] == key:
             # type-ignore[no-any-return]: heterogeneous per-name cache; each
             # call site pins T via its compute callable.
-            return cached[1]  # type: ignore[no-any-return]
+            return cached[2]  # type: ignore[no-any-return]
         value = compute(rows)
-        self._derived_cache[name] = (key, value)
+        self._derived_cache[name] = (rows, key, value)
         return value
 
     def _collect_session_rows(
@@ -1533,7 +1613,7 @@ class Collector:
         gateway_cfg = _as_dict(cfg.get("gateway"))
         scale_cfg = _as_dict(cfg.get("scale_to_zero")) or _as_dict(gateway_cfg.get("scale_to_zero"))
         active_agents = _coerce_int(data.get("active_agents"))
-        drain_request = self._read_json_cached(self._paths.shared_path(".drain_request.json"))
+        drain_request = self._read_json_confined(self._paths.shared_path(".drain_request.json"))
         config_generation = _config_generation(data)
         return GatewayState(
             code_sha=str(data.get("code_sha") or ""),
@@ -1752,11 +1832,13 @@ class Collector:
         )
 
     def _with_gateway_ledgers(self, gateway: GatewayState) -> GatewayState:
-        readout = self._read_state_db()
+        last = self._last_good_by_source.get("gateway_ledgers")
+        readout = self._state_db_for(
+            "gateway_ledgers",
+            "state.db gateway ledgers",
+            had_last_good=last is not None and bool(last.gateway_incarnation_count),
+        )
         if readout is None:
-            last = self._last_good_by_source.get("gateway_ledgers")
-            if last is not None and last.gateway_incarnation_count:
-                raise RuntimeError("state.db gateway ledgers disappeared or became unsafe")
             return gateway
         return gateway.model_copy(update=_gateway_ledger_fields(readout.ledgers, self._clock()))
 
@@ -1784,9 +1866,9 @@ class Collector:
             if had_last_good:
                 raise RuntimeError(f"{path.name} became unsafe")
             return MigrationState()
-        if not _exists_strict(path):
-            if had_last_good:
-                raise RuntimeError(f"{path.name} disappeared")
+        if not self._present_or_confirmed_absent(
+            path.name, _exists_strict(path), had_last_good=had_last_good
+        ):
             return MigrationState()
         return _migration_state(
             self._read_json_reporting_stale(path),
@@ -1803,10 +1885,10 @@ class Collector:
                 content = _read_text_capped(pid_file, self._paths.root_home).strip()
                 if content:
                     data = json.loads(content)
-                    if isinstance(data, dict):
-                        lpid = int(data.get("pid", 0) or 0)
-                    else:
-                        lpid = int(content)
+                    raw_pid = data.get("pid") if isinstance(data, dict) else data
+                    # A JSON true is not pid 1, and an overflowing or non-scalar
+                    # value is no pid at all.
+                    lpid = 0 if isinstance(raw_pid, bool) else _coerce_int(raw_pid)
                     if lpid > 0 and self._pid_exists(lpid):
                         return lpid
             except (ValueError, json.JSONDecodeError, ProcessLookupError, PermissionError, OSError):
@@ -1827,11 +1909,7 @@ class Collector:
                 pass
             except tomllib.TOMLDecodeError:
                 pass
-        behind = 0
-        update_check = self._read_json_cached(self._paths.shared_path(".update_check"))
-        if update_check:
-            behind = _coerce_int(update_check.get("behind"))
-        return version, behind
+        return version, self._collect_version_behind()
 
     def _read_context_lengths(self) -> dict[str, int]:
         path = self._paths.shared_path("context_length_cache.yaml")
@@ -1894,8 +1972,8 @@ class Collector:
                 # SQLite columns are untyped: a text value in an epoch column must
                 # coerce, not fail model validation and blank the whole source.
                 started_at=_coerce_float(r.get("started_at")),
-                ended_at=r.get("ended_at"),
-                title=r.get("title"),
+                ended_at=None if r.get("ended_at") is None else _coerce_float(r.get("ended_at")),
+                title=None if r.get("title") is None else str(r.get("title")),
                 is_active=r.get("ended_at") is None and not _coerce_bool(r.get("archived")),
                 git_branch=r.get("git_branch") or "",
                 chat_type=r.get("chat_type") or "",
@@ -2005,11 +2083,13 @@ class Collector:
         ``hermes_state_compression.py:433-605``). See
         ``.codex/rules/source-ownership.md`` (``session_leases``).
         """
-        readout = self._read_state_db()
+        last = self._last_good_by_source.get("session_leases")
+        readout = self._state_db_for(
+            "session_leases",
+            "state.db session leases",
+            had_last_good=last is not None and bool(last.lease_total),
+        )
         if readout is None:
-            last = self._last_good_by_source.get("session_leases")
-            if last is not None and last.lease_total:
-                raise RuntimeError("state.db session leases disappeared or became unsafe")
             return coord
         return coord.model_copy(
             update=_session_lease_fields(
@@ -2017,22 +2097,22 @@ class Collector:
             )
         )
 
-    def _with_gateway_hygiene(
-        self, coord: SessionCoordinationState, session_rows: list[dict[str, Any]]
-    ) -> SessionCoordinationState:
+    def _with_gateway_hygiene(self, coord: SessionCoordinationState) -> SessionCoordinationState:
         """Per-chat hygiene failure streaks (PROFILE ``state.db``, table
-        ``gateway_hygiene_state`` — ``hermes_state.py:160,178``). The raw
-        session rows join the recorded compression failure to each streak."""
-        readout = self._read_state_db()
+        ``gateway_hygiene_state`` — ``hermes_state.py:160,178``). The unfiltered
+        sessions table joins the recorded compression failure to each streak."""
+        last = self._last_good_by_source.get("gateway_hygiene")
+        readout = self._state_db_for(
+            "gateway_hygiene",
+            "state.db gateway hygiene",
+            had_last_good=last is not None and bool(last.hygiene),
+        )
         if readout is None:
-            last = self._last_good_by_source.get("gateway_hygiene")
-            if last is not None and last.hygiene:
-                raise RuntimeError("state.db gateway hygiene disappeared or became unsafe")
             return coord
         return coord.model_copy(
             update=_hygiene_fields(
                 readout.coordination.hygiene_rows,
-                session_rows,
+                readout.coordination.hygiene_errors,
                 readout.coordination.hygiene_total,
             )
         )
@@ -2044,11 +2124,13 @@ class Collector:
         session id has no row at all: the target set is the *unfiltered* id
         list, because upstream hides a session from the default listing while
         keeping it resumable (``hermes_state_sessions.py:898-900``)."""
-        readout = self._read_state_db()
+        last = self._last_good_by_source.get("gateway_routes")
+        readout = self._state_db_for(
+            "gateway_routes",
+            "state.db gateway routes",
+            had_last_good=last is not None and bool(last.route_total),
+        )
         if readout is None:
-            last = self._last_good_by_source.get("gateway_routes")
-            if last is not None and last.route_total:
-                raise RuntimeError("state.db gateway routes disappeared or became unsafe")
             return coord
         return coord.model_copy(
             update=_gateway_route_fields(
@@ -2072,11 +2154,13 @@ class Collector:
         recovers to the count seen before it. Comparing against last-seen would
         clear the warning on the very next refresh, leaving the operator's only
         cue to the one interval that happened to observe the drop."""
-        readout = self._read_state_db()
+        last = self._last_good_by_source.get("generation_churn")
+        readout = self._state_db_for(
+            "generation_churn",
+            "state.db generations",
+            had_last_good=last is not None and bool(last.generation_chat_total),
+        )
         if readout is None:
-            last = self._last_good_by_source.get("generation_churn")
-            if last is not None and last.generation_chat_total:
-                raise RuntimeError("state.db generations disappeared or became unsafe")
             return coord
         rows = readout.coordination
         previous = self._last_generation_chat_count
@@ -2109,7 +2193,6 @@ class Collector:
             return TerminalSessionReadout()
         now = self._clock()
         rows: list[TerminalBreadcrumb] = []
-        count = 0
         # Bound the listing before sorting, like the config-backups scan: a
         # hostile directory must not be materialised whole, and one extra entry
         # is enough to know the scan was cut.
@@ -2132,17 +2215,21 @@ class Collector:
             age = _age_seconds(ts or None, now)
             if age is None or age > _TERMINAL_SESSION_WINDOW_SECONDS:
                 continue
-            count += 1
-            if len(rows) < _TERMINAL_SESSION_ROW_LIMIT:
-                rows.append(
-                    TerminalBreadcrumb(
-                        terminal=_sanitized_file_label(entry.name),
-                        session_id=str(data.get("session_id") or ""),
-                        cwd=str(data.get("cwd") or ""),
-                        age_seconds=age,
-                    )
+            rows.append(
+                TerminalBreadcrumb(
+                    terminal=_sanitized_file_label(entry.name),
+                    session_id=str(data.get("session_id") or ""),
+                    cwd=str(data.get("cwd") or ""),
+                    age_seconds=age,
                 )
-        return TerminalSessionReadout(sessions=rows, count=count, truncated=truncated)
+            )
+        # Every in-window row is kept until here (at most the scan bound), so
+        # the displayed slice is the newest terminals rather than the first
+        # names in directory order.
+        rows.sort(key=lambda row: row.age_seconds or 0.0)
+        return TerminalSessionReadout(
+            sessions=rows[:_TERMINAL_SESSION_ROW_LIMIT], count=len(rows), truncated=truncated
+        )
 
     def _last_model_usage(self) -> _ModelUsageBundle:
         bundle: _ModelUsageBundle = self._last_good_by_source.get(
@@ -2206,7 +2293,10 @@ class Collector:
     def _collect_background_processes(self) -> list[BackgroundProcessInfo]:
         # hermes-agent >= 0.21 registers live processes in spawn-ledger.json;
         # processes.json is the legacy (now usually empty) registry.
-        ledger = self._read_json_list_cached(self._paths.shared_path("spawn-ledger.json"))
+        ledger_path = self._paths.shared_path("spawn-ledger.json")
+        ledger = self._read_json_list_cached(ledger_path)
+        if self._file_cache.last_read_was_stale(ledger_path):
+            raise RuntimeError(f"{ledger_path.name} is unreadable; keeping last-good values")
         if ledger:
             return [
                 _background_process_from_ledger(entry, self._pid_exists)
@@ -2500,7 +2590,7 @@ class Collector:
         jobs: list[CronJob] = []
         error_count = 0
         now = self._clock()
-        data = self._read_json_cached(self._paths.shared_path("cron", "jobs.json"))
+        data = self._read_json_reporting_stale(self._paths.shared_path("cron", "jobs.json"))
         if data:
             directory = self._read_json_cached(self._paths.shared_path("channel_directory.json"))
             for j in _as_list(data.get("jobs")):
@@ -2552,11 +2642,13 @@ class Collector:
                         silent_run=silent_run,
                         next_run_at=str(j.get("next_run_at") or ""),
                         last_status=str(last_status) if last_status is not None else None,
-                        last_error=str(j.get("last_error") or ""),
+                        last_error=_redact_secret_text(str(j.get("last_error") or "")),
                         failure_streak=_coerce_int(j.get("failure_streak")),
                         paused=paused,
                         paused_reason=paused_reason,
-                        last_delivery_error=str(j.get("last_delivery_error") or ""),
+                        last_delivery_error=_redact_secret_text(
+                            str(j.get("last_delivery_error") or "")
+                        ),
                         dispatch_lateness_seconds=dispatch_lateness,
                         dispatch_kind=dispatch_kind,
                         repeat_times=repeat_times,
@@ -2632,7 +2724,9 @@ class Collector:
         )
 
     def _collect_channels(self, gateway: GatewayState) -> ChannelDirectoryState:
-        directory = self._read_json_cached(self._paths.shared_path("channel_directory.json"))
+        directory = self._read_json_reporting_stale(
+            self._paths.shared_path("channel_directory.json")
+        )
         aliases = _as_dict(self._read_json_cached(self._paths.shared_path("channel_aliases.json")))
         platforms = _as_dict(directory.get("platforms"))
         gateway_states = {platform.name: platform.state for platform in gateway.platforms}
@@ -2731,9 +2825,11 @@ class Collector:
         )
         db_path = self._paths.shared_path("kanban.db")
         last_kanban = self._last_good_by_source.get("kanban")
-        if not _exists_strict(db_path):
-            if last_kanban is not None and last_kanban.db_present:
-                raise RuntimeError("kanban.db disappeared")
+        if not self._present_or_confirmed_absent(
+            "kanban.db",
+            _exists_strict(db_path),
+            had_last_good=last_kanban is not None and last_kanban.db_present,
+        ):
             return self._with_kanban_boards(base_state)
         if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
             if last_kanban is not None and last_kanban.db_present:
@@ -2756,13 +2852,20 @@ class Collector:
             if last_kanban is not None and last_kanban.current_board:
                 raise RuntimeError("kanban current board replaced by unsafe path")
             return ""
+        had_last_good = last_kanban is not None and bool(last_kanban.current_board)
         try:
             with path.open("rb") as handle:
                 raw = handle.read(_MAX_TEXT_READ_BYTES)
+        except FileNotFoundError:
+            self._present_or_confirmed_absent(
+                "kanban current board", False, had_last_good=had_last_good
+            )
+            return ""
         except OSError:
-            if last_kanban is not None and last_kanban.current_board:
+            if had_last_good:
                 raise
             return ""
+        self._present_or_confirmed_absent("kanban current board", True, had_last_good=had_last_good)
         return raw.decode("utf-8", errors="replace").strip()
 
     def _with_kanban_boards(self, state: KanbanState) -> KanbanState:
@@ -2931,9 +3034,11 @@ class Collector:
     def _with_response_store(self, operations: OperationsState) -> OperationsState:
         db_path = self._paths.shared_path("response_store.db")
         last = self._last_good_by_source.get("operations")
-        if not _exists_strict(db_path):
-            if last is not None and last.response_store_present:
-                raise RuntimeError("response_store.db disappeared")
+        if not self._present_or_confirmed_absent(
+            db_path.name,
+            _exists_strict(db_path),
+            had_last_good=last is not None and last.response_store_present,
+        ):
             return operations
         if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
             if last is not None and last.response_store_present:
@@ -2953,9 +3058,11 @@ class Collector:
     def _with_verification_evidence(self, operations: OperationsState) -> OperationsState:
         db_path = self._paths.profile_path("verification_evidence.db")
         last = self._last_good_by_source.get("operations")
-        if not _exists_strict(db_path):
-            if last is not None and last.verification_db_present:
-                raise RuntimeError("verification_evidence.db disappeared")
+        if not self._present_or_confirmed_absent(
+            db_path.name,
+            _exists_strict(db_path),
+            had_last_good=last is not None and last.verification_db_present,
+        ):
             return operations
         # Confined to profile_home, not root_home: a path that resolves into a
         # *sibling* profile is still under the root, and this source is
@@ -2980,25 +3087,35 @@ class Collector:
         )
         if not trace_dir.is_absolute():
             trace_dir = self._paths.shared_path(trace_dir_value)
+        last = self._last_good_by_source.get("operations")
+        had_last_good = last is not None and bool(last.moa_trace_count)
+        if not self._present_or_confirmed_absent(
+            "MoA trace directory",
+            trace_dir.is_symlink() or _exists_strict(trace_dir),
+            had_last_good=had_last_good,
+        ):
+            return operations
         if (
             trace_dir.is_symlink()
             or not _path_resolves_under(trace_dir, self._paths.root_home)
             or not trace_dir.is_dir()
         ):
-            last = self._last_good_by_source.get("operations")
-            if last is not None and last.moa_trace_count:
-                raise RuntimeError("MoA trace directory disappeared or became unsafe")
+            if had_last_good:
+                raise RuntimeError("MoA trace directory became unsafe")
             return operations
+        # Bounded like the sibling cache scans: the directory is untrusted and
+        # listed every refresh.
         traces = [
             path
-            for path in trace_dir.glob("*.jsonl")
+            for path in islice(trace_dir.glob("*.jsonl"), _BOUNDED_SCAN_LIMIT)
             if path.is_file()
             and not path.is_symlink()
             and _path_resolves_under(path, self._paths.root_home)
         ]
         if not traces:
             return operations
-        newest = max(traces, key=lambda path: path.stat().st_mtime)
+        # A trace deleted after the listing stats as mtime 0 rather than raising.
+        newest = max(traces, key=_safe_mtime)
         latest_record = _moa_latest_record_summary(newest, self._log_tail_bytes)
         return operations.model_copy(
             update={
@@ -3014,9 +3131,11 @@ class Collector:
     def _with_projects(self, operations: OperationsState) -> OperationsState:
         db_path = self._paths.profile_path("projects.db")
         last = self._last_good_by_source.get("operations")
-        if not _exists_strict(db_path):
-            if last is not None and last.projects_db_present:
-                raise RuntimeError("projects.db disappeared")
+        if not self._present_or_confirmed_absent(
+            db_path.name,
+            _exists_strict(db_path),
+            had_last_good=last is not None and last.projects_db_present,
+        ):
             return operations
         # Confined to profile_home, not root_home: a sibling profile's projects.db
         # is still under the root, and this source is profile-scoped.
@@ -3036,13 +3155,14 @@ class Collector:
         they share the single (mtime-cached) readout with the gateway ledgers
         rather than taking a WAL snapshot each.
         """
-        readout = self._read_state_db()
+        last = self._last_good_by_source.get("operations")
+        readout = self._state_db_for(
+            "operations",
+            "state.db operations data",
+            had_last_good=last is not None
+            and bool(last.goal_count or last.delegation_count or last.state_db_schema_version),
+        )
         if readout is None:
-            last = self._last_good_by_source.get("operations")
-            if last is not None and (
-                last.goal_count or last.delegation_count or last.state_db_schema_version
-            ):
-                raise RuntimeError("state.db operations data disappeared or became unsafe")
             return operations
         db_path = self._paths.profile_path("state.db")
         update = _state_db_update(readout.state, now=self._clock(), pid_exists=self._pid_exists)
@@ -3053,6 +3173,42 @@ class Collector:
             self._paths.root_home,
         )
         return operations.model_copy(update=update)
+
+    def _present_or_confirmed_absent(
+        self, label: str, present: bool, *, had_last_good: bool
+    ) -> bool:
+        """Return ``present``, raising on the first absent pass after a good read.
+
+        A second consecutive absent pass accepts the absence, so the source
+        reports the file gone instead of staying failed forever.
+        """
+        if present or not had_last_good:
+            self._absent_passes.pop(label, None)
+            return present
+        passes = self._absent_passes.get(label, 0) + 1
+        self._absent_passes[label] = passes
+        if passes < _ABSENCE_CONFIRM_PASSES:
+            raise RuntimeError(f"{label} disappeared")
+        return False
+
+    def _state_db_for(
+        self, source_name: str, label: str, *, had_last_good: bool
+    ) -> _StateDbReadout | None:
+        """The shared readout for one state.db source; None when absent or unsafe.
+
+        An absent state.db goes through the absence guard; one made unsafe after
+        a good read raises; a table-group error owned by this source re-raises.
+        """
+        present = _exists_strict(self._paths.profile_path("state.db"))
+        if not self._present_or_confirmed_absent(label, present, had_last_good=had_last_good):
+            return None
+        readout = self._read_state_db()
+        if readout is None:
+            if had_last_good:
+                raise RuntimeError(f"{label} became unsafe")
+            return None
+        readout.raise_for(source_name)
+        return readout
 
     def _read_state_db(self) -> _StateDbReadout | None:
         """Operations tables and gateway ledgers from one state.db pass; None when absent.
@@ -3076,8 +3232,19 @@ class Collector:
         cached = self._state_db_cache
         if cached is not None and mtime is not None and cached[0] == mtime:
             return cached[1]
-        readout = self._db.run_readout(_state_db_readout)
-        if mtime is not None:
+        this_pass = self._state_db_pass_readout
+        if this_pass is not None and this_pass[0] == self._collect_pass:
+            if isinstance(this_pass[1], sqlite3.Error):
+                raise this_pass[1]
+            return this_pass[1]
+        try:
+            readout = self._db.run_readout(_state_db_readout)
+        except sqlite3.Error as exc:
+            self._state_db_pass_readout = (self._collect_pass, exc)
+            raise
+        if readout.errors or mtime is None:
+            self._state_db_pass_readout = (self._collect_pass, readout)
+        else:
             self._state_db_cache = (mtime, readout)
         return readout
 
@@ -3145,9 +3312,11 @@ class Collector:
         """
         db_path = self._paths.shared_path("shared-state.db")
         last = self._last_good_by_source.get("hosted_rooms")
-        if not _exists_strict(db_path):
-            if last is not None and last.hosted_rooms.db_present:
-                raise RuntimeError("shared-state.db disappeared")
+        if not self._present_or_confirmed_absent(
+            db_path.name,
+            _exists_strict(db_path),
+            had_last_good=last is not None and last.hosted_rooms.db_present,
+        ):
             return operations
         # The symlink test is the load-bearing half: shared_path() can only
         # resolve outside root_home through a link, and this source is ROOT-scoped
@@ -3182,9 +3351,11 @@ class Collector:
         """
         db_path = self._paths.profile_path("runs_idempotency.db")
         last = self._last_good_by_source.get("api_runs")
-        if not _exists_strict(db_path):
-            if last is not None and last.api_runs.db_present:
-                raise RuntimeError("runs_idempotency.db disappeared")
+        if not self._present_or_confirmed_absent(
+            db_path.name,
+            _exists_strict(db_path),
+            had_last_good=last is not None and last.api_runs.db_present,
+        ):
             return operations
         # Confined to profile_home, not root_home: a sibling profile's store is
         # still under the root, and this source is profile-scoped.
@@ -3516,7 +3687,9 @@ class Collector:
 
     def _collect_hooks(self) -> list[HookInfo]:
         hooks_dir = self._paths.shared_path("hooks")
-        if not hooks_dir.is_dir():
+        # The per-hook reads are confined to hooks_dir, so hooks_dir itself must
+        # be a real directory under the home or those checks confine nothing.
+        if not _safe_child_path(hooks_dir, self._paths.root_home) or not hooks_dir.is_dir():
             return []
 
         hooks: list[HookInfo] = []
@@ -3794,7 +3967,12 @@ class Collector:
         gate = gate_plugin(key=key, name=name, kind=kind, enabled=enabled, disabled=disabled)
         install = install_provenance(install_metadata.get(name))
         catalog = self._read_catalog_sidecar(plugin_dir, base)
-        dashboard_manifest = self._read_json_cached(plugin_dir / "dashboard" / "manifest.json")
+        dashboard_path = plugin_dir / "dashboard" / "manifest.json"
+        dashboard_manifest = (
+            self._read_json_confined(dashboard_path)
+            if _safe_capped_file(dashboard_path, base)
+            else {}
+        )
         return PluginInfo(
             name=name,
             version=version,
@@ -3902,7 +4080,12 @@ class Collector:
 
     def _collect_checkpoints(self) -> list[CheckpointInfo]:
         checkpoints_dir = self._paths.profile_path("checkpoints")
-        if not checkpoints_dir.is_dir():
+        # Each entry is summarised by subprocesses run inside it, so a
+        # checkpoints/ link out of the profile home must not be followed.
+        if (
+            not _safe_child_path(checkpoints_dir, self._paths.profile_home)
+            or not checkpoints_dir.is_dir()
+        ):
             return []
 
         checkpoints: list[CheckpointInfo] = []
@@ -4161,7 +4344,10 @@ class Collector:
         self, name: str, path: Path, max_lines: int, scope: SourceScope
     ) -> LogStream:
         key = str(path)
-        if not _path_resolves_under(path, self._paths.root_home) or not path.exists():
+        # Each stream is confined to the home that owns it: a profile log that
+        # resolves elsewhere under the root is outside the profile's scope.
+        home = self._paths.profile_home if scope is SourceScope.PROFILE else self._paths.root_home
+        if not _path_resolves_under(path, home) or not path.exists():
             return LogStream(
                 name=name, path=path.name, scope=scope, lines=self._log_cache.get(key, [])
             )
@@ -4231,7 +4417,7 @@ class Collector:
         job_id: str,
         max_bytes: int,
     ) -> tuple[str, bool, str, float | None]:
-        cache_key = f"{output_root}:{job_id}"
+        cache_key = (output_root, job_id)
         cached = self._cron_excerpt_cache.get(cache_key)
         latest = _latest_cron_output_file(output_root, job_id, stop_at=self._paths.root_home)
         if latest is None:
@@ -4267,10 +4453,14 @@ class Collector:
         return redacted
 
     def _collect_version_behind(self) -> int:
+        """Commits behind upstream from ``.update_check``.
+
+        The single reader for both ``GatewayState.updates_behind`` and
+        ``DashboardState.version_behind``: the gateway copy exists only when
+        gateway_state.json does, so the panels fall back to this one.
+        """
         data = self._read_json_cached(self._paths.shared_path(".update_check"))
-        if data:
-            return _coerce_int(data.get("behind"))
-        return 0
+        return _coerce_int(data.get("behind"))
 
     def _collect_skin(self) -> str:
         cfg = self._read_yaml_reporting_stale()

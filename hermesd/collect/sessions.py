@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -363,9 +364,13 @@ class _SessionCoordinationRows:
     # Every session id in the store, *including* hidden ones. Route targets are
     # resolved against this set, not against the visible listing.
     session_ids: frozenset[str] = frozenset()
+    # Recorded compression failure per hygiene session_key, hidden chats included.
+    hygiene_errors: Mapping[str, str] = field(default_factory=dict)
 
 
-def _read_session_coordination_rows(conn: Any) -> _SessionCoordinationRows:
+def _read_session_coordination_rows(
+    conn: Any, errors: dict[str, sqlite3.Error]
+) -> _SessionCoordinationRows:
     """Every coordination table hermesd reads from state.db, absent-tolerant.
 
     The shapes mirror upstream ``hermes_state_common.py``: ``session_turn_leases``
@@ -380,9 +385,21 @@ def _read_session_coordination_rows(conn: Any) -> _SessionCoordinationRows:
 
     Tables predate nothing: agents older than the lease/hygiene/routing
     features simply have no table, which reads as empty — the same contract as
-    the operations and gateway-ledger readers. Once a table exists, read errors
-    propagate so the owning source fails to its last-good value.
+    the operations and gateway-ledger readers. Once a table exists, a read
+    error is recorded in ``errors`` under the owning source's name and that
+    group alone reads as empty, so the source fails to its last-good value
+    while one broken table cannot fail its siblings.
     """
+    fields: dict[str, Any] = {}
+    for source_name, reader in _COORDINATION_GROUP_READERS:
+        try:
+            fields.update(reader(conn))
+        except sqlite3.Error as exc:
+            errors[source_name] = exc
+    return _SessionCoordinationRows(**fields)
+
+
+def _read_lease_rows(conn: Any) -> dict[str, Any]:
     lease_rows: tuple[dict[str, Any], ...] = ()
     lock_rows: tuple[dict[str, Any], ...] = ()
     lease_total = 0
@@ -405,77 +422,119 @@ def _read_session_coordination_rows(conn: Any) -> _SessionCoordinationRows:
             )
         )
         lease_total += _table_count_or_zero(conn, "compression_locks")
-    hygiene_rows: tuple[dict[str, Any], ...] = ()
-    hygiene_total = 0
-    if _table_exists(conn, "gateway_hygiene_state"):
-        # A 0-streak row is cleared state upstream keeps only transiently; it is
-        # not a warning and never reaches the panel. The total counts exactly the
-        # rows the list is filtered to, so a capped list can never be mistaken
-        # for the count.
-        hygiene_rows = tuple(
-            _query_rows(
-                conn,
-                "SELECT session_key, failure_streak FROM gateway_hygiene_state "
-                "WHERE COALESCE(failure_streak, 0) > 0 "
-                f"ORDER BY COALESCE(failure_streak, 0) DESC LIMIT {_HYGIENE_ROW_LIMIT}",
-            )
-        )
-        hygiene_total = _count_rows(
+    return {"lease_rows": lease_rows, "lock_rows": lock_rows, "lease_total": lease_total}
+
+
+def _read_hygiene_rows(conn: Any) -> dict[str, Any]:
+    if not _table_exists(conn, "gateway_hygiene_state"):
+        return {}
+    # A 0-streak row is cleared state upstream keeps only transiently; it is
+    # not a warning and never reaches the panel. The total counts exactly the
+    # rows the list is filtered to, so a capped list can never be mistaken
+    # for the count.
+    hygiene_rows = tuple(
+        _query_rows(
             conn,
-            "SELECT COUNT(*) FROM gateway_hygiene_state WHERE COALESCE(failure_streak, 0) > 0",
+            "SELECT session_key, failure_streak FROM gateway_hygiene_state "
+            "WHERE COALESCE(failure_streak, 0) > 0 "
+            f"ORDER BY COALESCE(failure_streak, 0) DESC LIMIT {_HYGIENE_ROW_LIMIT}",
         )
-    routing_rows: tuple[dict[str, Any], ...] = ()
-    routing_total = 0
+    )
+    hygiene_total = _count_rows(
+        conn,
+        "SELECT COUNT(*) FROM gateway_hygiene_state WHERE COALESCE(failure_streak, 0) > 0",
+    )
+    return {
+        "hygiene_rows": hygiene_rows,
+        "hygiene_total": hygiene_total,
+        "hygiene_errors": _read_hygiene_errors(conn, hygiene_rows),
+    }
+
+
+def _read_hygiene_errors(conn: Any, hygiene_rows: tuple[dict[str, Any], ...]) -> dict[str, str]:
+    """Recorded compression failure per hygiene ``session_key``, newest first.
+
+    Read from the *unfiltered* sessions table: canonical bot chats are born
+    hidden (``hermes_state_sessions.py:898-900``) while their hygiene streak is
+    live, so joining against the visible listing would drop their reason.
+    """
+    keys = sorted({str(row.get("session_key") or "") for row in hygiene_rows} - {""})
+    if not keys or not _table_exists(conn, "sessions"):
+        return {}
+    # A literal PRAGMA: "sessions" is read by HermesDB, not the name allowlist.
+    columns = {str(row[1] or "") for row in conn.execute("PRAGMA table_info(sessions)")}
+    if not {"session_key", "compression_failure_error"}.issubset(columns):
+        return {}
+    order_by = (
+        "COALESCE(last_activity_at, started_at)" if "last_activity_at" in columns else "started_at"
+    )
+    placeholders = ", ".join("?" for _ in keys)
+    errors: dict[str, str] = {}
+    for row in _query_rows(
+        conn,
+        "SELECT session_key, compression_failure_error FROM sessions "
+        f"WHERE session_key IN ({placeholders}) "
+        "AND COALESCE(compression_failure_error, '') != '' "
+        f"ORDER BY {order_by} DESC",
+        tuple(keys),
+    ):
+        errors.setdefault(
+            str(row.get("session_key") or ""), str(row.get("compression_failure_error") or "")
+        )
+    return errors
+
+
+def _read_routing_rows(conn: Any) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
     if _table_exists(conn, "gateway_routing"):
-        routing_rows = tuple(
+        fields["routing_rows"] = tuple(
             _query_rows(
                 conn,
                 "SELECT scope, session_key, entry_json, updated_at FROM gateway_routing "
                 f"ORDER BY COALESCE(updated_at, 0) DESC LIMIT {_ROUTE_ROW_LIMIT}",
             )
         )
-        routing_total = _table_count_or_zero(conn, "gateway_routing")
-    generation_rows: tuple[dict[str, Any], ...] = ()
-    generation_chat_total = 0
-    generation_reset_total = 0
-    if _table_exists(conn, "conversation_generations"):
-        generation_rows = tuple(
-            _query_rows(
-                conn,
-                "SELECT source, session_key, generation FROM conversation_generations "
-                f"ORDER BY COALESCE(generation, 0) DESC, session_key LIMIT {_GENERATION_ROW_LIMIT}",
-            )
-        )
-        generation_chat_total = _table_count_or_zero(conn, "conversation_generations")
-        generation_reset_total = _count_rows(
-            conn, "SELECT COALESCE(SUM(COALESCE(generation, 0)), 0) FROM conversation_generations"
-        )
+        fields["routing_total"] = _table_count_or_zero(conn, "gateway_routing")
     # Route targets: the *unfiltered* id set. Upstream hides a session from the
     # default listing while keeping it resumable (``hermes_state_sessions.py:898-900``;
     # ``get_session`` ``:737-746`` selects by id with no hidden filter), and
     # canonical bot chats are born hidden — so a route to a hidden session is a
     # live route, not a dangling one. Only ids are read: 64-bit integers plus the
     # id string, one indexed column scan on the same cached connection.
-    session_ids: frozenset[str] = frozenset()
     if _table_exists(conn, "sessions"):
-        session_ids = frozenset(
+        fields["session_ids"] = frozenset(
             str(row.get("id"))
             for row in _query_rows(conn, "SELECT id FROM sessions")
             if row.get("id")
         )
-    return _SessionCoordinationRows(
-        lease_rows=lease_rows,
-        lock_rows=lock_rows,
-        lease_total=lease_total,
-        hygiene_rows=hygiene_rows,
-        hygiene_total=hygiene_total,
-        routing_rows=routing_rows,
-        routing_total=routing_total,
-        generation_rows=generation_rows,
-        generation_chat_total=generation_chat_total,
-        generation_reset_total=generation_reset_total,
-        session_ids=session_ids,
-    )
+    return fields
+
+
+def _read_generation_rows(conn: Any) -> dict[str, Any]:
+    if not _table_exists(conn, "conversation_generations"):
+        return {}
+    return {
+        "generation_rows": tuple(
+            _query_rows(
+                conn,
+                "SELECT source, session_key, generation FROM conversation_generations "
+                f"ORDER BY COALESCE(generation, 0) DESC, session_key LIMIT {_GENERATION_ROW_LIMIT}",
+            )
+        ),
+        "generation_chat_total": _table_count_or_zero(conn, "conversation_generations"),
+        "generation_reset_total": _count_rows(
+            conn, "SELECT COALESCE(SUM(COALESCE(generation, 0)), 0) FROM conversation_generations"
+        ),
+    }
+
+
+# Each coordination table group, keyed by the collector source that owns it.
+_COORDINATION_GROUP_READERS: tuple[tuple[str, Callable[[Any], dict[str, Any]]], ...] = (
+    ("session_leases", _read_lease_rows),
+    ("gateway_hygiene", _read_hygiene_rows),
+    ("gateway_routes", _read_routing_rows),
+    ("generation_churn", _read_generation_rows),
+)
 
 
 def _session_lease(
@@ -536,21 +595,15 @@ _HYGIENE_SUSPENSION_STREAK = 3
 
 def _hygiene_fields(
     rows: tuple[dict[str, Any], ...],
-    session_rows: list[dict[str, Any]],
+    errors_by_key: Mapping[str, str],
     total: int = 0,
 ) -> dict[str, Any]:
     """Pair each streak with the chat's recorded compression failure, if any.
 
-    The join runs over the raw session rows (rotation-stable ``session_key``
-    column, written by the gateway repair paths); a chat with no session row or
-    no recorded error simply carries an empty reason.
+    The join key is the rotation-stable ``session_key`` column, written by the
+    gateway repair paths; a chat with no session row or no recorded error
+    simply carries an empty reason.
     """
-    errors_by_key: dict[str, str] = {}
-    for row in session_rows:
-        key = str(row.get("session_key") or "")
-        error = str(row.get("compression_failure_error") or "")
-        if key and error:
-            errors_by_key.setdefault(key, error)
     hygiene = [
         GatewayHygieneState(
             session_key=str(row.get("session_key") or ""),
