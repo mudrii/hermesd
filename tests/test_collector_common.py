@@ -170,3 +170,25 @@ def test_coerce_float_huge_int_is_zero():
     assert _coerce_float(10**400) == 0.0
     assert _coerce_float(-(10**400)) == 0.0
     assert _optional_epoch(10**400) is None
+
+
+def test_file_swapped_for_non_regular_after_type_check_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import stat
+
+    from hermesd.collect import common
+
+    path = tmp_path / "agent.log"
+    path.write_text("line\n")
+    real_fstat = os.fstat
+
+    def fifo_fstat(fd: int) -> os.stat_result:
+        result = real_fstat(fd)
+        return os.stat_result((stat.S_IFIFO | 0o644, *tuple(result)[1:]))
+
+    monkeypatch.setattr(common.os, "fstat", fifo_fstat)
+
+    assert _read_text_capped(path) == ""
+    with pytest.raises(OSError, match="not a regular file"):
+        _read_tail_text(path, 64)
