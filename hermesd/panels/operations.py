@@ -1211,9 +1211,21 @@ def _verification_events_table(ops: OperationsState, theme: Theme) -> Table:
             escape(event.scope or "—"),
             escape(command) if command else "—",
             str(event.exit_code),
-            escape(event.output_summary) if event.output_summary else "—",
+            escape(_first_line(event.output_summary)) if event.output_summary.strip() else "—",
         )
     return event_table
+
+
+# A verification summary is the tool's captured output; the table shows its
+# first non-empty line, capped, so one noisy run cannot fill the detail view.
+_SUMMARY_CELL_CHARS = 120
+
+
+def _first_line(text: str) -> str:
+    line = next((part.strip() for part in text.splitlines() if part.strip()), "")
+    if len(line) > _SUMMARY_CELL_CHARS:
+        return line[: _SUMMARY_CELL_CHARS - 1] + "…"
+    return line
 
 
 def _verification_roots_table(ops: OperationsState, theme: Theme) -> Table:
