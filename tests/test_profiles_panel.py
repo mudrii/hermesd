@@ -116,3 +116,39 @@ def test_profiles_detail_handles_absurd_log_mtime() -> None:
     )
     rendered = render_to_str(render_profiles(state, Theme(), detail=True))
     assert "—" in rendered
+
+
+def _health_state() -> DashboardState:
+    from hermesd.models import DuplicatePlatformCredential
+
+    return DashboardState(
+        profiles=ProfilesState(
+            profile_count=2,
+            profiles=[
+                ProfileSummary(name="dev", config_present=True, env_present=True),
+                ProfileSummary(name="bare"),
+            ],
+            duplicate_platform_credentials=[
+                DuplicatePlatformCredential(
+                    key="TELEGRAM_BOT_TOKEN", platform="telegram", profiles=["default", "dev"]
+                )
+            ],
+        )
+    )
+
+
+def test_profiles_compact_warns_on_shared_platform_credential_names() -> None:
+    text = render_to_str(render_profiles(_health_state(), Theme()), no_color=True)
+    assert "⚠ 1 platform credential in several profiles" in text
+
+    calm = render_to_str(render_profiles(DashboardState(), Theme()), no_color=True)
+    assert "platform credential" not in calm
+
+
+def test_profiles_detail_shows_file_checks_and_credential_overlap() -> None:
+    text = render_to_str(render_profiles(_health_state(), Theme(), detail=True), no_color=True)
+    assert "config+.env" in text
+    assert "⚠ missing config, no .env" in text
+    assert "Shared platform credentials" in text
+    assert "TELEGRAM_BOT_TOKEN (telegram): default, dev" in text
+    assert "values not compared" in text

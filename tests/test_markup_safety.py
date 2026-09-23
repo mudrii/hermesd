@@ -30,6 +30,7 @@ from hermesd.models import (
     DelegationLiveManifest,
     DelegationLiveTask,
     DiscoveredRepoSummary,
+    DuplicatePlatformCredential,
     ForensicFile,
     GatewayHygieneState,
     GatewayRouteState,
@@ -486,6 +487,9 @@ def _state_for(panel_num: int) -> DashboardState:
             profiles=ProfilesState(
                 profile_count=1,
                 profiles=[ProfileSummary(name=INJECT, session_count=1, soul_excerpt=INJECT)],
+                duplicate_platform_credentials=[
+                    DuplicatePlatformCredential(key=INJECT, platform=INJECT, profiles=[INJECT])
+                ],
             ),
         )
     if panel_num == 10:  # Memory

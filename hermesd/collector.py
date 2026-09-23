@@ -66,6 +66,8 @@ from hermesd.collect.config import (
     _credential_cooldown_remaining,
     _credential_expiry,
     _doctor_config_findings,
+    _duplicate_platform_credentials,
+    _env_platform_credential_keys,
     _integration_flags,
     _mcp_tool_filter_summary,
     _moa_config_summary,
@@ -74,6 +76,7 @@ from hermesd.collect.config import (
     _provider_free_tier,
     _provider_model_label,
     _provider_routing_summary,
+    _read_env_text,
     _scale_to_zero_relay_only,
     _select_pool_entry,
     _stale_alias_count,
@@ -432,6 +435,8 @@ _RATE_LIMIT_FIELDS = ("rate_limit_holds",)
 # Pairing store listing bounds: files examined, platforms summarized.
 _PAIRING_DIR_ENTRY_LIMIT = 400
 _PAIRING_PLATFORM_LIMIT = 40
+# The `profile_credentials` source's field on ProfilesState.
+_PROFILE_CREDENTIAL_FIELDS = ("duplicate_platform_credentials",)
 # The `curator_activity` source's fields on CuratorRun.
 _CURATOR_ACTIVITY_FIELDS = (
     "suppressed_count",
@@ -1336,6 +1341,15 @@ class Collector:
             ),
             _SourceSpec("memory", "memory", self._collect_memory, MemoryOverview),
             _SourceSpec("profiles", "profiles", self._collect_profiles, ProfilesState),
+            _SourceSpec(
+                "profiles",
+                "profile_credentials",
+                lambda: self._with_profile_credentials(results["profiles"]),
+                lambda: results["profiles"],
+                fallback=lambda: self._last_source_fields(
+                    "profile_credentials", results["profiles"], _PROFILE_CREDENTIAL_FIELDS
+                ),
+            ),
             _SourceSpec("logs", "logs", self._collect_logs, LogState),
             _SourceSpec("version_behind", "version_check", self._collect_version_behind, int),
             # Without a last good read the fallback is the shipped skin name,
@@ -4634,6 +4648,44 @@ class Collector:
             skill_count=_count_skills(skills_path) if skills_safe else 0,
             db_size_bytes=_file_size(db_path) if db_safe else 0,
             soul_excerpt=(self._cached_soul_excerpt(soul_path, profile_home) if soul_safe else ""),
+            config_present=(profile_home / "config.yaml").exists(),
+            env_present=(profile_home / ".env").exists(),
+        )
+
+    def _with_profile_credentials(self, current: ProfilesState) -> ProfilesState:
+        """Platform credential key names held by more than one profile's .env.
+
+        ``hermes doctor`` names duplicates across the default home and every
+        named profile (``hermes_cli/doctor_state.py:576-581`` via
+        ``gateway_migrate.duplicate_credential_findings``, ``:434-443``); the
+        default profile's ``.env`` is the root one. Only key names leave the
+        read: values are checked for blankness and dropped. A symlinked ``.env``
+        is skipped rather than followed.
+        """
+        root = self._paths.root_home
+        homes = [("default", root)]
+        homes.extend(
+            (profile.name, self._paths.shared_path("profiles", profile.name))
+            for profile in current.profiles
+        )
+        holders: list[tuple[str, frozenset[str]]] = []
+        for name, home in homes:
+            env_path = home / ".env"
+            if env_path.is_symlink() or not _exists_strict(env_path):
+                continue
+            if not _path_resolves_under(env_path, root):
+                raise RuntimeError(f"unsafe .env for profile {name}")
+            holders.append((name, self._cached_env_credential_keys(env_path)))
+        return current.model_copy(
+            update={"duplicate_platform_credentials": _duplicate_platform_credentials(holders)}
+        )
+
+    def _cached_env_credential_keys(self, env_path: Path) -> frozenset[str]:
+        """Key names only are cached — the value set never outlives the read."""
+        return self._signature_cached(
+            "env_credential_keys",
+            env_path,
+            lambda: _env_platform_credential_keys(_read_env_text(env_path)),
         )
 
     def _last_profile_exists(self, name: str) -> bool:

@@ -1720,11 +1720,30 @@ class ProfileSummary(BaseModel):
     skill_count: int = 0
     db_size_bytes: int = 0
     soul_excerpt: str = ""
+    # The file checks `hermes doctor` runs per profile
+    # (hermes_cli/doctor_state.py:560-565): "⚠ missing config", "no .env".
+    config_present: bool = False
+    env_present: bool = False
+
+
+class DuplicatePlatformCredential(BaseModel):
+    """A platform credential key NAME set in more than one profile's .env.
+
+    Values are never read into the model or compared: the same name in two
+    profiles is the shape of upstream's duplicate-credential finding
+    (hermes_cli/gateway_migrate.py:403-431), not proof the tokens are equal.
+    """
+
+    key: str
+    platform: str = ""
+    profiles: list[str] = Field(default_factory=list)
 
 
 class ProfilesState(BaseModel):
     profile_count: int = 0
     profiles: list[ProfileSummary] = Field(default_factory=list)
+    # `profile_credentials` source: root .env ("default") and profiles/*/.env.
+    duplicate_platform_credentials: list[DuplicatePlatformCredential] = Field(default_factory=list)
 
 
 class LogLine(BaseModel):

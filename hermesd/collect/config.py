@@ -6,15 +6,18 @@ import math
 import re
 from collections.abc import Iterable
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from hermesd.collect.common import (
+    _MAX_TEXT_READ_BYTES,
     _age_seconds,
     _as_dict,
     _as_list,
     _coerce_bool,
     _coerce_int,
     _iso_to_epoch,
+    _open_regular_file,
 )
 from hermesd.collect.plugins import PLUGIN_KIND_STANDALONE, gate_plugin, plugin_name_set
 from hermesd.collect.redaction import (
@@ -25,6 +28,7 @@ from hermesd.collect.redaction import (
 from hermesd.models import (
     ConfigBackupGroup,
     ConfigBackupKind,
+    DuplicatePlatformCredential,
     ModelCooldown,
     PlatformStatus,
     PluginActivation,
@@ -260,6 +264,81 @@ def _doctor_config_findings(cfg: dict[str, Any]) -> dict[str, Any]:
         "stale_root_keys": stale,
         "legacy_custom_provider_labels": labels[:_MAX_LISTED_NAMES],
     }
+
+
+# Built-in platform credential env keys and the platform each makes an adapter
+# connect as: ``credential_env_keys`` (``hermes_cli/profile_channels.py:
+# 167-193``) over ``_ENV_ENABLE_CREDENTIALS`` and the ``_Cred`` steps in
+# ``gateway/config_env.py:38-58,507-640``, filtered to the credential suffixes.
+# Plugin-registered platforms are not included (their keys live in a runtime
+# registry hermesd cannot import).
+_PLATFORM_CREDENTIAL_KEYS: dict[str, str] = {
+    "TELEGRAM_BOT_TOKEN": "telegram",
+    "DISCORD_BOT_TOKEN": "discord",
+    "SLACK_BOT_TOKEN": "slack",
+    "WHATSAPP_CLOUD_ACCESS_TOKEN": "whatsapp_cloud",
+    "MATTERMOST_TOKEN": "mattermost",
+    "MATRIX_ACCESS_TOKEN": "matrix",
+    "MATRIX_PASSWORD": "matrix",
+    "HASS_TOKEN": "homeassistant",
+    "EMAIL_PASSWORD": "email",
+    "TWILIO_ACCOUNT_SID": "sms",
+    "DINGTALK_CLIENT_ID": "dingtalk",
+    "DINGTALK_CLIENT_SECRET": "dingtalk",
+    "FEISHU_APP_ID": "feishu",
+    "FEISHU_APP_SECRET": "feishu",
+    "WECOM_BOT_ID": "wecom",
+    "WECOM_SECRET": "wecom",
+    "WECOM_CALLBACK_CORP_SECRET": "wecom_callback",
+    "WEIXIN_TOKEN": "weixin",
+    "BLUEBUBBLES_PASSWORD": "bluebubbles",
+    "QQ_APP_ID": "qqbot",
+    "QQ_CLIENT_SECRET": "qqbot",
+    "YUANBAO_APP_ID": "yuanbao",
+    "YUANBAO_APP_KEY": "yuanbao",
+    "YUANBAO_APP_SECRET": "yuanbao",
+}
+_ENV_ASSIGNMENT_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
+
+
+def _env_platform_credential_keys(text: str) -> frozenset[str]:
+    """Platform credential key NAMES with a non-blank assignment in a .env text.
+
+    Mirrors ``_env_values`` (``hermes_cli/profile_channels.py:196-207``): only
+    non-blank assignments count. The assigned value is inspected for emptiness
+    and discarded on the spot — it is never returned, stored or compared.
+    """
+    keys: set[str] = set()
+    for raw_line in text.splitlines():
+        match = _ENV_ASSIGNMENT_RE.match(raw_line.strip())
+        if match is None or match.group(1) not in _PLATFORM_CREDENTIAL_KEYS:
+            continue
+        if match.group(2).split(" #", 1)[0].strip().strip("'\"").strip():
+            keys.add(match.group(1))
+    return frozenset(keys)
+
+
+def _read_env_text(path: Path) -> str:
+    """A capped .env read that raises on an unreadable file instead of reading as empty."""
+    with _open_regular_file(path) as handle:
+        return handle.read(_MAX_TEXT_READ_BYTES).decode("utf-8-sig", errors="replace")
+
+
+def _duplicate_platform_credentials(
+    holders: list[tuple[str, frozenset[str]]],
+) -> list[DuplicatePlatformCredential]:
+    """Keys held by two or more profiles, profiles in collection order."""
+    owners: dict[str, list[str]] = {}
+    for profile, keys in holders:
+        for key in keys:
+            owners.setdefault(key, []).append(profile)
+    return [
+        DuplicatePlatformCredential(
+            key=key, platform=_PLATFORM_CREDENTIAL_KEYS[key], profiles=profiles
+        )
+        for key, profiles in sorted(owners.items())
+        if len(profiles) > 1
+    ]
 
 
 def _coerce_session_cap(value: object) -> int | None:
