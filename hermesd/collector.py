@@ -4224,6 +4224,22 @@ class Collector:
             ),
             ("desktop", self._paths.shared_path("logs", "desktop.log"), _LOG_TAIL_LINES, root),
             ("dashboard", self._paths.shared_path("logs", "dashboard.log"), _LOG_TAIL_LINES, root),
+            # No upstream writer in the checkout, written beside dashboard.log
+            # on real installs: ROOT by observation, like dashboard.log.
+            (
+                "dashboard.error",
+                self._paths.shared_path("logs", "dashboard.error.log"),
+                _LOG_TAIL_LINES,
+                root,
+            ),
+            # get_hermes_home()/"logs"/"dashboard-restart.log" —
+            # hermes_cli/main_dashboard.py:360-368.
+            (
+                "dashboard.restart",
+                self._paths.profile_path("logs", "dashboard-restart.log"),
+                _LOG_TAIL_LINES,
+                profile,
+            ),
             ("gui", self._paths.shared_path("logs", "gui.log"), _LOG_TAIL_LINES, root),
             ("update", self._paths.shared_path("logs", "update.log"), _LOG_TAIL_LINES, root),
             (
@@ -4238,7 +4254,22 @@ class Collector:
                 _LOG_TAIL_LINES,
                 root,
             ),
-            ("audit", self._paths.shared_path("logs", "audit.log"), _LOG_TAIL_LINES, root),
+            # The real audit trails (nothing upstream writes logs/audit.log):
+            # skills hub installs/uninstalls under get_hermes_home()/skills/.hub
+            # (tools/skills_hub.py:59-63,386-399) and dashboard auth events under
+            # get_hermes_home()/logs (hermes_cli/dashboard_auth/audit.py:46-53).
+            (
+                "skills.audit",
+                self._paths.profile_path("skills", ".hub", "audit.log"),
+                _LOG_TAIL_LINES,
+                profile,
+            ),
+            (
+                "auth.audit",
+                self._paths.profile_path("logs", "dashboard-auth.log"),
+                _LOG_TAIL_LINES,
+                profile,
+            ),
             (
                 "mcp.stderr",
                 self._paths.shared_path("logs", "mcp-stderr.log"),
