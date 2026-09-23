@@ -1333,6 +1333,7 @@ def test_cron_panel_shows_usage_audit_token_rollup() -> None:
             )
         ],
         window_truncated=True,
+        unparseable_lines=3,
     )
     state = DashboardState(cron_usage=usage)
     detail = render_to_str(render_cron(state, Theme(), detail=True), width=220, no_color=True)
@@ -1344,6 +1345,7 @@ def test_cron_panel_shows_usage_audit_token_rollup() -> None:
     assert "last 2m ago 3.1K grok-4.6 12.5s" in detail
     assert "provider 429" in detail
     assert "lower bound" in detail
+    assert "3 unparseable line(s) skipped" in detail
     compact = render_to_str(render_cron(state, Theme()), no_color=True)
     assert "Tokens 24h: 12.5K" in compact
 

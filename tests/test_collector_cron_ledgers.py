@@ -56,6 +56,7 @@ def test_usage_audit_rolls_up_tokens_per_job_over_24h_and_7d(hermes_home: Path):
         _audit_line("job-a", 60, total_tokens=120, model="gpt-9", duration_ms=2500),
         _audit_line("job-b", 120, total_tokens=7),
         "{torn line",
+        json.dumps({"job_id": "job-a", "total_tokens": 5}),  # no stamp: junk
         "",
     ]
     (hermes_home / "cron" / "usage_audit.jsonl").write_text("\n".join(lines) + "\n")
@@ -65,7 +66,7 @@ def test_usage_audit_rolls_up_tokens_per_job_over_24h_and_7d(hermes_home: Path):
     usage = state.cron_usage
     assert "cron_usage_audit" not in state.health.failed_sources
     assert usage.present is True
-    assert usage.unparseable_lines == 1
+    assert usage.unparseable_lines == 2
     assert usage.window_truncated is False
     assert usage.tokens_24h == 127
     assert usage.tokens_7d == 627
@@ -327,6 +328,7 @@ def test_bot_chat_pending_counts_statuses_and_unsettled_age(hermes_home: Path, t
     (root / "torn.json").write_text("{not json")
     (root / "list.json").write_text("[1, 2]")
     (root / ".lock").write_text("")
+    (root / "dir.json").mkdir()
     outside = tmp_path / "outside.json"
     outside.write_text(json.dumps({"status": "queued"}))
     (root / "link.json").symlink_to(outside)
@@ -351,7 +353,7 @@ def test_bot_chat_pending_counts_statuses_and_unsettled_age(hermes_home: Path, t
     }
     assert bot.unsettled_count == 2
     assert bot.oldest_unsettled_age_seconds == pytest.approx(7200, abs=30)
-    assert bot.unreadable_count == 3
+    assert bot.unreadable_count == 4
     assert bot.scan_truncated is False
     assert [r.receipt_id for r in bot.attention] == ["a1", "c1"]
     ambiguous = bot.attention[0]
@@ -430,6 +432,7 @@ def test_recovery_ledgers_count_recent_entries_and_summarise_the_newest(hermes_h
                 "rearmed_at": iso_ago(600),
             },
             {"job_id": "j9", "name": "Ancient", "rearmed_at": iso_ago(30 * 86400)},
+            {"job_id": "j8", "name": "Stampless"},
             ["not", "an", "object"],
         ],
     )

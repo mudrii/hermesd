@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 import rich.box
 from rich.console import Group, RenderableType
 from rich.panel import Panel
@@ -528,7 +530,7 @@ def _executions_sections(executions: CronExecutionsState, theme: Theme) -> list[
         sections.append(_recent_executions_table(executions, theme))
     if executions.recent_failures:
         sections.append(section_heading("Recent Failures", theme))
-        sections.extend(_failure_line(run, theme) for run in executions.recent_failures)
+        sections.append(_joined(_failure_line(run, theme) for run in executions.recent_failures))
     if executions.open_incidents:
         sections.append(
             section_heading(
@@ -609,6 +611,18 @@ def _recent_executions_table(executions: CronExecutionsState, theme: Theme) -> T
             escape(run.error_excerpt) if run.error_excerpt else "—",
         )
     return table
+
+
+def _joined(lines: Iterable[Text]) -> Text:
+    """One renderable for a list of newline-terminated lines.
+
+    Separate ``Text`` items in a ``Group`` each end their own block, so a list
+    of them renders with a blank line between entries.
+    """
+    body = Text()
+    for line in lines:
+        body.append_text(line)
+    return body
 
 
 def _failure_line(run: CronExecution, theme: Theme) -> Text:
@@ -753,7 +767,10 @@ def _delivery_queue_sections(queue: CronDeliveryQueueState, theme: Theme) -> lis
         section_heading("Delivery Queue (deliveries.db)", theme),
         body,
     ]
-    sections.extend(_delivery_failure_line(failure, theme) for failure in queue.recent_failures)
+    if queue.recent_failures:
+        sections.append(
+            _joined(_delivery_failure_line(failure, theme) for failure in queue.recent_failures)
+        )
     return sections
 
 
@@ -811,7 +828,10 @@ def _bot_chat_sections(bot: CronBotChatState, theme: Theme) -> list[RenderableTy
         section_heading("Deferred Bot Chat (bot_chat_pending)", theme),
         body,
     ]
-    sections.extend(_bot_chat_receipt_line(receipt, theme) for receipt in bot.attention)
+    if bot.attention:
+        sections.append(
+            _joined(_bot_chat_receipt_line(receipt, theme) for receipt in bot.attention)
+        )
     return sections
 
 

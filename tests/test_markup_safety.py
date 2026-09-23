@@ -16,13 +16,21 @@ from hermesd.models import (
     ConfigSourceStamp,
     ConfigSummary,
     CredentialPoolEntry,
+    CronBotChatReceipt,
+    CronBotChatState,
+    CronDeliveryFailure,
+    CronDeliveryQueueState,
     CronExecution,
     CronExecutionsState,
     CronIncident,
     CronJob,
     CronJobExecutionStats,
+    CronJobUsage,
     CronModelSource,
+    CronRecoveryLedger,
+    CronRecoveryState,
     CronState,
+    CronUsageState,
     CuratorRun,
     DashboardState,
     DbRecoveryState,
@@ -380,6 +388,49 @@ def _state_for(panel_num: int) -> DashboardState:
                         error_excerpt=INJECT,
                     )
                 ],
+                recent_failures=[
+                    CronExecution(job_name=INJECT, status="failed", error_excerpt=INJECT)
+                ],
+            ),
+            cron_usage=CronUsageState(
+                present=True,
+                jobs=[
+                    CronJobUsage(
+                        job_id=INJECT,
+                        job_name=INJECT,
+                        fires_7d=1,
+                        last_fire_age_seconds=1.0,
+                        last_model=INJECT,
+                        last_error_excerpt=INJECT,
+                    )
+                ],
+            ),
+            cron_deliveries=CronDeliveryQueueState(
+                db_present=True,
+                status_counts={INJECT: 1},
+                recent_failures=[
+                    CronDeliveryFailure(execution_id=INJECT, status=INJECT, error_excerpt=INJECT)
+                ],
+            ),
+            cron_bot_chat=CronBotChatState(
+                present=True,
+                status_counts={INJECT: 1},
+                attention=[
+                    CronBotChatReceipt(
+                        receipt_id=INJECT, job_name=INJECT, status=INJECT, error_excerpt=INJECT
+                    )
+                ],
+            ),
+            cron_recovery=CronRecoveryState(
+                ledgers=[
+                    CronRecoveryLedger(
+                        label="stale-error re-arm",
+                        count_24h=1,
+                        newest_age_seconds=1.0,
+                        newest_job_name=INJECT,
+                        newest_detail=INJECT,
+                    )
+                ]
             ),
         )
     if panel_num == 7:  # Skills / Integrations
