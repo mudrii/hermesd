@@ -192,6 +192,7 @@ def test_observed_start_times_asks_for_every_pid_in_one_call(monkeypatch: pytest
         return dict.fromkeys(pids, 1000.0)
 
     monkeypatch.setattr(system_module, "_proc_start_times", lambda pids: {})
+    monkeypatch.setattr(system_module, "_darwin_start_times", lambda pids: {})
     monkeypatch.setattr(system_module, "_ps_start_times", fake_ps)
 
     observed = _observed_process_start_times([4242, 4242, 9999, 0, -3])
@@ -205,6 +206,7 @@ def test_observed_start_times_without_pids_does_not_probe(monkeypatch: pytest.Mo
         raise AssertionError("must not spawn a probe for an empty pid set")
 
     monkeypatch.setattr(system_module, "_proc_start_times", fail)
+    monkeypatch.setattr(system_module, "_darwin_start_times", fail)
     monkeypatch.setattr(system_module, "_ps_start_times", fail)
 
     assert _observed_process_start_times([]) == {}

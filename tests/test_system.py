@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -91,3 +94,57 @@ def test_ps_start_times_skips_malformed_and_non_positive_rows(monkeypatch: pytes
 
     assert list(observed) == [12]
     assert observed[12] == system._parse_lstart("Mon Jan  5 10:00:00 2026")
+
+
+def _no_ps(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+    raise AssertionError("ps must not run when the kernel answered every pid")
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sysctl KERN_PROC probe")
+def test_darwin_start_times_match_this_process():
+    observed = system._darwin_start_times([os.getpid()])
+
+    started = observed[os.getpid()]
+    assert started is not None
+    # This interpreter started before now and (for a test run) within a day.
+    assert time.time() - 86400 < started <= time.time()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sysctl KERN_PROC probe")
+def test_darwin_start_times_report_a_missing_pid_as_absent_not_unknown():
+    # 99998 is inside macOS's pid range but, absent a remarkable coincidence,
+    # unused; the kernel answers "no such process" with a zero-length reply.
+    if system._pid_exists(99998):
+        pytest.skip("pid 99998 happens to be live")
+
+    assert system._darwin_start_times([99998]) == {99998: None}
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sysctl KERN_PROC probe")
+def test_observed_start_times_skip_ps_when_the_kernel_answers(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(system.subprocess, "run", _no_ps)
+
+    observed = system._observed_process_start_times([os.getpid(), 99998, 1_000_000])
+
+    assert os.getpid() in observed
+    # A dead or out-of-range pid is simply unobserved, and no longer drags a
+    # whole-batch ps call (which rejects pids above 99999) into every pass.
+    assert 99998 not in observed
+    assert 1_000_000 not in observed
+
+
+def test_darwin_start_times_are_empty_off_macos(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(system.sys, "platform", "linux")
+
+    assert system._darwin_start_times([os.getpid()]) == {}
+
+
+def test_observed_start_times_fall_back_to_ps_when_sysctl_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(system, "_proc_start_times", lambda pids: {})
+    monkeypatch.setattr(system, "_darwin_libc", lambda: None)
+    monkeypatch.setattr(system.sys, "platform", "darwin")
+    monkeypatch.setattr(system, "_ps_start_times", lambda pids: dict.fromkeys(pids, 7.0))
+
+    assert system._observed_process_start_times([42]) == {42: 7.0}

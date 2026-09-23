@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import ctypes.util
+import functools
 import os
+import struct
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -39,6 +44,14 @@ _PS_START_TIMEOUT_SECONDS = 2
 # tighter than the pid wraparound a genuine reuse would require.
 _PROCESS_START_TOLERANCE_SECONDS = 2.0
 _LSTART_FORMAT = "%a %b %d %H:%M:%S %Y"
+# macOS sysctl({CTL_KERN, KERN_PROC, KERN_PROC_PID, pid}) returns one
+# ``struct kinfo_proc``; its first member, ``kp_proc.p_un.__p_starttime``, is a
+# ``struct timeval`` (int64 seconds, int32 microseconds). psutil reads the same
+# field. A kernel whose struct outgrows this buffer answers ENOMEM, which reads
+# as "unobserved" and falls back to ps.
+_KINFO_PROC_SIZE = 648
+_CTL_KERN, _KERN_PROC, _KERN_PROC_PID = 1, 14, 1
+_TIMEVAL = struct.Struct("=qi")
 
 
 def _pid_exists(pid: int) -> bool:
@@ -130,18 +143,69 @@ def _ps_start_times(pids: Sequence[int]) -> dict[int, float]:
     return observed
 
 
+@functools.cache
+def _darwin_libc() -> ctypes.CDLL | None:
+    """libc for sysctl, loaded once; None when it cannot be loaded."""
+    path = ctypes.util.find_library("c")
+    if path is None:
+        return None
+    try:
+        return ctypes.CDLL(path, use_errno=True)
+    except OSError:
+        return None
+
+
+def _darwin_start_times(pids: Sequence[int]) -> dict[int, float | None]:
+    """macOS start times straight from the kernel, without spawning ``ps``.
+
+    A pid maps to its epoch start time, or to None when the kernel reports no
+    such process (a zero-length reply). A pid missing from the result could not
+    be probed at all (sysctl error, out-of-range pid) and is left to ``ps``.
+    Off macOS, or when libc cannot be loaded, the result is empty.
+    """
+    if sys.platform != "darwin":
+        return {}
+    libc = _darwin_libc()
+    if libc is None:
+        return {}
+    observed: dict[int, float | None] = {}
+    for pid in pids:
+        if pid <= 0 or pid > _MAX_PID:
+            continue
+        mib = (ctypes.c_int * 4)(_CTL_KERN, _KERN_PROC, _KERN_PROC_PID, pid)
+        buffer = ctypes.create_string_buffer(_KINFO_PROC_SIZE)
+        size = ctypes.c_size_t(_KINFO_PROC_SIZE)
+        if libc.sysctl(mib, 4, buffer, ctypes.byref(size), None, ctypes.c_size_t(0)) != 0:
+            continue
+        if size.value == 0:
+            observed[pid] = None
+            continue
+        if size.value < _TIMEVAL.size:
+            continue
+        seconds, micros = _TIMEVAL.unpack_from(buffer.raw, 0)
+        if seconds > 0 and 0 <= micros < 1_000_000:
+            observed[pid] = seconds + micros / 1_000_000
+    return observed
+
+
 def _observed_process_start_times(pids: Sequence[int]) -> dict[int, float]:
     """Observed start time per pid as epoch seconds, best effort.
 
     A pid that cannot be observed is absent from the result, which callers must
-    read as *unverifiable* — never as dead. hermesd has no psutil dependency, so
-    outside Linux this relies on ``ps`` being present and its ``lstart`` format.
+    read as *unverifiable* — never as dead. hermesd has no psutil dependency:
+    Linux reads ``/proc``, macOS asks the kernel via sysctl, and only pids
+    neither could answer fall back to one ``ps`` call.
     """
     unique = sorted({pid for pid in pids if pid > 0})
     if not unique:
         return {}
     observed = _proc_start_times(unique)
     missing = [pid for pid in unique if pid not in observed]
+    if missing:
+        kernel = _darwin_start_times(missing)
+        observed.update({pid: start for pid, start in kernel.items() if start is not None})
+        # A pid the kernel says does not exist needs no ps round-trip either.
+        missing = [pid for pid in missing if pid not in kernel]
     if missing:
         observed.update(_ps_start_times(missing))
     return observed
