@@ -887,7 +887,6 @@ def sample_config(hermes_home: Path) -> Path:
                     "max_turns": 192,
                     "reasoning_effort": "medium",
                     "personalities": {"kawaii": "uwu"},
-                    "active_personality": "kawaii",
                 },
                 "compression": {"threshold": 0.86},
                 "security": {"redact_secrets": True},
@@ -967,7 +966,7 @@ def sample_config(hermes_home: Path) -> Path:
                 "image_gen": {"use_gateway": False},
                 "tts": {"use_gateway": True},
                 "browser": {"use_gateway": False},
-                "display": {"skin": "default"},
+                "display": {"skin": "default", "personality": "kawaii"},
                 "_config_version": 12,
             }
         )

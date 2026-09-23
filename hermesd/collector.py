@@ -57,6 +57,7 @@ from hermesd.collect.common import (
 )
 from hermesd.collect.config import (
     _CONFIG_BACKUP_ENTRY_LIMIT,
+    _active_personality_name,
     _channel_capabilities,
     _config_agent_limits,
     _config_backup_groups,
@@ -2447,11 +2448,6 @@ class Collector:
         auxiliary_cfg = _as_dict(cfg.get("auxiliary"))
         moa_cfg = _as_dict(cfg.get("moa"))
         moa_summary = _moa_config_summary(moa_cfg)
-        personality = str(agent_cfg.get("active_personality") or "")
-        if not personality:
-            personalities = _as_dict(agent_cfg.get("personalities"))
-            if personalities:
-                personality = str(next(iter(personalities)))
         dashboard_auth_provider = str(
             dashboard_cfg.get("auth_provider")
             or dashboard_cfg.get("auth")
@@ -2462,7 +2458,7 @@ class Collector:
             # bare .get(key, default) would fail the whole config source.
             model=str(model_cfg.get("default") or ""),
             provider=str(model_cfg.get("provider") or ""),
-            personality=personality,
+            personality=_active_personality_name(cfg),
             max_turns=_coerce_int(agent_cfg.get("max_turns")),
             compression_threshold=_coerce_float(comp_cfg.get("threshold")),
             reasoning_effort=str(agent_cfg.get("reasoning_effort") or ""),

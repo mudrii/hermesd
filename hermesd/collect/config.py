@@ -53,6 +53,53 @@ def _config_agent_limits(cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Built-in personality names, ``BUILTIN_PERSONALITIES`` in
+# ``hermes_cli/personality.py:19-34`` (names only; the prompts are upstream's).
+_BUILTIN_PERSONALITY_NAMES = frozenset(
+    {
+        "helpful",
+        "concise",
+        "technical",
+        "creative",
+        "teacher",
+        "kawaii",
+        "catgirl",
+        "pirate",
+        "shakespeare",
+        "surfer",
+        "noir",
+        "uwu",
+        "philosopher",
+        "hype",
+    }
+)
+# ``NEUTRAL_PERSONALITY_NAMES`` (``hermes_cli/personality.py:16``).
+_NEUTRAL_PERSONALITY_NAMES = frozenset({"", "none", "default", "neutral"})
+
+
+def _normalize_personality_name(value: object) -> str:
+    name = str(value or "").strip().lower()
+    return "" if name in _NEUTRAL_PERSONALITY_NAMES else name
+
+
+def _active_personality_name(cfg: dict[str, Any]) -> str:
+    """The selected personality, as ``active_personality_name`` resolves it.
+
+    ``display.personality`` holds the selection (the only sanctioned write path,
+    ``persist_personality`` at ``hermes_cli/personality.py:127-131``); it counts
+    only when it names a known personality — a built-in, a root
+    ``personalities`` entry or an ``agent.personalities`` entry
+    (``available_personalities``, ``:86-96``). Anything else is no overlay.
+    """
+    name = _normalize_personality_name(_as_dict(cfg.get("display")).get("personality"))
+    if not name:
+        return ""
+    known = set(_BUILTIN_PERSONALITY_NAMES)
+    for user in (cfg.get("personalities"), _as_dict(cfg.get("agent")).get("personalities")):
+        known.update(_normalize_personality_name(key) for key in _as_dict(user))
+    return name if name in known else ""
+
+
 def _coerce_session_cap(value: object) -> int | None:
     """Upstream's ``coerce_max_concurrent_sessions``: a positive int, else None.
 
