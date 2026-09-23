@@ -19,6 +19,7 @@ from hermesd.collect.common import (
     _coerce_bool,
     _read_text_capped,
 )
+from hermesd.collect.config import _MAX_LISTED_NAMES
 from hermesd.models import (
     MCPCacheEntry,
     MCPCacheEntryState,
@@ -27,8 +28,6 @@ from hermesd.models import (
     ToolsetAvailability,
 )
 
-# Upper bound on cached server names surfaced from the MCP schema cache.
-_MAX_LISTED_NAMES = 20
 # Display bound on the per-entry validity list, and on the recorded fingerprint
 # prefix carried per entry. Neither bound feeds a count.
 _MAX_CACHE_ENTRIES = 20

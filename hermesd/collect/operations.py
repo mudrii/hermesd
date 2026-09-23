@@ -28,6 +28,7 @@ from hermesd.collect.common import (
     _iso_to_epoch,
     _json_object_capped,
     _mtime,
+    _optional_int,
     _path_resolves_under,
     _read_tail_text,
     _read_text_capped,
@@ -636,11 +637,10 @@ def _process_receipt_from_file(
         return None
     output = str(data.get("output") or "")
     started_at = _coerce_float(data.get("started_at"))
-    exit_code = _coerce_int(data.get("exit_code"))
     return ProcessReceipt(
         process_id=str(data.get("id") or path.stem),
         command=_redact_command_string(str(data.get("command") or "")),
-        exit_code=exit_code if data.get("exit_code") is not None else None,
+        exit_code=_optional_int(data.get("exit_code")),
         completion_reason=str(data.get("completion_reason") or ""),
         termination_source=str(data.get("termination_source") or ""),
         started_age_seconds=_age_seconds(started_at if started_at > 0 else None, now),
@@ -701,8 +701,7 @@ def _read_checkpoint_prune_marker(
         or not marker_path.is_file()
     ):
         return update
-    stamp = _coerce_float(_read_text_capped(marker_path, home).strip())
-    age = _age_seconds(stamp if stamp > 0 else None, now)
+    age = _epoch_age_seconds(_read_text_capped(marker_path, home).strip(), now)
     if age is None:
         age = _age_seconds(_safe_mtime(marker_path), now)
     update["checkpoint_prune_marker_present"] = True

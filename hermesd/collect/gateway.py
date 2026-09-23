@@ -31,6 +31,7 @@ from hermesd.collect.common import (
     _file_size,
     _iso_to_epoch,
     _mtime,
+    _optional_int,
     _read_tail_text,
     _read_text_capped,
     _safe_child_path,
@@ -135,11 +136,6 @@ _INGRESS_SUPPRESSED_STATES = frozenset({"fatal", "disconnected", "stopped"})
 # unrecognised or missing state are refused, so neither may publish a callback
 # URL hermesd synthesized for a secondary profile.
 _MIRROR_SERVING_STATES = frozenset({"connected", "connecting", "retrying"})
-
-
-def _optional_int(value: object) -> int | None:
-    """Coerce to int, preserving a genuine null (an exit code that never happened)."""
-    return None if value is None else _coerce_int(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -850,9 +846,8 @@ class _DashboardClientStatus:
 def _dashboard_client_status(path: Path, root: Path, now: float) -> _DashboardClientStatus:
     status = _DashboardClientStatus()
     if _safe_child_path(path, root):
-        stamp = _mtime(path)
-        if stamp is not None:
-            age = max(0.0, now - stamp)
+        age = _age_seconds(_mtime(path), now)
+        if age is not None:
             status = _DashboardClientStatus(
                 attached=age <= _DASHBOARD_CLIENT_ATTACHED_SECONDS,
                 age_seconds=age,
@@ -925,12 +920,11 @@ def _read_forensic_companions(logs_dir: Path, root: Path, now: float) -> list[Fo
         path = logs_dir / name
         if not _safe_child_path(path, root) or not path.is_file():
             continue
-        stamp = _mtime(path)
         files.append(
             ForensicFile(
                 name=name,
                 size_bytes=_file_size(path),
-                age_seconds=max(0.0, now - stamp) if stamp is not None else None,
+                age_seconds=_age_seconds(_mtime(path), now),
             )
         )
     return files

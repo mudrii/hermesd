@@ -23,6 +23,7 @@ from hermesd.collect.common import (
     _exists_strict,
     _iso_to_epoch,
     _mtime,
+    _optional_int,
     _path_resolves_under,
     _read_tail_text,
     _read_text_capped,
@@ -942,6 +943,5 @@ def _cron_job_paused(job: dict[str, Any]) -> tuple[bool, str]:
 def _cron_job_repeat(job: dict[str, Any]) -> tuple[int | None, int]:
     """`repeat` times (None means unlimited) and completed count."""
     repeat = _as_dict(job.get("repeat"))
-    raw_times = repeat.get("times")
-    times = None if raw_times is None else _coerce_int(raw_times)
+    times = _optional_int(repeat.get("times"))
     return times, _coerce_int(repeat.get("completed"))

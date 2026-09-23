@@ -318,3 +318,8 @@ def _excerpt(value: object, cap: int) -> str:
     from hermesd.collect.redaction import _redact_secret_text
 
     return _redact_secret_text(" ".join(str(value)[:_EXCERPT_SCAN_CHARS].split()))[:cap]
+
+
+def _optional_int(value: object) -> int | None:
+    """Coerce to int, preserving a genuine null (an exit code that never happened)."""
+    return None if value is None else _coerce_int(value)
