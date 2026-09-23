@@ -2191,7 +2191,6 @@ class Collector:
             return TerminalSessionReadout()
         now = self._clock()
         rows: list[TerminalBreadcrumb] = []
-        count = 0
         # Bound the listing before sorting, like the config-backups scan: a
         # hostile directory must not be materialised whole, and one extra entry
         # is enough to know the scan was cut.
@@ -2214,17 +2213,21 @@ class Collector:
             age = _age_seconds(ts or None, now)
             if age is None or age > _TERMINAL_SESSION_WINDOW_SECONDS:
                 continue
-            count += 1
-            if len(rows) < _TERMINAL_SESSION_ROW_LIMIT:
-                rows.append(
-                    TerminalBreadcrumb(
-                        terminal=_sanitized_file_label(entry.name),
-                        session_id=str(data.get("session_id") or ""),
-                        cwd=str(data.get("cwd") or ""),
-                        age_seconds=age,
-                    )
+            rows.append(
+                TerminalBreadcrumb(
+                    terminal=_sanitized_file_label(entry.name),
+                    session_id=str(data.get("session_id") or ""),
+                    cwd=str(data.get("cwd") or ""),
+                    age_seconds=age,
                 )
-        return TerminalSessionReadout(sessions=rows, count=count, truncated=truncated)
+            )
+        # Every in-window row is kept until here (at most the scan bound), so
+        # the displayed slice is the newest terminals rather than the first
+        # names in directory order.
+        rows.sort(key=lambda row: row.age_seconds or 0.0)
+        return TerminalSessionReadout(
+            sessions=rows[:_TERMINAL_SESSION_ROW_LIMIT], count=len(rows), truncated=truncated
+        )
 
     def _last_model_usage(self) -> _ModelUsageBundle:
         bundle: _ModelUsageBundle = self._last_good_by_source.get(

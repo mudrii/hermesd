@@ -2678,6 +2678,24 @@ def test_terminal_breadcrumb_rows_are_bounded(hermes_home: Path) -> None:
     assert len(state.terminal_sessions.sessions) == 12
 
 
+def test_terminal_breadcrumb_rows_keep_the_newest_not_the_first_named(hermes_home: Path) -> None:
+    """The bounded row list is the most recent terminals, newest first, even
+    when the newest breadcrumbs sort last by file name."""
+    directory = hermes_home / "terminal-sessions"
+    for i in range(15):
+        _write_breadcrumb(
+            directory,
+            f"tty-{i:02d}",
+            {"session_id": f"s{i}", "cwd": "/r", "ts": _COORD_NOW - 60 * (15 - i)},
+        )
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    state = c.collect()
+    c.close()
+    assert [row.session_id for row in state.terminal_sessions.sessions] == [
+        f"s{i}" for i in range(14, 2, -1)
+    ]
+
+
 # ── Item 10: joinable session chip ──────────────────────────────────────────
 
 
