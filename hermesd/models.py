@@ -1087,6 +1087,44 @@ class CronExecutionsState(BaseModel):
     newest_claimed_age_seconds: float | None = None
 
 
+class CronJobUsage(BaseModel):
+    """One job's fires and tokens from ``cron/usage_audit.jsonl``.
+
+    Tokens sum only the fires that recorded ``total_tokens``; a fire without
+    them (script job, pre-agent failure) still counts as a fire.
+    """
+
+    job_id: str = ""
+    job_name: str = ""
+    fires_24h: int = 0
+    tokens_24h: int = 0
+    fires_7d: int = 0
+    tokens_7d: int = 0
+    errors_7d: int = 0
+    last_fire_age_seconds: float | None = None
+    last_total_tokens: int | None = None
+    last_model: str = ""
+    last_duration_seconds: float | None = None
+    last_error_excerpt: str = ""
+
+
+class CronUsageState(BaseModel):
+    """Per-fire usage audit (``_FireAudit``, ``cron/scheduler.py:2415-2433``).
+
+    Upstream never prunes the ledger, so only a capped tail is read.
+    ``window_truncated`` means that tail was cut while still inside the 7d
+    window: the 7d figures are then a lower bound.
+    """
+
+    present: bool = False
+    jobs: list[CronJobUsage] = Field(default_factory=list)
+    tokens_24h: int = 0
+    tokens_7d: int = 0
+    fires_7d: int = 0
+    window_truncated: bool = False
+    unparseable_lines: int = 0
+
+
 class CronState(BaseModel):
     last_tick_ago_seconds: float | None = None
     ticker_heartbeat_age_seconds: float | None = None
@@ -2636,6 +2674,7 @@ class DashboardState(BaseModel):
     config: ConfigSummary = Field(default_factory=ConfigSummary)
     cron: CronState = Field(default_factory=CronState)
     cron_executions: CronExecutionsState = Field(default_factory=CronExecutionsState)
+    cron_usage: CronUsageState = Field(default_factory=CronUsageState)
     channels: ChannelDirectoryState = Field(default_factory=ChannelDirectoryState)
     kanban: KanbanState = Field(default_factory=KanbanState)
     operations: OperationsState = Field(default_factory=OperationsState)

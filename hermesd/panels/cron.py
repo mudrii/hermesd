@@ -15,6 +15,7 @@ from hermesd.models import (
     CronModelSource,
     CronState,
     CronTickerHealth,
+    CronUsageState,
     DashboardState,
 )
 from hermesd.panels.formatting import (
@@ -23,6 +24,7 @@ from hermesd.panels.formatting import (
 from hermesd.panels.formatting import (
     fmt_age_seconds,
     fmt_iso_timestamp,
+    fmt_tokens,
     sanitize_terminal_text,
     section_heading,
 )
@@ -184,6 +186,9 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append(f"{c.error_count}\n", style=err_color)
     lines.append("  Parallel: ", style=theme.ui_label)
     lines.append(str(c.max_parallel_jobs or "—"), style=theme.banner_text)
+    if state.cron_usage.present:
+        lines.append("  Tokens 24h: ", style=theme.ui_label)
+        lines.append(fmt_tokens(state.cron_usage.tokens_24h), style=theme.banner_text)
 
     if c.jobs:
         lines.append("\n")
@@ -237,6 +242,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         sections.append(Text("  No cron jobs configured\n", style=theme.banner_dim))
 
     sections.extend(_executions_sections(executions, theme))
+    sections.extend(_usage_sections(state.cron_usage, theme))
 
     return Panel(
         Group(*sections),
@@ -679,6 +685,51 @@ def _incidents_table(executions: CronExecutionsState, theme: Theme) -> Table:
             escape(incident.error_excerpt) if incident.error_excerpt else "—",
         )
     return table
+
+
+def _usage_sections(usage: CronUsageState, theme: Theme) -> list[RenderableType]:
+    """Per-job fires and tokens from ``cron/usage_audit.jsonl``, biggest first."""
+    if not usage.present:
+        return []
+    body = Text()
+    body.append(
+        f"  Total: 24h {fmt_tokens(usage.tokens_24h)}  7d {fmt_tokens(usage.tokens_7d)}"
+        f" over {usage.fires_7d} fires\n",
+        style=theme.banner_text,
+    )
+    if usage.window_truncated:
+        body.append(
+            "  ⚠ Only the ledger tail is read and it ends inside the 7d window —"
+            " 7d figures are a lower bound.\n",
+            style=theme.ui_warn,
+        )
+    if usage.unparseable_lines:
+        body.append(
+            f"  {usage.unparseable_lines} unparseable line(s) skipped\n", style=theme.banner_dim
+        )
+    for job in usage.jobs:
+        body.append(
+            f"  {sanitize_terminal_text(job.job_name or job.job_id or '—')}: ", style=theme.ui_label
+        )
+        parts = [
+            f"24h {job.fires_24h} fires {fmt_tokens(job.tokens_24h)}",
+            f"7d {job.fires_7d} fires {fmt_tokens(job.tokens_7d)}",
+        ]
+        if job.errors_7d:
+            parts.append(f"{job.errors_7d} errors")
+        if job.last_fire_age_seconds is not None:
+            last = [f"last {fmt_age_seconds(job.last_fire_age_seconds)} ago"]
+            if job.last_total_tokens is not None:
+                last.append(fmt_tokens(job.last_total_tokens))
+            if job.last_model:
+                last.append(job.last_model)
+            if job.last_duration_seconds is not None:
+                last.append(f"{job.last_duration_seconds:.1f}s")
+            parts.append(" ".join(last))
+        if job.last_error_excerpt:
+            parts.append(f"error: {job.last_error_excerpt}")
+        body.append(sanitize_terminal_text("  ".join(parts)) + "\n", style=theme.banner_text)
+    return [section_heading("Token Usage (usage_audit.jsonl)", theme), body]
 
 
 def _latest_output_line(j: CronJob, theme: Theme) -> Text:

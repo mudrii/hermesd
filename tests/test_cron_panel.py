@@ -9,9 +9,11 @@ from hermesd.models import (
     CronIncident,
     CronJob,
     CronJobExecutionStats,
+    CronJobUsage,
     CronModelSource,
     CronState,
     CronTickerHealth,
+    CronUsageState,
     DashboardState,
 )
 from hermesd.panels import render_panel
@@ -1300,3 +1302,48 @@ def test_cron_detail_lists_recent_failures_with_their_errors() -> None:
     assert "Recent Failures" in text
     assert "Script execution failed: [Errno 2] missing" in text
     assert "2h ago" in text
+
+
+def test_cron_panel_shows_usage_audit_token_rollup() -> None:
+    usage = CronUsageState(
+        present=True,
+        tokens_24h=12_500,
+        tokens_7d=80_000,
+        fires_7d=40,
+        jobs=[
+            CronJobUsage(
+                job_id="j1",
+                job_name="nightly",
+                fires_24h=4,
+                tokens_24h=12_500,
+                fires_7d=40,
+                tokens_7d=80_000,
+                errors_7d=2,
+                last_fire_age_seconds=120.0,
+                last_total_tokens=3_100,
+                last_model="grok-4.6",
+                last_duration_seconds=12.5,
+                last_error_excerpt="provider 429",
+            )
+        ],
+        window_truncated=True,
+    )
+    state = DashboardState(cron_usage=usage)
+    detail = render_to_str(render_cron(state, Theme(), detail=True), width=220, no_color=True)
+    assert "Token Usage" in detail
+    assert "nightly" in detail
+    assert "24h 4 fires 12.5K" in detail
+    assert "7d 40 fires 80.0K" in detail
+    assert "2 errors" in detail
+    assert "last 2m ago 3.1K grok-4.6 12.5s" in detail
+    assert "provider 429" in detail
+    assert "lower bound" in detail
+    compact = render_to_str(render_cron(state, Theme()), no_color=True)
+    assert "Tokens 24h: 12.5K" in compact
+
+
+def test_cron_panel_hides_token_usage_without_an_audit_ledger() -> None:
+    state = DashboardState()
+    detail = render_to_str(render_cron(state, Theme(), detail=True), width=220, no_color=True)
+    assert "Token Usage" not in detail
+    assert "Tokens 24h" not in render_to_str(render_cron(state, Theme()), no_color=True)

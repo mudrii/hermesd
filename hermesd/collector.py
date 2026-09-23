@@ -88,10 +88,12 @@ from hermesd.collect.cron import (
     _cron_ticker_ages,
     _cron_ticker_health,
     _cron_ticker_last_error,
+    _cron_usage_state,
     _delivery_target_label,
     _latest_cron_output_excerpt,
     _latest_cron_output_file,
     _read_cron_executions_state,
+    _read_usage_audit_records,
     _tail_latest_cron_output,
 )
 from hermesd.collect.curator import (
@@ -260,6 +262,7 @@ from hermesd.models import (
     CronExecutionsState,
     CronJob,
     CronState,
+    CronUsageState,
     CuratorRun,
     DashboardState,
     DesktopPluginInfo,
@@ -1092,6 +1095,12 @@ class Collector:
                 "cron_executions",
                 lambda: self._collect_cron_executions(results["cron"]),
                 CronExecutionsState,
+            ),
+            _SourceSpec(
+                "cron_usage",
+                "cron_usage_audit",
+                lambda: self._collect_cron_usage(results["cron"]),
+                CronUsageState,
             ),
             _SourceSpec(
                 "channels",
@@ -2732,6 +2741,25 @@ class Collector:
             now=self._clock(),
             root=self._paths.root_home,
         )
+
+    def _collect_cron_usage(self, cron: CronState) -> CronUsageState:
+        """Per-job token rollup from ``cron/usage_audit.jsonl``.
+
+        Upstream appends one line per fire at ``get_hermes_home()/cron``
+        (``_usage_audit_path``, ``cron/scheduler.py:1196-1197``; record keys
+        ``_FireAudit.write``, ``:2415-2433``); read from the root store with the
+        rest of ``cron``. The capped-tail parse is cached by file signature.
+        """
+        path = self._paths.shared_path("cron", "usage_audit.jsonl")
+        if not _exists_strict(path):
+            return CronUsageState()
+        if not _safe_child_path(path, self._paths.root_home):
+            raise RuntimeError("cron/usage_audit.jsonl escapes the Hermes home")
+        audit = self._signature_cached(
+            "cron_usage_audit", path, lambda: _read_usage_audit_records(path)
+        )
+        job_names = {job.job_id: job.name for job in cron.jobs if job.job_id and job.name}
+        return _cron_usage_state(audit, job_names, now=self._clock())
 
     def _collect_channels(self, gateway: GatewayState) -> ChannelDirectoryState:
         directory = self._read_json_reporting_stale(

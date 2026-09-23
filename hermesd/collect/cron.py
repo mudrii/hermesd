@@ -9,6 +9,7 @@ import json
 import math
 import sqlite3
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from hermesd.collect.common import (
     _coerce_float,
     _coerce_int,
     _exists_strict,
+    _file_size,
     _iso_to_epoch,
     _mtime,
     _optional_int,
@@ -34,6 +36,7 @@ from hermesd.collect.common import (
 from hermesd.collect.logs import _MAX_LOG_LINE_CHARS
 from hermesd.collect.redaction import _redact_secret_text
 from hermesd.collect.sqlite_util import (
+    _column_exists,
     _connect_readonly_sqlite,
     _count_rows,
     _query_rows,
@@ -45,8 +48,10 @@ from hermesd.models import (
     CronFireClaimState,
     CronIncident,
     CronJobExecutionStats,
+    CronJobUsage,
     CronModelSource,
     CronTickerHealth,
+    CronUsageState,
     LogLine,
 )
 
@@ -638,8 +643,8 @@ def _read_cron_incidents(
         f"SELECT COUNT(*) FROM cron_incidents {open_clause} AND acked_at IS NULL",
     )
     # ``alerted_at`` was added in place for older ledgers (``:83,90``).
-    columns = {str(row[1] or "") for row in conn.execute("PRAGMA table_info(cron_incidents)")}
-    alerted = "alerted_at" if "alerted_at" in columns else "NULL AS alerted_at"
+    has_alerted = _column_exists(conn, "cron_incidents", "alerted_at")
+    alerted = "alerted_at" if has_alerted else "NULL AS alerted_at"
     rows = _query_rows(
         conn,
         f"SELECT id, job_id, state, failure_type, first_seen_at, last_seen_at, {alerted}, error "
@@ -1023,3 +1028,117 @@ def _cron_job_repeat(job: dict[str, Any]) -> tuple[int | None, int]:
     repeat = _as_dict(job.get("repeat"))
     times = _optional_int(repeat.get("times"))
     return times, _coerce_int(repeat.get("completed"))
+
+
+# ``cron/usage_audit.jsonl`` is appended once per fire and never pruned upstream
+# (``_write_usage_audit``, ``cron/scheduler.py:1196-1216``). A line is ~350
+# bytes, so this tail holds a few thousand fires; the parse is cached by file
+# signature and only the windowing reruns each refresh.
+_USAGE_AUDIT_TAIL_BYTES = 1024 * 1024
+_USAGE_WINDOW_7D_SECONDS = 7 * 24 * 60 * 60.0
+_USAGE_JOBS_LIMIT = 20
+
+
+@dataclass(frozen=True, slots=True)
+class _UsageRecord:
+    """One parsed audit line; the error is already a redacted excerpt."""
+
+    epoch: float
+    job_id: str
+    total_tokens: int | None
+    model: str
+    duration_seconds: float | None
+    error_excerpt: str
+
+
+@dataclass(frozen=True, slots=True)
+class _UsageAudit:
+    records: tuple[_UsageRecord, ...]
+    cut: bool
+    unparseable: int
+
+
+def _usage_record(data: dict[str, Any]) -> _UsageRecord | None:
+    epoch = _iso_to_epoch(str(data.get("ts") or ""))
+    if epoch is None:
+        return None
+    tokens = data.get("total_tokens")
+    duration_ms = data.get("duration_ms")
+    return _UsageRecord(
+        epoch=epoch,
+        job_id=str(data.get("job_id") or ""),
+        total_tokens=None if tokens is None else _coerce_int(tokens),
+        model=str(data.get("model") or "")[:_EXCERPT_MAX_CHARS],
+        duration_seconds=None if duration_ms is None else _coerce_float(duration_ms) / 1000.0,
+        error_excerpt=_cron_error_excerpt(str(data.get("error") or "")),
+    )
+
+
+def _read_usage_audit_records(path: Path) -> _UsageAudit:
+    """Parse the capped tail of ``cron/usage_audit.jsonl``.
+
+    Torn and foreign lines are counted, never fatal; an I/O error propagates so
+    the source keeps its last-good value.
+    """
+    max_bytes = _USAGE_AUDIT_TAIL_BYTES
+    cut = _file_size(path) > max_bytes
+    records: list[_UsageRecord] = []
+    unparseable = 0
+    for line in _read_tail_text(path, max_bytes).splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        record = None
+        with contextlib.suppress(json.JSONDecodeError, RecursionError):
+            data = json.loads(stripped)
+            if isinstance(data, dict):
+                record = _usage_record(data)
+        if record is None:
+            unparseable += 1
+        else:
+            records.append(record)
+    return _UsageAudit(records=tuple(records), cut=cut, unparseable=unparseable)
+
+
+def _cron_usage_state(
+    audit: _UsageAudit, job_names: Mapping[str, str], *, now: float
+) -> CronUsageState:
+    """Roll the parsed audit up into 24h/7d per-job windows at ``now``."""
+    day_start = now - _EXECUTIONS_WINDOW_SECONDS
+    week_start = now - _USAGE_WINDOW_7D_SECONDS
+    by_job: dict[str, CronJobUsage] = {}
+    last_epoch: dict[str, float] = {}
+    for record in audit.records:
+        if record.epoch < week_start or record.epoch > now:
+            continue
+        entry = by_job.setdefault(
+            record.job_id,
+            CronJobUsage(
+                job_id=record.job_id, job_name=job_names.get(record.job_id) or record.job_id
+            ),
+        )
+        tokens = record.total_tokens or 0
+        entry.fires_7d += 1
+        entry.tokens_7d += tokens
+        entry.errors_7d += 1 if record.error_excerpt else 0
+        if record.epoch >= day_start:
+            entry.fires_24h += 1
+            entry.tokens_24h += tokens
+        if record.epoch >= last_epoch.get(record.job_id, -math.inf):
+            last_epoch[record.job_id] = record.epoch
+            entry.last_fire_age_seconds = _age_seconds(record.epoch, now)
+            entry.last_total_tokens = record.total_tokens
+            entry.last_model = record.model
+            entry.last_duration_seconds = record.duration_seconds
+            entry.last_error_excerpt = record.error_excerpt
+    jobs = sorted(by_job.values(), key=lambda job: (-job.tokens_7d, -job.fires_7d, job.job_id))
+    oldest = min((record.epoch for record in audit.records), default=None)
+    return CronUsageState(
+        present=True,
+        jobs=jobs[:_USAGE_JOBS_LIMIT],
+        tokens_24h=sum(job.tokens_24h for job in jobs),
+        tokens_7d=sum(job.tokens_7d for job in jobs),
+        fires_7d=sum(job.fires_7d for job in jobs),
+        window_truncated=audit.cut and (oldest is None or oldest > week_start),
+        unparseable_lines=audit.unparseable,
+    )
