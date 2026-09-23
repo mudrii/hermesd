@@ -509,6 +509,11 @@ _GENERATION_FIELDS = (
 _TERMINAL_SESSION_SCAN_LIMIT = 200
 _TERMINAL_SESSION_ROW_LIMIT = 12
 _TERMINAL_SESSION_WINDOW_SECONDS = 24 * 60 * 60
+# A file read successfully and then found missing fails its source on the
+# first absent pass (keeping last-good: it may be mid-rewrite), and the absence
+# is accepted as the new state after this many consecutive absent passes, so an
+# intentionally deleted file cannot keep its source failed forever.
+_ABSENCE_CONFIRM_PASSES = 2
 # Bucket for the time-dependent part of derived-cache keys: sliding 7d/30d
 # window cutoffs recompute at most this often when nothing else changed
 # (matches the 60s cutoff bucketing in db.py's model-usage reads).
@@ -791,6 +796,9 @@ class Collector:
         # state and the gateway ledgers so a pass snapshots the (large, WAL)
         # db only once.
         self._state_db_cache: tuple[int, _StateDbReadout] | None = None
+        # Consecutive passes each previously-read file has been found absent,
+        # keyed by its label — see _present_or_confirmed_absent.
+        self._absent_passes: dict[str, int] = {}
         # A readout that carried a group error (or failed outright) is reused
         # only within the pass that read it, so each state.db source re-raises
         # the same failure instead of re-reading the database, while the next
@@ -1814,13 +1822,14 @@ class Collector:
         )
 
     def _with_gateway_ledgers(self, gateway: GatewayState) -> GatewayState:
-        readout = self._read_state_db()
+        last = self._last_good_by_source.get("gateway_ledgers")
+        readout = self._state_db_for(
+            "gateway_ledgers",
+            "state.db gateway ledgers",
+            had_last_good=last is not None and bool(last.gateway_incarnation_count),
+        )
         if readout is None:
-            last = self._last_good_by_source.get("gateway_ledgers")
-            if last is not None and last.gateway_incarnation_count:
-                raise RuntimeError("state.db gateway ledgers disappeared or became unsafe")
             return gateway
-        readout.raise_for("gateway_ledgers")
         return gateway.model_copy(update=_gateway_ledger_fields(readout.ledgers, self._clock()))
 
     def _collect_migration(self, gateway: GatewayState, *, gateway_fresh: bool) -> MigrationState:
@@ -1847,9 +1856,9 @@ class Collector:
             if had_last_good:
                 raise RuntimeError(f"{path.name} became unsafe")
             return MigrationState()
-        if not _exists_strict(path):
-            if had_last_good:
-                raise RuntimeError(f"{path.name} disappeared")
+        if not self._present_or_confirmed_absent(
+            path.name, _exists_strict(path), had_last_good=had_last_good
+        ):
             return MigrationState()
         return _migration_state(
             self._read_json_reporting_stale(path),
@@ -2068,13 +2077,14 @@ class Collector:
         ``hermes_state_compression.py:433-605``). See
         ``.codex/rules/source-ownership.md`` (``session_leases``).
         """
-        readout = self._read_state_db()
+        last = self._last_good_by_source.get("session_leases")
+        readout = self._state_db_for(
+            "session_leases",
+            "state.db session leases",
+            had_last_good=last is not None and bool(last.lease_total),
+        )
         if readout is None:
-            last = self._last_good_by_source.get("session_leases")
-            if last is not None and last.lease_total:
-                raise RuntimeError("state.db session leases disappeared or became unsafe")
             return coord
-        readout.raise_for("session_leases")
         return coord.model_copy(
             update=_session_lease_fields(
                 readout.coordination, now=self._clock(), pid_exists=self._pid_exists
@@ -2085,13 +2095,14 @@ class Collector:
         """Per-chat hygiene failure streaks (PROFILE ``state.db``, table
         ``gateway_hygiene_state`` — ``hermes_state.py:160,178``). The unfiltered
         sessions table joins the recorded compression failure to each streak."""
-        readout = self._read_state_db()
+        last = self._last_good_by_source.get("gateway_hygiene")
+        readout = self._state_db_for(
+            "gateway_hygiene",
+            "state.db gateway hygiene",
+            had_last_good=last is not None and bool(last.hygiene),
+        )
         if readout is None:
-            last = self._last_good_by_source.get("gateway_hygiene")
-            if last is not None and last.hygiene:
-                raise RuntimeError("state.db gateway hygiene disappeared or became unsafe")
             return coord
-        readout.raise_for("gateway_hygiene")
         return coord.model_copy(
             update=_hygiene_fields(
                 readout.coordination.hygiene_rows,
@@ -2107,13 +2118,14 @@ class Collector:
         session id has no row at all: the target set is the *unfiltered* id
         list, because upstream hides a session from the default listing while
         keeping it resumable (``hermes_state_sessions.py:898-900``)."""
-        readout = self._read_state_db()
+        last = self._last_good_by_source.get("gateway_routes")
+        readout = self._state_db_for(
+            "gateway_routes",
+            "state.db gateway routes",
+            had_last_good=last is not None and bool(last.route_total),
+        )
         if readout is None:
-            last = self._last_good_by_source.get("gateway_routes")
-            if last is not None and last.route_total:
-                raise RuntimeError("state.db gateway routes disappeared or became unsafe")
             return coord
-        readout.raise_for("gateway_routes")
         return coord.model_copy(
             update=_gateway_route_fields(
                 readout.coordination.routing_rows,
@@ -2136,13 +2148,14 @@ class Collector:
         recovers to the count seen before it. Comparing against last-seen would
         clear the warning on the very next refresh, leaving the operator's only
         cue to the one interval that happened to observe the drop."""
-        readout = self._read_state_db()
+        last = self._last_good_by_source.get("generation_churn")
+        readout = self._state_db_for(
+            "generation_churn",
+            "state.db generations",
+            had_last_good=last is not None and bool(last.generation_chat_total),
+        )
         if readout is None:
-            last = self._last_good_by_source.get("generation_churn")
-            if last is not None and last.generation_chat_total:
-                raise RuntimeError("state.db generations disappeared or became unsafe")
             return coord
-        readout.raise_for("generation_churn")
         rows = readout.coordination
         previous = self._last_generation_chat_count
         shrank = previous is not None and rows.generation_chat_total < previous
@@ -2796,9 +2809,11 @@ class Collector:
         )
         db_path = self._paths.shared_path("kanban.db")
         last_kanban = self._last_good_by_source.get("kanban")
-        if not _exists_strict(db_path):
-            if last_kanban is not None and last_kanban.db_present:
-                raise RuntimeError("kanban.db disappeared")
+        if not self._present_or_confirmed_absent(
+            "kanban.db",
+            _exists_strict(db_path),
+            had_last_good=last_kanban is not None and last_kanban.db_present,
+        ):
             return self._with_kanban_boards(base_state)
         if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
             if last_kanban is not None and last_kanban.db_present:
@@ -2821,13 +2836,20 @@ class Collector:
             if last_kanban is not None and last_kanban.current_board:
                 raise RuntimeError("kanban current board replaced by unsafe path")
             return ""
+        had_last_good = last_kanban is not None and bool(last_kanban.current_board)
         try:
             with path.open("rb") as handle:
                 raw = handle.read(_MAX_TEXT_READ_BYTES)
+        except FileNotFoundError:
+            self._present_or_confirmed_absent(
+                "kanban current board", False, had_last_good=had_last_good
+            )
+            return ""
         except OSError:
-            if last_kanban is not None and last_kanban.current_board:
+            if had_last_good:
                 raise
             return ""
+        self._present_or_confirmed_absent("kanban current board", True, had_last_good=had_last_good)
         return raw.decode("utf-8", errors="replace").strip()
 
     def _with_kanban_boards(self, state: KanbanState) -> KanbanState:
@@ -2996,9 +3018,11 @@ class Collector:
     def _with_response_store(self, operations: OperationsState) -> OperationsState:
         db_path = self._paths.shared_path("response_store.db")
         last = self._last_good_by_source.get("operations")
-        if not _exists_strict(db_path):
-            if last is not None and last.response_store_present:
-                raise RuntimeError("response_store.db disappeared")
+        if not self._present_or_confirmed_absent(
+            db_path.name,
+            _exists_strict(db_path),
+            had_last_good=last is not None and last.response_store_present,
+        ):
             return operations
         if db_path.is_symlink() or not _path_resolves_under(db_path, self._paths.root_home):
             if last is not None and last.response_store_present:
@@ -3018,9 +3042,11 @@ class Collector:
     def _with_verification_evidence(self, operations: OperationsState) -> OperationsState:
         db_path = self._paths.profile_path("verification_evidence.db")
         last = self._last_good_by_source.get("operations")
-        if not _exists_strict(db_path):
-            if last is not None and last.verification_db_present:
-                raise RuntimeError("verification_evidence.db disappeared")
+        if not self._present_or_confirmed_absent(
+            db_path.name,
+            _exists_strict(db_path),
+            had_last_good=last is not None and last.verification_db_present,
+        ):
             return operations
         # Confined to profile_home, not root_home: a path that resolves into a
         # *sibling* profile is still under the root, and this source is
@@ -3045,14 +3071,21 @@ class Collector:
         )
         if not trace_dir.is_absolute():
             trace_dir = self._paths.shared_path(trace_dir_value)
+        last = self._last_good_by_source.get("operations")
+        had_last_good = last is not None and bool(last.moa_trace_count)
+        if not self._present_or_confirmed_absent(
+            "MoA trace directory",
+            trace_dir.is_symlink() or _exists_strict(trace_dir),
+            had_last_good=had_last_good,
+        ):
+            return operations
         if (
             trace_dir.is_symlink()
             or not _path_resolves_under(trace_dir, self._paths.root_home)
             or not trace_dir.is_dir()
         ):
-            last = self._last_good_by_source.get("operations")
-            if last is not None and last.moa_trace_count:
-                raise RuntimeError("MoA trace directory disappeared or became unsafe")
+            if had_last_good:
+                raise RuntimeError("MoA trace directory became unsafe")
             return operations
         traces = [
             path
@@ -3079,9 +3112,11 @@ class Collector:
     def _with_projects(self, operations: OperationsState) -> OperationsState:
         db_path = self._paths.profile_path("projects.db")
         last = self._last_good_by_source.get("operations")
-        if not _exists_strict(db_path):
-            if last is not None and last.projects_db_present:
-                raise RuntimeError("projects.db disappeared")
+        if not self._present_or_confirmed_absent(
+            db_path.name,
+            _exists_strict(db_path),
+            had_last_good=last is not None and last.projects_db_present,
+        ):
             return operations
         # Confined to profile_home, not root_home: a sibling profile's projects.db
         # is still under the root, and this source is profile-scoped.
@@ -3101,15 +3136,15 @@ class Collector:
         they share the single (mtime-cached) readout with the gateway ledgers
         rather than taking a WAL snapshot each.
         """
-        readout = self._read_state_db()
+        last = self._last_good_by_source.get("operations")
+        readout = self._state_db_for(
+            "operations",
+            "state.db operations data",
+            had_last_good=last is not None
+            and bool(last.goal_count or last.delegation_count or last.state_db_schema_version),
+        )
         if readout is None:
-            last = self._last_good_by_source.get("operations")
-            if last is not None and (
-                last.goal_count or last.delegation_count or last.state_db_schema_version
-            ):
-                raise RuntimeError("state.db operations data disappeared or became unsafe")
             return operations
-        readout.raise_for("operations")
         db_path = self._paths.profile_path("state.db")
         update = _state_db_update(readout.state, now=self._clock(), pid_exists=self._pid_exists)
         update["state_db_size_bytes"] = _file_size(db_path)
@@ -3119,6 +3154,42 @@ class Collector:
             self._paths.root_home,
         )
         return operations.model_copy(update=update)
+
+    def _present_or_confirmed_absent(
+        self, label: str, present: bool, *, had_last_good: bool
+    ) -> bool:
+        """Return ``present``, raising on the first absent pass after a good read.
+
+        A second consecutive absent pass accepts the absence, so the source
+        reports the file gone instead of staying failed forever.
+        """
+        if present or not had_last_good:
+            self._absent_passes.pop(label, None)
+            return present
+        passes = self._absent_passes.get(label, 0) + 1
+        self._absent_passes[label] = passes
+        if passes < _ABSENCE_CONFIRM_PASSES:
+            raise RuntimeError(f"{label} disappeared")
+        return False
+
+    def _state_db_for(
+        self, source_name: str, label: str, *, had_last_good: bool
+    ) -> _StateDbReadout | None:
+        """The shared readout for one state.db source; None when absent or unsafe.
+
+        An absent state.db goes through the absence guard; one made unsafe after
+        a good read raises; a table-group error owned by this source re-raises.
+        """
+        present = _exists_strict(self._paths.profile_path("state.db"))
+        if not self._present_or_confirmed_absent(label, present, had_last_good=had_last_good):
+            return None
+        readout = self._read_state_db()
+        if readout is None:
+            if had_last_good:
+                raise RuntimeError(f"{label} became unsafe")
+            return None
+        readout.raise_for(source_name)
+        return readout
 
     def _read_state_db(self) -> _StateDbReadout | None:
         """Operations tables and gateway ledgers from one state.db pass; None when absent.
@@ -3222,9 +3293,11 @@ class Collector:
         """
         db_path = self._paths.shared_path("shared-state.db")
         last = self._last_good_by_source.get("hosted_rooms")
-        if not _exists_strict(db_path):
-            if last is not None and last.hosted_rooms.db_present:
-                raise RuntimeError("shared-state.db disappeared")
+        if not self._present_or_confirmed_absent(
+            db_path.name,
+            _exists_strict(db_path),
+            had_last_good=last is not None and last.hosted_rooms.db_present,
+        ):
             return operations
         # The symlink test is the load-bearing half: shared_path() can only
         # resolve outside root_home through a link, and this source is ROOT-scoped
@@ -3259,9 +3332,11 @@ class Collector:
         """
         db_path = self._paths.profile_path("runs_idempotency.db")
         last = self._last_good_by_source.get("api_runs")
-        if not _exists_strict(db_path):
-            if last is not None and last.api_runs.db_present:
-                raise RuntimeError("runs_idempotency.db disappeared")
+        if not self._present_or_confirmed_absent(
+            db_path.name,
+            _exists_strict(db_path),
+            had_last_good=last is not None and last.api_runs.db_present,
+        ):
             return operations
         # Confined to profile_home, not root_home: a sibling profile's store is
         # still under the root, and this source is profile-scoped.
