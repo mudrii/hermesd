@@ -6,7 +6,13 @@ import rich.box
 from rich.panel import Panel
 from rich.text import Text
 
-from hermesd.models import DashboardState, LogLine, SourceScope
+from hermesd.models import (
+    DashboardState,
+    LogHealthCounter,
+    LogLine,
+    LogStreamHealth,
+    SourceScope,
+)
 from hermesd.panels.formatting import sanitize_terminal_text
 from hermesd.theme import Theme
 
@@ -42,11 +48,11 @@ def _resolve_log_view(
     return log_map, sub_view, unfiltered, _filter_log_lines(unfiltered, filter_query)
 
 
-def _visible_line_count(detail_height: int | None, filter_query: str) -> int:
+def _visible_line_count(detail_height: int | None, filter_query: str, extra_rows: int = 0) -> int:
     """Log lines that fit in ``detail_height`` rows (fixed default when unknown)."""
     if detail_height is None:
         return _DETAIL_VISIBLE_LOG_LINES
-    chrome = _DETAIL_CHROME_ROWS + (1 if filter_query else 0)
+    chrome = _DETAIL_CHROME_ROWS + (1 if filter_query else 0) + extra_rows
     return max(_MIN_DETAIL_VISIBLE_LOG_LINES, detail_height - chrome)
 
 
@@ -54,8 +60,29 @@ def max_detail_scroll_offset(
     state: DashboardState, sub_view: str, filter_query: str, detail_height: int | None = None
 ) -> int:
     """Effective max scroll offset for the logs detail view."""
-    _, _, _, lines = _resolve_log_view(state, sub_view, filter_query)
-    return max(0, len(lines) - _visible_line_count(detail_height, filter_query))
+    _, sub_view, _, lines = _resolve_log_view(state, sub_view, filter_query)
+    extra = 1 if _stream_health(state, sub_view) is not None else 0
+    return max(0, len(lines) - _visible_line_count(detail_height, filter_query, extra))
+
+
+def _stream_health(state: DashboardState, sub_view: str) -> LogStreamHealth | None:
+    return next((entry for entry in state.logs.health if entry.stream == sub_view), None)
+
+
+def log_health_counter_label(counter: LogHealthCounter) -> str:
+    """``label 2/1h · 5/24h`` plus the undated backfill count when there is one."""
+    label = f"{counter.label} {counter.last_1h}/1h · {counter.last_24h}/24h"
+    if counter.undated:
+        label += f" (+{counter.undated} undated)"
+    return label
+
+
+def log_health_summary(health: LogStreamHealth) -> str:
+    """Every counter of one scanned stream, with the catch-up state."""
+    summary = " · ".join(log_health_counter_label(counter) for counter in health.counters)
+    if health.backlog_bytes:
+        summary += f" (catching up: {health.backlog_bytes:,} bytes left)"
+    return summary
 
 
 def render_logs(
@@ -131,8 +158,9 @@ def _render_detail(
     log_map, sub_view, unfiltered_lines, log_lines = _resolve_log_view(
         state, sub_view, filter_query
     )
+    health = _stream_health(state, sub_view)
     total = len(log_lines)
-    window = _visible_line_count(detail_height, filter_query)
+    window = _visible_line_count(detail_height, filter_query, 1 if health is not None else 0)
     max_offset = max(0, total - window)
     # Clamp both ends: a negative offset would slice from the end of the list
     # and render an empty page with a negative line counter.
@@ -150,6 +178,10 @@ def _render_detail(
     lines.append("\n")
     lines.append(" Scope: ", style=theme.ui_label)
     lines.append(_scope_label(state, sub_view), style=theme.ui_accent)
+    if health is not None:
+        lines.append("\n")
+        lines.append(" Health: ", style=theme.ui_label)
+        lines.append(sanitize_terminal_text(log_health_summary(health)), style=theme.banner_text)
     if filter_query:
         lines.append("\n")
         lines.append(" Filter: ", style=theme.ui_label)

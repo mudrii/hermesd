@@ -33,6 +33,7 @@ from hermesd.models import (
 )
 from hermesd.panels.formatting import escape_terminal_text as escape
 from hermesd.panels.formatting import fmt_age_seconds, sanitize_terminal_text
+from hermesd.panels.logs import log_health_summary
 from hermesd.theme import Theme
 
 # Rendered under the Database Recovery section. Every line is a limit on what the
@@ -188,6 +189,10 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
             f"{ops.pending_action_total} (oldest {fmt_age_seconds(oldest)})\n",
             style=theme.ui_warn,
         )
+    health_line = _log_health_compact(state)
+    if health_line:
+        lines.append("  Log health: ", style=theme.ui_label)
+        lines.append(f"{health_line}\n", style=theme.banner_text)
     disk_warnings = _disk_warnings(state.disk)
     if disk_warnings:
         lines.append("  ⚠ Disk: ", style=theme.ui_warn)
@@ -284,6 +289,10 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
                     style=theme.banner_dim,
                 )
             )
+
+    if state.logs.health:
+        sections.append(_heading("Log Health", theme))
+        sections.append(_log_health_table(state, theme))
 
     if _disk_has_readout(state.disk):
         sections.append(_heading("Disk & Retention", theme))
@@ -933,6 +942,38 @@ def _delegation_procs_label(delegation: DelegationInfo) -> str:
     if delegation.unread_completion_count:
         parts.append(f"{delegation.unread_completion_count} unread")
     return " · ".join(parts) if parts else "—"
+
+
+# Compact labels for the counters worth a glance on the overview.
+_LOG_HEALTH_COMPACT_LABELS = {
+    "mcp_server_starts": "MCP starts",
+    "gateway_errors": "gateway errors",
+    "workspace_crashes": "workspace crashes",
+}
+
+
+def _log_health_compact(state: DashboardState) -> str:
+    """One line of last-hour rates, only for counters with events in 24h."""
+    parts = [
+        f"{_LOG_HEALTH_COMPACT_LABELS[counter.key]} {counter.last_1h}/1h"
+        for health in state.logs.health
+        for counter in health.counters
+        if counter.key in _LOG_HEALTH_COMPACT_LABELS and counter.last_24h
+    ]
+    return " · ".join(parts)
+
+
+def _log_health_table(state: DashboardState, theme: Theme) -> Table:
+    """Per-stream counters with the top repeated signatures (escaped)."""
+    table = Table(box=None, show_header=False, padding=(0, 2))
+    table.add_column("Key", style=theme.ui_label)
+    table.add_column("Value", style=theme.banner_text)
+    for health in state.logs.health:
+        table.add_row(escape(health.path), escape(log_health_summary(health)))
+        for top in health.top:
+            count = f"{top.last_24h}/24h" + (f" (+{top.undated} undated)" if top.undated else "")
+            table.add_row("", f"[{theme.banner_dim}]{count}[/]  {escape(top.signature)}")
+    return table
 
 
 def _disk_warnings(disk: DiskUsageState) -> list[str]:

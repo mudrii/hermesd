@@ -133,6 +133,8 @@ from hermesd.collect.logs import (
     _LOG_LINE_PATTERN,
     _LOG_TAIL_LINES,
     _MAX_LOG_LINE_CHARS,
+    LOG_HEALTH_SPECS,
+    IncrementalLogScanner,
     _extract_session_id,
     _latest_log_mtime,
 )
@@ -838,6 +840,9 @@ class Collector:
         self._tree_size_cache: TreeSizeCache = {}
         # Per-file (observed-at, size) samples behind the log growth rates.
         self._log_growth_samples: LogGrowthSamples = {}
+        # One incremental scanner per health-scanned log file (byte offset,
+        # inode and 24h event window survive between refreshes).
+        self._log_health_scanners: dict[str, IncrementalLogScanner] = {}
         self._checkpoint_summary_cache: dict[
             str, tuple[tuple[int, ...], tuple[int, float | None, str]]
         ] = {}
@@ -1265,6 +1270,18 @@ class Collector:
             _SourceSpec("memory", "memory", self._collect_memory, MemoryOverview),
             _SourceSpec("profiles", "profiles", self._collect_profiles, ProfilesState),
             _SourceSpec("logs", "logs", self._collect_logs, LogState),
+            # Second writer of `logs`: incremental health counters over the big
+            # unrotated logs. A read failure keeps the last-good counters while
+            # the tails beside them stay fresh.
+            _SourceSpec(
+                "logs",
+                "log_health",
+                lambda: self._with_log_health(results["logs"]),
+                lambda: results["logs"],
+                fallback=lambda: self._last_source_fields(
+                    "log_health", results["logs"], ("health",)
+                ),
+            ),
             _SourceSpec("version_behind", "version_check", self._collect_version_behind, int),
             # Without a last good read the fallback is the shipped skin name,
             # not the "" that the str default factory would yield.
@@ -4382,6 +4399,29 @@ class Collector:
             cron_lines=cron_lines,
             streams=streams,
         )
+
+    def _with_log_health(self, logs: LogState) -> LogState:
+        """Health counters over ROOT ``logs/mcp-stderr.log``, ``gateway.error.log``
+        and ``workspace.log``, read incrementally (only appended bytes).
+
+        The same root copies the Logs panel tails: ``tools/mcp_tool_config.py:
+        31-35,62-67`` (MCP server banners), ``hermes_cli/gateway_launchd.py:
+        265-278`` with ``hermes_cli/stderr_timestamp.py:19-30`` (timestamped
+        gateway stderr); ``workspace.log`` has no upstream writer in the
+        checkout and is read by observation, as the ``logs`` source reads it.
+        """
+        now = self._clock()
+        health = []
+        for filename, spec in LOG_HEALTH_SPECS:
+            scanner = self._log_health_scanners.get(filename)
+            if scanner is None:
+                scanner = self._log_health_scanners[filename] = IncrementalLogScanner(spec)
+            result = scanner.scan(
+                self._paths.shared_path("logs", filename), self._paths.root_home, now
+            )
+            if result is not None:
+                health.append(result)
+        return logs.model_copy(update={"health": health})
 
     def _collect_profiles(self) -> ProfilesState:
         profiles_dir = self._paths.shared_path("profiles")

@@ -1668,12 +1668,60 @@ class LogStream(BaseModel):
     lines: list[LogLine] = Field(default_factory=list)
 
 
+class LogHealthCounter(BaseModel):
+    """One event class counted in an incrementally scanned log.
+
+    ``last_1h``/``last_24h`` count dated events: the line's own timestamp, the
+    nearest timestamp above it in the same file, or — for lines appended while
+    hermesd watches a log that carries no timestamps — the refresh that first
+    saw them. ``undated`` counts events found in the initial backfill of a log
+    with no usable timestamp, which cannot be placed in either window.
+    """
+
+    key: str
+    label: str
+    last_1h: int = 0
+    last_24h: int = 0
+    undated: int = 0
+    last_seen_age_seconds: float | None = None
+
+
+class LogSignatureCount(BaseModel):
+    """A repeated error signature (or MCP server name) with its 24h count."""
+
+    signature: str
+    last_24h: int = 0
+    undated: int = 0
+    last_seen_age_seconds: float | None = None
+
+
+class LogStreamHealth(BaseModel):
+    """Health counters for one log scanned incrementally (source ``log_health``).
+
+    Only appended bytes are read once a log has been caught up; the first sight
+    of a log scans at most a bounded backfill from its end, a chunk per
+    refresh, so ``backlog_bytes`` is non-zero while that catch-up is running and
+    counts cover only ``scanned_bytes`` of history.
+    """
+
+    stream: str
+    path: str = ""
+    size_bytes: int = 0
+    scanned_bytes: int = 0
+    backlog_bytes: int = 0
+    oldest_event_age_seconds: float | None = None
+    counters: list[LogHealthCounter] = Field(default_factory=list)
+    top: list[LogSignatureCount] = Field(default_factory=list)
+
+
 class LogState(BaseModel):
     agent_lines: list[LogLine] = Field(default_factory=list)
     gateway_lines: list[LogLine] = Field(default_factory=list)
     error_lines: list[LogLine] = Field(default_factory=list)
     cron_lines: list[LogLine] = Field(default_factory=list)
     streams: list[LogStream] = Field(default_factory=list)
+    # Written by its own source (``log_health``).
+    health: list[LogStreamHealth] = Field(default_factory=list)
 
 
 class ChannelPlatformInfo(BaseModel):
