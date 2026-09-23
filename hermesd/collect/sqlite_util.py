@@ -5,11 +5,18 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import tempfile
+import threading
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from hermesd.collect.common import _exists_strict, _optional_epoch
+from hermesd.collect.common import (
+    _db_source_signature,
+    _DbSourceSignature,
+    _exists_strict,
+    _optional_epoch,
+)
 from hermesd.db import _SQLITE_TIMEOUT_SECONDS, readonly_sqlite_uri, snapshot_wal_database
 
 
@@ -69,17 +76,98 @@ def _connect_readonly_sqlite(
         with _connect_resolved_sqlite(db_path, immutable=False) as resolved_conn:
             yield resolved_conn
         return
-    snapshot = _snapshot_wal_if_present(db_path)
-    if snapshot is None:
+    entry = _SNAPSHOTS.acquire(db_path)
+    if entry is None:
         with _connect_resolved_sqlite(db_path, immutable=True) as conn:
             yield conn
         return
-    snapshot_dir, snapshot_db = snapshot
     try:
-        with _connect_resolved_sqlite(snapshot_db, immutable=False) as conn:
+        with _connect_resolved_sqlite(entry.path, immutable=False) as conn:
             yield conn
     finally:
-        snapshot_dir.cleanup()
+        _SNAPSHOTS.release(entry)
+
+
+@dataclass
+class _SnapshotEntry:
+    signature: _DbSourceSignature
+    owner: tempfile.TemporaryDirectory[str]
+    path: Path
+    users: int = 0
+    superseded: bool = False
+
+
+class _SnapshotCache:
+    """WAL snapshots reused until the source db or its -wal changes.
+
+    Readers poll every refresh, and copying each WAL database into a fresh temp
+    dir every time rewrote the same bytes over and over. An entry is keyed on the
+    (mtime, size, inode) signature of the db and its -wal; the signature is taken
+    before copying, so a write racing the copy only ever makes the entry *newer*
+    than its key, which the next refresh re-copies. A superseded entry that a
+    reader still holds open is deleted when that reader releases it.
+    """
+
+    def __init__(self, limit: int = 16) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[str, _SnapshotEntry] = {}
+        self._limit = limit
+
+    def acquire(self, db_path: Path) -> _SnapshotEntry | None:
+        wal_path = db_path.with_name(f"{db_path.name}-wal")
+        if wal_path.is_symlink():
+            raise OSError(f"Refusing to open database with unsafe SQLite WAL sidecar: {wal_path}")
+        # Strict, not Path.exists(): see _snapshot_wal_if_present.
+        if not _exists_strict(wal_path):
+            return None
+        key = str(db_path)
+        signature = _db_source_signature(db_path)
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None and signature is not None and entry.signature == signature:
+                entry.users += 1
+                return entry
+            if entry is not None:
+                self._retire(key)
+        owner, snapshot_db = snapshot_wal_database(db_path, prefix="hermesd-sqlite-")
+        fresh = _SnapshotEntry(signature or (), owner, snapshot_db, users=1)
+        with self._lock:
+            if signature is None:
+                # Unknown signature: never reuse, drop on release.
+                fresh.superseded = True
+                return fresh
+            if key in self._entries:
+                self._retire(key)
+            if len(self._entries) >= self._limit:
+                for stale_key in list(self._entries):
+                    self._retire(stale_key)
+            self._entries[key] = fresh
+        return fresh
+
+    def release(self, entry: _SnapshotEntry) -> None:
+        with self._lock:
+            entry.users -= 1
+            if entry.superseded and entry.users <= 0:
+                entry.owner.cleanup()
+
+    def clear(self) -> None:
+        with self._lock:
+            for key in list(self._entries):
+                self._retire(key)
+
+    def _retire(self, key: str) -> None:
+        entry = self._entries.pop(key)
+        entry.superseded = True
+        if entry.users <= 0:
+            entry.owner.cleanup()
+
+
+_SNAPSHOTS = _SnapshotCache()
+
+
+def clear_snapshot_cache() -> None:
+    """Delete every idle cached WAL snapshot; in-use ones go on release."""
+    _SNAPSHOTS.clear()
 
 
 # Every table hermesd reads by name. `_table_count` and `_column_exists` splice
