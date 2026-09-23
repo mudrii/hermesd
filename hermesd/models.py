@@ -216,6 +216,11 @@ class GatewayState(BaseModel):
     # distinguishable from "no live record" — while ``served_profiles`` still keeps
     # the names a dead gateway left behind, as preserved rather than current.
     served_profiles_recorded: bool = False
+    # Why the live gateway stayed standalone instead of multiplexing: the boot
+    # guard's reason, persisted by ``record_multiplex_decision``
+    # (hermes_cli/gateway_multiplex_mode.py:194-199) and cleared on any other
+    # verdict. Redacted and capped; empty unless the state-file writer is live.
+    multiplex_standalone_reason: str = ""
     scale_to_zero_idle_timeout_minutes: int = 0
     scale_to_zero_relay_only: bool = False
     # Event-loop liveness (state/gateway.heartbeat)
@@ -307,19 +312,18 @@ class MigrationVerificationGap(StrEnum):
     """Which clause of the verified predicate hermesd could not satisfy.
 
     ``NONE`` is the only value that licenses a "multiplexed (verified)" claim.
-    Every other value names *missing evidence*, never an outcome: upstream writes
-    the manifest before it flips the multiplex flag and restarts the default
-    gateway, and never updates it afterwards, so the file cannot tell a migration
-    still in flight from one that was applied and never verified — and neither can
-    hermesd. ``NO_MANIFEST`` is likewise ambiguous: rollback deletes the manifest on
-    success, so absence means "never migrated OR successfully rolled back".
+    Every other value names *missing evidence*, never an outcome. Convergence is
+    TOPOLOGY, not a config flag (``hermes_cli/gateway_migrate.py:1-8,130-139``), so
+    the multiplex flag is not a clause: an explicit ``false`` is retired and ignored
+    at boot. ``NO_MANIFEST`` is ambiguous: upstream deletes the manifest on confirmed
+    convergence and after a successful compensation, so absence means "never
+    migrated, converged, or compensated".
     """
 
     NONE = ""
     NO_MANIFEST = "no_manifest"
     MANIFEST_UNREADABLE = "manifest_unreadable"
     MANIFEST_INVALID = "manifest_invalid"
-    FLAG_OFF = "flag_off"
     GATEWAY_NOT_LIVE = "gateway_not_live"
     SERVED_NOT_RECORDED = "served_not_recorded"
     PROFILES_UNSERVED = "profiles_unserved"
@@ -329,9 +333,8 @@ class MigrationVerificationGap(StrEnum):
 class MigrationProfileRecord(BaseModel):
     """One profile's standalone-gateway footprint as recorded in the manifest.
 
-    ``home`` is display data that hermesd never resolves: upstream's rollback builds
-    ``Path(rec["home"])`` straight from this file (``gateway_migrate.py:594``), and
-    an untrusted manifest must not be able to steer a hermesd read. ``served`` is
+    ``home`` is display data that hermesd never resolves: an untrusted manifest must
+    not be able to steer a hermesd read. ``served`` is
     coverage by the *live* default gateway's recorded ``served_profiles``, so it is
     always False when nothing live was recorded.
     """
@@ -345,7 +348,7 @@ class MigrationProfileRecord(BaseModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def service_label(self) -> str:
-        """Upstream's own ``ProfileGateway.service_label()`` wording (``:48-52``)."""
+        """Upstream's ``_service_label`` wording (``gateway_migrate.py:88-92``)."""
         if not self.service_kind:
             return "none"
         if self.service_kind == "systemd":
@@ -354,30 +357,33 @@ class MigrationProfileRecord(BaseModel):
 
 
 class MigrationState(BaseModel):
-    """``gateway_migration.json``: recorded intent, progress, and one verified verdict.
+    """``gateway_migration.json``: an unfinished migration, its progress, one verdict.
 
-    Three things are kept apart on purpose, because the manifest conflates them:
+    Three things are kept apart on purpose:
 
     * **recorded intent** — the manifest contents. ``migrated_at`` means "the attempt
-      began at": upstream builds the dict and writes it *inside* the per-secondary
-      loop (``gateway_migrate.py:528-544``), before ``_write_multiplex_flag``
-      (``:545``) and before ``_restart_default`` (``:549``), rewrites it
-      byte-identically at ``:546``, and then never touches it again on either the
-      verified (``:553-557``) or the unverified (``:558-561``) path. There is no
-      ``completed``/``verified``/``outcome`` field, so the file is a start marker.
+      began at": upstream writes the dict once, before the first destructive step
+      (``gateway_migrate.py:945-953``), and never rewrites it. It deletes the file
+      when the apply confirms the default gateway serves every profile
+      (``:967-973``) and after a successful compensation (``:1059``, ``:1087``), so a
+      manifest on disk means the migration is UNFINISHED; re-running
+      ``hermes gateway migrate --multiplex`` resumes from it.
     * **intermediate progress** — ``flag_flipped``, ``default_gateway_live``,
       ``served_recorded`` and each record's ``served``: re-read every pass, and each
       one true of a migration that crashed halfway.
     * **verified current topology** — ``migration_verified``, derived from a
-      predicate over artifacts hermesd can actually read.
+      predicate over artifacts hermesd can actually read. A verified topology can
+      still leave a manifest behind (``already_multiplexed`` short-circuits without
+      deleting it, ``:130-139``).
 
-    ``multiplex_flag_on`` mirrors upstream's *reader* (``:203-215``), which ORs a
-    stale top-level ``multiplex_profiles`` alias with ``gateway.multiplex_profiles``
-    after an environment override hermesd cannot see — so every verdict built on it
-    is labelled "as recorded in config".
+    ``multiplex_flag_on`` is the explicit opt-in as upstream's
+    ``explicit_multiplex_flag`` reads it (``gateway_multiplex_mode.py:49-72``), minus
+    an environment override hermesd cannot see — so it is labelled "as recorded in
+    config". ``multiplex_flag_retired_off`` is an explicit ``false``, which is retired:
+    parsed, logged and resolved like an unset key (``:161-191``).
 
     Known limit: upstream verifies against every profile in its plan
-    (``expected = {p.name for p in plan.profiles}``, ``:551-552``), which includes
+    (``expected = {p.name for p in plan.profiles}``, ``:967``), which includes
     profiles that never had a standalone gateway and so are *not* in the manifest.
     hermesd can only see the manifest, so its expected set is a subset of upstream's
     and its verdict is correspondingly weaker.
@@ -385,8 +391,8 @@ class MigrationState(BaseModel):
 
     # Recorded intent (the manifest, never rewritten after the attempt began)
     manifest_present: bool = False
-    # A present manifest hermesd could not parse: upstream writes it with a plain
-    # write_text, so a torn file is observable mid-write. Distinct from absent.
+    # A present manifest hermesd could not parse (upstream writes it atomically, so
+    # this is a hand-edited or foreign file). Distinct from absent.
     manifest_parsed: bool = False
     # Parsed JSON can still be an unsupported or malformed migration schema.
     # Its intent remains displayable, but it cannot license a verified verdict.
@@ -401,6 +407,7 @@ class MigrationState(BaseModel):
     secondaries_truncated: bool = False
     # Intermediate progress, re-read every pass
     multiplex_flag_on: bool = False
+    multiplex_flag_retired_off: bool = False
     default_gateway_live: bool = False
     served_recorded: bool = False
 
@@ -437,8 +444,6 @@ class MigrationState(BaseModel):
             return MigrationVerificationGap.MANIFEST_UNREADABLE
         if not self.manifest_schema_valid:
             return MigrationVerificationGap.MANIFEST_INVALID
-        if not self.multiplex_flag_on:
-            return MigrationVerificationGap.FLAG_OFF
         if not self.default_gateway_live:
             return MigrationVerificationGap.GATEWAY_NOT_LIVE
         if not self.served_recorded:

@@ -113,6 +113,7 @@ from hermesd.collect.gateway import (
     _lifecycle_status,
     _loop_tick_probe_plan,
     _loop_tick_verdict,
+    _multiplex_standalone_reason,
     _platform_status,
     _read_exit_diag,
     _read_forensic_companions,
@@ -1014,9 +1015,9 @@ class Collector:
                     "gateway_ledgers", results["gateway"], _LEDGER_FIELDS
                 ),
             ),
-            # Own source_name so a torn gateway_migration.json (upstream writes it
-            # with a plain write_text) degrades only the migration verdict and keeps
-            # its own last-good value, leaving the gateway beside it fresh.
+            # Own source_name so a malformed gateway_migration.json (upstream writes
+            # it atomically, so hand-edited or foreign) degrades only the migration
+            # verdict and keeps its own last-good value, leaving the gateway fresh.
             _SourceSpec(
                 "migration",
                 "migration",
@@ -1650,6 +1651,9 @@ class Collector:
             drain_suppress_notification=_coerce_bool(drain_request.get("suppress_notification")),
             served_profiles=served_names,
             served_profiles_recorded=served_recorded,
+            multiplex_standalone_reason=_multiplex_standalone_reason(
+                data, record_current=recorded_writer_live
+            ),
             scale_to_zero_idle_timeout_minutes=_coerce_int(scale_cfg.get("idle_timeout_minutes")),
             scale_to_zero_relay_only=_scale_to_zero_relay_only(scale_cfg, platforms),
         )
@@ -1856,15 +1860,15 @@ class Collector:
         """Read ``gateway_migration.json`` and judge it against the live artifacts.
 
         ROOT-scoped: upstream anchors the manifest at the *default* profile home
-        (``hermes_cli/gateway_migrate.py:467-468``), never a secondary's, so a
+        (``hermes_cli/gateway_migrate.py:741-742``), never a secondary's, so a
         served profile has no copy of its own to read.
 
         Presence is checked separately from parseability because the two carry
-        different meanings: absent is "never migrated OR successfully rolled back",
-        while present-but-unparseable is a torn ``write_text`` mid-flight. A file
-        that was readable and then vanished or turned unsafe *raises*, so the source
-        is marked failed and its last-good verdict stays on display instead of
-        silently reporting "no migration".
+        different meanings: absent is "never migrated, converged, or compensated",
+        present means an unfinished migration, and present-but-unparseable is a
+        hand-edited or foreign file (upstream writes it atomically). A file that was
+        readable and then vanished or turned unsafe fails the source for one pass
+        (see ``_present_or_confirmed_absent``) before the absence is accepted.
         """
         if not gateway_fresh:
             raise RuntimeError("gateway dependency is stale; keeping last-good migration verdict")

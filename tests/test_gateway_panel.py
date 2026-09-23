@@ -563,7 +563,6 @@ def test_gateway_detail_reports_a_verified_multiplex_topology() -> None:
     [
         ({"served_recorded": False}, "no live gateway recorded a served-profile set"),
         ({"default_gateway_live": False}, "the default gateway is not live"),
-        ({"multiplex_flag_on": False}, "gateway.multiplex_profiles is off as recorded in config"),
         ({"manifest_parsed": False}, "gateway_migration.json is present but unreadable"),
         ({"manifest_schema_valid": False}, "manifest schema is malformed or unsupported"),
     ],
@@ -571,10 +570,10 @@ def test_gateway_detail_reports_a_verified_multiplex_topology() -> None:
 def test_gateway_detail_names_the_missing_evidence(
     overrides: dict[str, object], expected: str
 ) -> None:
-    """Unverified says *what* could not be verified, never that the migration failed."""
+    """Unfinished says *what* could not be verified, never that the migration failed."""
     rendered = _render_migration(_migration_dashboard(**overrides))
 
-    assert "migration unverified" in rendered
+    assert "migration unfinished" in rendered
     assert expected in rendered
     assert "multiplexed (verified)" not in rendered
 
@@ -590,7 +589,7 @@ def test_gateway_detail_names_the_profiles_the_live_set_does_not_cover() -> None
 
     rendered = _render_migration(state)
 
-    assert "migration unverified" in rendered
+    assert "migration unfinished" in rendered
     assert "not in the live served set: coding" in rendered
     assert "dev" in rendered
 
@@ -604,7 +603,7 @@ def test_gateway_detail_reports_a_truncated_secondary_list() -> None:
 
     rendered = _render_migration(state)
 
-    assert "migration unverified" in rendered
+    assert "migration unfinished" in rendered
     assert "only the first 1 of 60 recorded secondaries were retained" in rendered
 
 
@@ -696,7 +695,7 @@ def test_gateway_detail_shows_multiplex_config_without_a_manifest() -> None:
 
     assert "Multiplex Migration" in rendered
     assert "no migration manifest" in rendered
-    assert "migration unverified" not in rendered
+    assert "migration unfinished" not in rendered
     assert "multiplexed (verified)" not in rendered
 
 
@@ -710,10 +709,10 @@ def test_gateway_detail_omits_the_section_without_a_manifest_or_a_flag() -> None
     assert "Multiplex Migration" not in rendered
 
 
-def test_gateway_compact_warns_about_an_unverified_migration() -> None:
+def test_gateway_compact_warns_about_an_unfinished_migration() -> None:
     rendered = _render_migration(_migration_dashboard(served_recorded=False), detail=False)
 
-    assert "migration unverified" in rendered
+    assert "migration unfinished" in rendered
 
 
 def test_gateway_compact_stays_quiet_about_a_verified_migration() -> None:

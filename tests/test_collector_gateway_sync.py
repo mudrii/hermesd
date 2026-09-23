@@ -126,3 +126,46 @@ def test_degraded_gateway_counts_as_live_for_uptime_migration_and_runtime(hermes
     assert state.gateway.current_incarnation_uptime_seconds == pytest.approx(3600.0)
     assert state.migration.default_gateway_live is True
     assert state.runtime.agent_running is True
+
+
+# --------------------------------------------------------------------------
+# multiplex_standalone_reason (hermes_cli/gateway_multiplex_mode.py:194-199)
+# --------------------------------------------------------------------------
+
+
+def test_standalone_reason_of_a_live_gateway_is_surfaced(hermes_home: Path):
+    _write_gateway_state(
+        hermes_home, multiplex_standalone_reason="profiles 'default' and 'dev' share a token"
+    )
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.multiplex_standalone_reason == "profiles 'default' and 'dev' share a token"
+
+
+def test_standalone_reason_of_a_dead_gateway_is_not_current(hermes_home: Path):
+    """Upstream prints it only for a running gateway (hermes_cli/gateway.py:5046,5054)."""
+    _write_gateway_state(hermes_home, multiplex_standalone_reason="stale reason")
+
+    gateway = _collect(hermes_home, live_pid=-1).gateway
+
+    assert gateway.multiplex_standalone_reason == ""
+
+
+@pytest.mark.parametrize("value", [None, "", 7, ["x"], {"a": 1}])
+def test_standalone_reason_ignores_non_string_values(hermes_home: Path, value: object):
+    _write_gateway_state(hermes_home, multiplex_standalone_reason=value)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert gateway.multiplex_standalone_reason == ""
+
+
+def test_standalone_reason_is_redacted_and_bounded(hermes_home: Path):
+    secret = "sk-" + "A" * 40
+    _write_gateway_state(hermes_home, multiplex_standalone_reason=f"token {secret} " + "x" * 5000)
+
+    gateway = _collect(hermes_home).gateway
+
+    assert secret not in gateway.multiplex_standalone_reason
+    assert len(gateway.multiplex_standalone_reason) <= 800

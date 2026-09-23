@@ -126,6 +126,14 @@ _WATCHDOG_EXIT_WORDING = {
 }
 
 
+# Upstream's convergence command (``MIGRATE_COMMAND``, hermes_cli/gateway_migrate.py:38).
+_MIGRATE_COMMAND = "hermes gateway migrate --multiplex"
+# The boot guard's single-profile verdict (``SINGLE_PROFILE_REASON``,
+# hermes_cli/gateway_multiplex_mode.py:28): standalone because there is nothing to
+# multiplex, which is not worth a compact warning.
+_SINGLE_PROFILE_REASON = "only one profile exists (nothing to multiplex)"
+
+
 def _serving_badge(gw: GatewayState, theme: Theme) -> tuple[str, str]:
     """Dot colour and label for a live gateway: ``degraded`` is serving, but a warning."""
     if gw.degraded:
@@ -310,6 +318,15 @@ def _status_header(state: DashboardState, theme: Theme) -> Text:
     if gw.drain_active:
         _append_drain(header, gw, theme)
     _append_served_profiles(header, gw, theme)
+    if gw.multiplex_standalone_reason:
+        header.append("\n  Standalone: ", style=theme.ui_warn)
+        header.append(
+            sanitize_terminal_text(gw.multiplex_standalone_reason), style=theme.banner_text
+        )
+        header.append(
+            f"\n    serves only the launching profile; fold every profile with `{_MIGRATE_COMMAND}`",
+            style=theme.banner_dim,
+        )
     if gw.scale_to_zero_idle_timeout_minutes:
         relay = " relay-only" if gw.scale_to_zero_relay_only else ""
         header.append(
@@ -445,10 +462,12 @@ def _append_compact_warnings(lines: Text, state: DashboardState, theme: Theme) -
         warnings.append("⚠ update unfinished")
     if gw.runtime_code_skew:
         warnings.append("⚠ code skew")
-    # A manifest proves an attempt began, never that it finished: warn whenever one
-    # exists and the live artifacts do not verify the topology it aimed at.
+    # A manifest on disk marks an unfinished migration: warn whenever one exists and
+    # the live artifacts do not verify the topology it aimed at.
     if state.migration.manifest_present and not state.migration.migration_verified:
-        warnings.append("⚠ migration unverified")
+        warnings.append("⚠ migration unfinished")
+    if gw.multiplex_standalone_reason and gw.multiplex_standalone_reason != _SINGLE_PROFILE_REASON:
+        warnings.append("⚠ standalone (not multiplexing)")
     preserved = sum(1 for p in gw.platforms if p.ownership is PlatformOwnership.PRESERVED)
     if preserved:
         warnings.append(f"⚠ {preserved} platform record(s) outlived their writer")
@@ -648,16 +667,17 @@ def _append_skew_verdict(text: Text, gw: GatewayState, theme: Theme) -> None:
 def _migration_section(mig: MigrationState, theme: Theme) -> list[RenderableType]:
     """The multiplex-migration manifest, kept strictly separate from a success claim.
 
-    Upstream writes ``gateway_migration.json`` *before* it flips
-    ``gateway.multiplex_profiles`` and restarts the default gateway, and never
-    updates it afterwards, so the file records that an attempt began and nothing
-    about how it ended. This section therefore shows three separate things: the
-    recorded intent, the intermediate progress hermesd can re-read, and one verdict
-    that is only ever "multiplexed (verified)" when the live artifacts cover the
-    recorded set. The words "migrated" and "migration complete" are deliberately
-    absent from every branch.
+    Upstream writes ``gateway_migration.json`` once, before its first destructive
+    step, and deletes it only when the apply confirms the default gateway serves
+    every profile (``hermes_cli/gateway_migrate.py:967-973``) or the failed-apply
+    compensator restores a gateway. A manifest on disk therefore marks an
+    UNFINISHED migration that ``hermes gateway migrate --multiplex`` resumes. This
+    section shows three separate things: the recorded intent, the intermediate
+    progress hermesd can re-read, and one verdict that is only ever
+    "multiplexed (verified)" when the live artifacts cover the recorded set. The
+    words "migrated" and "migration complete" are deliberately absent.
     """
-    if not (mig.manifest_present or mig.multiplex_flag_on):
+    if not (mig.manifest_present or mig.multiplex_flag_on or mig.multiplex_flag_retired_off):
         return []
     text = Text()
     text.append("\nMultiplex Migration\n", style=f"bold {theme.ui_label}")
@@ -676,23 +696,21 @@ def _append_migration_verdict(text: Text, mig: MigrationState, theme: Theme) -> 
         text.append("  ● ", style=f"bold {theme.ui_ok}")
         text.append("multiplexed (verified)", style=theme.ui_ok)
         text.append(
-            "\n    against gateway.multiplex_profiles as recorded in config and the"
-            " live served-profile record\n",
+            "\n    the live served-profile record covers every recorded profile; the"
+            " manifest is still on disk (upstream removes it only when an apply"
+            " confirms convergence)\n",
             style=theme.banner_dim,
         )
         return
     if not mig.manifest_present:
-        # No manifest: never migrated, or rolled back — the two are indistinguishable
-        # because rollback deletes the file. Nothing here was ever an attempt.
-        text.append(
-            f"  multiplexing is on as recorded in config; {_migration_gap_sentence(mig)}\n",
-            style=theme.banner_dim,
-        )
+        # No manifest: never migrated, converged, or compensated — upstream deletes
+        # the file in the last two cases, so the three are indistinguishable.
+        text.append(f"  {_migration_gap_sentence(mig)}\n", style=theme.banner_dim)
         return
     text.append("  ⚠ ", style=f"bold {theme.ui_warn}")
-    text.append("migration unverified", style=theme.ui_warn)
+    text.append("migration unfinished", style=theme.ui_warn)
     text.append(
-        f"\n    not verified: {_migration_gap_sentence(mig)}\n",
+        f"\n    resume with `{_MIGRATE_COMMAND}`; not verified: {_migration_gap_sentence(mig)}\n",
         style=theme.banner_dim,
     )
 
@@ -704,8 +722,6 @@ def _migration_gap_sentence(mig: MigrationState) -> str:
         return "gateway_migration.json is present but unreadable"
     if gap is MigrationVerificationGap.MANIFEST_INVALID:
         return "the manifest schema is malformed or unsupported"
-    if gap is MigrationVerificationGap.FLAG_OFF:
-        return "gateway.multiplex_profiles is off as recorded in config"
     if gap is MigrationVerificationGap.GATEWAY_NOT_LIVE:
         return "the default gateway is not live"
     if gap is MigrationVerificationGap.SERVED_NOT_RECORDED:
@@ -720,12 +736,12 @@ def _migration_gap_sentence(mig: MigrationState) -> str:
         # profile names instead of escaping them.
         names = ", ".join(sanitize_terminal_text(name) for name in mig.unserved_profiles)
         return f"not in the live served set: {names}"
-    return "no migration manifest recorded"
+    return "no migration manifest recorded (none pending)"
 
 
 def _append_migration_intent(text: Text, mig: MigrationState, theme: Theme) -> None:
     """What the manifest recorded, with ``migrated_at`` labelled as a start."""
-    if not mig.manifest_parsed:
+    if mig.manifest_present and not mig.manifest_parsed:
         text.append(
             "  Recorded: gateway_migration.json could not be parsed this pass",
             style=theme.ui_warn,
@@ -743,15 +759,31 @@ def _append_migration_intent(text: Text, mig: MigrationState, theme: Theme) -> N
         )
         text.append(suffix, style=theme.banner_dim)
     text.append("\n  Config flag: ", style=theme.ui_label)
-    text.append(
-        f"gateway.multiplex_profiles {'on' if mig.multiplex_flag_on else 'off'}",
-        style=theme.banner_text,
+    text.append(_multiplex_flag_label(mig), style=theme.banner_text)
+    recorded = (
+        f" (manifest recorded {'on' if mig.flag_was else 'off'})" if mig.manifest_parsed else ""
     )
     text.append(
-        f" (manifest recorded {'on' if mig.flag_was else 'off'})"
-        " — as recorded in config, an env override is invisible here",
+        f"{recorded} — as recorded in config, an env override is invisible here",
         style=theme.banner_dim,
     )
+
+
+def _multiplex_flag_label(mig: MigrationState) -> str:
+    """The flag in upstream's multiplex-only vocabulary; ``false`` is no opt-out.
+
+    ``hermes_cli/gateway_multiplex_mode.py:161-191``: an explicit ``true`` is never
+    second-guessed, an unset key is the default (on) the gateway settles at boot,
+    and an explicit ``false`` is retired — logged and resolved like an unset key.
+    """
+    if mig.multiplex_flag_on:
+        return "gateway.multiplex_profiles true (explicit)"
+    if mig.multiplex_flag_retired_off:
+        return (
+            "gateway.multiplex_profiles false — retired / ignored: one gateway per host"
+            " serves every profile"
+        )
+    return "gateway.multiplex_profiles unset — default on, settled by the gateway at boot"
 
 
 def _append_migration_progress(text: Text, mig: MigrationState, theme: Theme) -> None:

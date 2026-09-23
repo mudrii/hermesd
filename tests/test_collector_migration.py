@@ -1,12 +1,12 @@
-"""F19 — ``gateway_migration.json`` is progress evidence, never proof of success.
+"""F19 — ``gateway_migration.json`` marks an unfinished migration, never a success.
 
-Upstream writes the manifest *inside* the per-secondary loop, before it flips
-``gateway.multiplex_profiles`` and before it restarts the default gateway, and
-never touches it again on either the verified or the unverified exit path
-(``hermes_cli/gateway_migrate.py:528-561``). There is no ``completed`` /
-``verified`` / ``outcome`` field. So a manifest on disk cannot distinguish
-mid-flight from crashed, applied-but-unverified, or fully verified, and every
-test here pins one of those separations.
+Upstream writes the manifest once, before the first destructive step
+(``hermes_cli/gateway_migrate.py:945-953``), never rewrites it, and deletes it
+only when the apply confirms the default gateway serves every profile
+(``:967-973``) or the failed-apply compensator restores a gateway (``:1059``,
+``:1087``). A manifest on disk therefore means "unfinished — re-run
+``hermes gateway migrate --multiplex`` to resume", and the verified verdict is
+computed only from the live topology hermesd can read.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import yaml
 from hermesd.collect.common import _iso_to_epoch
 from hermesd.collect.migration import (
     _MANIFEST_SECONDARY_LIMIT,
+    _explicit_multiplex_flag,
     _migration_state,
     _multiplex_flag_on,
 )
@@ -32,7 +33,7 @@ from tests.conftest import render_to_str
 
 NOW = 1_800_000_000.0
 # The only local-time, uncolonned-offset stamp hermesd reads: upstream builds it
-# with time.strftime("%Y-%m-%dT%H:%M:%S%z") (gateway_migrate.py:529).
+# with time.strftime("%Y-%m-%dT%H:%M:%S%z") (gateway_migrate.py:946).
 MIGRATED_AT = "2026-09-13T00:52:11+0200"
 MIGRATED_AT_EPOCH = 1_789_253_531.0
 _MISSING = object()
@@ -127,7 +128,7 @@ def _multiplexed(home: Path, *, served: object = None) -> None:
 
 
 def test_absent_manifest_reads_as_no_record(hermes_home: Path):
-    """Absent means "never migrated OR successfully rolled back" — indistinguishable."""
+    """Absent means "never migrated, converged, or compensated" — indistinguishable."""
     _write_gateway_state(hermes_home, served=["default"])
     _write_config(hermes_home, multiplex=False)
 
@@ -185,7 +186,9 @@ def test_an_empty_live_served_record_is_not_verified(hermes_home: Path):
     assert migration.unserved_profiles == ["default", "dev", "coding"]
 
 
-def test_the_multiplex_flag_must_be_on(hermes_home: Path):
+def test_a_retired_false_flag_does_not_refute_a_live_topology(hermes_home: Path):
+    """``gateway.multiplex_profiles: false`` is retired and ignored at boot
+    (``hermes_cli/gateway_multiplex_mode.py:161-191``): topology decides."""
     _write_gateway_state(hermes_home, served=["default", "dev", "coding"])
     _write_config(hermes_home, multiplex=False)
     _write_manifest(hermes_home)
@@ -193,27 +196,46 @@ def test_the_multiplex_flag_must_be_on(hermes_home: Path):
     migration = _collect(hermes_home).migration
 
     assert migration.multiplex_flag_on is False
-    assert migration.migration_verified is False
-    assert migration.verification_gap is MigrationVerificationGap.FLAG_OFF
+    assert migration.multiplex_flag_retired_off is True
+    assert migration.migration_verified is True
+
+
+def test_an_unset_flag_is_neither_on_nor_retired(hermes_home: Path):
+    _write_gateway_state(hermes_home, served=["default"])
+    (hermes_home / "config.yaml").write_text(yaml.dump({"gateway": {}}))
+    _write_manifest(hermes_home, _manifest(secondaries=[]))
+
+    migration = _collect(hermes_home).migration
+
+    assert migration.multiplex_flag_on is False
+    assert migration.multiplex_flag_retired_off is False
+    assert migration.migration_verified is True
 
 
 @pytest.mark.parametrize(
     ("cfg", "expected"),
     [
-        ({"multiplex_profiles": True}, True),  # stale top-level alias only
+        ({"multiplex_profiles": True}, True),  # top-level alias only
         ({"gateway": {"multiplex_profiles": True}}, True),
-        # The reader ORs the stale alias with the nested key, so a leftover
-        # top-level True wins over a nested False. hermesd matches the *reader*
-        # (gateway_migrate.py:203-215), not the writer, which pops the alias.
+        # ``explicit_multiplex_flag`` (gateway_multiplex_mode.py:49-72) reads the
+        # top-level alias first and falls back to the nested key only when the
+        # alias is absent, so a present alias wins either way.
         ({"multiplex_profiles": True, "gateway": {"multiplex_profiles": False}}, True),
-        ({"gateway": {}}, False),
-        ({}, False),
+        ({"multiplex_profiles": False, "gateway": {"multiplex_profiles": True}}, False),
+        ({"multiplex_profiles": None, "gateway": {"multiplex_profiles": True}}, True),
+        ({"gateway": {}}, None),
+        ({}, None),
+        ({"gateway": "bad"}, None),
         ({"multiplex_profiles": "yes"}, True),
+        ({"multiplex_profiles": " OFF "}, False),
+        # An unrecognised string token counts as an explicit opt-in upstream.
+        ({"multiplex_profiles": "maybe"}, True),
         ({"multiplex_profiles": 0, "gateway": {"multiplex_profiles": None}}, False),
     ],
 )
-def test_the_flag_is_read_the_way_upstream_reads_it(cfg: dict[str, object], expected: bool):
-    assert _multiplex_flag_on(cfg) is expected
+def test_the_flag_is_read_the_way_upstream_reads_it(cfg: dict[str, object], expected: bool | None):
+    assert _explicit_multiplex_flag(cfg) is expected
+    assert _multiplex_flag_on(cfg) is (expected is True)
 
 
 def test_a_dead_default_gateway_is_not_verified(hermes_home: Path):
@@ -716,7 +738,8 @@ def test_a_torn_manifest_keeps_last_good_and_fails_only_its_own_source(hermes_ho
     try:
         first = collector.collect()
         assert first.migration.migration_verified is True
-        # _write_manifest upstream is a plain write_text, so a torn file is observable.
+        # _write_manifest is atomic upstream now, but a hand-edited or foreign file
+        # can still be malformed, and it must degrade only its own source.
         manifest.write_text('{"version": 1, "migrated_at": "2026-09-13T00:5')
         second = collector.collect()
     finally:
@@ -747,7 +770,7 @@ def test_a_torn_manifest_without_a_prior_read_is_present_but_unparsed(hermes_hom
 
 
 def test_a_manifest_that_disappears_after_a_good_read_fails_the_source(hermes_home: Path):
-    """Rollback deletes the manifest, so vanishing after a good read is reported."""
+    """Confirmed convergence deletes the manifest: one absent pass is not yet trusted."""
     _multiplexed(hermes_home)
     manifest = hermes_home / "gateway_migration.json"
 
@@ -917,7 +940,6 @@ def test_the_verdict_needs_every_clause():
     refutations = {
         "manifest": verified.model_copy(update={"manifest_parsed": False}),
         "manifest schema": verified.model_copy(update={"manifest_schema_valid": False}),
-        "flag": verified.model_copy(update={"multiplex_flag_on": False}),
         "liveness": verified.model_copy(update={"default_gateway_live": False}),
         "served record": verified.model_copy(update={"served_recorded": False}),
         "coverage": verified.model_copy(

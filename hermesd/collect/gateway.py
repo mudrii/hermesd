@@ -147,6 +147,23 @@ _SERVING_GATEWAY_STATES = frozenset({"running", "degraded"})
 _WATCHDOG_EXIT_REASONS = frozenset({"loop_liveness_watchdog", "shutdown_watchdog"})
 
 
+# The boot guard's reason can name several profiles and a remedy; keep the whole
+# sentence but never an unbounded one from an untrusted file.
+_STANDALONE_REASON_CHARS = 800
+
+
+def _multiplex_standalone_reason(data: JsonMapping, *, record_current: bool) -> str:
+    """The recorded standalone reason, only while its writer is live.
+
+    Upstream prints it only for a running gateway (hermes_cli/gateway.py:1542-1549,
+    5046, 5054); a dead writer's reason describes a boot that is over.
+    """
+    raw = data.get("multiplex_standalone_reason")
+    if not record_current or not isinstance(raw, str):
+        return ""
+    return _excerpt(raw, _STANDALONE_REASON_CHARS)
+
+
 def _claims_serving(state: str) -> bool:
     """Whether the recorded ``gateway_state`` claims a serving gateway (PID not checked)."""
     return state in _SERVING_GATEWAY_STATES
