@@ -956,6 +956,10 @@ class CronJob(BaseModel):
     # a no-agent job or when nothing is configured (upstream refuses to run).
     effective_model: str = ""
     model_source: CronModelSource | None = None
+    # ``quota_hold_until`` (``cron/quota_hold.py:27,69-93``): fires are parked
+    # past a closed provider usage window. Verbatim instant while the hold is
+    # active; "" once it has expired, which upstream treats as inert.
+    quota_hold_until: str = ""
     # ``fire_claim`` (``cron/jobs.py:2588-2608``): the dispatch lease, refreshed
     # every 60 s against a 300 s TTL. ``fire_claim_state`` is derived from the
     # claim age in the collector; both are None/"" when no usable claim exists.

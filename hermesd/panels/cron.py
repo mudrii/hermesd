@@ -113,6 +113,8 @@ def _job_markers(job: CronJob) -> str:
         markers.append(f"✗{job.failure_streak}")
     if job.paused:
         markers.append("⏸")
+    if job.quota_hold_until:
+        markers.append("held")
     return " ".join(markers)
 
 
@@ -456,6 +458,11 @@ def _job_flags_line(j: CronJob, theme: Theme) -> Text | None:
     if j.paused:
         reason = sanitize_terminal_text(j.paused_reason)
         parts.append(f"paused: {reason}" if reason else "paused")
+    if j.quota_hold_until:
+        parts.append(
+            f"held until {sanitize_terminal_text(fmt_iso_timestamp(j.quota_hold_until))}"
+            " (provider usage window)"
+        )
     if j.last_delivery_error:
         parts.append(f"delivery: {sanitize_terminal_text(j.last_delivery_error[:80])}")
     if j.preflight_alerted:

@@ -1272,3 +1272,13 @@ def test_cron_detail_shows_resolved_counts_without_open_incidents() -> None:
     )
     text = render_to_str(render_cron(state, Theme(), detail=True), width=200, no_color=True)
     assert "Resolved incidents: 1 (1 in the last 24h" in text
+
+
+def test_cron_panel_labels_a_quota_held_job() -> None:
+    job = CronJob(job_id="j1", name="held-job", quota_hold_until="2026-09-24T09:00:00+00:00")
+    state = DashboardState(cron=CronState(job_count=1, jobs=[job]))
+    detail = render_to_str(render_cron(state, Theme(), detail=True), width=200, no_color=True)
+    assert "held until" in detail
+    assert "(provider usage window)" in detail
+    compact = render_to_str(render_cron(state, Theme()), no_color=True)
+    assert "held" in compact

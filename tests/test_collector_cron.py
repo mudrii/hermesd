@@ -3375,3 +3375,29 @@ def test_recent_cron_executions_match_a_full_python_ordering(hermes_home: Path):
 
     recent = [run.execution_id for run in state.cron_executions.recent]
     assert recent == expected[:_EXECUTIONS_RECENT_LIMIT]
+
+
+def test_collect_cron_reports_only_an_active_quota_hold(hermes_home: Path):
+    """``quota_hold_until`` parks a job past a closed provider usage window; an
+    expired marker is inert upstream (``hold_active``, ``cron/quota_hold.py:58-64``)."""
+    _write_jobs_json(
+        hermes_home,
+        [
+            {"id": "job-held", "quota_hold_until": iso_ago(-3600)},
+            {"id": "job-expired", "quota_hold_until": iso_ago(60)},
+            {"id": "job-garbage", "quota_hold_until": "not a time"},
+            {"id": "job-free"},
+        ],
+    )
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    by_id = {job.job_id: job for job in state.cron.jobs}
+    assert by_id["job-held"].quota_hold_until != ""
+    assert by_id["job-expired"].quota_hold_until == ""
+    assert by_id["job-garbage"].quota_hold_until == ""
+    assert by_id["job-free"].quota_hold_until == ""

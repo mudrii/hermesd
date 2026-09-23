@@ -82,6 +82,7 @@ from hermesd.collect.cron import (
     _cron_job_model,
     _cron_job_paused,
     _cron_job_pending_slot,
+    _cron_job_quota_hold,
     _cron_job_repeat,
     _cron_suggestion_count,
     _cron_ticker_ages,
@@ -2673,6 +2674,7 @@ class Collector:
                         preflight_alerted=_coerce_bool(j.get("preflight_alerted")),
                         effective_model=effective_model,
                         model_source=model_source,
+                        quota_hold_until=_cron_job_quota_hold(j, now=now),
                     )
                 )
 

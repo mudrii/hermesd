@@ -991,6 +991,17 @@ def _cron_job_model(
     return (main_text, CronModelSource.MAIN_MODEL) if main_text else ("", None)
 
 
+def _cron_job_quota_hold(job: dict[str, Any], *, now: float) -> str:
+    """The ``quota_hold_until`` instant while the hold is active, else "".
+
+    Upstream's ``hold_active`` (``cron/quota_hold.py:58-64``) treats an expired
+    or unparseable marker as inert, so neither is reported.
+    """
+    until = str(job.get("quota_hold_until") or "")
+    until_epoch = _iso_to_epoch(until)
+    return until if until_epoch is not None and until_epoch > now else ""
+
+
 def _cron_job_repeat(job: dict[str, Any]) -> tuple[int | None, int]:
     """`repeat` times (None means unlimited) and completed count."""
     repeat = _as_dict(job.get("repeat"))
