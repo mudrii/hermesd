@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from rich.console import Console
@@ -40,17 +41,23 @@ def _frame(app: DashboardApp) -> str:
     return capture.get()
 
 
-def test_idle_frames_and_scrolling_reuse_the_rendered_detail(counted_app):
+def test_idle_frames_and_scrolling_reuse_the_rendered_detail(counted_app, monkeypatch):
     app, calls = counted_app
+    clock = Mock()
+    clock.now.return_value.strftime.side_effect = ["12:00:00", "12:00:01", "12:00:02"]
+    monkeypatch.setattr(app_module, "datetime", clock)
     app.handle_key("2")
 
     first = _frame(app)
-    assert _frame(app) == first
+    second = _frame(app)
+    # The live header clock advances even when the detail viewport is cached.
+    assert second.splitlines()[0] != first.splitlines()[0]
+    assert second.splitlines()[1:] == first.splitlines()[1:]
     app.handle_key("j")
     scrolled = _frame(app)
 
     assert _detail_renders(calls, 2) == 1
-    assert scrolled != first, "scrolling still moves the viewport"
+    assert scrolled.splitlines()[1:] != first.splitlines()[1:], "scrolling moves the viewport"
 
 
 def test_new_state_width_or_view_settings_rerender(counted_app):
