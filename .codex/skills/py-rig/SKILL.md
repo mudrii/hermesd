@@ -61,7 +61,7 @@ Follow this workflow:
    If the task materially changes project conventions, architecture, or workflow expectations, update `AGENTS.md` or the relevant rule/skill in the same change. Update `CHANGELOG.md` for user-visible changes and `README.md` when install/usage instructions change.
 
 8. Verify locally before opening a PR.
-   Run `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy hermesd`, `uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing`, `uv run pip-audit`, `uv lock --check`, `uv build`, wheel smoke installs, and `uvx twine check dist/*`. CI runs the same gate commands across Python 3.11/3.12/3.13/3.14.
+   Run `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy hermesd scripts`, `uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd --cov-report=term-missing`, `uv run python scripts/pip_audit_gate.py`, `uv lock --check`, `uv build`, wheel smoke installs, and `uv run twine check dist/*`. CI runs the same gate commands across Python 3.11/3.12/3.13/3.14.
 </process>
 
 <design_rules>
@@ -327,11 +327,11 @@ Verification is part of the implementation, not an optional cleanup step.
 
 - Run `uv run ruff format --check .` (or `uv run ruff format .` to fix)
 - Run `uv run ruff check .` (with `--fix` for auto-fixable issues)
-- Run `uv run mypy hermesd` (configured via `[tool.mypy]` in `pyproject.toml`)
+- Run `uv run mypy hermesd scripts` (configured via `[tool.mypy]` in `pyproject.toml`)
 - Run `uv run pytest tests/ -v -W error::ResourceWarning` (with relevant paths for tighter affected-scope checks)
-- Run `uv run pip-audit`; CI runs it on every push
+- Run `uv run python scripts/pip_audit_gate.py`; CI runs it on every push
 - Run `uv lock --check`; if dependencies changed, run `uv lock` and verify the diff
-- Run `uv build`, smoke install `dist/hermesd-*.whl`, and run `uvx twine check dist/*` before release or packaging-affecting changes
+- Run `uv build`, smoke install `dist/hermesd-*.whl`, and run `uv run twine check dist/*` before release or packaging-affecting changes
 - If public API changed, verify docstrings and update README/CHANGELOG if user-facing
 - Treat linting and static analysis as normal development tools, not release-only checks
 - Fix root causes instead of scattering `# noqa` or `# type: ignore` comments
@@ -402,5 +402,5 @@ This skill is being followed correctly when:
 - the resulting code reads clearly without comments explaining the control flow
 - the resulting code is easier to extend without rewriting stable behavior
 - cache-preservation and read-only invariants are preserved
-- `uv run ruff check`, `uv run mypy hermesd`, `uv run pytest`, and `uv run pip-audit` all pass
+- `uv run ruff check`, `uv run mypy hermesd scripts`, `uv run pytest`, and `uv run python scripts/pip_audit_gate.py` all pass
 </success_criteria>

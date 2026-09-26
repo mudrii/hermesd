@@ -37,6 +37,7 @@ from hermesd.collect.common import (
     _coerce_int,
     _json_object_capped,
     _optional_epoch,
+    _printable_capped,
 )
 from hermesd.collect.sqlite_util import (
     _count_rows,
@@ -157,7 +158,7 @@ def _reservation(
 ) -> ApiRunReservation:
     owner_pid = _coerce_int(row.get("owner_pid"))
     return ApiRunReservation(
-        run_id=_capped_text(row.get("run_id")),
+        run_id=_printable_capped(row.get("run_id"), MAX_API_RUN_TEXT_CHARS),
         status=_allowlisted_status(row.get("status_json")),
         created_at_age_seconds=_age_seconds(_optional_epoch(row.get("created_at")), now),
         updated_at_age_seconds=_age_seconds(_optional_epoch(row.get("updated_at")), now),
@@ -212,10 +213,3 @@ def _gated_count(
     if column not in columns:
         return 0
     return _count_rows(conn, sql, params)
-
-
-def _capped_text(value: object) -> str:
-    """Printable, length-capped text safe to hand to a panel."""
-    if not isinstance(value, str):
-        return ""
-    return "".join(char for char in value if char.isprintable())[:MAX_API_RUN_TEXT_CHARS]

@@ -7,6 +7,55 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Secret redaction:** log, config and error text now redacts passwords, passphrases, credentials, cookies, AWS/GCS signatures, Telegram/Discord/Slack webhook tokens carried in URL paths, and bare `sk-`/`ghp_`/JWT tokens. `Authorization: Bearer x` no longer leaves a stray `]`. Delivery errors, platform error messages, cron `last_error`/`last_delivery_error`, and delegation goals and errors are now redacted before they are clipped. A log tail that starts mid-line drops the partial first line, so the cut-off end of a secret can no longer appear without its label.
+- **Skills:** skills are found by `SKILL.md` at any depth, as upstream does. Flat skills and nested categories are counted, and directories without `SKILL.md` are no longer counted as skills. A `SKILL.md` that starts with a UTF-8 BOM shows its description.
+- **Plugins:** a broken plugin catalog cache no longer brings back the previous plugin list. Newly installed plugins appear, and catalog flags carry over by name.
+- **state.db:** one malformed table now fails only the source that reads it. Before, it failed six sources and forced repeated reconnects.
+- **Deleted files:** a file that is deleted after a good read, such as `response_store.db`, `projects.db`, `kanban.db` or `gateway_migration.json`, is reported failed for one refresh and then accepted as absent. Before, it stayed failed until restart.
+- **Kanban:** the stale-claim count only includes active tasks, not finished ones. Notify subscriptions on older schemas without `notifier_profile`/`platform` columns no longer fail the source. Temporary WAL copies of deleted boards are cleaned up.
+- **Gateway:** a stopped gateway no longer shows a growing incarnation uptime. A malformed `gateway.pid` (a bool, a list or an overflowing number) no longer reports a running gateway as pid 1. A profile-namespaced `api_server`/`webhook` entry no longer invents mirror URLs.
+- **Malformed input:** a source no longer fails on any of these:
+  - a junk session `ended_at` or `title`
+  - an oversized number
+  - a list or dict update outcome
+  - a non-ASCII fire-claim pid
+  - deeply nested JSON or YAML
+  - a non-string MoA preset key
+  - a non-mapping `config.yaml`
+
+  A corrupt `jobs.json`, `channel_directory.json` or `spawn-ledger.json` now marks its source stale instead of staying green.
+- **Filesystem safety:**
+  - A FIFO in place of a config or log file no longer hangs hermesd.
+  - `--snapshot` against an unreadable Hermes home reports an error instead of printing a traceback.
+  - On case-insensitive filesystems, `--snapshot-file` refuses paths that alias the Hermes home.
+  - Hooks, checkpoints, `.drain_request.json`, dashboard manifests and profile log streams are confined to their home.
+- **Caching:** the file cache and SQLite change keys use (mtime, size, inode), so a rewrite with the same timestamp on a coarse-timestamp filesystem is picked up. WAL snapshots detect a concurrent checkpoint and retry, and no longer copy `-shm`.
+- **Bounded scans:** cron output, curator run and MoA trace scans are limited on every refresh. Files that disappear during a scan are skipped.
+- **Terminals:** the terminal breadcrumb list shows the most recent terminals, not the first names alphabetically. Hidden (Bot Mode) chats show their compression-failure reason.
+- **Scrolling:** every detail view except Logs scrolls with `j`/`k`/`g`/`G`. That includes Tokens, Tools, Profiles, Memory, Kanban and Curator, whose content was previously cut off. The Logs window fills the terminal height.
+- **Snapshots:** `--snapshot-panel N` prints the full detail when piped. Before, it was cut at 48 lines.
+- **Layout:** the overview picks its layout from each layout's minimum height. The wide grid needs 34 rows, the compact grid 26, and shorter terminals get a new reduced two-per-row grid, so panels are no longer drawn as empty borders.
+- **Input:**
+  - `r2` refreshes and then opens panel 2.
+  - Application-mode arrows, F1–F4 and Alt+key no longer exit a detail view.
+  - `Esc` closes the help overlay first.
+  - `j`/`k` do nothing in the overview.
+- **Sessions:** the `cost` sort follows the displayed Cost column. An empty `msg:` filter no longer hides every session.
+- **Display:** untrusted bracketed text no longer shows a stray backslash (`\[x]`) in the Gateway, Curator, Cron and Tokens panels.
+- **CLI:**
+  - `--refresh-rate` is capped at 86400.
+  - Error messages name the problem and the valid values.
+  - `--snapshot-panel 00` works like `0`.
+  - An empty `--hermes-home` or `--snapshot-file` is rejected.
+
+### Changed
+
+- Ages of a day or more display as `Nd` in every panel, instead of `NNh` in some. Non-finite ages display as `—`, and Gateway KB sizes show one decimal.
+- The installed smoke script no longer relies on `assert`, so it still checks under `python -O`.
+- Reader helpers are shared through `hermesd/collect/common.py`. Dead code paths are removed: skills windowing, the test-only renderers, and the retry loop in `db.py` that always had exactly one target.
+
 ## [2026.9.13] - 2026-09-13
 
 This release includes all changes since the published
@@ -84,21 +133,6 @@ release scope grouped by dashboard area.
   identity (`providers.nous` with `auth_method` "anonymous" in auth.json — the
   single condition upstream's `is_guest_state` tests), next to the provider
   list in both views. Key names only — no credential values are read or shown.
-
-### CI/CD
-
-- Hosted release validation caught two Nix-specific gaps: Intel macOS now selects an immutable pin from the still-supported Nixpkgs 26.05 Darwin branch, while the other systems retain their validated package set; fake dependency-scanner tests invoke their own interpreter rather than relying on `/usr/bin/env` inside a pure sandbox. Nix jobs stream complete build/test logs and avoid writing a lockfile during either validation command.
-- Follow-up validation binds release eligibility to protected-main ancestry and the latest attempt of the exact-SHA main-push CI workflow, makes dependency review part of the required aggregate gate, and rejects cancelled, missing, or unexpected gate outcomes. Both release test and build caches are disabled. Scanner reports are validated for shape, completeness and exit-code agreement; wheel pins reject duplicate requirements; sdists include their helper scripts, lockfile and policy documents. Nix restores the required Hatchling build tool and installed Git support, with package, CLI and checkpoint checks configured for all four Linux/macOS architecture targets. The publication environment now admits only `v*` tags without administrator bypass; version-tag creation is administrator-only and tag updates/deletion are blocked. Protected-main ancestry is enforced separately by the release workflow.
-- Validated development-tool updates include pytest 9.1.1, Ruff 0.16.6 and types-PyYAML 6.0.12.20260906. Cross-version JSON-error and platform timestamp tests now exercise failures deterministically.
-- Hardened the whole pipeline per the consolidated CI/CD audit. Nix now proves buildability: the flake derives its version from `pyproject.toml` (single source of truth), declares `checks` outputs that build the package, run its pytest suite, and smoke the installed CLI, and CI builds `.#hermesd` on Linux and macOS instead of merely evaluating. Published runtime requirements are exact pins matching `uv.lock` (`rich==14.3.3`, `pyyaml==6.0.3`, `pydantic==2.13.4`), enforced against wheel metadata by `scripts/check_wheel_pins.py`; the pydantic upgrade itself was validated on hermesd's own full Python 3.11–3.14 matrix, mypy, and snapshot/threading surfaces before landing (decision and evidence in `docs/dependency-decisions.md`).
-- CI now separates lint/format/types into a `static` job, dependency auditing into a `security` job (per-interpreter, marker-aware), and keeps the test matrix to behavior; a composite `locked-env` action defines toolchain setup once so CI and the publication workflow cannot drift, with release builds keeping uv caching disabled to preserve the publication trust boundary.
-- Docker and Nix jobs are classified by changed inputs on pull requests — always including application source and package metadata — behind an always-reporting **CI gate** that fails on any non-success outcome of expected work (failure, cancellation, or skipped-but-expected), giving branch protection one stable required check.
-- Release eligibility is mechanically enforced: a `release-eligibility` job requires the exact tagged commit to carry a completed, successful CI gate run and refuses to publish on missing, failed, cancelled, stale, or in-progress validation.
-- Security validation runs on a schedule: a weekly workflow re-audits the locked environment on every supported Python and scans the exported lockfile directly (dev toolchain included) without installing, with pip-audit outcomes classified so scanner failures retry once and then fail as infrastructure errors rather than looking clean; pull requests additionally pass a SHA-pinned dependency-review gate (moderate severity blocks, missing snapshots retried visibly, read-only permissions).
-- Installed-artifact testing now covers runtime behavior: `scripts/installed_smoke.py` runs the installed wheel/sdist from outside the checkout against synthetic Hermes-home fixtures (text/JSON snapshots, panel selection, missing-data handling, the read-only invariant, `py.typed`, exact dependency pins, and metadata/version agreement); smoke environments live under `$RUNNER_TEMP` instead of the repository; the Docker checkpoint smoke goes through the public CLI with a synthetic checkpoint repo instead of a private helper; Nix builds run the package tests on two OSes; test runs use concise `-q -ra --tb=short` output and upload JUnit plus coverage data on success and failure alike; Dependabot groups routine minor/patch action updates while majors stay individually reviewed.
-- CI/CD and release policy is documented canonically in `docs/ci-release-policy.md`, which `AGENTS.md`, `CONTRIBUTING.md`, and the README link to instead of restating; it also records the retained release re-validation, the disabled release-cache trust decision, the local-build-only container posture, and the manual release checks CI cannot replace.
-
-### Added
 
 - The Kanban panel now reports task-notification subscriptions and their delivery backlog, which had no
   reader anywhere in hermesd. A new `kanban_notify` health source reads `kanban_notify_subs` from the same
@@ -221,6 +255,19 @@ release scope grouped by dashboard area.
   of assuming a pin that is not there.
 
 - The Cron panel's Open Incidents table labels a `detected` incident **no delivered failure ping** and explains acknowledgement beside the table. Upstream marks a row `alerted` only when the ping leaves the process; a notice may also be intentionally suppressed or have no route, so a detected record warrants investigation without proving the delivery path is broken. Because `acked_at` is written together with `closed_at` by the terminal closing transition, an open incident cannot be acknowledged independently of closure.
+
+### CI/CD
+
+- Hosted release validation caught two Nix-specific gaps: Intel macOS now selects an immutable pin from the still-supported Nixpkgs 26.05 Darwin branch, while the other systems retain their validated package set; fake dependency-scanner tests invoke their own interpreter rather than relying on `/usr/bin/env` inside a pure sandbox. Nix jobs stream complete build/test logs and avoid writing a lockfile during either validation command.
+- Follow-up validation binds release eligibility to protected-main ancestry and the latest attempt of the exact-SHA main-push CI workflow, makes dependency review part of the required aggregate gate, and rejects cancelled, missing, or unexpected gate outcomes. Both release test and build caches are disabled. Scanner reports are validated for shape, completeness and exit-code agreement; wheel pins reject duplicate requirements; sdists include their helper scripts, lockfile and policy documents. Nix restores the required Hatchling build tool and installed Git support, with package, CLI and checkpoint checks configured for all four Linux/macOS architecture targets. The publication environment now admits only `v*` tags without administrator bypass; version-tag creation is administrator-only and tag updates/deletion are blocked. Protected-main ancestry is enforced separately by the release workflow.
+- Validated development-tool updates include pytest 9.1.1, Ruff 0.16.6 and types-PyYAML 6.0.12.20260906. Cross-version JSON-error and platform timestamp tests now exercise failures deterministically.
+- Hardened the whole pipeline per the consolidated CI/CD audit. Nix now proves buildability: the flake derives its version from `pyproject.toml` (single source of truth), declares `checks` outputs that build the package, run its pytest suite, and smoke the installed CLI, and CI builds `.#hermesd` on Linux and macOS instead of merely evaluating. Published runtime requirements are exact pins matching `uv.lock` (`rich==14.3.3`, `pyyaml==6.0.3`, `pydantic==2.13.4`), enforced against wheel metadata by `scripts/check_wheel_pins.py`; the pydantic upgrade itself was validated on hermesd's own full Python 3.11–3.14 matrix, mypy, and snapshot/threading surfaces before landing (decision and evidence in `docs/dependency-decisions.md`).
+- CI now separates lint/format/types into a `static` job, dependency auditing into a `security` job (per-interpreter, marker-aware), and keeps the test matrix to behavior; a composite `locked-env` action defines toolchain setup once so CI and the publication workflow cannot drift, with release builds keeping uv caching disabled to preserve the publication trust boundary.
+- Docker and Nix jobs are classified by changed inputs on pull requests — always including application source and package metadata — behind an always-reporting **CI gate** that fails on any non-success outcome of expected work (failure, cancellation, or skipped-but-expected), giving branch protection one stable required check.
+- Release eligibility is mechanically enforced: a `release-eligibility` job requires the exact tagged commit to carry a completed, successful CI gate run and refuses to publish on missing, failed, cancelled, stale, or in-progress validation.
+- Security validation runs on a schedule: a weekly workflow re-audits the locked environment on every supported Python and scans the exported lockfile directly (dev toolchain included) without installing, with pip-audit outcomes classified so scanner failures retry once and then fail as infrastructure errors rather than looking clean; pull requests additionally pass a SHA-pinned dependency-review gate (moderate severity blocks, missing snapshots retried visibly, read-only permissions).
+- Installed-artifact testing now covers runtime behavior: `scripts/installed_smoke.py` runs the installed wheel/sdist from outside the checkout against synthetic Hermes-home fixtures (text/JSON snapshots, panel selection, missing-data handling, the read-only invariant, `py.typed`, exact dependency pins, and metadata/version agreement); smoke environments live under `$RUNNER_TEMP` instead of the repository; the Docker checkpoint smoke goes through the public CLI with a synthetic checkpoint repo instead of a private helper; Nix builds run the package tests on two OSes; test runs use concise `-q -ra --tb=short` output and upload JUnit plus coverage data on success and failure alike; Dependabot groups routine minor/patch action updates while majors stay individually reviewed.
+- CI/CD and release policy is documented canonically in `docs/ci-release-policy.md`, which `AGENTS.md`, `CONTRIBUTING.md`, and the README link to instead of restating; it also records the retained release re-validation, the disabled release-cache trust decision, the local-build-only container posture, and the manual release checks CI cannot replace.
 
 ### Fixed
 

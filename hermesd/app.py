@@ -51,27 +51,12 @@ def _panel_num_by_name(name: str) -> int:
 
 
 _LOG_PANEL_NUM = _panel_num_by_name("Logs")
-_GATEWAY_PANEL_NUM = _panel_num_by_name("Gateway & Platforms")
 _SESSIONS_PANEL_NUM = _panel_num_by_name("Sessions")
-_CRON_PANEL_NUM = _panel_num_by_name("Cron")
-_SKILLS_PANEL_NUM = _panel_num_by_name("Skills / Integrations")
 _PROFILES_PANEL_NUM = _panel_num_by_name("Profiles")
-_OPERATIONS_PANEL_NUM = _panel_num_by_name("Operations")
-_CONFIG_PANEL_NUM = _panel_num_by_name("Config")
-_RENDERED_VIEWPORT_PANEL_NUMS = frozenset(
-    {
-        _GATEWAY_PANEL_NUM,
-        _SESSIONS_PANEL_NUM,
-        _CRON_PANEL_NUM,
-        # Config renders ~72 lines at a default terminal (settings, session
-        # capacity, agent limits, integrations, backups, tool gateway), so the
-        # sections it appends last — including the corrupt-snapshot alert — are
-        # only reachable through the viewport.
-        _CONFIG_PANEL_NUM,
-        _SKILLS_PANEL_NUM,
-        _OPERATIONS_PANEL_NUM,
-    }
-)
+# Every detail except Logs scrolls its complete rendered output: any detail can
+# outgrow the terminal, and without the viewport its tail is clipped with no
+# way to reach it. Logs keeps its own line window so its tab bar stays visible.
+_RENDERED_VIEWPORT_PANEL_NUMS = frozenset(set(_PANEL_NUMBERS) - {_LOG_PANEL_NUM})
 _WIDE_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
     ("row1", 4, (1,)),
     ("row2", None, (2, 3)),
@@ -91,10 +76,35 @@ _COMPACT_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
     ("row7", 3, (10, 11)),
     ("row8", 3, (12, 13)),
 )
+# Last resort below the compact minimum: two panels per row after Gateway.
+_REDUCED_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
+    ("row1", 3, (1,)),
+    ("row2", 3, (2, 3)),
+    ("row3", 3, (4, 5)),
+    ("row4", 3, (6, 7)),
+    ("row5", 3, (8, 9)),
+    ("row6", 3, (10, 11)),
+    ("row7", 3, (12, 13)),
+)
 _TALL_NARROW_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = tuple(
     (f"row{panel_num}", None, (panel_num,)) for panel_num in _PANEL_NUMBERS
 )
+# Top border + one content line + bottom border: the least a flexible row
+# needs to show any content at all.
+_MIN_FLEX_ROW_HEIGHT = 3
+
+
+def _layout_min_height(spec: tuple[tuple[str, int | None, tuple[int, ...]], ...]) -> int:
+    """Terminal rows a spec needs so no panel is squeezed to bare borders."""
+    rows = sum(_MIN_FLEX_ROW_HEIGHT if size is None else size for _, size, _ in spec)
+    return rows + 2  # one-line header and footer
+
+
+_WIDE_LAYOUT_MIN_HEIGHT = _layout_min_height(_WIDE_LAYOUT_SPEC)
+_COMPACT_LAYOUT_MIN_HEIGHT = _layout_min_height(_COMPACT_LAYOUT_SPEC)
 _SESSION_SORTS = ("recent", "cost", "tokens")
+# SS3 cursor keys map onto their CSI form so both cursor modes decode alike.
+_SS3_TO_CSI = {final: f"\x1b[{final}" for final in "ABCDHF"}
 _TermiosSettings: TypeAlias = (
     list[int | list[bytes | int]] | list[int | list[bytes]] | list[int | list[int]]
 )
@@ -333,9 +343,35 @@ class DashboardApp:
             scratch = ViewState()
             scratch.log_sub_view = view.log_sub_view
             scratch.enter_detail(panel_num)
-            view = _view_snapshot(scratch)
+            return self._capture_full_detail_text(
+                snapshot_console, panel_num, _view_snapshot(scratch)
+            )
         with snapshot_console.capture() as capture:
             snapshot_console.print(self._build_layout(console=snapshot_console, view=view))
+        return capture.get()
+
+    def _capture_full_detail_text(
+        self, console: Console, panel_num: int, view: ViewSnapshot
+    ) -> str:
+        # A detail snapshot prints the whole panel: going through the Layout
+        # would crop it to the console height, silently truncating piped output.
+        with self._lock:
+            state = self._state
+            theme = self._theme
+            input_error = self._input_error
+        panel = render_panel(
+            panel_num,
+            state,
+            theme,
+            detail=True,
+            log_sub_view=view.log_sub_view,
+            # Unbounded: the Logs window lists every line in a snapshot.
+            detail_height=sys.maxsize,
+        )
+        with console.capture() as capture:
+            console.print(self._build_header(state, theme, console=console))
+            console.print(panel)
+            console.print(self._build_footer(state, theme, view, input_error))
         return capture.get()
 
     def render_snapshot_text(self, panel_num: int | None = None) -> str:
@@ -358,9 +394,6 @@ class DashboardApp:
 
     def render_current_view_text(self) -> str:
         return self._capture_layout_text(refresh=False)
-
-    def render_snapshot(self, panel_num: int | None = None) -> None:
-        self._console.print(self.render_snapshot_text(panel_num=panel_num), end="")
 
     def copy_current_view(self) -> str:
         copied_text = _truncate_for_osc52(self.render_current_view_text())
@@ -439,8 +472,10 @@ class DashboardApp:
             while self._running.is_set():
                 try:
                     if not select.select([fd], [], [], 0.25)[0]:
-                        if pending == b"\x1b":
-                            self.handle_key("\x1b")
+                        if pending in (b"\x1b", b"\x1bO"):
+                            # No continuation arrived: a lone Esc is Esc, and a
+                            # lone ESC O is Alt+O (ignored like other Alt keys).
+                            self.handle_key(pending.decode("ascii"))
                             pending = b""
                         failures = 0
                         continue
@@ -484,12 +519,20 @@ class DashboardApp:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
     def _handle_input_data(self, data: bytes, pending: bytes = b"") -> tuple[str | None, bytes]:
-        keys, remainder = _decode_input_keys_with_remainder(pending + data)
+        if pending == b"\x1b" and not data.startswith((b"[", b"O")):
+            # A lone Esc held across a read boundary was a real Esc keypress:
+            # terminals send Alt+key in one write, so it cannot be an Alt prefix.
+            keys, remainder = _decode_input_keys_with_remainder(data)
+            keys.insert(0, "\x1b")
+        else:
+            keys, remainder = _decode_input_keys_with_remainder(pending + data)
+        last_action: str | None = None
         for key in keys:
             action = self.handle_key(key)
-            if action is not None:
+            if action == "quit":
                 return action, b""
-        return None, remainder
+            last_action = action or last_action
+        return last_action, remainder
 
     def _set_state(self, state: DashboardState) -> None:
         with self._lock:
@@ -535,7 +578,9 @@ class DashboardApp:
         return self._handle_command_key(key)
 
     def _handle_escape_key(self, key: str) -> None:
-        if len(key) == 1 and self._view.filter_edit_mode:
+        if len(key) == 1 and self._view.show_help:
+            self._view.show_help = False
+        elif len(key) == 1 and self._view.filter_edit_mode:
             self._view.stop_filter()
         elif len(key) == 1 and self._view.mode == "detail":
             self._view.exit_detail()
@@ -590,10 +635,12 @@ class DashboardApp:
                 self._view.jump_bottom()
             return None
         if key == "j":
-            self._view.scroll_down()
+            if self._current_detail_is_scrollable():
+                self._view.scroll_down()
             return None
         if key == "k":
-            self._view.scroll_up()
+            if self._current_detail_is_scrollable():
+                self._view.scroll_up()
             return None
         if len(key) == 1 and key.isdigit():
             panel_num = 10 if key == "0" and 10 in _PANEL_NUMBERS else int(key)
@@ -612,22 +659,9 @@ class DashboardApp:
         return _LOG_VIEWS
 
     def _current_detail_is_scrollable(self) -> bool:
-        detail_panel = self._view.detail_panel
-        if detail_panel is None:
-            return False
-        if detail_panel in _RENDERED_VIEWPORT_PANEL_NUMS:
-            return True
-        with self._lock:
-            state = self._state
-        return (
-            _detail_max_scroll_offset(
-                detail_panel,
-                state,
-                self._view.log_sub_view,
-                self._view.filter_query,
-            )
-            is not None
-        )
+        # Every detail scrolls: Logs windows its own lines and all other
+        # panels use the rendered-line viewport, clamped on the next render.
+        return self._view.detail_panel is not None
 
     def _build_layout(
         self, console: Console | None = None, view: ViewSnapshot | None = None
@@ -648,7 +682,6 @@ class DashboardApp:
         show_help = view.show_help
         profile_view_index = view.profile_cycle_index
         filter_query = view.filter_query
-        filter_edit_mode = view.filter_edit_mode
         session_sort = view.session_sort
         session_message_match_ids: set[str] | None = None
         message_query = ""
@@ -660,6 +693,8 @@ class DashboardApp:
             self._ensure_session_message_search(message_query)
             if state.session_message_match_query == message_query:
                 session_message_match_ids = state.session_message_match_ids
+        # Rows between the one-line header and footer.
+        body_height = max(1, render_console.height - 2)
         max_offset = None
         if mode == "detail" and detail_panel is not None:
             max_offset = _detail_max_scroll_offset(
@@ -667,6 +702,7 @@ class DashboardApp:
                 state,
                 log_sub_view,
                 filter_query,
+                body_height,
             )
             if max_offset is not None and scroll_offset > max_offset:
                 scroll_offset = max_offset
@@ -690,11 +726,11 @@ class DashboardApp:
                 detail=True,
                 log_sub_view=log_sub_view,
                 scroll_offset=scroll_offset,
-                expand_skills=detail_panel == _SKILLS_PANEL_NUM,
                 profile_view_index=profile_view_index,
                 filter_query=filter_query,
                 session_sort=session_sort,
                 session_message_match_ids=session_message_match_ids,
+                detail_height=body_height,
             )
             if detail_panel in _RENDERED_VIEWPORT_PANEL_NUMS:
                 viewport, max_offset = _rendered_detail_viewport(
@@ -717,19 +753,7 @@ class DashboardApp:
                 ):
                     self._view.scroll_offset = max_offset
 
-        layout["footer"].update(
-            self._build_footer(
-                state,
-                theme,
-                input_error=input_error,
-                view_mode=mode,
-                detail_panel=detail_panel,
-                filter_query=filter_query,
-                filter_edit_mode=filter_edit_mode,
-                session_sort=session_sort,
-                log_sub_view=log_sub_view,
-            )
-        )
+        layout["footer"].update(self._build_footer(state, theme, view, input_error))
         return layout
 
     def _ensure_session_message_search(self, message_query: str) -> None:
@@ -833,68 +857,29 @@ class DashboardApp:
     def _build_footer(
         self,
         state: DashboardState,
-        theme: Theme | None = None,
-        input_error: str | None = None,
-        view_mode: str | None = None,
-        detail_panel: int | None = None,
-        filter_query: str | None = None,
-        filter_edit_mode: bool | None = None,
-        session_sort: str | None = None,
-        log_sub_view: str | None = None,
+        theme: Theme,
+        view: ViewSnapshot,
+        input_error: str | None,
     ) -> Text:
-        active_theme = theme or self._theme
-        if input_error is None:
-            with self._lock:
-                footer_error = self._input_error
+        t = Text(style=f"on {theme.status_bar_bg}")
+        if view.mode == "overview":
+            self._append_overview_footer_actions(t, theme)
         else:
-            footer_error = input_error
-        if (
-            view_mode is None
-            or detail_panel is None
-            or filter_query is None
-            or filter_edit_mode is None
-            or session_sort is None
-            or log_sub_view is None
-        ):
-            with self._view_lock:
-                mode = self._view.mode if view_mode is None else view_mode
-                panel = self._view.detail_panel if detail_panel is None else detail_panel
-                query = self._view.filter_query if filter_query is None else filter_query
-                editing = (
-                    self._view.filter_edit_mode if filter_edit_mode is None else filter_edit_mode
-                )
-                sort_mode = self._view.session_sort if session_sort is None else session_sort
-                sub_view = self._view.log_sub_view if log_sub_view is None else log_sub_view
-        else:
-            mode = view_mode
-            panel = detail_panel
-            query = filter_query
-            editing = filter_edit_mode
-            sort_mode = session_sort
-            sub_view = log_sub_view
-        t = Text(style=f"on {active_theme.status_bar_bg}")
-        if mode == "overview":
-            self._append_overview_footer_actions(t, active_theme)
-        else:
-            scrollable = panel in _RENDERED_VIEWPORT_PANEL_NUMS or (
-                panel is not None
-                and _detail_max_scroll_offset(panel, state, sub_view, query) is not None
-            )
             self._append_detail_footer_actions(
                 t,
-                active_theme,
-                panel=panel,
-                scrollable=scrollable,
-                editing=editing,
-                query=query,
-                sort_mode=sort_mode,
+                theme,
+                panel=view.detail_panel,
+                scrollable=view.detail_panel is not None,
+                editing=view.filter_edit_mode,
+                query=view.filter_query,
+                sort_mode=view.session_sort,
             )
 
         self._append_footer_status(
             t,
-            active_theme,
+            theme,
             state=state,
-            footer_error=footer_error,
+            footer_error=input_error,
         )
         return t
 
@@ -992,10 +977,14 @@ class DashboardApp:
         height = active_console.height
 
         if width < 100 and height >= 50:
-            return self._build_overview_from_spec(state, active_theme, _TALL_NARROW_LAYOUT_SPEC)
-        if width < 100 or height < 30:
-            return self._build_overview_from_spec(state, active_theme, _COMPACT_LAYOUT_SPEC)
-        return self._build_overview_from_spec(state, active_theme, _WIDE_LAYOUT_SPEC)
+            spec = _TALL_NARROW_LAYOUT_SPEC
+        elif width >= 100 and height >= _WIDE_LAYOUT_MIN_HEIGHT:
+            spec = _WIDE_LAYOUT_SPEC
+        elif height >= _COMPACT_LAYOUT_MIN_HEIGHT:
+            spec = _COMPACT_LAYOUT_SPEC
+        else:
+            spec = _REDUCED_LAYOUT_SPEC
+        return self._build_overview_from_spec(state, active_theme, spec)
 
     def _build_overview_from_spec(
         self,
@@ -1070,15 +1059,8 @@ def _panel_shortcut_label() -> str:
     return ",".join(shortcuts)
 
 
-def _decode_input_keys(data: bytes) -> list[str]:
-    keys, remainder = _decode_input_keys_with_remainder(data)
-    if remainder:
-        keys.append(remainder.decode("utf-8", errors="replace"))
-    return keys
-
-
 def _decode_input_keys_with_remainder(data: bytes) -> tuple[list[str], bytes]:
-    """Decode raw input into keys plus any incomplete trailing CSI sequence.
+    """Decode raw input into keys plus any incomplete trailing escape sequence.
 
     A partial escape sequence (e.g. "\\x1b[" split across the 64-byte bulk
     read boundary) is returned as the remainder so the caller can prepend it
@@ -1097,7 +1079,21 @@ def _decode_input_keys_with_remainder(data: bytes) -> tuple[list[str], bytes]:
         next_index = index + 1
         if next_index >= len(text):
             return keys, b"\x1b"
-        if text[next_index] != "[":
+        introducer = text[next_index]
+        if introducer == "O":
+            # SS3: application-cursor arrows (ESC O A) and F1-F4 (ESC O P).
+            if next_index + 1 >= len(text):
+                return keys, b"\x1bO"
+            final = text[next_index + 1]
+            keys.append(_SS3_TO_CSI.get(final, f"\x1bO{final}"))
+            index = next_index + 2
+            continue
+        if introducer != "[":
+            if introducer.isprintable():
+                # Alt+key arrives as ESC + key in one write: one key, not Esc.
+                keys.append(f"\x1b{introducer}")
+                index = next_index + 1
+                continue
             keys.append("\x1b")
             index = next_index
             continue
@@ -1134,16 +1130,17 @@ def _detail_max_scroll_offset(
     state: DashboardState,
     log_sub_view: str,
     filter_query: str,
+    detail_height: int,
 ) -> int | None:
-    """Effective max scroll offset for scrollable detail panels, else None.
+    """Logs' max scroll offset for ``detail_height`` rows; None for other panels.
 
-    Logs delegates to its panel's own clamp. Gateway, Sessions, Cron, Skills
-    and Operations use a rendered-line viewport instead.
+    Logs delegates to its panel's own clamp. Every other detail uses the
+    rendered-line viewport instead.
     """
     if panel_num == _LOG_PANEL_NUM:
         from hermesd.panels.logs import max_detail_scroll_offset
 
-        return max_detail_scroll_offset(state, log_sub_view, filter_query)
+        return max_detail_scroll_offset(state, log_sub_view, filter_query, detail_height)
     return None
 
 

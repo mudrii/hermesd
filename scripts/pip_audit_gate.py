@@ -77,7 +77,7 @@ def summarize_report(report_path: Path) -> tuple[int, list[tuple[str, str]]]:
                 isinstance(version, str) for version in fix_values
             ):
                 raise ValueError(f"JSON report contains invalid fix versions for {name}")
-            fix_versions = ",".join(vuln.get("fix_versions") or []) or "none known"
+            fix_versions = ",".join(fix_values) or "none known"
             print(f"VULNERABLE {name}=={version} {vuln['id']} fix: {fix_versions}")
     return count, skipped
 

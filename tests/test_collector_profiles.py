@@ -392,6 +392,24 @@ def test_profiled_collector_reads_profile_scoped_runtime_data(profiled_hermes_ho
     c.close()
 
 
+def test_profile_log_stream_is_confined_to_the_profile_home(profiled_hermes_home: Path):
+    """A profile log symlinked to a root-only file is outside the profile's
+    scope even though it stays under the root home."""
+    root_only = profiled_hermes_home / "root-only.log"
+    root_only.write_text("SENTINEL root-only line\n")
+    agent_log = profiled_hermes_home / "profiles" / "coding" / "logs" / "agent.log"
+    agent_log.unlink()
+    agent_log.symlink_to(root_only)
+
+    c = Collector(profiled_hermes_home, profile_name="coding")
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert not any("SENTINEL" in line.message for line in state.logs.agent_lines)
+
+
 def test_profiled_collector_rejects_profile_root_swapped_to_outside(
     profiled_hermes_home: Path, tmp_path: Path
 ):

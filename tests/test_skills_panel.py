@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import re
 
-from rich.console import Console
-
 from hermesd.models import (
     ConfigSummary,
     CredentialPoolEntry,
@@ -272,78 +270,24 @@ def test_skills_detail_shows_configured_activation_not_a_yes_no_flag():
     assert "Enabled" not in text.split("MCP Servers")[0]
 
 
-def test_skills_detail_scroll_offset():
-    state = build_skills_state(
-        30, category="cat", name_template="skill-{i}", description_template="Desc {i}"
-    )
-    # Scroll to offset 5 (the window is 20 rows, so 30 skills leave room)
-    panel = render_panel(7, state, Theme(), detail=True, scroll_offset=5)
-    text = render_to_str(panel, width=100, no_color=True)
-    # Should show "↑" indicator for scrolled content
-    assert "↑" in text
-    # Names sort lexicographically, so offset 5 starts at "skill-13";
-    # the first rows (skill-0, skill-1, skill-10...) are scrolled off.
-    assert "skill-13" in text
-    assert "skill-0" not in text
-    assert "skill-12" not in text
-
-
-def test_skills_detail_small_list_shows_every_row_and_no_hint():
-    """A list shorter than the window renders whole, with no scroll hint."""
-    state = build_skills_state(5)
-    panel = render_panel(7, state, Theme(), detail=True, scroll_offset=0)
-    text = render_to_str(panel, width=100, no_color=True)
-    assert "skill-00" in text
-    assert "skill-04" in text
-    assert "/5]" not in text
-
-
-def test_skills_detail_caps_visible_window():
+def test_skills_detail_lists_every_row_for_the_app_viewport():
+    """The detail renders every skill; the app viewport does the scrolling."""
     state = build_skills_state(40)
     text = render_to_str(render_panel(7, state, Theme(), detail=True), width=100, no_color=True)
-    assert "[1-20/40]" in text
-    assert "skill-39" not in text
-
-
-def test_skills_detail_scroll_pages_the_window():
-    state = build_skills_state(40)
-    text = render_to_str(
-        render_panel(7, state, Theme(), detail=True, scroll_offset=20), width=100, no_color=True
-    )
-    assert "[21-40/40]" in text
+    assert "skill-00" in text
     assert "skill-39" in text
-
-
-def test_skills_detail_scroll_clamps_to_full_window():
-    """Scrolling past the end must clamp to a full window, not a 1-row stub."""
-    state = build_skills_state(40)
-    text = render_to_str(
-        render_panel(7, state, Theme(), detail=True, scroll_offset=39), width=100, no_color=True
-    )
-    assert "[21-40/40]" in text
-    assert "skill-20" in text
-
-
-def test_skills_detail_can_expand_all_rows_for_app_viewport():
-    state = build_skills_state(40)
-    text = render_to_str(
-        render_panel(7, state, Theme(), detail=True, expand_skills=True),
-        width=100,
-        no_color=True,
-    )
-    assert "[1-40/40]" in text
-    assert "skill-0" in text
-    assert "skill-39" in text
+    assert "/40]" not in text
 
 
 def test_detail_max_scroll_offset_skills_uses_rendered_viewport():
-    from hermesd.app import _SKILLS_PANEL_NUM, _detail_max_scroll_offset
+    from hermesd.app import _detail_max_scroll_offset, _panel_num_by_name
 
     state = build_skills_state(30)
-    assert _detail_max_scroll_offset(_SKILLS_PANEL_NUM, state, "", "") is None
+    skills_panel = _panel_num_by_name("Skills / Integrations")
+    assert _detail_max_scroll_offset(skills_panel, state, "", "", 24) is None
 
 
-def test_skills_detail_uses_dash_for_empty_descriptions_after_scrolling():
+def test_skills_detail_uses_dash_for_empty_descriptions():
     state = DashboardState(
         skills_memory=SkillsMemory(
             skill_count=2,
@@ -356,7 +300,7 @@ def test_skills_detail_uses_dash_for_empty_descriptions_after_scrolling():
         ),
     )
 
-    panel = render_panel(7, state, Theme(), detail=True, scroll_offset=1)
+    panel = render_panel(7, state, Theme(), detail=True)
     text = render_to_str(panel, width=100, no_color=True)
 
     assert "—" in text
@@ -377,24 +321,6 @@ def test_skills_detail_does_not_truncate_long_descriptions():
     text = render_to_str(panel, width=200, no_color=True)
 
     assert long_description in text
-
-
-def _export_skills_detail_text(state: DashboardState, scroll_offset: int) -> str:
-    """Render the skills detail view through a recording console and export it."""
-    console = Console(width=120, height=120, record=True)
-    console.print(render_panel(7, state, Theme(), detail=True, scroll_offset=scroll_offset))
-    return console.export_text()
-
-
-def test_skills_detail_negative_scroll_offset_renders_from_the_top():
-    state = build_skills_state(40, description_template="description {i}")
-
-    negative = _export_skills_detail_text(state, -5)
-
-    # A negative offset must clamp to the top, not slice from the end.
-    assert negative == _export_skills_detail_text(state, 0)
-    assert "skill-00" in negative
-    assert "skill-39" not in negative
 
 
 def _mcp_state(**kwargs) -> DashboardState:

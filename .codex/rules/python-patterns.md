@@ -102,7 +102,7 @@ hermesd is threading-based. See `.codex/skills/py-rig/SKILL.md` `<threading_rule
 - **Logging**: hermesd currently prints via Rich; there is no structured logger. Do not add `structlog` or `logging` configuration speculatively.
 - **Config**: CLI flags (`argparse`) + env var fallback (`HERMES_HOME`) + YAML at `~/.hermes/config.yaml`. Do not hardcode paths or tokens. No `pydantic-settings` — the existing pattern is sufficient.
 - **Database**: parameterized queries only. Read-only URI (`file:...?mode=ro`). Cache last-good results. Count consecutive errors and reconnect after N failures.
-- **Security**: `pip-audit` runs in CI. Keep dependencies minimal and pinned via `uv.lock`.
+- **Security**: `pip-audit` runs in CI via `uv run python scripts/pip_audit_gate.py`. Keep dependencies minimal and pinned via `uv.lock`.
 
 ## Documentation
 

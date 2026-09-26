@@ -20,6 +20,8 @@ from hermesd.panels.formatting import (
     escape_terminal_text as escape,
 )
 from hermesd.panels.formatting import (
+    fmt_age_seconds,
+    fmt_bytes,
     fmt_iso_timestamp,
     sanitize_terminal_text,
     section_heading,
@@ -146,7 +148,7 @@ def _platforms_table(gw: GatewayState, theme: Theme) -> Table:
             status,
             _ownership_label(p.ownership, theme),
             escape(fmt_iso_timestamp(p.updated_at)),
-            _duration_label(p.retrying_since_age_seconds),
+            fmt_age_seconds(p.retrying_since_age_seconds),
             error,
         )
     return table
@@ -180,8 +182,11 @@ def _ingress_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
             style=theme.banner_dim,
         )
         for profile, url, platform_name in mirror_rows:
-            mirrors.append(f"  {escape(platform_name)} / {escape(profile)}: ", style=theme.ui_label)
-            mirrors.append(f"{escape(url)}\n", style=theme.banner_text)
+            mirrors.append(
+                f"  {sanitize_terminal_text(platform_name)} / {sanitize_terminal_text(profile)}: ",
+                style=theme.ui_label,
+            )
+            mirrors.append(f"{sanitize_terminal_text(url)}\n", style=theme.banner_text)
         if any(platform.mirror_urls_truncated for platform in gw.platforms):
             # Say the roster is a slice: a bounded list must not read as the
             # complete set of served profiles.
@@ -287,7 +292,7 @@ def _append_served_profiles(header: Text, gw: GatewayState, theme: Theme) -> Non
     that never recorded anything.
     """
     if gw.served_profiles_recorded:
-        names = escape(", ".join(gw.served_profiles))
+        names = sanitize_terminal_text(", ".join(gw.served_profiles))
         header.append("\n  Served Profiles: ", style=theme.ui_label)
         header.append(
             names or "none (the live gateway serves no other profile)",
@@ -296,7 +301,7 @@ def _append_served_profiles(header: Text, gw: GatewayState, theme: Theme) -> Non
         return
     if gw.served_profiles:
         header.append("\n  Served Profiles (record, writer not current): ", style=theme.ui_warn)
-        header.append(escape(", ".join(gw.served_profiles)), style=theme.banner_dim)
+        header.append(sanitize_terminal_text(", ".join(gw.served_profiles)), style=theme.banner_dim)
 
 
 def _loop_style(loop_health: GatewayLoopHealth, theme: Theme) -> str:
@@ -350,14 +355,14 @@ def _restart_storm_text(gw: GatewayState, theme: Theme) -> Text:
     """
     text = Text()
     text.append("\n  Starts: ", style=theme.ui_label)
-    window = _duration_label(gw.restart_storm_window_seconds)
+    window = fmt_age_seconds(gw.restart_storm_window_seconds)
     text.append(
         f"{window} {gw.gateway_starts_window}/{gw.restart_storm_cap}  1h {gw.gateway_starts_1h}",
         style=theme.banner_text,
     )
     last = gw.seconds_since_last_gateway_start
     if last is not None:
-        text.append(f"  last start {_duration_label(last)} ago", style=theme.banner_dim)
+        text.append(f"  last start {fmt_age_seconds(last)} ago", style=theme.banner_dim)
     if gw.in_respawn_backoff:
         text.append(
             "  ⚠ respawn backoff (the supervisor pauses between restarts)",
@@ -373,10 +378,10 @@ def _dashboard_client_text(gw: GatewayState, theme: Theme) -> Text:
     if gw.dashboard_client_attached:
         text.append("web dashboard client attached", style=theme.ui_ok)
         if age is not None:
-            text.append(f"  last frame {_duration_label(age)} ago", style=theme.banner_dim)
+            text.append(f"  last frame {fmt_age_seconds(age)} ago", style=theme.banner_dim)
     elif age is not None:
         text.append(
-            f"no client attached (last frame {_duration_label(age)} ago)",
+            f"no client attached (last frame {fmt_age_seconds(age)} ago)",
             style=theme.banner_dim,
         )
     else:
@@ -384,21 +389,14 @@ def _dashboard_client_text(gw: GatewayState, theme: Theme) -> Text:
     return text
 
 
-def _duration_label(seconds: float | None) -> str:
-    if seconds is None:
-        return "—"
-    total = max(0, int(seconds))
-    if total < 60:
-        return f"{total}s"
-    if total < 3600:
-        return f"{total // 60}m"
-    if total < 86400:
-        return f"{total // 3600}h"
-    return f"{total // 86400}d"
-
-
 def _or_dash(value: str) -> str:
+    """Markup-escaped value or a dash, for markup-parsed table cells."""
     return escape(value) if value else "—"
+
+
+def _text_or_dash(value: str) -> str:
+    """Sanitized value or a dash, for ``Text.append`` (no markup parsing)."""
+    return sanitize_terminal_text(value) if value else "—"
 
 
 def _append_compact_warnings(lines: Text, state: DashboardState, theme: Theme) -> None:
@@ -426,7 +424,7 @@ def _append_compact_warnings(lines: Text, state: DashboardState, theme: Theme) -
     if gw.in_respawn_backoff:
         warnings.append("⚠ respawn backoff")
     if warnings:
-        lines.append("\n  " + escape("  ".join(warnings)), style=theme.ui_warn)
+        lines.append("\n  " + "  ".join(warnings), style=theme.ui_warn)
     if gw.pending_delivery_count or gw.failed_delivery_count:
         lines.append("\n  Deliveries: ", style=theme.ui_label)
         lines.append(f"{gw.pending_delivery_count} pending", style=theme.banner_text)
@@ -439,10 +437,10 @@ def _liveness_text(gw: GatewayState, theme: Theme) -> Text:
     text.append("  Loop: ", style=theme.ui_label)
     text.append(gw.loop_health.value, style=_loop_style(gw.loop_health, theme))
     text.append(
-        f"  heartbeat {_duration_label(gw.heartbeat_age_seconds)} ago"
+        f"  heartbeat {fmt_age_seconds(gw.heartbeat_age_seconds)} ago"
         f"  incarnations {gw.gateway_incarnation_count}"
         f"  restarts 24h {gw.gateway_restarts_24h}"
-        f"  uptime {_duration_label(gw.current_incarnation_uptime_seconds)}",
+        f"  uptime {fmt_age_seconds(gw.current_incarnation_uptime_seconds)}",
         style=theme.banner_dim,
     )
     text.append_text(_witness_label(gw, theme))
@@ -450,11 +448,11 @@ def _liveness_text(gw: GatewayState, theme: Theme) -> Text:
         text.append_text(_restart_storm_text(gw, theme))
     text.append_text(_dashboard_client_text(gw, theme))
     text.append("\n  Code: ", style=theme.ui_label)
-    text.append(_or_dash(gw.code_version), style=theme.banner_text)
+    text.append(_text_or_dash(gw.code_version), style=theme.banner_text)
     text.append(
-        f"  sha {_or_dash(gw.code_sha[:12])}"
-        f"  config {_or_dash(gw.config_generation_short)}"
-        f"  session store {_or_dash(gw.session_store_status)}",
+        f"  sha {_text_or_dash(gw.code_sha[:12])}"
+        f"  config {_text_or_dash(gw.config_generation_short)}"
+        f"  session store {_text_or_dash(gw.session_store_status)}",
         style=theme.banner_dim,
     )
     if gw.config_stale:
@@ -468,11 +466,15 @@ def _liveness_text(gw: GatewayState, theme: Theme) -> Text:
 
 def _append_lifecycle(text: Text, gw: GatewayState, theme: Theme) -> None:
     text.append("\n  Lifecycle: ", style=theme.ui_label)
-    text.append(_or_dash(gw.lifecycle_phase), style=theme.banner_text)
+    text.append(_text_or_dash(gw.lifecycle_phase), style=theme.banner_text)
     exit_code = "—" if gw.last_exit_code is None else str(gw.last_exit_code)
-    text.append(f"  last exit {exit_code}  {_or_dash(gw.last_exit_reason)}", style=theme.banner_dim)
+    text.append(
+        f"  last exit {exit_code}  {_text_or_dash(gw.last_exit_reason)}", style=theme.banner_dim
+    )
     if gw.exit_reason:
-        text.append(f"\n  Exit reason: {escape(gw.exit_reason)}", style=theme.ui_warn)
+        text.append(
+            f"\n  Exit reason: {sanitize_terminal_text(gw.exit_reason)}", style=theme.ui_warn
+        )
     if gw.unclean_previous_exit:
         text.append(
             "\n  ⚠ previous gateway life ended without recording an exit",
@@ -495,14 +497,6 @@ def _append_lifecycle(text: Text, gw: GatewayState, theme: Theme) -> None:
         text.append("\n  ⚠ suspected OOM", style=theme.ui_warn)
 
 
-def _size_label(size_bytes: int) -> str:
-    if size_bytes >= 1024 * 1024:
-        return f"{size_bytes / (1024 * 1024):.1f} MB"
-    if size_bytes >= 1024:
-        return f"{size_bytes / 1024:.0f} KB"
-    return f"{size_bytes} B"
-
-
 def _exit_diag_text(gw: GatewayState, theme: Theme) -> Text:
     """Crash forensics from the exit-diag ledger: tags and counts only.
 
@@ -519,14 +513,14 @@ def _exit_diag_text(gw: GatewayState, theme: Theme) -> Text:
     # The newest ledger record is whatever the gateway last wrote — a start
     # record on a healthy boot — so it is labelled as a record, not an exit.
     text.append("last record ", style=theme.ui_label)
-    text.append(_or_dash(gw.exit_diag_last_tag), style=theme.banner_text)
+    text.append(_text_or_dash(gw.exit_diag_last_tag), style=theme.banner_text)
     if gw.exit_diag_last_age_seconds is not None:
         text.append(
-            f"  {_duration_label(gw.exit_diag_last_age_seconds)} ago",
+            f"  {fmt_age_seconds(gw.exit_diag_last_age_seconds)} ago",
             style=theme.banner_dim,
         )
     text.append(f"  unclean exits 24h: {gw.exit_diag_unclean_24h}", style=theme.banner_dim)
-    text.append(f"  ledger {_size_label(gw.exit_diag_size_bytes)}", style=theme.banner_dim)
+    text.append(f"  ledger {fmt_bytes(gw.exit_diag_size_bytes)}", style=theme.banner_dim)
     if gw.exit_diag_oversized:
         text.append(
             "  ⚠ past a few MB and nothing prunes it",
@@ -541,10 +535,10 @@ def _forensic_files_text(gw: GatewayState, theme: Theme) -> Text:
         return Text()
     text = Text("\n  Event logs: ", style=theme.ui_label)
     parts = [
-        f"{escape(file.name)} ({_size_label(file.size_bytes)}, "
-        f"{_duration_label(file.age_seconds)} ago)"
+        f"{sanitize_terminal_text(file.name)} ({fmt_bytes(file.size_bytes)}, "
+        f"{fmt_age_seconds(file.age_seconds)} ago)"
         if file.age_seconds is not None
-        else f"{escape(file.name)} ({_size_label(file.size_bytes)})"
+        else f"{sanitize_terminal_text(file.name)} ({fmt_bytes(file.size_bytes)})"
         for file in gw.forensic_files
     ]
     text.append("; ".join(parts), style=theme.banner_dim)
@@ -562,20 +556,23 @@ def _updates_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
     text.append("\nUpdates\n", style=f"bold {theme.ui_label}")
     text.append("  Outcome: ", style=theme.ui_label)
     text.append(
-        _or_dash(gw.last_update_outcome),
+        _text_or_dash(gw.last_update_outcome),
         style=theme.ui_warn if gw.update_receipt_unfinished else theme.ui_ok,
     )
     text.append(
-        f"  finished {_duration_label(gw.last_update_finished_age_seconds)} ago",
+        f"  finished {fmt_age_seconds(gw.last_update_finished_age_seconds)} ago",
         style=theme.banner_dim,
     )
     text.append("\n  Version: ", style=theme.ui_label)
     text.append(
-        f"{_or_dash(gw.last_update_from_version)} → {_or_dash(gw.last_update_to_version)}",
+        f"{_text_or_dash(gw.last_update_from_version)} → {_text_or_dash(gw.last_update_to_version)}",
         style=theme.banner_text,
     )
     if gw.last_update_failed_step:
-        text.append(f"\n  Failed step: {escape(gw.last_update_failed_step)}", style=theme.ui_error)
+        text.append(
+            f"\n  Failed step: {sanitize_terminal_text(gw.last_update_failed_step)}",
+            style=theme.ui_error,
+        )
     _append_fleet_evidence(text, gw, theme)
     _append_skew_verdict(text, gw, theme)
     return [text]
@@ -586,7 +583,8 @@ def _append_fleet_evidence(text: Text, gw: GatewayState, theme: Theme) -> None:
     if not gw.update_fleet_runtime_count:
         return
     states = "  ".join(
-        f"{escape(state)} {count}" for state, count in sorted(gw.update_fleet_states.items())
+        f"{sanitize_terminal_text(state)} {count}"
+        for state, count in sorted(gw.update_fleet_states.items())
     )
     text.append(f"\n  Recorded fleet: {gw.update_fleet_runtime_count}", style=theme.banner_dim)
     if states:
@@ -704,7 +702,7 @@ def _append_migration_intent(text: Text, mig: MigrationState, theme: Theme) -> N
         suffix = (
             " (local time; the recorded stamp could not be parsed)"
             if mig.migrated_at_age_seconds is None
-            else f" (local time, {_duration_label(mig.migrated_at_age_seconds)} ago)"
+            else f" (local time, {fmt_age_seconds(mig.migrated_at_age_seconds)} ago)"
         )
         text.append(suffix, style=theme.banner_dim)
     text.append("\n  Config flag: ", style=theme.ui_label)
@@ -735,7 +733,7 @@ def _append_migration_progress(text: Text, mig: MigrationState, theme: Theme) ->
             else f"{len(mig.unserved_profiles)} recorded profile(s) not in the live served set"
         )
     text.append("\n  Progress: ", style=theme.ui_label)
-    text.append(escape(" · ".join(parts)), style=theme.banner_dim)
+    text.append(" · ".join(parts), style=theme.banner_dim)
 
 
 def _append_migration_roster(text: Text, mig: MigrationState, theme: Theme) -> None:
@@ -746,7 +744,7 @@ def _append_migration_roster(text: Text, mig: MigrationState, theme: Theme) -> N
         else f"{mig.secondary_count} secondaries"
     )
     style = theme.ui_warn if mig.secondaries_truncated else theme.banner_dim
-    text.append(f"\n  Recorded profiles: {escape(retained)} (+ default)\n", style=style)
+    text.append(f"\n  Recorded profiles: {retained} (+ default)\n", style=style)
 
 
 def _migration_table(mig: MigrationState, theme: Theme) -> Table:
@@ -795,16 +793,18 @@ def _deliveries_section(gw: GatewayState, theme: Theme) -> list[RenderableType]:
             _or_dash(entry.platform),
             _or_dash(entry.state),
             str(entry.attempts),
-            _duration_label(entry.age_seconds),
+            fmt_age_seconds(entry.age_seconds),
             _or_dash(entry.last_error),
         )
     return [header, table]
 
 
 def _append_drain(header: Text, gw: GatewayState, theme: Theme) -> None:
-    principal = f" by {escape(gw.drain_principal)}" if gw.drain_principal else ""
+    principal = f" by {sanitize_terminal_text(gw.drain_principal)}" if gw.drain_principal else ""
     requested_at = (
-        f" at {escape(fmt_iso_timestamp(gw.drain_requested_at))}" if gw.drain_requested_at else ""
+        f" at {sanitize_terminal_text(fmt_iso_timestamp(gw.drain_requested_at))}"
+        if gw.drain_requested_at
+        else ""
     )
     suppress = " suppress-notify" if gw.drain_suppress_notification else ""
     header.append(

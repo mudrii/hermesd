@@ -177,9 +177,9 @@ def _validate_gate_job(
         raise EligibilityError("latest workflow-attempt job evidence is incomplete")
 
     gates = [
-        _object(job, "workflow job")
-        for job in jobs
-        if _object(job, "workflow job").get("name") == CI_GATE_NAME
+        job
+        for job in (_object(entry, "workflow job") for entry in jobs)
+        if job.get("name") == CI_GATE_NAME
     ]
     if len(gates) != 1:
         raise EligibilityError(

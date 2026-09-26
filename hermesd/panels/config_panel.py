@@ -303,7 +303,7 @@ def _backup_section(c: ConfigSummary, theme: Theme) -> list[RenderableType]:
     if newest_good:
         changed = newest_good
         if newest_good_age is not None:
-            changed = f"{newest_good} ({fmt_age_seconds(int(newest_good_age))} ago)"
+            changed = f"{newest_good} ({fmt_age_seconds(newest_good_age)} ago)"
         table.add_row("Last changed", escape(changed))
     else:
         table.add_row("Last changed", "no good copy")

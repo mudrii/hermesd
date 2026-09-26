@@ -77,10 +77,10 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 - **Clipboard export** — press `c` to copy the current rendered view as plain text via OSC 52 in compatible terminals
 - **Inline detail filters** — press `/` in Sessions or Logs detail view to live-filter the current table/log stream with field-aware queries, including message-content and severity-threshold filters
 - **Session sorting** — press `s` in Sessions detail to cycle recent/cost/token ordering
-- **Jump navigation** — press `g` / `G` in scrollable detail views to jump to the top or bottom
+- **Jump navigation** — press `g` / `G` in any detail view to jump to the top or bottom
 - **Footer health indicator** — a green/yellow/red dot shows how many collector sources succeeded on the last refresh, with failed source names surfaced inline when degraded
 - **Header status** — the top-left header shows the installed `hermesd` version, while the header/footer surface an `AGENT OFFLINE` warning when Hermes Agent appears inactive
-- **Scrollable detail views** — `j`/`k` scroll Gateway, Sessions, Config, Cron, Skills, Logs, and Operations; every listed panel except Logs scrolls its complete rendered detail, while Logs scrolls the selected stream
+- **Scrollable detail views** — `j`/`k` scroll every detail view; all panels except Logs scroll their complete rendered detail, while Logs scrolls the selected stream in a window sized to the terminal
 - **Profile inspection** — press `p` inside the Profiles panel to cycle the viewed profile without changing the selected data source
 - **Resilient** — keeps showing last known good data on transient SQLite and log-read failures
 - **Theme-aware** — inherits your Hermes Agent skin and updates live when `config.yaml` changes
@@ -377,14 +377,14 @@ hermesd --log-tail-bytes 8192
 |-----|--------|
 | `1`-`9`, `0` | Expand panels 1-10 to full-screen detail view (`0` opens panel 10) |
 | `[` / `]` | Move to the previous/next registered panel, including panels 11-13 |
-| `Esc` | Return to overview |
+| `Esc` | Close the help overlay, otherwise return to overview |
 | `f` | Toggle focus mode for the last selected panel |
 | `c` | Copy the current rendered view as plain text via OSC 52 |
-| `j` / `k` | Scroll down/up in scrollable detail views |
+| `j` / `k` | Scroll down/up in detail views |
 | `Tab` | Cycle log sub-view for the discovered log streams (panel 8) |
 | `/` | Edit the inline filter for Sessions or Logs detail |
 | `s` | Cycle session sort in Sessions detail |
-| `g` / `G` | Jump to top/bottom in scrollable detail views |
+| `g` / `G` | Jump to top/bottom in detail views |
 | `p` | Cycle the viewed profile in Profiles detail |
 | `r` | Force immediate refresh |
 | `q` | Quit |
@@ -406,7 +406,7 @@ The header/footer show `AGENT OFFLINE` when Hermes Agent appears inactive: the g
 The green/yellow/red dot next to the polling spinner shows how many collector sources succeeded on the last refresh (`ok/total`). Green means every source read cleanly, yellow means some failed (the failed source names are listed inline), red means none did. A `(stale)` marker after the refresh interval means the last refresh failed outright and hermesd is showing cached data.
 
 **Does hermesd fight Hermes Agent for the SQLite database?**
-No. Source databases without a WAL sidecar use immutable, read-only connections. Databases with a WAL sidecar are copied with their available `-wal`/`-shm` sidecars to a private temporary directory outside your Hermes home and opened read-only there. Any SQLite shared-memory coordination is confined to that copy, including when another connection in the same process is writing to the source. The shared `state.db` snapshot is reused until the source changes; updates require another copy, which adds I/O for large databases. If a read fails transiently (e.g. during a WAL checkpoint), hermesd keeps the last good data on screen and retries on the next poll instead of blanking panels.
+No. Source databases without a WAL sidecar use immutable, read-only connections. Databases with a WAL sidecar are copied with their `-wal` sidecar to a private temporary directory outside your Hermes home and opened read-only there; the copy is checked for a concurrent checkpoint and retried once rather than served torn, and SQLite rebuilds `-shm` inside the copy. Any SQLite shared-memory coordination is confined to that copy, including when another connection in the same process is writing to the source. The shared `state.db` snapshot is reused until the source changes; updates require another copy, which adds I/O for large databases. If a read fails transiently (e.g. during a WAL checkpoint), hermesd keeps the last good data on screen and retries on the next poll instead of blanking panels.
 
 **hermesd is slow with very large log files**
 Each refresh reads only the last `--log-tail-bytes` bytes of every log file and cron output excerpt (default: 32768). Lower it to cut I/O on multi-GB logs:
@@ -459,7 +459,7 @@ hermesd is a **read-only companion** — it reads files from `~/.hermes/` and ne
 | `tty.setcbreak` (not `setraw`) | Preserves signal handling over SSH/tmux |
 | `os.read(fd, 64)` bulk read | Captures escape sequences as single chunks |
 | Cost estimation from tokens | Shows ~USD when provider doesn't report costs |
-| Adaptive layout threshold | Width < 100 with height >= 50 gets the tall single-column layout; smaller terminals get the compact mixed grid |
+| Adaptive layout threshold | Width < 100 with height >= 50 gets the tall single-column layout; width >= 100 with height >= 34 gets the wide grid; otherwise height >= 26 gets the compact mixed grid and shorter terminals get a reduced two-panels-per-row grid |
 
 ## Themes
 
@@ -537,6 +537,7 @@ hermesd/
     config.py     config.yaml and auth.json summaries
     cron.py       Cron output discovery, excerpts, suggestions,
                   executions.db history/incidents, ticker health
+    curator.py    Curator run reports, scheduler state, thresholds, skill hygiene
     desktop_plugins.py
                   Content-free app-level Desktop plugin inventory
     gateway.py    Gateway heartbeat, lifecycle, updates, ledgers
@@ -548,7 +549,7 @@ hermesd/
     logs.py       Log line parsing constants and helpers
     migration.py  gateway_migration.json: recorded intent, progress,
                   and the verified-topology predicate
-    operations.py Verification, goals, projects, MoA, curator
+    operations.py Verification, goals, projects, MoA, delegations, receipts
     plugins.py    Agent-plugin discovery (3 manifest formats, 2 directory shapes),
                   the configured-activation gate, and install/catalog provenance
     recovery.py   state.db recovery evidence: repair ledger, forensic
@@ -560,10 +561,11 @@ hermesd/
     system.py     Process liveness, git checkpoints, activity age
   defaults.py          Shared refresh-rate and log-tail-bytes defaults
   db.py                Read-only SQLite with data_version caching
-  file_cache.py        mtime-keyed JSON/YAML cache
+  file_cache.py        (mtime, size, inode)-keyed JSON/YAML cache
   models.py            Pydantic models for dashboard state
   paths.py             HermesPaths root/profile path resolution (source
                        ownership: .codex/rules/source-ownership.md)
+  py.typed             PEP 561 typed-package marker
   theme.py             Skin/color system matching Hermes Agent
   panels/
     __init__.py        Panel dispatch and registry
@@ -593,7 +595,7 @@ hermesd uses **TDD-first** contribution (see [`CONTRIBUTING.md`](CONTRIBUTING.md
 3. Collect data in the matching `hermesd/collect/*.py` reader, wired in via `hermesd/collector.py`
 4. Create `hermesd/panels/your_panel.py` with `render_*(state, theme, detail)` function
 5. Register in `hermesd/panels/__init__.py` (`PANEL_NAMES` and `_RENDERERS`)
-6. Add the panel number to the overview layout specs in `hermesd/app.py` (`_WIDE_LAYOUT_SPEC`, `_COMPACT_LAYOUT_SPEC`, `_TALL_NARROW_LAYOUT_SPEC`) as needed
+6. Add the panel number to the overview layout specs in `hermesd/app.py` (`_WIDE_LAYOUT_SPEC`, `_COMPACT_LAYOUT_SPEC`, `_REDUCED_LAYOUT_SPEC`, `_TALL_NARROW_LAYOUT_SPEC`) as needed
 7. Update `CHANGELOG.md` under `[Unreleased]`
 
 ## Requirements

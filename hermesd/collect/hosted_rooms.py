@@ -36,7 +36,12 @@ import json
 import sqlite3
 from typing import Any
 
-from hermesd.collect.common import _age_seconds, _coerce_int, _optional_epoch
+from hermesd.collect.common import (
+    _age_seconds,
+    _coerce_int,
+    _optional_epoch,
+    _printable_capped,
+)
 from hermesd.collect.sqlite_util import (
     _count_by,
     _count_rows,
@@ -134,8 +139,8 @@ def _room_fields(conn: sqlite3.Connection, *, now: float) -> dict[str, Any]:
 
 def _room_summary(row: dict[str, Any], *, now: float) -> HostedRoomSummary:
     return HostedRoomSummary(
-        room_id=_capped_text(row.get("room_id")),
-        name=_capped_text(row.get("name")),
+        room_id=_printable_capped(row.get("room_id"), MAX_HOSTED_ROOM_TEXT_CHARS),
+        name=_printable_capped(row.get("name"), MAX_HOSTED_ROOM_TEXT_CHARS),
         member_count=_member_count(row.get("members_json")),
         authority_epoch=_coerce_int(row.get("authority_epoch")),
         next_seq=_coerce_int(row.get("next_seq")),
@@ -239,14 +244,3 @@ def _member_count(raw: object) -> int:
         if isinstance(decoded, list | dict):
             return len(decoded)
     return 0
-
-
-def _capped_text(value: object) -> str:
-    """Printable, length-capped text safe to hand to a panel.
-
-    Control characters are stripped here, in the collector: a panel escapes
-    markup but must not be the place an escape sequence is neutralised.
-    """
-    if not isinstance(value, str):
-        return ""
-    return "".join(char for char in value if char.isprintable())[:MAX_HOSTED_ROOM_TEXT_CHARS]

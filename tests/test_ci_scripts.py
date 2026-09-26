@@ -278,8 +278,30 @@ def test_installed_smoke_rejects_empty_data_for_a_populated_fixture(
 
     monkeypatch.setattr(installed_smoke, "hermesd", fake_hermesd)
 
-    with pytest.raises(AssertionError, match="fixture model not collected"):
+    with pytest.raises(SystemExit, match="fixture model not collected"):
         installed_smoke.check_snapshots(home, "populated home", populated=True)
+
+
+def test_installed_smoke_checks_survive_python_optimize() -> None:
+    """`python -O` strips assert statements; smoke checks must not rely on them."""
+    import ast
+
+    tree = ast.parse(Path("scripts/installed_smoke.py").read_text(encoding="utf-8"))
+    assert not [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Assert)]
+
+
+def test_installed_smoke_missing_home_failure_exits_nonzero(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fake_hermesd(*args: str, home: Path | None = None) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(installed_smoke, "hermesd", fake_hermesd)
+
+    with pytest.raises(SystemExit, match="missing home: unexpected exit 0") as exc:
+        installed_smoke.check_missing_home(tmp_path / "missing")
+    assert exc.value.code != 0
 
 
 def test_sdist_includes_ci_helpers_lockfile_and_policy_docs() -> None:

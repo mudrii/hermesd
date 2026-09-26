@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 from pathlib import Path
 
@@ -229,3 +230,40 @@ def test_json_snapshot_accepts_the_separate_desktop_inventory(hermes_home: Path)
 
     assert payload["state"]["skills_memory"]["desktop_plugins"] == [{"name": "weather"}]
     assert payload["state"]["skills_memory"]["desktop_plugin_scan_truncated"] is False
+
+
+def test_desktop_root_that_is_a_regular_file_fails_only_its_own_source(
+    hermes_home: Path,
+) -> None:
+    (hermes_home / "desktop-plugins").write_text("not a directory")
+
+    with pytest.raises(RuntimeError, match="not a confined directory"):
+        read_desktop_plugins(hermes_home / "desktop-plugins", hermes_home)
+
+    state = _collect(hermes_home)
+
+    assert state.health.failed_sources == ["desktop_plugins"]
+    assert state.skills_memory.desktop_plugins == []
+
+
+def test_desktop_entries_vanishing_between_listing_and_stat_are_skipped(
+    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kept = _write_desktop_plugin(hermes_home, "kept")
+    gone_dir = _write_desktop_plugin(hermes_home, "gone-dir")
+    gone_entry = _write_desktop_plugin(hermes_home, "gone-entry") / "plugin.js"
+    original_stat = Path.stat
+
+    def racing_stat(path: Path, *args: object, **kwargs: object):
+        if path in (gone_dir, gone_entry):
+            # Carry errno like a real vanished entry: pathlib's is_symlink()
+            # (3.11) only swallows ENOENT-tagged errors from stat().
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(path))
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", racing_stat)
+
+    plugins, truncated = read_desktop_plugins(hermes_home / "desktop-plugins", hermes_home)
+
+    assert [plugin.name for plugin in plugins] == [kept.name]
+    assert truncated is False

@@ -96,7 +96,7 @@ def test_snapshot_read_paths_do_not_write_to_hermes_home(forensic_hermes_home: P
     before = _manifest(forensic_hermes_home)
 
     app = DashboardApp(forensic_hermes_home, refresh_rate=5, no_color=True)
-    app.render_snapshot()
+    app.render_snapshot_text()
     app.render_snapshot_text(10)
     app.render_snapshot_json()
     app.close()

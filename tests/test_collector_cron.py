@@ -3121,3 +3121,104 @@ def test_cron_enabled_flag_is_read_strictly(hermes_home: Path):
     assert by_id["job-real-false"].enabled is False
     assert by_id["job-real-true"].enabled is True
     assert by_id["job-absent"].enabled is True
+
+
+def _write_outputs(job_dir: Path, names_to_ages: dict[str, float]) -> None:
+    job_dir.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    for name, age in names_to_ages.items():
+        path = job_dir / name
+        path.write_text(f"{name}\n")
+        os.utime(path, (now - age, now - age))
+
+
+def test_latest_cron_output_file_stats_only_the_newest_names(
+    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Output names are timestamps; only the lexically newest few are stat'ed."""
+    output_root = hermes_home / "cron" / "output"
+    _write_outputs(
+        output_root / "job-1",
+        {
+            "2026-09-01_00-00-00.md": 0.0,  # oldest name, newest mtime: never considered
+            "2026-09-22_00-00-00.md": 50.0,
+            "2026-09-23_00-00-00.md": 100.0,
+        },
+    )
+    monkeypatch.setattr(cron_module, "_CRON_OUTPUT_STAT_LIMIT", 2)
+
+    latest = cron_module._latest_cron_output_file(output_root, "job-1")
+
+    assert latest is not None
+    assert latest.name == "2026-09-22_00-00-00.md"
+
+
+def test_latest_cron_output_file_listing_is_bounded(
+    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    output_root = hermes_home / "cron" / "output"
+    _write_outputs(output_root / "job-1", {f"2026-09-{day:02d}.md": 0.0 for day in range(1, 11)})
+    monkeypatch.setattr(cron_module, "_CRON_OUTPUT_LIST_LIMIT", 3)
+    seen: list[str] = []
+    original = cron_module._safe_mtime
+
+    def recording_mtime(path: Path) -> float:
+        seen.append(path.name)
+        return original(path)
+
+    monkeypatch.setattr(cron_module, "_safe_mtime", recording_mtime)
+
+    assert cron_module._latest_cron_output_file(output_root, "job-1") is not None
+    assert 0 < len(seen) <= 3
+
+
+@_skip_if_root
+def test_unreadable_cron_output_dirs_read_as_no_output(hermes_home: Path):
+    output_root = hermes_home / "cron" / "output"
+    job_dir = output_root / "job-1"
+    _write_outputs(job_dir, {"2026-09-23_00-00-00.md": 0.0})
+    os.chmod(job_dir, 0o000)
+    try:
+        assert cron_module._latest_cron_output_file(output_root, "job-1") is None
+        assert cron_module._tail_latest_cron_output(output_root, 5, 1024) == []
+    finally:
+        os.chmod(job_dir, 0o755)
+    os.chmod(output_root, 0o000)
+    try:
+        assert cron_module._tail_latest_cron_output(output_root, 5, 1024) == []
+    finally:
+        os.chmod(output_root, 0o755)
+
+
+def test_tail_latest_cron_output_picks_newest_across_jobs(hermes_home: Path):
+    output_root = hermes_home / "cron" / "output"
+    _write_outputs(output_root / "job-a", {"2026-09-22_00-00-00.md": 500.0})
+    _write_outputs(output_root / "job-b", {"2026-09-23_00-00-00.md": 5.0})
+
+    lines = cron_module._tail_latest_cron_output(output_root, 5, 1024)
+
+    assert [line.message for line in lines] == ["2026-09-23_00-00-00.md"]
+
+
+def test_delivery_rows_for_a_job_without_executions_still_get_stats():
+    stats = cron_module._job_execution_stats(
+        [],
+        [],
+        [{"job_id": "job-orphan", "delivery_outcome": "delivered", "row_count": 2}],
+        delivery_tracked=True,
+    )
+
+    assert [entry.job_id for entry in stats] == ["job-orphan"]
+    assert stats[0].delivery_outcomes_24h == {"delivered": 2}
+    assert stats[0].last_status == ""
+    assert stats[0].delivery_tracked is True
+
+
+def test_cron_marker_symlinked_outside_home_reads_as_empty(hermes_home: Path, tmp_path: Path):
+    outside = tmp_path / "outside-marker"
+    outside.write_text("OUTSIDE-SENTINEL\n")
+    marker = hermes_home / "cron" / "ticker_last_error"
+    marker.parent.mkdir(exist_ok=True)
+    marker.symlink_to(outside)
+
+    assert cron_module._read_cron_marker_text_strict(marker, hermes_home) == ""

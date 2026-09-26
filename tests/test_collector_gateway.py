@@ -20,6 +20,8 @@ import yaml
 from hermesd.collect.gateway import (
     _INCARNATION_SCAN_LIMIT,
     _OPEN_DELIVERY_LIMIT,
+    _gateway_ledger_fields,
+    _GatewayLedgerRows,
     _listener_mirror_urls,
 )
 from hermesd.collector import (
@@ -30,7 +32,7 @@ from hermesd.collector import (
 from hermesd.models import DashboardState, GatewayLoopHealth, PlatformOwnership, PlatformStatus
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
-from tests.conftest import create_state_db_tables, render_to_str
+from tests.conftest import _skip_if_root, create_state_db_tables, render_to_str
 
 
 def test_collect_gateway_preserves_last_good_mapping_on_non_mapping_json(hermes_home: Path):
@@ -1607,6 +1609,17 @@ def test_gateway_ledgers_from_state_db(hermes_home: Path):
     assert gateway.current_incarnation_uptime_seconds == pytest.approx(3600.0)
 
 
+def test_stopped_gateway_reports_no_incarnation_uptime(hermes_home: Path):
+    _write_gateway_state(hermes_home)
+    _write_ledgers(hermes_home)
+
+    gateway = _collect(hermes_home, live_pid=-1).gateway
+
+    assert gateway.running is False
+    assert gateway.gateway_incarnation_count == 3
+    assert gateway.current_incarnation_uptime_seconds is None
+
+
 def test_delivery_obligation_counts_and_excerpts(hermes_home: Path):
     _write_gateway_state(hermes_home)
     _write_ledgers(hermes_home)
@@ -1763,6 +1776,17 @@ def test_gateway_ledger_uptime_clamps_future_start(hermes_home: Path):
     gateway = _collect(hermes_home).gateway
 
     assert gateway.current_incarnation_uptime_seconds == 0.0
+
+
+def test_gateway_ledger_uptime_is_none_while_gateway_stopped():
+    rows = _GatewayLedgerRows(incarnation_count=1, incarnation_starts=[NOW - 600])
+
+    stopped = _gateway_ledger_fields(rows, NOW, running=False)
+    running = _gateway_ledger_fields(rows, NOW, running=True)
+
+    assert stopped["current_incarnation_uptime_seconds"] is None
+    assert stopped["gateway_incarnation_count"] == 1
+    assert running["current_incarnation_uptime_seconds"] == pytest.approx(600.0)
 
 
 def test_goal_state_still_collected_alongside_gateway_ledgers(hermes_home: Path):
@@ -3160,6 +3184,22 @@ def test_listener_base_mirrors_are_synthesized_for_served_profiles(hermes_home: 
     assert platforms["telegram"].mirror_urls == {}
 
 
+def test_listener_base_mirrors_only_come_from_the_default_bare_entry(hermes_home: Path):
+    _write_gateway_state(
+        hermes_home,
+        served_profiles=["dev", "ops"],
+        platforms={
+            "dev:api_server": {"state": "connected", "listener_base": "http://127.0.0.1:8088"},
+        },
+    )
+
+    platform = _collect(hermes_home).gateway.platforms[0]
+
+    assert platform.profile == "dev"
+    assert platform.mirror_urls == {}
+    assert platform.mirror_urls_truncated is False
+
+
 def test_listener_base_mirrors_need_a_live_writer_and_a_serving_state(hermes_home: Path):
     _write_gateway_state(
         hermes_home,
@@ -3670,3 +3710,32 @@ def test_gateway_stringified_request_flags_are_read_strictly(hermes_home: Path):
 
     assert gw.restart_requested is False
     assert gw.drain_suppress_notification is False
+
+
+@_skip_if_root
+def test_unreadable_non_empty_start_ledger_yields_no_verdict(hermes_home: Path):
+    from hermesd.collect.gateway import _read_start_storm
+
+    ledger = hermes_home / "gateway-starts.log"
+    ledger.write_text(f"{NOW - 10}\n{NOW - 5}\n")
+    os.chmod(ledger, 0o000)
+    try:
+        storm = _read_start_storm(ledger, hermes_home, NOW)
+    finally:
+        os.chmod(ledger, 0o644)
+
+    assert storm.recorded is False
+    assert storm.starts_window == 0
+
+
+def test_loop_tick_probe_with_unstatable_socket_node_has_no_node_to_ask(
+    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from hermesd.collect.gateway import _default_loop_tick_probe
+
+    def failing_is_socket(path: Path) -> bool:
+        raise PermissionError(path)
+
+    monkeypatch.setattr(Path, "is_socket", failing_is_socket)
+
+    assert _default_loop_tick_probe(4242, None, hermes_home) is None
