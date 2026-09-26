@@ -744,10 +744,14 @@ def _cron_marker_present(cron_dir: Path, name: str, root: Path) -> bool:
 
 
 def _read_cron_marker_text_strict(path: Path, root: Path) -> str:
-    """Read a confined marker without treating an I/O failure as empty text."""
+    """Read a confined marker without treating an I/O failure as empty text.
+
+    The regular-file guard runs before the open: a FIFO in the marker's place
+    would otherwise block the collector thread on a writer that never comes.
+    """
     if not _safe_child_path(path, root):
         return ""
-    with path.open("rb") as handle:
+    with _open_regular_file(path) as handle:
         return handle.read(_MAX_TEXT_READ_BYTES).decode("utf-8", errors="replace")
 
 

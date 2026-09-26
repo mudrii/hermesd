@@ -24,6 +24,7 @@ from hermesd.collect.common import (
 )
 from hermesd.collect.redaction import (
     _redact_bare_credentials,
+    _redact_secret_text,
     _redact_secret_url,
     _redact_text_fields,
 )
@@ -220,7 +221,9 @@ def _top_sessions(rows: list[dict[str, Any]]) -> list[TopSession]:
     return [
         TopSession(
             session_id=str(row.get("id") or ""),
-            title=str(row.get("display_name") or row.get("title") or ""),
+            # Same chat-controlled free text as the session listing: redact at
+            # this boundary too, before the Tokens panel or JSON snapshot sees it.
+            title=_redact_secret_text(str(row.get("display_name") or row.get("title") or "")),
             source=str(row.get("source") or ""),
             model=str(row.get("model") or ""),
             input_tokens=_coerce_int(row.get("input_tokens")),
@@ -735,7 +738,9 @@ def _hygiene_fields(
             session_key=str(row.get("session_key") or ""),
             failure_streak=_coerce_int(row.get("failure_streak")),
             suspended=_coerce_int(row.get("failure_streak")) >= _HYGIENE_SUSPENSION_STREAK,
-            compression_failure_error=errors_by_key.get(str(row.get("session_key") or ""), ""),
+            compression_failure_error=_redact_secret_text(
+                errors_by_key.get(str(row.get("session_key") or ""), "")
+            ),
         )
         for row in rows
     ]

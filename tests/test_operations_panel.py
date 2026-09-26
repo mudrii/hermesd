@@ -948,3 +948,13 @@ def test_verification_summary_shows_one_line_not_the_whole_output() -> None:
     assert "compile OK" in rendered
     assert "privacy tests" not in rendered
     assert "Failed to spawn" not in rendered
+
+
+def test_size_label_saturates_absurd_byte_counts() -> None:
+    """DB/JSON byte counts can be arbitrary-precision ints; dividing one into a
+    float raises OverflowError, so the label saturates at a bounded sentinel."""
+    from hermesd.panels.operations import _size_label
+
+    assert _size_label(10**400) == ">=1000T"
+    assert _size_label(2 * 10**12) == "2000.0G"
+    assert _size_label(512) == "512"

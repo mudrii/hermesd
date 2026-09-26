@@ -1784,16 +1784,17 @@ def test_available_tools_cache_hit_skips_reread(hermes_home: Path, monkeypatch):
     session_file.write_text(json.dumps({"session_id": "s1", "tools": [{"name": "web_search"}]}))
 
     # Count real file opens of the per-session file (observable behavior) rather
-    # than wrapping a private collector method.
+    # than wrapping a private collector method. The regular-file guard opens the
+    # descriptor directly with os.open, so that is the lane to count.
     opens: list[Path] = []
-    real_open = Path.open
+    real_os_open = os.open
 
-    def counting_open(self: Path, *args, **kwargs):
-        if self == session_file:
-            opens.append(self)
-        return real_open(self, *args, **kwargs)
+    def counting_open(name, flags, *args, **kwargs):
+        if Path(name) == session_file:
+            opens.append(Path(name))
+        return real_os_open(name, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", counting_open)
+    monkeypatch.setattr(os, "open", counting_open)
 
     c = Collector(hermes_home)
     try:

@@ -811,14 +811,14 @@ def test_cron_tail_open_error_yields_no_cron_lines(
     out = job_dir / "run.log"
     out.write_text("2026-04-09 15:41:58,123 - hermes - INFO - cron ran\n")
 
-    real_open = Path.open
+    real_os_open = os.open
 
-    def fail_target_open(self: Path, *args, **kwargs):
-        if self == out:
+    def fail_target_open(name, flags, *args, **kwargs):
+        if Path(name) == out:
             raise OSError("simulated cron read failure")
-        return real_open(self, *args, **kwargs)
+        return real_os_open(name, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", fail_target_open)
+    monkeypatch.setattr(os, "open", fail_target_open)
     c = Collector(hermes_home)
     try:
         state = c.collect()
@@ -858,14 +858,14 @@ def test_cron_output_excerpt_open_error_returns_empty(
     out = job_dir / "latest.md"
     out.write_text("some cron output\n")
 
-    real_open = Path.open
+    real_os_open = os.open
 
-    def fail_target_open(self: Path, *args, **kwargs):
-        if self == out:
+    def fail_target_open(name, flags, *args, **kwargs):
+        if Path(name) == out:
             raise OSError("simulated cron excerpt read failure")
-        return real_open(self, *args, **kwargs)
+        return real_os_open(name, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", fail_target_open)
+    monkeypatch.setattr(os, "open", fail_target_open)
 
     assert _latest_cron_output_excerpt(output_root, "job-x", max_bytes=4096) == (
         "",
@@ -2638,14 +2638,14 @@ def test_cron_marker_open_failure_keeps_last_good_and_fails_the_source(
 
         blocked_path = hermes_home / "cron" / marker_name
         blocked_path.stat()
-        real_open = Path.open
+        real_os_open = os.open
 
-        def fail_marker_open(self: Path, *args: object, **kwargs: object):
-            if self == blocked_path:
+        def fail_marker_open(name, flags, *args, **kwargs):
+            if Path(name) == blocked_path:
                 raise PermissionError("marker read failed after stat")
-            return real_open(self, *args, **kwargs)
+            return real_os_open(name, flags, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "open", fail_marker_open)
+        monkeypatch.setattr(os, "open", fail_marker_open)
         second = c.collect()
 
         assert "cron" in second.health.failed_sources
@@ -2653,7 +2653,7 @@ def test_cron_marker_open_failure_keeps_last_good_and_fails_the_source(
         assert second.cron.catch_up_occurrences_recorded is True
         assert second.cron.ticker_last_error == "RuntimeError: boom"
 
-        monkeypatch.setattr(Path, "open", real_open)
+        monkeypatch.setattr(os, "open", real_os_open)
         third = c.collect()
 
         assert "cron" not in third.health.failed_sources

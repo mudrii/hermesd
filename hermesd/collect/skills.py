@@ -17,7 +17,8 @@ from hermesd.collect.common import (
     _as_dict,
     _as_list,
     _coerce_bool,
-    _read_text_capped,
+    _exists_strict,
+    _read_text_capped_strict,
 )
 from hermesd.collect.config import _MAX_LISTED_NAMES
 from hermesd.models import (
@@ -243,15 +244,17 @@ def _count_skills(skills_dir: Path) -> int:
 
 
 def _word_count(path: Path, root: Path | None = None) -> int:
-    if not path.exists():
+    # Strict on both legs: a stat failure or a failed read on a *present* file
+    # must propagate so the signature cache never records it as a genuine zero.
+    if not _exists_strict(path):
         return 0
-    return len(_read_text_capped(path, root).split())
+    return len(_read_text_capped_strict(path, root).split())
 
 
 def _read_soul_excerpt(path: Path, root: Path | None = None) -> str:
-    if not path.exists():
+    if not _exists_strict(path):
         return ""
-    for line in _read_text_capped(path, root).splitlines():
+    for line in _read_text_capped_strict(path, root).splitlines():
         stripped = line.strip()
         if stripped:
             return stripped[:_EXCERPT_MAX_CHARS]
@@ -337,9 +340,12 @@ def _learned_skill_names(skills_dir: Path) -> list[str]:
 
 
 def _skill_frontmatter(path: Path, root: Path | None = None) -> dict[str, Any]:
-    # Nesting deep enough to exhaust the YAML composer is just more junk.
+    if not _exists_strict(path):
+        return {}
+    # Nesting deep enough to exhaust the YAML composer is just more junk; an
+    # I/O failure on a present file is not — it propagates out of the suppress.
     with contextlib.suppress(yaml.YAMLError, RecursionError):
-        lines = _read_text_capped(path, root).removeprefix("﻿").splitlines()
+        lines = _read_text_capped_strict(path, root).removeprefix("﻿").splitlines()
         if not lines or lines[0].strip() != "---":
             return {}
         frontmatter: list[str] = []
@@ -352,7 +358,11 @@ def _skill_frontmatter(path: Path, root: Path | None = None) -> dict[str, Any]:
 
 
 def _memory_card_count(path: Path, root: Path | None = None) -> int:
-    return sum(1 for line in _read_text_capped(path, root).splitlines() if line.startswith("## "))
+    if not _exists_strict(path):
+        return 0
+    return sum(
+        1 for line in _read_text_capped_strict(path, root).splitlines() if line.startswith("## ")
+    )
 
 
 def _skill_description(path: Path, root: Path | None = None) -> str:

@@ -320,14 +320,17 @@ def test_collect_profiles_reads_soul_excerpt_when_present(profiled_hermes_home: 
 
 
 @_skip_if_root
-def test_read_soul_excerpt_oserror_returns_empty(tmp_path: Path):
+def test_read_soul_excerpt_oserror_propagates(tmp_path: Path):
+    """A failed read of a present file is not empty content: it must raise so
+    the signature cache never records the failure as a successful empty."""
     f = tmp_path / "SOUL.md"
     f.write_text("Remember the operator.")
     os.chmod(f, 0o000)
     try:
         if not _unreadable(f):
             pytest.skip("filesystem allowed read despite chmod 000")
-        assert _read_soul_excerpt(f) == ""
+        with pytest.raises(PermissionError):
+            _read_soul_excerpt(f)
     finally:
         os.chmod(f, 0o644)
 

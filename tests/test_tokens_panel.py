@@ -384,3 +384,39 @@ def test_sparkline_scales_to_the_largest_value() -> None:
     assert sparkline([0, 1, 4, 8]) == "▁▂▅█"
     assert sparkline([0, 0]) == "▁▁"
     assert sparkline([]) == ""
+
+
+def test_oversized_token_count_from_sqlite_renders_bounded_snapshots(hermes_home) -> None:
+    """SQLite keeps a TEXT value in an INTEGER column, and Pydantic coerces the
+    underscore-separated digits into an arbitrary-precision int. Every accepted
+    count must format: panel 3, the overview, and the JSON dump all complete."""
+    import sqlite3
+    import time
+
+    from hermesd.app import DashboardApp
+
+    conn = sqlite3.connect(str(hermes_home / "state.db"))
+    conn.executescript(
+        "CREATE TABLE sessions ("
+        "id TEXT, source TEXT, started_at REAL, ended_at REAL, input_tokens INTEGER);"
+    )
+    conn.execute(
+        "INSERT INTO sessions VALUES (?,?,?,?,?)",
+        ("s1", "cli", time.time(), None, "_".join(["9"] * 400)),
+    )
+    conn.commit()
+    conn.close()
+
+    app = DashboardApp(hermes_home, no_color=True)
+    try:
+        state = app._collector.collect()
+        panel_text = app.render_snapshot_text(panel_num=3)
+        overview_text = app.render_snapshot_text()
+        json_text = app.render_snapshot_json()
+    finally:
+        app.close()
+
+    assert state.sessions[0].input_tokens == 10**400 - 1
+    assert ">=999T" in panel_text
+    for output in (panel_text, overview_text, json_text):
+        assert len(output) < 100_000

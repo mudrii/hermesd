@@ -1337,6 +1337,11 @@ def _discovered_repos_table(ops: OperationsState, theme: Theme) -> Table:
 
 
 def _size_label(size_bytes: int) -> str:
+    # Untrusted byte counts can be arbitrary-precision ints (a TEXT value in a
+    # numeric SQLite column); past 10**15 the precise figure is noise and the
+    # float division would raise OverflowError, so the label saturates.
+    if size_bytes >= 10**15:
+        return ">=1000T"
     if size_bytes >= 1_000_000_000:
         return f"{size_bytes / 1_000_000_000:.1f}G"
     if size_bytes >= 1_000_000:

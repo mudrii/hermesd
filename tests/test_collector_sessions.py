@@ -2968,3 +2968,122 @@ def test_gateway_route_reasons_are_clipped(hermes_home: Path) -> None:
     assert route.resume_reason == "R" * 40
     assert route.auto_reset_reason == "A" * 30 + "[REDACTED]"
     assert "sk-live" not in route.auto_reset_reason
+
+
+# --------------------------------------------------------------------------
+# Session free-text redaction
+#
+# `display_name`, `title`, `handoff_error`, `last_activity_description` and
+# `compression_failure_error` are chat-controlled or exception-derived free
+# text. They must be redacted at the collection boundary, the same way cron
+# `last_error` and gateway route display names already are, so a credential
+# cannot reach the text snapshot, the clipboard copy of it, or the JSON dump.
+
+_AUDIT_FAKE_SECRET = "api_key=sk-test-AUDITFAKE0123456789"
+
+
+def _write_secret_session_db(home: Path) -> None:
+    conn = sqlite3.connect(str(home / "state.db"))
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            source TEXT,
+            started_at REAL,
+            ended_at REAL,
+            title TEXT,
+            display_name TEXT,
+            handoff_error TEXT,
+            last_activity_description TEXT,
+            compression_failure_error TEXT
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, title, display_name, handoff_error, "
+        "last_activity_description, compression_failure_error) VALUES (?,?,?,?,?,?,?,?)",
+        (
+            "sess-secret",
+            "cli",
+            time.time(),
+            f"review {_AUDIT_FAKE_SECRET}",
+            f"chat {_AUDIT_FAKE_SECRET}",
+            f"handoff failed: {_AUDIT_FAKE_SECRET}",
+            f"edited {_AUDIT_FAKE_SECRET}",
+            f"compression failed: {_AUDIT_FAKE_SECRET}",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_session_free_text_fields_are_redacted_at_collection(hermes_home: Path) -> None:
+    _write_secret_session_db(hermes_home)
+
+    session = _collect_once(hermes_home).sessions[0]
+
+    for field in (
+        session.title,
+        session.display_name,
+        session.handoff_error,
+        session.last_activity_description,
+        session.compression_failure_error,
+    ):
+        assert field is not None
+        assert "sk-test-AUDITFAKE0123456789" not in field
+        assert "[REDACTED]" in field
+
+
+def test_session_free_text_redaction_reaches_text_and_json_snapshots(hermes_home: Path) -> None:
+    """Collector -> state -> rendered text / JSON: the secret appears in neither."""
+    from hermesd.app import DashboardApp
+
+    _write_secret_session_db(hermes_home)
+    app = DashboardApp(hermes_home, no_color=True)
+    try:
+        text_snapshot = app.render_snapshot_text(panel_num=2)
+        json_snapshot = app.render_snapshot_json()
+    finally:
+        app.close()
+
+    assert "sk-test-AUDITFAKE0123456789" not in text_snapshot
+    assert "sk-test-AUDITFAKE0123456789" not in json_snapshot
+    assert "[REDACTED]" in json_snapshot
+
+
+def test_top_sessions_title_is_redacted(hermes_home: Path) -> None:
+    """The usage-analytics aggregation re-reads display_name/title from raw rows."""
+    _write_secret_session_db(hermes_home)
+
+    state = _collect_once(hermes_home)
+
+    top = state.usage_analytics.top_sessions_7d[0]
+    assert "sk-test-AUDITFAKE0123456789" not in top.title
+    assert "[REDACTED]" in top.title
+
+
+def test_hygiene_compression_failure_error_is_redacted(hermes_home: Path) -> None:
+    """The hygiene join reads compression_failure_error from the unfiltered table."""
+    conn = sqlite3.connect(hermes_home / "state.db")
+    create_state_db_tables(
+        conn, include_schema_version=False, include_v021_columns=True, include_session_key=True
+    )
+    create_session_coordination_tables(conn)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, session_key, compression_failure_error) "
+        f"VALUES ('sess_h', 'gateway', ?, 'telegram:42:7', 'summary failed: {_AUDIT_FAKE_SECRET}')",
+        (_COORD_NOW - 30,),
+    )
+    conn.execute("INSERT INTO gateway_hygiene_state VALUES ('telegram:42:7', 4)")
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home, clock=lambda: _COORD_NOW, pid_exists=lambda pid: True)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    error = state.session_coordination.hygiene[0].compression_failure_error
+    assert "sk-test-AUDITFAKE0123456789" not in error
+    assert "[REDACTED]" in error

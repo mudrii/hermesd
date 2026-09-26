@@ -349,14 +349,14 @@ def test_log_stream_open_error_preserves_last_good_lines(
         good = [line.message for line in first.logs.agent_lines]
         assert good == ["Tool call: web_search"]
 
-        real_open = Path.open
+        real_os_open = os.open
 
-        def fail_target_open(self: Path, *args, **kwargs):
-            if self == agent_log:
+        def fail_target_open(name, flags, *args, **kwargs):
+            if Path(name) == agent_log:
                 raise OSError("simulated log read failure")
-            return real_open(self, *args, **kwargs)
+            return real_os_open(name, flags, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "open", fail_target_open)
+        monkeypatch.setattr(os, "open", fail_target_open)
         os.utime(agent_log, None)
 
         second = c.collect()

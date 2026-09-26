@@ -44,6 +44,7 @@ from hermesd.collect.common import (
     _len_if_sized,
     _local_date,
     _mtime,
+    _open_regular_file,
     _optional_epoch,
     _path_resolves_under,
     _printable_capped,
@@ -2368,16 +2369,28 @@ class Collector:
         """Read hermes-agent version from pyproject.toml and update status."""
         version = ""
         pyproject = self._paths.shared_path("hermes-agent", "pyproject.toml")
-        if pyproject.exists():
+        if _exists_strict(pyproject) and (
+            # Bounded, confined, regular-file-only read. An I/O failure (FIFO,
+            # unreadable file) propagates so the gateway source falls back to
+            # its last-good state; a symlink or escaping path reads as absent,
+            # matching the lenient readers.
+            not pyproject.is_symlink() and _path_resolves_under(pyproject, self._paths.root_home)
+        ):
+            # Structured TOML must not parse a truncated prefix as a
+            # complete document: read one byte past the cap and treat an
+            # over-cap file as a failed read, not a partial parse.
+            with _open_regular_file(pyproject) as handle:
+                data = handle.read(_MAX_TEXT_READ_BYTES + 1)
+            if len(data) > _MAX_TEXT_READ_BYTES:
+                raise OSError(f"{pyproject} exceeds the {_MAX_TEXT_READ_BYTES}-byte read cap")
+            # Malformed TOML is data, not a read failure.
             try:
-                with pyproject.open("rb") as handle:
-                    data = tomllib.load(handle)
-                project = _as_dict(data.get("project"))
-                version = str(project.get("version") or "")
-            except OSError:
-                pass
+                project = _as_dict(
+                    tomllib.loads(data.decode("utf-8", errors="replace")).get("project")
+                )
             except tomllib.TOMLDecodeError:
-                pass
+                project = {}
+            version = str(project.get("version") or "")
         return version, self._collect_version_behind()
 
     def _read_context_lengths(self) -> dict[str, int]:
@@ -2437,25 +2450,32 @@ class Collector:
                 rewind_count=r.get("rewind_count") or 0,
                 handoff_state=r.get("handoff_state") or "",
                 handoff_platform=r.get("handoff_platform") or "",
-                handoff_error=r.get("handoff_error") or "",
+                # Chat-controlled or exception-derived free text is redacted at
+                # this boundary, before any panel clips it — like cron
+                # last_error and gateway route display names.
+                handoff_error=_redact_secret_text(r.get("handoff_error") or ""),
                 # SQLite columns are untyped: a text value in an epoch column must
                 # coerce, not fail model validation and blank the whole source.
                 started_at=_coerce_float(r.get("started_at")),
                 ended_at=None if r.get("ended_at") is None else _coerce_float(r.get("ended_at")),
-                title=None if r.get("title") is None else str(r.get("title")),
+                title=None if r.get("title") is None else _redact_secret_text(str(r.get("title"))),
                 is_active=r.get("ended_at") is None and not _coerce_bool(r.get("archived")),
                 git_branch=r.get("git_branch") or "",
                 chat_type=r.get("chat_type") or "",
-                display_name=r.get("display_name") or "",
+                display_name=_redact_secret_text(r.get("display_name") or ""),
                 title_source=r.get("title_source") or "",
                 profile_name=r.get("profile_name") or "",
                 pinned=_coerce_bool(r.get("pinned")),
                 last_activity_at=_coerce_float(r.get("last_activity_at")),
-                last_activity_description=r.get("last_activity_description") or "",
+                last_activity_description=_redact_secret_text(
+                    r.get("last_activity_description") or ""
+                ),
                 actual_cost_usd=_coerce_float(r.get("actual_cost_usd")),
                 cost_source=r.get("cost_source") or "",
                 transport_profile=r.get("transport_profile") or "",
-                compression_failure_error=r.get("compression_failure_error") or "",
+                compression_failure_error=_redact_secret_text(
+                    r.get("compression_failure_error") or ""
+                ),
                 # 0 and NULL both mean "no deadline" — see _optional_epoch.
                 compression_failure_cooldown_until=_optional_epoch(
                     r.get("compression_failure_cooldown_until")
@@ -3476,7 +3496,9 @@ class Collector:
             return ""
         had_last_good = last_kanban is not None and bool(last_kanban.current_board)
         try:
-            with path.open("rb") as handle:
+            # A FIFO here has no writer to satisfy the open; the regular-file
+            # guard refuses it before the collector thread can block on one.
+            with _open_regular_file(path) as handle:
                 raw = handle.read(_MAX_TEXT_READ_BYTES)
         except FileNotFoundError:
             self._present_or_confirmed_absent(

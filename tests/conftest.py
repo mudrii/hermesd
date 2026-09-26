@@ -1968,16 +1968,28 @@ def _unreadable(path: Path) -> bool:
 
 
 def _count_opens(monkeypatch: pytest.MonkeyPatch, target: Path) -> list[Path]:
-    """Record every real `Path.open` call on `target` and return the growing log."""
+    """Record every real open of `target` and return the growing log.
+
+    Two lanes: most readers open through `Path.open`, but the regular-file
+    guard opens the descriptor directly with `os.open` (nonblocking). A single
+    logical open crosses exactly one lane, so counting both never double-counts.
+    """
     opens: list[Path] = []
     real_open = Path.open
+    real_os_open = os.open
 
     def counting_open(self: Path, *args: object, **kwargs: object) -> object:
         if self == target:
             opens.append(self)
         return real_open(self, *args, **kwargs)
 
+    def counting_os_open(name: object, flags: int, *args: object, **kwargs: object) -> int:
+        if Path(name) == target:  # type: ignore[arg-type]
+            opens.append(Path(name))  # type: ignore[arg-type]
+        return real_os_open(name, flags, *args, **kwargs)
+
     monkeypatch.setattr(Path, "open", counting_open)
+    monkeypatch.setattr(os, "open", counting_os_open)
     return opens
 
 
