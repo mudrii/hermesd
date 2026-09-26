@@ -9,13 +9,18 @@ from hermesd.models import (
     CredentialPoolEntry,
     DashboardState,
     HookInfo,
+    IntegrationsState,
     MCPCacheEntry,
     MCPCacheEntryState,
     MCPSchemaCache,
     MCPServerInfo,
+    ModelCooldown,
+    PairingPlatformSummary,
     PluginActivation,
     PluginInfo,
+    ProfileRouteSummary,
     ProviderInfo,
+    RateLimitHold,
     SkillInfo,
     SkillsMemory,
     SkillsPromptSnapshot,
@@ -86,7 +91,8 @@ def test_skills_detail_shows_credential_pools_without_secrets():
                     source="env:ANTHROPIC_API_KEY",
                     last_status="rate_limited",
                     request_count=3,
-                    cooldown_remaining="58m",
+                    cooldown_remaining_seconds=58 * 60,
+                    model_cooldowns=[ModelCooldown(model="claude-opus", remaining_seconds=300)],
                     priority=2,
                     token_present=True,
                 ),
@@ -100,6 +106,8 @@ def test_skills_detail_shows_credential_pools_without_secrets():
     assert "Fallback Anthropic" in text
     assert "rate_limited" in text
     assert "58m" in text
+    assert "Model cooldowns" in text
+    assert "anthropic: claude-opus 5m left" in text
     assert "Yes" in text
     assert "sk-live-secret" not in text
 
@@ -116,7 +124,6 @@ def test_skills_detail_uses_dash_for_missing_priority():
                     source="codex",
                     last_status="ok",
                     request_count=42,
-                    cooldown_remaining="ready",
                     priority=0,
                     token_present=True,
                 ),
@@ -158,6 +165,148 @@ def test_skills_compact_shows_summary():
     text = render_to_str(panel, width=100, no_color=True)
     assert re.search(r"Skills:\s+77\s+\(39 cat\)", text)
     assert "openai-codex" in text
+    assert "cooling" not in text
+
+
+def test_skills_compact_counts_cooling_credential_pools():
+    state = DashboardState(
+        skills_memory=SkillsMemory(
+            credential_pools=[
+                CredentialPoolEntry(name="a", cooldown_remaining_seconds=60),
+                CredentialPoolEntry(
+                    name="b", model_cooldowns=[ModelCooldown(model="m", remaining_seconds=5)]
+                ),
+                CredentialPoolEntry(name="c"),
+            ],
+        ),
+    )
+    text = render_to_str(render_panel(7, state, Theme(), detail=False), width=100, no_color=True)
+    assert "Creds: 3 pools (2 cooling)" in text
+
+
+def test_skills_hub_counts_render_compact_and_detail():
+    state = DashboardState(
+        skills_memory=SkillsMemory(
+            hub_lock_present=True, hub_installed_count=5, hub_quarantine_count=2
+        )
+    )
+    compact = render_to_str(render_panel(7, state, Theme(), detail=False), no_color=True)
+    assert "Hub: 5 installed · 2 quarantined" in compact
+    detail = render_to_str(render_panel(7, state, Theme(), detail=True), no_color=True)
+    assert "Skills Hub" in detail
+    assert re.search(r"Installed\s+5", detail)
+    assert re.search(r"Quarantined\s+2 pending review", detail)
+
+
+def test_skills_hub_hidden_without_a_lock_or_quarantine():
+    state = DashboardState(skills_memory=SkillsMemory())
+    compact = render_to_str(render_panel(7, state, Theme(), detail=False), no_color=True)
+    detail = render_to_str(render_panel(7, state, Theme(), detail=True), no_color=True)
+    assert "Hub:" not in compact
+    assert "Skills Hub" not in detail
+
+
+def test_skills_hub_compact_without_quarantine():
+    state = DashboardState(skills_memory=SkillsMemory(hub_lock_present=True, hub_installed_count=1))
+    compact = render_to_str(render_panel(7, state, Theme(), detail=False), no_color=True)
+    assert "Hub: 1 installed" in compact
+    assert "quarantined" not in compact
+
+
+def _integrations_state() -> DashboardState:
+    return DashboardState(
+        integrations=IntegrationsState(
+            pairing_platforms=[
+                PairingPlatformSummary(
+                    platform="telegram",
+                    pending_count=1,
+                    approved_count=3,
+                    newest_approved_age_seconds=120,
+                ),
+                PairingPlatformSummary(platform="discord", approved_count=1),
+            ],
+            webhook_subscriptions_present=True,
+            webhook_subscription_count=2,
+            webhook_enabled_count=1,
+            webhook_route_names=["alerts", "[red]gh[/]"],
+            shared_metrics_present=True,
+            shared_metrics_counter_rows=4,
+            shared_metrics_pending_periods=2,
+            shared_metrics_outbox_by_state={"pending": 2, "rejected": 1},
+            shared_metrics_outbox_error_count=1,
+            shared_metrics_consent_marks={"obs": "2026-09-01T00:00:00Z"},
+            rate_limit_holds=[
+                RateLimitHold(name="nous", remaining_seconds=240, recorded_age_seconds=60)
+            ],
+        ),
+        config=ConfigSummary(
+            webhook_platform_enabled=True,
+            profile_routes=[
+                ProfileRouteSummary(
+                    name="alice",
+                    platform="telegram",
+                    profile="alice",
+                    discriminators=["chat_id", "user_id"],
+                ),
+                ProfileRouteSummary(
+                    name="ops", platform="discord", profile="ops", enabled=False, bot_profile="ops"
+                ),
+            ],
+            profile_routes_skipped=1,
+            monitoring_health_export_enabled=True,
+            monitoring_otlp_enabled=True,
+            langfuse_plugin_enabled=True,
+        ),
+    )
+
+
+def test_integrations_compact_flags_pending_pairing_and_throttling():
+    text = render_to_str(
+        render_panel(7, _integrations_state(), Theme(), detail=False), no_color=True
+    )
+    assert "Pairing: 1 pending" in text
+    assert "Throttled: nous 4m" in text
+
+    quiet = render_to_str(render_panel(7, DashboardState(), Theme(), detail=False), no_color=True)
+    assert "Pairing:" not in quiet
+    assert "Throttled:" not in quiet
+
+
+def test_integrations_detail_lists_stores_and_switches():
+    text = render_to_str(
+        render_panel(7, _integrations_state(), Theme(), detail=True), width=160, no_color=True
+    )
+    assert "Integrations" in text
+    assert "telegram: 1 pending · 3 approved (newest 2m ago)" in text
+    assert "discord: 0 pending · 1 approved" in text
+    assert re.search(r"Webhooks\s+platform on · 2 subscriptions \(1 enabled\)", text)
+    assert "[red]gh[/]" in text
+    assert re.search(r"Profile routes\s+2 routes \(1 by user_id\) · 1 skipped", text)
+    assert "alice: telegram → alice  chat_id+user_id" in text
+    assert "ops: discord → ops  platform-wide (disabled, bot ops)" in text
+    assert re.search(r"Monitoring\s+health export on · OTLP on \(no endpoint\)", text)
+    assert re.search(r"Langfuse\s+enabled", text)
+    assert re.search(
+        r"Shared metrics\s+4 counter rows · 2 periods unpackaged · outbox 2 pending, "
+        r"1 rejected · 1 with errors",
+        text,
+    )
+    assert "consent obs 2026-09-01T00:00:00Z" in text
+    assert "Provider Throttling" in text
+    assert re.search(r"nous\s+4m left \(recorded 1m ago\)", text)
+
+
+def test_integrations_detail_placeholders_when_nothing_configured():
+    text = render_to_str(
+        render_panel(7, DashboardState(), Theme(), detail=True), width=160, no_color=True
+    )
+    assert re.search(r"Pairing\s+no pairing store", text)
+    assert re.search(r"Webhooks\s+platform off · no subscriptions file", text)
+    assert re.search(r"Profile routes\s+none", text)
+    assert re.search(r"Monitoring\s+health export off · OTLP off", text)
+    assert re.search(r"Langfuse\s+not enabled", text)
+    assert re.search(r"Shared metrics\s+no store", text)
+    assert "Provider Throttling" not in text
 
 
 def test_skills_detail_shows_description_column():

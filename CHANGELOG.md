@@ -7,8 +7,11 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ## [Unreleased]
 
+## [2026.9.26] - 2026-09-26
+
 ### Fixed
 
+- **Verification evidence:** the Operations detail shows one line of each verification summary, capped at 120 characters. Before, one noisy run's full captured output could fill the view.
 - **Secret redaction:** log, config and error text now redacts passwords, passphrases, credentials, cookies, AWS/GCS signatures, Telegram/Discord/Slack webhook tokens carried in URL paths, and bare `sk-`/`ghp_`/JWT tokens. `Authorization: Bearer x` no longer leaves a stray `]`. Delivery errors, platform error messages, cron `last_error`/`last_delivery_error`, and delegation goals and errors are now redacted before they are clipped. A log tail that starts mid-line drops the partial first line, so the cut-off end of a secret can no longer appear without its label.
 - **Skills:** skills are found by `SKILL.md` at any depth, as upstream does. Flat skills and nested categories are counted, and directories without `SKILL.md` are no longer counted as skills. A `SKILL.md` that starts with a UTF-8 BOM shows its description.
 - **Plugins:** a broken plugin catalog cache no longer brings back the previous plugin list. Newly installed plugins appear, and catalog flags carry over by name.
@@ -49,6 +52,60 @@ and this project uses date-based versions in `YYYY.M.D` form.
   - Error messages name the problem and the valid values.
   - `--snapshot-panel 00` works like `0`.
   - An empty `--hermes-home` or `--snapshot-file` is rejected.
+- **Personality:** the Config panel reads the selected personality from `display.personality`, as upstream does. It counts only when it names a built-in, a root `personalities` entry or an `agent.personalities` entry. Before, hermesd read `agent.active_personality`, which upstream never writes, or fell back to the first `agent.personalities` key.
+- **Degraded gateway:** a live gateway whose state is `degraded` (a configured platform is parked or retrying) now reads as serving, with a `Degraded` label. Before, it rendered as stopped and dropped out of the busy/drainable state, the loop probe, ledger uptime, migration liveness and the agent-running check. A dead record whose exit reason is `loop_liveness_watchdog` or `shutdown_watchdog` is reported as a watchdog exit.
+- **Multiplex mode:** `gateway_state.json`'s `multiplex_standalone_reason` is shown in the Gateway detail header and as a compact `⚠ standalone (not multiplexing)` warning. The single-profile reason does not warn. `gateway.multiplex_profiles` is read like upstream: a top-level `multiplex_profiles` wins when present, and string tokens are parsed. An explicit `false` is shown as retired and ignored, not as an opt-out.
+- **Migration:** a `gateway_migration.json` on disk now means an unfinished migration, because upstream deletes it once an apply confirms convergence. The panel shows `⚠ migration unfinished` and names `hermes gateway migrate --multiplex` to resume. A verified topology notes that the manifest is still on disk. The multiplex flag is no longer part of the verified check.
+- **Update skew:** fleet rows in state `external` serve a checkout the update did not touch. They no longer count as code skew, and their code roots are listed instead.
+- **Credential pools:** pool cooldowns are computed the way upstream benches an entry: only exhausted entries, until the provider's `last_error_reset_at`, else `last_status_at` plus the TTL for the recorded error. Active per-model cooldowns from `model_cooldowns` are listed by model name. Before, hermesd read a `cooldown_remaining` key that upstream never writes.
+- **Learned skills:** skills with `created_by: learn` (a foreground `/learn`) count as learned. The agent-created count still covers `created_by: agent` only.
+- **Cron model:** jobs show the model the next fire resolves to, labelled `pinned`, `cron.model default` or `follows main model`. An unpinned job follows `cron.model`, then the main model. The retired `model_snapshot`/`provider_snapshot` keys are no longer read.
+- **Async delegations:** the active count covers upstream's live states only (`running`, `stalling`, `finalizing`). The failed count also covers the persisted `timeout`, `stalled`, `unknown` and `interrupted` states.
+- **State snapshots:** a loose `x.db` with its `-wal`/`-shm`/`-journal` files counts as one snapshot, not four. Snapshot directories are sized recursively (bounded and cached). Each `manifest.json`'s label, file count, size, `failed_dbs` and `oversized_skipped` are read, and snapshots with failed databases are flagged in panel 12.
+- **Audit logs:** the Logs panel no longer tails `logs/audit.log`, which nothing upstream writes. It tails the Skills Hub audit trail (`skills/.hub/audit.log`) as `skills.audit` and the dashboard auth log (`logs/dashboard-auth.log`) as `auth.audit`, plus new `dashboard.error` and `dashboard.restart` streams.
+- **Compact Gateway warnings:** warnings render directly under the status line, so the wide overview's two content rows show them.
+- **Logs tab bar:** the detail view counts tab-bar rows as wrapped at the real terminal width, since 16 streams no longer fit one row. A trailing newline that overflowed the view by one row is gone.
+- **Session free text:** the session row's `title`, `display_name`, `handoff_error`, `last_activity_description` and `compression_failure_error` — chat-controlled or exception-derived text — are now redacted at collection, like cron `last_error` and gateway route names already are. The Tokens panel's top-session titles and the hygiene join's compression-failure reason are redacted too. Before, a credential in any of these reached the text and JSON snapshots unredacted.
+- **Filesystem safety:** a FIFO in place of `cron/catch_up_occurrences`, `cron/ticker_last_error`, `kanban/current` or `hermes-agent/pyproject.toml` no longer hangs collection — not even when a regular file is swapped for a FIFO mid-open: state files are opened nonblocking and the opened descriptor itself is validated as a regular file, so there is no stat-then-open race. A FIFO counts as a failed read and falls back to the last-good value; for the version read that means the last-good gateway state, and an over-cap `pyproject.toml` fails the same way instead of being parsed from a truncated prefix.
+- **Unreadable memory files:** a `MEMORY.md`/`USER.md`, `SOUL.md` or learned `SKILL.md` that becomes unreadable after a good read no longer reads as empty. The failed read is never cached as a successful zero, the source is reported in `health.failed_sources`, the panel keeps the last-good counts and excerpt, and the next poll retries without needing another edit.
+- **Oversized counts:** an arbitrary-precision integer in a numeric SQLite column (kept as TEXT) no longer crashes the Tokens panel or the overview snapshot with `OverflowError`. Token counts saturate at `>=999T`, byte sizes at `>=1024 TB`/`>=1000T`, and sparklines scale huge values with exact integer math.
+
+### Added
+
+- **Header:** an engaged `ESTOP` sentinel (`hermes pause`) shows `⏸ PAUSED (ESTOP): <reason>, since <age> ago` in the header and in Operations. The profile sentinel is checked first, then the root one, as upstream does. An empty or unparseable sentinel still counts as engaged.
+- **Gateway:**
+  - The heartbeat's memory sample (RSS, available and total memory, swap) with upstream's pressure tier. The tier reads `unknown` once the sample is older than 150 s, and the compact view warns at `elevated` or `critical`.
+  - Dead delivery targets from `gateway/dead_targets.json`: count, per-platform counts, and the newest three with a redacted reason. Chat ids are never read.
+  - The restart-loop breaker from `gateway/restart_loop.json`, evaluated against the `gateway.restart_loop_guard` policy. A tripped breaker is a warning.
+  - A **Restart Backlog** section: the back-online notice a planned restart still owes home channels (`.restart_pending.json`), and manual serve restarts still owed (`serve_restart_pending/*.json`). Records for processes already gone are counted as stale.
+  - The Updates section adds the ten newest archived update receipts, with the runs that never finished cleanly counted and the newest three listed. It also shows the post-swap pid, owed manual serve restarts, the fleet settle time, runtime outcomes and skips.
+  - Backend heartbeat rows from `state.db` `gateway_heartbeats`, grouped by profile and host (up to eight groups), each with its row count, a live verdict and the beat age.
+- **Sessions:** a **Repositories** table (7d/30d session counts per git repository), a 24-slot hour-of-day activity sparkline over the last 7 days in local time, and a **Via** column for the bot transport profile when any shown session has one.
+- **Tokens:** **Daily Usage (14d)** by local day, **By Source** for 24h and 7d, and **Top Sessions (7d)** with the five costliest sessions. The compact view ends with a 14-day token sparkline.
+- **Cron:**
+  - Per-job token usage from `cron/usage_audit.jsonl`: 24h/7d fires and tokens, plus the last fire's tokens, model, duration and redacted error. When the 1 MiB tail ends inside the 7d window, the 7d figures are marked as a lower bound.
+  - The delivery queue from `cron/deliveries.db`: status counts, the pending backlog with its oldest age, failures in the last 24h, and the newest failures with redacted errors. Payload columns are never read.
+  - Deferred Bot Chat receipts from `cron/bot_chat_pending/`: counts by status, the unsettled backlog with its oldest age, and claimed or ambiguous receipts with redacted errors. Receipt content is never kept.
+  - **Recovery Ledgers**: 24h/7d counts and the newest entry for persisted-error recoveries, timezone-migration catch-ups and forced in-flight releases. The compact view warns only for 24h activity.
+  - A **Recent Failures** list keeps the newest failed runs and their redacted errors visible after newer successes push them out of Recent Executions.
+  - A job parked by a provider quota hold shows `held until X (provider usage window)` and a compact `held` marker. Resolved incidents are counted (total and 24h), and each open incident shows the age of its last alert.
+- **Skills / Integrations:**
+  - An **Integrations** section: pairing codes pending and approvals per platform, webhook subscription route names and enabled counts, profile routes with their discriminator names, monitoring and OTLP export flags, the Langfuse plugin gate, and shared-metrics telemetry counts. Names and counts only; codes, ids, secrets and payloads are never read.
+  - **Provider Throttling** from `rate_limits/nous*.json` holds, with time remaining.
+  - **Skills Hub** installed and quarantined counts from `skills/.hub/`.
+  - A **Model cooldowns** list and a cooling count in the compact view.
+- **Config:** a **Doctor (file checks)** row for stale root `provider`/`base_url` keys and legacy `custom_providers` entries without a `providers:` twin, with a compact finding count.
+- **Profiles:** a **Files** column for `config.yaml` / `.env` presence, as `hermes doctor` reports it. **Shared platform credentials** lists platform credential key names set in more than one profile's `.env`. Only names are compared; values are checked for blankness and dropped.
+- **Logs:** incremental health counters for `mcp-stderr.log`, `gateway.error.log` and `workspace.log`: MCP server starts per server, supervisor argparse errors, repeated error and exception signatures, and pnpm crash lines, with 1h/24h rates. Only appended bytes are read (at most 256 KiB per stream per refresh), and a truncated or replaced file restarts the scan.
+- **Kanban:** worker pids are checked against `worker_started_at`. A pid now held by another process is marked `reused`, with a count.
+- **Tools:** background processes are checked against the spawn ledger's `create_time`. A reused pid is marked `✗ pid reused`, and a live helper whose spawner is gone is marked `⚠ orphaned`, with a compact count.
+- **Operations:**
+  - **Disk & Retention**: root `logs/` size with per-file growth, unrotated logs over 10 MB, `sessions/`, `checkpoints/` against `checkpoints.max_total_size_mb`, `cache/scratch`, any `cache/*` directory of 1 GiB or more, the `state.db` WAL against the 10 MB / 50 MB doctor thresholds, and each known database's journal mode. Directory walks are bounded and cached.
+  - **Log Health**, a summary of the Logs health counters.
+  - **Pending Review**: staged writes under `pending/<subsystem>/` awaiting operator review, with counts and the oldest age. The staged payload is never kept.
+  - **State Snapshots** with each snapshot's manifest verdict.
+  - An ESTOP row while the pause sentinel is engaged.
+- **Curator:** the last run's duration, the count of suppressed built-ins, the recent ledger actions, and the `skills/.locks/curator-run` claim. The claim is live only while its pid runs and it is less than an hour old.
 
 ### Performance
 
@@ -65,6 +122,11 @@ and this project uses date-based versions in `YYYY.M.D` form.
 - Ages of a day or more display as `Nd` in every panel, instead of `NNh` in some. Non-finite ages display as `—`, and Gateway KB sizes show one decimal.
 - The installed smoke script no longer relies on `assert`, so it still checks under `python -O`.
 - Reader helpers are shared through `hermesd/collect/common.py`. Dead code paths are removed: skills windowing, the test-only renderers, and the retry loop in `db.py` that always had exactly one target.
+- **JSON snapshot schema:**
+  - `CredentialPoolEntry.cooldown_remaining` (a string) is replaced by `cooldown_remaining_seconds` (a number or `null`) and a `model_cooldowns` list.
+  - `migration.verification_gap` no longer produces `flag_off`.
+  - `CronJob.model_snapshot` and `CronJob.provider_snapshot` are removed. Jobs carry `effective_model` and `model_source` instead.
+  - New top-level fields: `usage_analytics`, `cron_usage`, `cron_deliveries`, `cron_bot_chat`, `cron_recovery`, `disk` and `integrations`. Existing objects gain fields, including `runtime.estop_*`, `logs.health`, `operations.snapshots`, `operations.pending_actions`, `profiles.duplicate_platform_credentials` and the new gateway memory, dead-target, restart-loop and restart-backlog fields.
 
 ## [2026.9.13] - 2026-09-13
 

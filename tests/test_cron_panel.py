@@ -3,14 +3,23 @@
 from __future__ import annotations
 
 from hermesd.models import (
+    CronBotChatReceipt,
+    CronBotChatState,
+    CronDeliveryFailure,
+    CronDeliveryQueueState,
     CronExecution,
     CronExecutionsState,
     CronFireClaimState,
     CronIncident,
     CronJob,
     CronJobExecutionStats,
+    CronJobUsage,
+    CronModelSource,
+    CronRecoveryLedger,
+    CronRecoveryState,
     CronState,
     CronTickerHealth,
+    CronUsageState,
     DashboardState,
 )
 from hermesd.panels import render_panel
@@ -1096,24 +1105,37 @@ def test_cron_compact_hides_fire_forward_line_when_none() -> None:
     assert "Fire forward" not in text
 
 
-def test_cron_detail_shows_model_snapshot_only_when_unpinned() -> None:
-    """Operators must see which model an unpinned job will actually run: the
-    creation-time snapshot (``cron/jobs.py:1600-1630``)."""
-    unpinned = CronJob(
-        job_id="j1",
-        name="unpinned",
-        model="",
-        model_snapshot="hermes-default-large",
-        provider="",
-        provider_snapshot="openai",
-    )
-    pinned = CronJob(job_id="j2", name="pinned", model="gpt-9", provider="openai")
-    state = DashboardState(cron=CronState(job_count=2, jobs=[unpinned, pinned]))
-    text = render_to_str(render_cron(state, Theme(), detail=True), no_color=True)
-    assert "model hermes-default-large (unpinned snapshot)" in text
-    assert "provider openai (unpinned snapshot)" in text
-    # The pinned job's explicit pin is never described as a snapshot.
-    assert pinned.model not in text or "gpt-9 (unpinned" not in text
+def test_cron_detail_labels_the_effective_model_by_its_source() -> None:
+    """A pin is labelled pinned; an unpinned job says which config axis it
+    follows at fire time (``cron/scheduler.py:1561-1590``)."""
+    jobs = [
+        CronJob(
+            job_id="j1",
+            name="pinned-job",
+            model="gpt-9",
+            provider="openai",
+            effective_model="gpt-9",
+            model_source=CronModelSource.PINNED,
+        ),
+        CronJob(
+            job_id="j2",
+            name="fleet-job",
+            effective_model="fleet",
+            model_source=CronModelSource.CRON_DEFAULT,
+        ),
+        CronJob(
+            job_id="j3",
+            name="main-job",
+            effective_model="grok",
+            model_source=CronModelSource.MAIN_MODEL,
+        ),
+    ]
+    state = DashboardState(cron=CronState(job_count=3, jobs=jobs))
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=200, no_color=True)
+    assert "model gpt-9 via openai (pinned)" in text
+    assert "model fleet (cron.model default)" in text
+    assert "model grok (follows main model)" in text
+    assert "snapshot" not in text
 
 
 def test_cron_detail_labels_detected_incident_as_no_delivered_failure_ping() -> None:
@@ -1217,3 +1239,239 @@ def test_cron_compact_hides_unacked_when_it_cannot_differ() -> None:
     text = render_to_str(render_cron(state, Theme()), width=100, no_color=True)
     assert "Incidents: 2 open" in text
     assert "unacked" not in text
+
+
+def test_cron_detail_shows_last_alert_age_and_resolved_counts() -> None:
+    """``alerted_at`` is restamped on every delivered ping
+    (``cron/incidents.py:196-212``), so it renders as the last alert's age; the
+    auto-``resolved`` rows are summarised apart from the open ones."""
+    incident = CronIncident(
+        incident_id="i1",
+        job_id="j1",
+        job_name="nightly",
+        state="alerted",
+        failure_type="timeout",
+        first_seen_age_seconds=7200.0,
+        last_seen_age_seconds=600.0,
+        alerted_age_seconds=300.0,
+        error_excerpt="boom",
+    )
+    state = DashboardState(
+        cron_executions=CronExecutionsState(
+            db_present=True,
+            open_incident_count=1,
+            unacked_incident_count=1,
+            open_incidents=[incident],
+            resolved_incident_count=4,
+            resolved_24h_count=2,
+        )
+    )
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=200, no_color=True)
+    assert "Last alert" in text
+    assert "5m ago" in text
+    assert "Resolved incidents: 4 (2 in the last 24h" in text
+
+
+def test_cron_detail_shows_resolved_counts_without_open_incidents() -> None:
+    state = DashboardState(
+        cron_executions=CronExecutionsState(
+            db_present=True, resolved_incident_count=1, resolved_24h_count=1
+        )
+    )
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=200, no_color=True)
+    assert "Resolved incidents: 1 (1 in the last 24h" in text
+
+
+def test_cron_panel_labels_a_quota_held_job() -> None:
+    job = CronJob(job_id="j1", name="held-job", quota_hold_until="2026-09-24T09:00:00+00:00")
+    state = DashboardState(cron=CronState(job_count=1, jobs=[job]))
+    detail = render_to_str(render_cron(state, Theme(), detail=True), width=200, no_color=True)
+    assert "held until" in detail
+    assert "(provider usage window)" in detail
+    compact = render_to_str(render_cron(state, Theme()), no_color=True)
+    assert "held" in compact
+
+
+def test_cron_detail_lists_recent_failures_with_their_errors() -> None:
+    failure = CronExecution(
+        execution_id="e1",
+        job_id="j1",
+        job_name="nightly",
+        status="failed",
+        started_age_seconds=7200.0,
+        error_excerpt="Script execution failed: [Errno 2] missing",
+    )
+    state = DashboardState(
+        cron_executions=CronExecutionsState(db_present=True, recent_failures=[failure])
+    )
+    text = render_to_str(render_cron(state, Theme(), detail=True), width=200, no_color=True)
+    assert "Recent Failures" in text
+    assert "Script execution failed: [Errno 2] missing" in text
+    assert "2h ago" in text
+
+
+def test_cron_panel_shows_usage_audit_token_rollup() -> None:
+    usage = CronUsageState(
+        present=True,
+        tokens_24h=12_500,
+        tokens_7d=80_000,
+        fires_7d=40,
+        jobs=[
+            CronJobUsage(
+                job_id="j1",
+                job_name="nightly",
+                fires_24h=4,
+                tokens_24h=12_500,
+                fires_7d=40,
+                tokens_7d=80_000,
+                errors_7d=2,
+                last_fire_age_seconds=120.0,
+                last_total_tokens=3_100,
+                last_model="grok-4.6",
+                last_duration_seconds=12.5,
+                last_error_excerpt="provider 429",
+            )
+        ],
+        window_truncated=True,
+        unparseable_lines=3,
+    )
+    state = DashboardState(cron_usage=usage)
+    detail = render_to_str(render_cron(state, Theme(), detail=True), width=220, no_color=True)
+    assert "Token Usage" in detail
+    assert "nightly" in detail
+    assert "24h 4 fires 12.5K" in detail
+    assert "7d 40 fires 80.0K" in detail
+    assert "2 errors" in detail
+    assert "last 2m ago 3.1K grok-4.6 12.5s" in detail
+    assert "provider 429" in detail
+    assert "lower bound" in detail
+    assert "3 unparseable line(s) skipped" in detail
+    compact = render_to_str(render_cron(state, Theme()), no_color=True)
+    assert "Tokens 24h: 12.5K" in compact
+
+
+def test_cron_panel_hides_token_usage_without_an_audit_ledger() -> None:
+    state = DashboardState()
+    detail = render_to_str(render_cron(state, Theme(), detail=True), width=220, no_color=True)
+    assert "Token Usage" not in detail
+    assert "Tokens 24h" not in render_to_str(render_cron(state, Theme()), no_color=True)
+
+
+def test_cron_panel_shows_the_delivery_queue() -> None:
+    queue = CronDeliveryQueueState(
+        db_present=True,
+        status_counts={"delivered": 10, "failed": 2, "pending": 3, "unknown": 1},
+        pending_count=3,
+        oldest_pending_age_seconds=900.0,
+        failed_24h=2,
+        recent_failures=[
+            CronDeliveryFailure(
+                execution_id="exec-1",
+                status="failed",
+                for_failure=True,
+                finished_age_seconds=1700.0,
+                error_excerpt="telegram 401 token=[REDACTED]",
+            ),
+            CronDeliveryFailure(execution_id="exec-2", status="unknown"),
+        ],
+    )
+    state = DashboardState(cron_deliveries=queue)
+    compact = render_to_str(render_cron(state, Theme()), no_color=True)
+    assert "Delivery queue: 3 pending (oldest 15m)" in compact
+    assert "2 failed 24h" in compact
+    detail = render_to_str(render_cron(state, Theme(), detail=True), width=220, no_color=True)
+    assert "Delivery Queue (deliveries.db)" in detail
+    assert "delivered 10  failed 2  pending 3  unknown 1" in detail
+    assert "exec-1 failed (failure notice) 28m ago: telegram 401 token=[REDACTED]" in detail
+    assert "exec-2 unknown (sender died mid-send; never retried)" in detail
+
+
+def test_cron_panel_hides_an_idle_delivery_queue_from_compact() -> None:
+    queue = CronDeliveryQueueState(db_present=True, status_counts={"delivered": 4})
+    compact = render_to_str(
+        render_cron(DashboardState(cron_deliveries=queue), Theme()), no_color=True
+    )
+    assert "Delivery queue" not in compact
+
+
+def test_cron_panel_shows_deferred_bot_chat_receipts() -> None:
+    bot = CronBotChatState(
+        present=True,
+        status_counts={"ambiguous": 1, "claimed": 1, "queued": 1, "settled": 40},
+        unsettled_count=2,
+        oldest_unsettled_age_seconds=7200.0,
+        unreadable_count=1,
+        scan_truncated=True,
+        attention=[
+            CronBotChatReceipt(
+                receipt_id="a1",
+                job_name="nightly",
+                status="ambiguous",
+                for_failure=True,
+                age_seconds=60.0,
+                error_excerpt="RuntimeError: token=[REDACTED]",
+            ),
+            CronBotChatReceipt(receipt_id="c1", job_name="", status="claimed", age_seconds=7200.0),
+        ],
+    )
+    state = DashboardState(cron_bot_chat=bot)
+    compact = render_to_str(render_cron(state, Theme()), no_color=True)
+    assert "Bot Chat deferred: 2 unsettled (oldest 2h)  1 ambiguous" in compact
+    detail = render_to_str(render_cron(state, Theme(), detail=True), width=220, no_color=True)
+    assert "Deferred Bot Chat (bot_chat_pending)" in detail
+    assert "ambiguous 1  claimed 1  queued 1  settled 40" in detail
+    assert "1 unreadable" in detail
+    assert "listing capped" in detail
+    assert "nightly a1 ambiguous (failure notice) 1m ago: RuntimeError: token=[REDACTED]" in detail
+    assert "c1 claimed 2h ago" in detail
+
+
+def test_cron_panel_hides_settled_bot_chat_from_compact() -> None:
+    bot = CronBotChatState(present=True, status_counts={"settled": 3})
+    compact = render_to_str(render_cron(DashboardState(cron_bot_chat=bot), Theme()), no_color=True)
+    assert "Bot Chat" not in compact
+
+
+def test_cron_panel_shows_recovery_ledgers() -> None:
+    recovery = CronRecoveryState(
+        ledgers=[
+            CronRecoveryLedger(
+                kind="persisted_error_recoveries",
+                label="stale-error re-arm",
+                count_24h=2,
+                count_7d=5,
+                newest_age_seconds=600.0,
+                newest_job_name="Nightly",
+                newest_detail="was due 2026-09-24T04:00:00+00:00",
+            ),
+            CronRecoveryLedger(
+                kind="inflight_forced_releases",
+                label="forced in-flight release",
+                count_7d=1,
+                newest_age_seconds=3 * 86400.0,
+                newest_job_name="Stuck",
+                window_truncated=True,
+            ),
+        ]
+    )
+    state = DashboardState(cron_recovery=recovery)
+    compact = render_to_str(render_cron(state, Theme()), width=120, no_color=True)
+    assert "Recoveries 24h: 2 stale-error re-arm" in compact
+    assert "forced in-flight release" not in compact
+    detail = render_to_str(render_cron(state, Theme(), detail=True), width=220, no_color=True)
+    assert "Recovery Ledgers" in detail
+    assert (
+        "stale-error re-arm: 24h 2  7d 5  newest 10m ago Nightly: was due 2026-09-24T04:00:00+00:00"
+        in detail
+    )
+    assert "forced in-flight release: 24h 0  7d 1+  newest 3d ago Stuck" in detail
+
+
+def test_cron_panel_hides_quiet_recovery_ledgers_from_compact() -> None:
+    recovery = CronRecoveryState(
+        ledgers=[CronRecoveryLedger(kind="k", label="stale-error re-arm", count_7d=1)]
+    )
+    compact = render_to_str(
+        render_cron(DashboardState(cron_recovery=recovery), Theme()), no_color=True
+    )
+    assert "Recoveries" not in compact

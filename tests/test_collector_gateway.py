@@ -3739,3 +3739,112 @@ def test_loop_tick_probe_with_unstatable_socket_node_has_no_node_to_ask(
     monkeypatch.setattr(Path, "is_socket", failing_is_socket)
 
     assert _default_loop_tick_probe(4242, None, hermes_home) is None
+
+
+def _write_gateway_and_pyproject(home: Path, version: str) -> Path:
+    (home / "gateway_state.json").write_text(
+        json.dumps({"pid": 4242, "gateway_state": "running", "platforms": {}})
+    )
+    agent_dir = home / "hermes-agent"
+    agent_dir.mkdir(exist_ok=True)
+    pyproject = agent_dir / "pyproject.toml"
+    pyproject.write_text(f'[project]\nversion = "{version}"\n')
+    return pyproject
+
+
+def test_pyproject_symlink_reads_as_absent_version(hermes_home: Path, tmp_path: Path) -> None:
+    """An unsafe path (symlink out of the home) reads as absent, not a failure."""
+    _write_gateway_and_pyproject(hermes_home, "0.8.0")
+    pyproject = hermes_home / "hermes-agent" / "pyproject.toml"
+    pyproject.unlink()
+    outside = tmp_path / "pyproject.toml"
+    outside.write_text('[project]\nversion = "9.9.9"\n')
+    pyproject.symlink_to(outside)
+
+    c = Collector(hermes_home, pid_exists=lambda pid: pid == 4242)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.gateway.hermes_version == ""
+    assert "gateway" not in state.health.failed_sources
+
+
+def test_malformed_pyproject_reads_as_empty_version(hermes_home: Path) -> None:
+    """Malformed TOML is data, not a read failure: empty version, healthy source."""
+    _write_gateway_and_pyproject(hermes_home, "0.8.0")
+    (hermes_home / "hermes-agent" / "pyproject.toml").write_text("not = [valid toml\n")
+
+    c = Collector(hermes_home, pid_exists=lambda pid: pid == 4242)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.gateway.hermes_version == ""
+    assert "gateway" not in state.health.failed_sources
+
+
+def test_failed_pyproject_read_keeps_last_good_version_and_recovers(
+    hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deterministic under root: an injected read failure degrades the gateway
+    source to its last-good state, and the next poll retries without an edit."""
+    import hermesd.collector as collector_module
+
+    pyproject = _write_gateway_and_pyproject(hermes_home, "1.2.3")
+
+    c = Collector(hermes_home, pid_exists=lambda pid: pid == 4242)
+    try:
+        first = c.collect()
+        assert "gateway" not in first.health.failed_sources
+        assert first.gateway.hermes_version == "1.2.3"
+
+        real_open_regular_file = collector_module._open_regular_file
+
+        def denied(path: Path, *args: object, **kwargs: object):
+            if path == pyproject:
+                raise PermissionError(path)
+            return real_open_regular_file(path, *args, **kwargs)
+
+        monkeypatch.setattr(collector_module, "_open_regular_file", denied)
+        pyproject.write_text('[project]\nversion = "2.0.0"\n')
+        second = c.collect()
+        assert "gateway" in second.health.failed_sources
+        assert second.gateway.hermes_version == "1.2.3"
+
+        monkeypatch.setattr(collector_module, "_open_regular_file", real_open_regular_file)
+        third = c.collect()
+        assert "gateway" not in third.health.failed_sources
+        assert third.gateway.hermes_version == "2.0.0"
+    finally:
+        c.close()
+
+
+def test_oversized_pyproject_fails_to_last_good_instead_of_parsing_a_prefix(
+    hermes_home: Path,
+) -> None:
+    """A valid [project] version near the start of an over-cap file must not be
+    parsed from a truncated prefix; the read fails and last-good is kept."""
+    from hermesd.collect.common import _MAX_TEXT_READ_BYTES
+
+    pyproject = _write_gateway_and_pyproject(hermes_home, "1.2.3")
+
+    c = Collector(hermes_home, pid_exists=lambda pid: pid == 4242)
+    try:
+        assert c.collect().gateway.hermes_version == "1.2.3"
+
+        oversized = '[project]\nversion = "9.9.9"\n' + "#" * _MAX_TEXT_READ_BYTES
+        pyproject.write_text(oversized)
+        assert pyproject.stat().st_size > _MAX_TEXT_READ_BYTES
+        degraded = c.collect()
+        assert "gateway" in degraded.health.failed_sources
+        assert degraded.gateway.hermes_version == "1.2.3"
+
+        pyproject.write_text('[project]\nversion = "2.0.0"\n')
+        recovered = c.collect()
+        assert "gateway" not in recovered.health.failed_sources
+        assert recovered.gateway.hermes_version == "2.0.0"
+    finally:
+        c.close()

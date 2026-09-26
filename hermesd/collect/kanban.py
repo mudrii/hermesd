@@ -296,7 +296,13 @@ def _kanban_task_from_row(row: dict[str, Any], *, failure_limit: int = 0) -> Kan
         # A breaker trips on failures: upstream increments the counter before it
         # compares, so a fresh task under a 0 limit is not "0/0 tripped".
         breaker_tripped=consecutive_failures >= max(breaker_limit, 1),
+        worker_started_at=_fingerprint_text(row.get("worker_started_at")),
     )
+
+
+def _fingerprint_text(value: object) -> str:
+    """``worker_started_at`` as stored: text fingerprint, legacy integer or ""."""
+    return "" if value is None else str(value)
 
 
 def _kanban_run_from_row(row: dict[str, Any]) -> KanbanRunSummary:
@@ -307,6 +313,7 @@ def _kanban_run_from_row(row: dict[str, Any]) -> KanbanRunSummary:
         status=str(row.get("status") or ""),
         outcome=str(row.get("outcome") or ""),
         worker_pid=_coerce_int(row.get("worker_pid")),
+        worker_started_at=_fingerprint_text(row.get("worker_started_at")),
         started_at=_coerce_int(row.get("started_at")),
         ended_at=_coerce_int(row.get("ended_at")),
         error=str(row.get("error") or ""),
@@ -334,7 +341,7 @@ def _kanban_board_present(paths: HermesPaths, board_slug: str) -> bool:
 # gateway kanban-notifier is the consumer (gateway/kanban_watchers_notifier.py).
 # The table lives in the same root-anchored kanban.db as the board itself —
 # kanban_home() = get_default_hermes_root(), "Shared across profiles BY
-# DESIGN" (hermes_cli/kanban_db.py:382-401) — so this reader is ROOT-scoped
+# DESIGN" (hermes_cli/kanban_db.py:399-407) — so this reader is ROOT-scoped
 # like the kanban source it complements.
 
 _NOTIFY_BACKLOG_SUB_LIMIT = 10
@@ -344,7 +351,7 @@ _NOTIFY_ORPHAN_PROFILE_LIMIT = 5
 _NOTIFY_PLATFORM_LIMIT = 6
 
 # "default" is what upstream get_active_profile_name() reports for the root
-# home (hermes_cli/profiles.py:1368-1382); it owns no profiles/ directory, so
+# home (hermes_cli/profiles.py:358-366); it owns no profiles/ directory, so
 # a sub stamped with it is not orphaned. ""/NULL stamps are legacy unowned
 # rows that the dispatch owner covers (include_unowned, :119-146).
 _DEFAULT_PROFILE_NAME = "default"

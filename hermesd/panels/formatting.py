@@ -55,8 +55,22 @@ def _same_key(cached: tuple[object, ...], key: tuple[object, ...]) -> bool:
     )
 
 
+# Saturating cap for display-only counts. Token columns are untyped SQLite
+# values: a TEXT payload coerces to an arbitrary-precision int, and dividing
+# one into a float raises OverflowError instead of producing inf. Anything at
+# or past the cap renders as a bounded sentinel rather than a fake precise
+# figure; the cap matches the 10**15 bound _bounded_token_count applies to
+# cost estimation.
+_TOKEN_COUNT_CAP = 10**15
+
+# Same guard for byte sizes (binary units): 1 PiB is past any real artifact.
+_BYTES_CAP = 1024**5
+
+
 def fmt_tokens(n: int) -> str:
     magnitude = abs(n)
+    if magnitude >= _TOKEN_COUNT_CAP:
+        return ">=999T" if n >= 0 else "<=-999T"
     if magnitude >= 999_950:
         label = f"{magnitude / 1_000_000:.1f}M"
     elif magnitude >= 1_000:
@@ -106,6 +120,8 @@ def fmt_bytes(size_bytes: int) -> str:
     """Binary-unit size label: B, then KB/MB/GB/TB with one decimal."""
     if size_bytes < 1024:
         return f"{size_bytes} B"
+    if size_bytes >= _BYTES_CAP:
+        return ">=1024 TB"
     value = float(size_bytes)
     for unit in ("KB", "MB", "GB"):
         value /= 1024
@@ -134,3 +150,19 @@ def fmt_iso_timestamp(value: str | None) -> str:
     except ValueError:
         return value
     return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
+_SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(values: list[int]) -> str:
+    """One block per value, scaled to the largest; zero is always the lowest block."""
+    peak = max(values, default=0)
+    if peak <= 0:
+        return _SPARK_BLOCKS[0] * len(values)
+    top = len(_SPARK_BLOCKS) - 1
+    # Exact integer ceil: ceil(v*top/peak) == (v*top + peak - 1)//peak. SQLite
+    # keeps arbitrary-precision counts as TEXT, and pure integer math neither
+    # overflows through float nor rounds a tiny positive share down to the
+    # zero block, however wide the counts get.
+    return "".join(_SPARK_BLOCKS[min(top, (max(v, 0) * top + peak - 1) // peak)] for v in values)

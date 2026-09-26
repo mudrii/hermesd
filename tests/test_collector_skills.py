@@ -127,6 +127,28 @@ def test_collect_memory_learning_summary(hermes_home: Path):
     c.close()
 
 
+def test_collect_memory_counts_learn_created_skills_as_learned_not_agent(hermes_home: Path):
+    # record_created stamps created_by="learn" for a foreground /learn create
+    # (tools/skill_usage.py:518-529): a learning signal, not the curator opt-in.
+    (hermes_home / "skills" / ".usage.json").write_text(
+        json.dumps(
+            {
+                "taught": {"use_count": 1, "created_by": "learn"},
+                "curated": {"use_count": 1, "created_by": "agent"},
+                "installed": {"use_count": 1, "created_by": "installed"},
+            }
+        )
+    )
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert state.memory.learned_skill_count == 2
+    assert state.memory.agent_created_skill_count == 1
+
+
 def test_collect_skills_and_memory_visibility_render_from_collected_state(hermes_home: Path):
     (hermes_home / "auth.json").write_text(
         json.dumps(
@@ -327,14 +349,17 @@ def test_curator_run_json_symlink_returns_empty_without_failing_source(hermes_ho
 
 
 @_skip_if_root
-def test_word_count_oserror_returns_zero(tmp_path: Path):
+def test_word_count_oserror_propagates(tmp_path: Path):
+    """A failed read of a present file is not a genuine zero: it must raise so
+    the signature cache never records the failure as a successful empty."""
     f = tmp_path / "BOOT.md"
     f.write_text("one two three")
     os.chmod(f, 0o000)
     try:
         if not _unreadable(f):
             pytest.skip("filesystem allowed read despite chmod 000")
-        assert _word_count(f) == 0
+        with pytest.raises(PermissionError):
+            _word_count(f)
     finally:
         os.chmod(f, 0o644)
 
@@ -1477,3 +1502,209 @@ def test_curator_run_record_keeps_the_usage_rollup_and_thresholds(hermes_home: P
     assert re.search(r"Managed\s+3", text)
     assert "stale after 7d · archive after 9d" in text
     assert "curator.stale_after_days" in text
+
+
+# --- failed reads must not cache as successful empties -----------------------
+#
+# The signature cache keys on `_file_signature` — (path, mtime_ns, size) — so a
+# read that fails after an edit used to be recorded under the new signature as
+# a genuine zero/empty: the panel blanked, health.failed_sources stayed silent,
+# and the poisoned value survived even after the file became readable again.
+
+
+@_skip_if_root
+def test_unreadable_memory_md_keeps_last_good_word_count_and_recovers(
+    hermes_home: Path, collector: Collector
+):
+    memory_md = hermes_home / "memories" / "MEMORY.md"
+    memory_md.write_text("one two")
+    assert collector.collect().memory.memory_word_count == 2
+
+    memory_md.write_text("one two three four")
+    memory_md.chmod(0o000)
+    try:
+        assert _unreadable(memory_md)
+
+        degraded = collector.collect()
+        assert "memory" in degraded.health.failed_sources
+        assert degraded.memory.memory_word_count == 2
+
+        # No edit needed: the failed read was never cached as a new state, so
+        # the next poll retries the same signature and picks the file up.
+    finally:
+        memory_md.chmod(0o644)
+    recovered = collector.collect()
+    assert "memory" not in recovered.health.failed_sources
+    assert recovered.memory.memory_word_count == 4
+
+
+@_skip_if_root
+def test_unreadable_memory_md_keeps_last_good_card_count(hermes_home: Path, collector: Collector):
+    memory_md = hermes_home / "memories" / "MEMORY.md"
+    memory_md.write_text("## one\n## two\n")
+    assert collector.collect().memory.memory_card_count == 2
+
+    memory_md.write_text("## one\n## two\n## three\n")
+    memory_md.chmod(0o000)
+    try:
+        assert _unreadable(memory_md)
+
+        degraded = collector.collect()
+        assert "memory" in degraded.health.failed_sources
+        assert degraded.memory.memory_card_count == 2
+    finally:
+        memory_md.chmod(0o644)
+    recovered = collector.collect()
+    assert recovered.memory.memory_card_count == 3
+
+
+@_skip_if_root
+def test_unreadable_soul_md_keeps_last_good_excerpt(hermes_home: Path, collector: Collector):
+    soul_md = hermes_home / "SOUL.md"
+    soul_md.write_text("calm and precise\n")
+    assert collector.collect().memory.soul_excerpt == "calm and precise"
+
+    soul_md.write_text("warm and thorough\n")
+    soul_md.chmod(0o000)
+    try:
+        assert _unreadable(soul_md)
+
+        degraded = collector.collect()
+        assert "memory" in degraded.health.failed_sources
+        assert degraded.memory.soul_excerpt == "calm and precise"
+    finally:
+        soul_md.chmod(0o644)
+    recovered = collector.collect()
+    assert recovered.memory.soul_excerpt == "warm and thorough"
+
+
+@_skip_if_root
+def test_unreadable_learned_skill_frontmatter_keeps_last_good_counts(
+    hermes_home: Path, collector: Collector
+):
+    skill_md = hermes_home / "skills" / "learned" / "grep-first" / "SKILL.md"
+    skill_md.parent.mkdir(parents=True)
+    skill_md.write_text("---\ncreated_by: agent\n---\n")
+    assert collector.collect().memory.agent_created_skill_count == 1
+
+    skill_md.write_text("---\ncreated_by: agent\npinned: true\n---\n")
+    skill_md.chmod(0o000)
+    try:
+        assert _unreadable(skill_md)
+
+        degraded = collector.collect()
+        assert "memory" in degraded.health.failed_sources
+        assert degraded.memory.agent_created_skill_count == 1
+    finally:
+        skill_md.chmod(0o644)
+    recovered = collector.collect()
+    assert recovered.memory.pinned_skill_count == 1
+
+
+# The same failure/no-cache/recovery contract without relying on filesystem
+# permissions (chmod 000 is a no-op for root): the denial is injected at the
+# reader boundary, so these run everywhere.
+
+
+def test_memory_word_count_read_failure_keeps_last_good_and_recovers(
+    hermes_home: Path, collector: Collector, monkeypatch: pytest.MonkeyPatch
+):
+    import hermesd.collector as collector_module
+
+    memory_md = hermes_home / "memories" / "MEMORY.md"
+    memory_md.write_text("one two")
+    assert collector.collect().memory.memory_word_count == 2
+
+    memory_md.write_text("one two three four")
+    real_word_count = collector_module._word_count
+
+    def denied(path: Path, root: Path | None = None) -> int:
+        raise PermissionError(path)
+
+    monkeypatch.setattr(collector_module, "_word_count", denied)
+    degraded = collector.collect()
+    assert "memory" in degraded.health.failed_sources
+    assert degraded.memory.memory_word_count == 2
+
+    monkeypatch.setattr(collector_module, "_word_count", real_word_count)
+    recovered = collector.collect()
+    assert "memory" not in recovered.health.failed_sources
+    assert recovered.memory.memory_word_count == 4
+
+
+def test_memory_card_count_read_failure_keeps_last_good_and_recovers(
+    hermes_home: Path, collector: Collector, monkeypatch: pytest.MonkeyPatch
+):
+    """The card cache fails independently: with only the card read denied, the
+    word count succeeding first must not mask the card failure."""
+    import hermesd.collector as collector_module
+
+    memory_md = hermes_home / "memories" / "MEMORY.md"
+    memory_md.write_text("## one\n## two\n")
+    first = collector.collect()
+    assert first.memory.memory_card_count == 2
+    assert first.memory.memory_word_count == 4
+
+    memory_md.write_text("## one\n## two\n## three\n")
+    real_card_count = collector_module._memory_card_count
+
+    def denied(path: Path, root: Path | None = None) -> int:
+        raise PermissionError(path)
+
+    monkeypatch.setattr(collector_module, "_memory_card_count", denied)
+    degraded = collector.collect()
+    assert "memory" in degraded.health.failed_sources
+    # The memory source fails as a unit, so every field serves last-good.
+    assert degraded.memory.memory_card_count == 2
+    assert degraded.memory.memory_word_count == 4
+
+    monkeypatch.setattr(collector_module, "_memory_card_count", real_card_count)
+    recovered = collector.collect()
+    assert "memory" not in recovered.health.failed_sources
+    assert recovered.memory.memory_card_count == 3
+    assert recovered.memory.memory_word_count == 6
+
+
+def test_memory_card_count_initially_failing_read_recovers(
+    hermes_home: Path, collector: Collector, monkeypatch: pytest.MonkeyPatch
+):
+    """No last-good baseline: a failed first read reports zero plus a degraded
+    source, and the next poll picks the file up once the read succeeds."""
+    import hermesd.collector as collector_module
+
+    memory_md = hermes_home / "memories" / "MEMORY.md"
+    memory_md.write_text("## one\n")
+
+    def denied(path: Path, root: Path | None = None) -> int:
+        raise PermissionError(path)
+
+    monkeypatch.setattr(collector_module, "_memory_card_count", denied)
+    degraded = collector.collect()
+    assert "memory" in degraded.health.failed_sources
+    assert degraded.memory.memory_card_count == 0
+
+    monkeypatch.undo()
+    recovered = collector.collect()
+    assert "memory" not in recovered.health.failed_sources
+    assert recovered.memory.memory_card_count == 1
+
+
+def test_empty_memory_md_is_a_legitimate_zero(hermes_home: Path, collector: Collector):
+    memory_md = hermes_home / "memories" / "MEMORY.md"
+    memory_md.write_text("")
+
+    state = collector.collect()
+    assert "memory" not in state.health.failed_sources
+    assert state.memory.memory_word_count == 0
+    assert state.memory.memory_card_count == 0
+
+
+def test_deleted_memory_md_is_a_legitimate_zero(hermes_home: Path, collector: Collector):
+    memory_md = hermes_home / "memories" / "MEMORY.md"
+    memory_md.write_text("one two")
+    assert collector.collect().memory.memory_word_count == 2
+
+    memory_md.unlink()
+    state = collector.collect()
+    assert "memory" not in state.health.failed_sources
+    assert state.memory.memory_word_count == 0

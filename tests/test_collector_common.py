@@ -11,6 +11,7 @@ from typing import BinaryIO
 import pytest
 
 from hermesd.collect.common import _read_tail_text, _read_text_capped
+from tests.conftest import _skip_if_root, _unreadable
 
 
 class _MutatingHandle:
@@ -53,15 +54,18 @@ def _mutate_before_read(
     target: Path,
     mutation: Callable[[Path], None],
 ) -> None:
-    real_open = Path.open
+    """Intercept the real descriptor boundary `_read_tail_text` opens through."""
+    import hermesd.collect.common as common
 
-    def mutating_open(self: Path, *args, **kwargs):
-        handle = real_open(self, *args, **kwargs)
-        if self == target and args and args[0] == "rb":
+    real_open = common._open_regular_file
+
+    def mutating_open(path: Path, *args, **kwargs):
+        handle = real_open(path, *args, **kwargs)
+        if path == target:
             return _MutatingHandle(handle, target, mutation)
         return handle
 
-    monkeypatch.setattr(Path, "open", mutating_open)
+    monkeypatch.setattr(common, "_open_regular_file", mutating_open)
 
 
 def test_read_tail_text_bounded_when_file_grows_before_read(
@@ -201,3 +205,61 @@ def test_printable_capped_strips_controls_caps_and_rejects_non_str():
     assert _printable_capped("abcdef", 3) == "abc"
     assert _printable_capped(42, 10) == ""
     assert _printable_capped(None, 10) == ""
+
+
+def test_read_text_capped_strict_reads_and_reads_unsafe_paths_as_absent(tmp_path: Path):
+    from hermesd.collect.common import _read_text_capped_strict
+
+    target = tmp_path / "MEMORY.md"
+    target.write_text("one two")
+    assert _read_text_capped_strict(target) == "one two"
+
+    symlink = tmp_path / "linked.md"
+    symlink.symlink_to(target)
+    assert _read_text_capped_strict(symlink) == ""
+
+    root = tmp_path / "home"
+    root.mkdir()
+    assert _read_text_capped_strict(target, root) == ""
+
+
+def test_read_text_capped_strict_raises_on_a_missing_file(tmp_path: Path):
+    from hermesd.collect.common import _read_text_capped_strict
+
+    with pytest.raises(FileNotFoundError):
+        _read_text_capped_strict(tmp_path / "absent.md")
+
+
+def test_read_text_capped_strict_propagates_an_injected_open_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Deterministic under root: an OSError from the open boundary propagates."""
+    import hermesd.collect.common as common
+
+    target = tmp_path / "MEMORY.md"
+    target.write_text("one two")
+    real_open = common._open_regular_file
+
+    def denied(path: Path, *args: object, **kwargs: object):
+        if path == target:
+            raise PermissionError(path)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(common, "_open_regular_file", denied)
+    with pytest.raises(PermissionError):
+        common._read_text_capped_strict(target)
+
+
+@_skip_if_root
+def test_read_text_capped_strict_raises_on_an_unreadable_file(tmp_path: Path):
+    from hermesd.collect.common import _read_text_capped_strict
+
+    target = tmp_path / "MEMORY.md"
+    target.write_text("one two")
+    target.chmod(0o000)
+    assert _unreadable(target)
+    try:
+        with pytest.raises(PermissionError):
+            _read_text_capped_strict(target)
+    finally:
+        target.chmod(0o644)

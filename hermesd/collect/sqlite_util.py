@@ -177,9 +177,15 @@ _KNOWN_TABLES = frozenset(
     {
         "async_delegations",
         "compression_locks",
+        # telemetry/shared_metrics/metrics.sqlite3
+        # (hermes_cli/observability/shared_metrics.py:38-88).
+        "consent_marks",
         "conversation_generations",
         "conversations",
+        "counter_aggregates",
         "cron_incidents",
+        # cron/deliveries.db (cron/delivery_queue.py:108-122).
+        "deliveries",
         "delivery_obligations",
         "discovered_repos",
         "executions",
@@ -197,6 +203,7 @@ _KNOWN_TABLES = frozenset(
         "hosted_room_revoked_grants",
         "hosted_rooms",
         "kanban_notify_subs",
+        "package_outbox",
         "project_folders",
         "projects",
         "responses",

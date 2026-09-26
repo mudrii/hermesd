@@ -36,8 +36,22 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append("  Skills: ", style=theme.ui_label)
     lines.append(f"{sm.skill_count}", style=theme.ui_accent)
     lines.append(f" ({sm.skill_categories} cat)\n", style=theme.banner_dim)
+    if sm.hub_lock_present or sm.hub_quarantine_count:
+        lines.append("  Hub: ", style=theme.ui_label)
+        lines.append(f"{sm.hub_installed_count} installed", style=theme.banner_text)
+        if sm.hub_quarantine_count:
+            lines.append(f" · {sm.hub_quarantine_count} quarantined", style=theme.ui_warn)
+        lines.append("\n")
     lines.append("  Creds: ", style=theme.ui_label)
-    lines.append(f"{len(sm.credential_pools)} pools\n", style=theme.banner_text)
+    lines.append(f"{len(sm.credential_pools)} pools", style=theme.banner_text)
+    cooling = sum(
+        1
+        for entry in sm.credential_pools
+        if entry.cooldown_remaining_seconds is not None or entry.model_cooldowns
+    )
+    if cooling:
+        lines.append(f" ({cooling} cooling)", style=theme.ui_warn)
+    lines.append("\n")
     lines.append("  Integrations: ", style=theme.ui_label)
     # A trailing "+" marks a walk that hit its directory budget: the number is
     # what hermesd retained, not what is on disk.
@@ -51,6 +65,21 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         f"{plugin_count} plug (agent)  {desktop_count} plug (desktop)  {len(sm.mcp_servers)} mcp\n",
         style=theme.banner_text,
     )
+    integrations = state.integrations
+    pending = sum(p.pending_count for p in integrations.pairing_platforms)
+    if pending:
+        lines.append("  Pairing: ", style=theme.ui_label)
+        lines.append(f"{pending} pending\n", style=theme.ui_warn)
+    if integrations.rate_limit_holds:
+        lines.append("  Throttled: ", style=theme.ui_label)
+        lines.append(
+            ", ".join(
+                f"{sanitize_terminal_text(hold.name)} {fmt_age_seconds(hold.remaining_seconds)}"
+                for hold in integrations.rate_limit_holds
+            )
+            + "\n",
+            style=theme.ui_warn,
+        )
     if sm.plugin_catalog_update_count or sm.plugin_catalog_removed_count:
         lines.append("  Catalog: ", style=theme.ui_label)
         catalog_style = theme.ui_warn if sm.plugin_catalog_removed_count else theme.banner_text
@@ -93,9 +122,15 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         _providers_table(sm, theme),
     ]
 
+    if state.integrations.rate_limit_holds:
+        sections.append(section_heading("Provider Throttling", theme))
+        sections.append(_rate_limit_table(state, theme))
+
     if sm.credential_pools:
         sections.append(section_heading("Credential Pools", theme))
         sections.append(_credential_pools_table(sm, theme))
+        if any(entry.model_cooldowns for entry in sm.credential_pools):
+            sections.append(_model_cooldown_lines(sm, theme))
 
     if sm.hooks:
         sections.append(section_heading("Hooks", theme))
@@ -115,6 +150,9 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         sections.append(section_heading("MCP Servers", theme))
         sections.append(_mcp_servers_table(sm, theme))
 
+    sections.append(section_heading("Integrations", theme))
+    sections.extend(_integrations_section(state, theme))
+
     sections.extend(_mcp_cache_section(state, theme))
 
     if state.skills_prompt.prompted_skill_count:
@@ -125,6 +163,10 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         boot_text.append("\nBOOT.md\n", style=f"bold {theme.ui_label}")
         boot_text.append("  Present", style=theme.banner_text)
         sections.append(boot_text)
+
+    if sm.hub_lock_present or sm.hub_quarantine_count:
+        sections.append(section_heading("Skills Hub", theme))
+        sections.append(_skills_hub_table(sm, theme))
 
     if sm.skills:
         # Every row: the app scrolls the rendered detail through its viewport.
@@ -316,12 +358,26 @@ def _credential_pools_table(sm: SkillsMemory, theme: Theme) -> Table:
             "Yes" if entry.token_present else "No",
             escape(entry.last_status),
             str(entry.request_count),
-            escape(entry.cooldown_remaining),
+            fmt_age_seconds(entry.cooldown_remaining_seconds),
             escape(entry.expires_at) if entry.expires_at else "—",
             escape(entry.last_refresh) if entry.last_refresh else "—",
             str(entry.priority) if entry.priority else "—",
         )
     return pool_table
+
+
+def _model_cooldown_lines(sm: SkillsMemory, theme: Theme) -> Text:
+    """Models a pooled credential is benched for while its siblings stay usable."""
+    lines = Text()
+    lines.append("\nModel cooldowns\n", style=theme.ui_label)
+    for entry in sm.credential_pools:
+        for cooldown in entry.model_cooldowns:
+            lines.append(
+                f"  {sanitize_terminal_text(entry.name)}: {sanitize_terminal_text(cooldown.model)}"
+                f" {fmt_age_seconds(cooldown.remaining_seconds)} left\n",
+                style=theme.ui_warn,
+            )
+    return lines
 
 
 def _hooks_table(sm: SkillsMemory, theme: Theme) -> Table:
@@ -585,6 +641,148 @@ def _mcp_servers_table(sm: SkillsMemory, theme: Theme) -> Table:
             escape(server.tool_filter) if server.tool_filter else "—",
         )
     return mcp_table
+
+
+def _rate_limit_table(state: DashboardState, theme: Theme) -> Table:
+    """Active rate_limits/<name>.json holds and the time left on each."""
+    table = Table(box=None, show_header=False, padding=(0, 2))
+    table.add_column("Hold", style=theme.ui_accent)
+    table.add_column("Remaining", style=theme.ui_warn)
+    for hold in state.integrations.rate_limit_holds:
+        recorded = (
+            f" (recorded {fmt_age_seconds(hold.recorded_age_seconds)} ago)"
+            if hold.recorded_age_seconds is not None
+            else ""
+        )
+        table.add_row(
+            escape(hold.name), f"{fmt_age_seconds(hold.remaining_seconds)} left{recorded}"
+        )
+    return table
+
+
+def _integrations_section(state: DashboardState, theme: Theme) -> list[RenderableType]:
+    """Pairing, webhooks, routes, monitoring and telemetry — names and counts only."""
+    integrations = state.integrations
+    config = state.config
+    table = Table(box=None, show_header=False, padding=(0, 2))
+    table.add_column("Key", style=theme.ui_label)
+    table.add_column("Value", style=theme.banner_text)
+    table.add_row("Pairing", _pairing_label(state))
+    table.add_row("Webhooks", _webhooks_label(state))
+    table.add_row("Profile routes", _profile_routes_label(state))
+    otlp = "OTLP on" if config.monitoring_otlp_enabled else "OTLP off"
+    if config.monitoring_otlp_enabled and not config.monitoring_otlp_endpoint_configured:
+        otlp += " (no endpoint)"
+    health = "on" if config.monitoring_health_export_enabled else "off"
+    table.add_row("Monitoring", f"health export {health} · {otlp}")
+    table.add_row("Langfuse", "enabled" if config.langfuse_plugin_enabled else "not enabled")
+    table.add_row("Shared metrics", _shared_metrics_label(state))
+    sections: list[RenderableType] = [table]
+    if config.profile_routes:
+        routes = Text()
+        for route in config.profile_routes:
+            flags = []
+            if not route.enabled:
+                flags.append("disabled")
+            if route.bot_profile:
+                flags.append(f"bot {route.bot_profile}")
+            suffix = f" ({', '.join(flags)})" if flags else ""
+            matches = "+".join(route.discriminators) or "platform-wide"
+            routes.append(
+                sanitize_terminal_text(
+                    f"  {route.name or '(unnamed)'}: {route.platform} → {route.profile}"
+                    f"  {matches}{suffix}"
+                )
+                + "\n",
+                style=theme.banner_dim,
+            )
+        sections.append(routes)
+    if integrations.webhook_route_names:
+        sections.append(
+            Text(
+                "  webhook routes: "
+                + sanitize_terminal_text(", ".join(integrations.webhook_route_names)),
+                style=theme.banner_dim,
+            )
+        )
+    return sections
+
+
+def _pairing_label(state: DashboardState) -> str:
+    platforms = state.integrations.pairing_platforms
+    if not platforms:
+        return "no pairing store"
+    parts = []
+    for summary in platforms:
+        label = (
+            f"{summary.platform}: {summary.pending_count} pending"
+            f" · {summary.approved_count} approved"
+        )
+        if summary.newest_approved_age_seconds is not None:
+            label += f" (newest {fmt_age_seconds(summary.newest_approved_age_seconds)} ago)"
+        parts.append(label)
+    return escape("\n".join(parts))
+
+
+def _webhooks_label(state: DashboardState) -> str:
+    integrations = state.integrations
+    platform = "platform on" if state.config.webhook_platform_enabled else "platform off"
+    if not integrations.webhook_subscriptions_present:
+        return f"{platform} · no subscriptions file"
+    return (
+        f"{platform} · {integrations.webhook_subscription_count} subscriptions"
+        f" ({integrations.webhook_enabled_count} enabled)"
+    )
+
+
+def _profile_routes_label(state: DashboardState) -> str:
+    config = state.config
+    if not config.profile_routes and not config.profile_routes_skipped:
+        return "none"
+    by_user = sum(1 for route in config.profile_routes if "user_id" in route.discriminators)
+    label = f"{len(config.profile_routes)} routes ({by_user} by user_id)"
+    if config.profile_routes_skipped:
+        label += f" · {config.profile_routes_skipped} skipped"
+    return label
+
+
+def _shared_metrics_label(state: DashboardState) -> str:
+    integrations = state.integrations
+    if not integrations.shared_metrics_present:
+        return "no store"
+    parts = [
+        f"{integrations.shared_metrics_counter_rows} counter rows",
+        f"{integrations.shared_metrics_pending_periods} periods unpackaged",
+    ]
+    if integrations.shared_metrics_outbox_by_state:
+        outbox = ", ".join(
+            f"{count} {send_state}"
+            for send_state, count in sorted(integrations.shared_metrics_outbox_by_state.items())
+        )
+        parts.append(f"outbox {outbox}")
+    if integrations.shared_metrics_outbox_error_count:
+        parts.append(f"{integrations.shared_metrics_outbox_error_count} with errors")
+    label = " · ".join(parts)
+    if integrations.shared_metrics_consent_marks:
+        marks = ", ".join(
+            f"{name} {stamp}"
+            for name, stamp in sorted(integrations.shared_metrics_consent_marks.items())
+        )
+        label += f"\nconsent {marks}"
+    return escape(label)
+
+
+def _skills_hub_table(sm: SkillsMemory, theme: Theme) -> Table:
+    """skills/.hub counts, as ``hermes doctor`` reports them."""
+    table = Table(box=None, show_header=False, padding=(0, 2))
+    table.add_column("Key", style=theme.ui_label)
+    table.add_column("Value", style=theme.banner_text)
+    table.add_row("Installed", str(sm.hub_installed_count) if sm.hub_lock_present else "no lock")
+    table.add_row(
+        "Quarantined",
+        f"{sm.hub_quarantine_count} pending review" if sm.hub_quarantine_count else "0",
+    )
+    return table
 
 
 def _skill_rows(sm: SkillsMemory) -> list[tuple[str, str, str]]:

@@ -928,3 +928,33 @@ def test_operations_detail_shows_a_reservation_with_no_retention_deadline() -> N
 
     assert "run-no-deadline" in text
     assert "—" in text
+
+
+def test_verification_summary_shows_one_line_not_the_whole_output() -> None:
+    from hermesd.models import DashboardState, OperationsState, VerificationEventSummary
+
+    summary = "\n\ncompile OK\n=== run carried privacy tests ===\nerror: Failed to spawn\n"
+    state = DashboardState(
+        operations=OperationsState(
+            verification_db_present=True,
+            verification_latest_events=[
+                VerificationEventSummary(kind="test", status="passed", output_summary=summary)
+            ],
+        )
+    )
+
+    rendered = render_to_str(render_operations(state, Theme(), detail=True), width=160)
+
+    assert "compile OK" in rendered
+    assert "privacy tests" not in rendered
+    assert "Failed to spawn" not in rendered
+
+
+def test_size_label_saturates_absurd_byte_counts() -> None:
+    """DB/JSON byte counts can be arbitrary-precision ints; dividing one into a
+    float raises OverflowError, so the label saturates at a bounded sentinel."""
+    from hermesd.panels.operations import _size_label
+
+    assert _size_label(10**400) == ">=1000T"
+    assert _size_label(2 * 10**12) == "2000.0G"
+    assert _size_label(512) == "512"

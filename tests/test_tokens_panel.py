@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 from hermesd.models import (
+    DailyUsage,
     DashboardState,
     ModelUsage,
     SessionInfo,
     TokenAnalytics,
     TokenBreakdown,
     TokenSummary,
+    TopSession,
+    UsageAnalytics,
 )
+from hermesd.panels.formatting import sparkline
 from hermesd.panels.tokens import render_tokens
 from hermesd.theme import Theme
 from tests.conftest import render_to_str
@@ -275,3 +279,144 @@ def test_model_usage_cost_split_fields_serialize_in_snapshot() -> None:
     assert first["estimated_only_cost_usd"] == 2.00
     assert first["reported_row_count"] == 1
     assert first["row_count"] == 2
+
+
+def _analytics_state() -> DashboardState:
+    daily = [DailyUsage(day=f"2026-09-{day:02d}") for day in range(11, 25)]
+    daily[-1] = DailyUsage(
+        day="2026-09-24",
+        sessions=3,
+        input_tokens=120_000,
+        output_tokens=30_000,
+        api_calls=17,
+        total_cost_usd=1.25,
+        cost_is_estimated=False,
+    )
+    daily[-2] = DailyUsage(day="2026-09-23", sessions=1, input_tokens=10_000, total_cost_usd=0.1)
+    return DashboardState(
+        usage_analytics=UsageAnalytics(
+            daily=daily,
+            by_source_24h=[
+                TokenBreakdown(
+                    label="telegram", session_count=2, input_tokens=5_000, total_cost_usd=0.4
+                )
+            ],
+            by_source_7d=[
+                TokenBreakdown(
+                    label="telegram", session_count=4, input_tokens=9_000, total_cost_usd=0.9
+                ),
+                TokenBreakdown(label="cron", session_count=40, input_tokens=80_000),
+            ],
+            top_sessions_7d=[
+                TopSession(
+                    session_id="20260924_abcdef12",
+                    title="[/] evil [x]\x1b[2Jtitle",
+                    source="telegram",
+                    model="gpt-5.4",
+                    input_tokens=50_000,
+                    output_tokens=5_000,
+                    total_cost_usd=0.75,
+                    cost_is_estimated=False,
+                )
+            ],
+        )
+    )
+
+
+def test_tokens_detail_renders_daily_usage_table() -> None:
+    rendered = render_to_str(render_tokens(_analytics_state(), Theme(), detail=True), width=160)
+
+    assert "Daily Usage (14d)" in rendered
+    assert "09-24" in rendered
+    # Like upstream's daily series, only days with sessions get a row.
+    assert "09-11" not in rendered
+    assert "$1.25" in rendered
+    assert "~$0.10" in rendered
+    assert "17" in rendered
+
+
+def test_tokens_detail_renders_source_breakdown_for_both_windows() -> None:
+    rendered = render_to_str(render_tokens(_analytics_state(), Theme(), detail=True), width=160)
+
+    assert "By Source" in rendered
+    source_lines = [line for line in rendered.splitlines() if "telegram" in line]
+    assert any("5.0K" in line and "9.0K" in line for line in source_lines)
+    cron_line = next(line for line in rendered.splitlines() if "cron" in line)
+    assert "40" in cron_line
+
+
+def test_tokens_detail_renders_top_sessions_with_escaped_title() -> None:
+    rendered = render_to_str(render_tokens(_analytics_state(), Theme(), detail=True), width=160)
+
+    assert "Top Sessions (7d)" in rendered
+    assert "abcdef12" in rendered
+    assert "[/] evil [x]" in rendered
+    assert "\x1b[2J" not in rendered
+    assert "gpt-5.4" in rendered
+    assert "$0.75" in rendered
+
+
+def test_tokens_detail_omits_analytics_sections_without_data() -> None:
+    rendered = render_to_str(render_tokens(DashboardState(), Theme(), detail=True), width=160)
+
+    assert "Daily Usage" not in rendered
+    assert "By Source" not in rendered
+    assert "Top Sessions" not in rendered
+
+
+def test_tokens_compact_shows_daily_token_sparkline() -> None:
+    rendered = render_to_str(render_tokens(_analytics_state(), Theme()), width=80)
+
+    assert "14d" in rendered
+    assert "▁" * 12 + "▂█" in rendered
+
+
+def test_tokens_compact_hides_sparkline_without_usage() -> None:
+    state = DashboardState(
+        usage_analytics=UsageAnalytics(daily=[DailyUsage(day="2026-09-24")] * 14)
+    )
+    rendered = render_to_str(render_tokens(state, Theme()), width=80)
+
+    assert "14d" not in rendered
+
+
+def test_sparkline_scales_to_the_largest_value() -> None:
+    assert sparkline([0, 1, 4, 8]) == "▁▂▅█"
+    assert sparkline([0, 0]) == "▁▁"
+    assert sparkline([]) == ""
+
+
+def test_oversized_token_count_from_sqlite_renders_bounded_snapshots(hermes_home) -> None:
+    """SQLite keeps a TEXT value in an INTEGER column, and Pydantic coerces the
+    underscore-separated digits into an arbitrary-precision int. Every accepted
+    count must format: panel 3, the overview, and the JSON dump all complete."""
+    import sqlite3
+    import time
+
+    from hermesd.app import DashboardApp
+
+    conn = sqlite3.connect(str(hermes_home / "state.db"))
+    conn.executescript(
+        "CREATE TABLE sessions ("
+        "id TEXT, source TEXT, started_at REAL, ended_at REAL, input_tokens INTEGER);"
+    )
+    conn.execute(
+        "INSERT INTO sessions VALUES (?,?,?,?,?)",
+        ("s1", "cli", time.time(), None, "_".join(["9"] * 400)),
+    )
+    conn.commit()
+    conn.close()
+
+    app = DashboardApp(hermes_home, no_color=True)
+    try:
+        state = app._collector.collect()
+        panel_text = app.render_snapshot_text(panel_num=3)
+        overview_text = app.render_snapshot_text()
+        json_text = app.render_snapshot_json()
+    finally:
+        app.close()
+
+    assert state.sessions[0].input_tokens == 10**400 - 1
+    assert ">=999T" in panel_text
+    for output in (panel_text, overview_text, json_text):
+        assert len(output) < 100_000

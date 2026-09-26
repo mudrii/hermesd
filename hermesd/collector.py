@@ -44,6 +44,7 @@ from hermesd.collect.common import (
     _len_if_sized,
     _local_date,
     _mtime,
+    _open_regular_file,
     _optional_epoch,
     _path_resolves_under,
     _printable_capped,
@@ -57,71 +58,120 @@ from hermesd.collect.common import (
 )
 from hermesd.collect.config import (
     _CONFIG_BACKUP_ENTRY_LIMIT,
+    _active_model_cooldowns,
+    _active_personality_name,
     _channel_capabilities,
     _config_agent_limits,
     _config_backup_groups,
     _credential_auth_type,
+    _credential_cooldown_remaining,
     _credential_expiry,
+    _doctor_config_findings,
+    _duplicate_platform_credentials,
+    _env_platform_credential_keys,
+    _integration_flags,
     _mcp_tool_filter_summary,
     _moa_config_summary,
     _platform_family_label,
+    _pool_entries,
     _provider_free_tier,
     _provider_model_label,
     _provider_routing_summary,
+    _read_env_text,
     _scale_to_zero_relay_only,
     _select_pool_entry,
     _stale_alias_count,
 )
 from hermesd.collect.cron import (
+    _RECOVERY_LEDGERS,
+    _BotChatReceipt,
+    _BotChatSignature,
     _chronos_configured,
     _cron_catch_up_occurrences,
     _cron_catch_up_policy,
     _cron_job_dispatch,
     _cron_job_fire_claim,
     _cron_job_fire_error,
+    _cron_job_model,
     _cron_job_paused,
     _cron_job_pending_slot,
+    _cron_job_quota_hold,
     _cron_job_repeat,
     _cron_suggestion_count,
     _cron_ticker_ages,
     _cron_ticker_health,
     _cron_ticker_last_error,
+    _cron_usage_state,
     _delivery_target_label,
     _latest_cron_output_excerpt,
     _latest_cron_output_file,
+    _read_cron_bot_chat,
+    _read_cron_delivery_queue,
     _read_cron_executions_state,
+    _read_recovery_ledger,
+    _read_usage_audit_records,
+    _recovery_ledger,
     _tail_latest_cron_output,
 )
 from hermesd.collect.curator import (
+    _CURATOR_CLAIM_STALE_SECONDS,
+    _LEDGER_TAIL_BYTES,
+    _claim_pid,
     _curator_thresholds,
     _curator_with_scheduler_state,
+    _ledger_recent,
     _skill_curation_hygiene,
     _state_transition_label,
+    _suppressed_count,
 )
 from hermesd.collect.desktop_plugins import read_desktop_plugins
 from hermesd.collect.gateway import (
     _LOOP_TICK_SILENCE_STRIKES,
+    _claims_serving,
     _config_generation,
     _config_stale,
     _dashboard_client_status,
+    _dead_target_fields,
+    _dead_target_rows,
     _default_loop_tick_probe,
     _gateway_ledger_fields,
     _gateway_start_epoch,
     _GatewayLedgerRows,
     _heartbeat_liveness,
+    _heartbeat_memory,
     _lifecycle_status,
     _loop_tick_probe_plan,
     _loop_tick_verdict,
+    _multiplex_standalone_reason,
     _platform_status,
     _read_exit_diag,
     _read_forensic_companions,
     _read_gateway_ledger_rows,
     _read_start_storm,
+    _receipt_history_row,
     _record_writer,
     _respawn_storm_policy,
+    _restart_loop_fields,
+    _restart_loop_policy,
+    _restart_notice_fields,
+    _serve_obligation_fields,
+    _serve_obligation_paths,
+    _serve_obligation_row,
+    _update_history_fields,
+    _update_history_paths,
     _update_receipt_status,
+    _watchdog_exit_reason,
 )
 from hermesd.collect.hosted_rooms import _read_hosted_rooms
+from hermesd.collect.integrations import (
+    PAIRING_SUFFIXES,
+    RATE_LIMIT_NAMES,
+    pairing_platforms,
+    pairing_summary,
+    rate_limit_hold,
+    shared_metrics_readout,
+    webhook_summary,
+)
 from hermesd.collect.kanban import (
     _kanban_claim_ttl_seconds,
     _read_kanban_board_summary,
@@ -133,6 +183,8 @@ from hermesd.collect.logs import (
     _LOG_LINE_PATTERN,
     _LOG_TAIL_LINES,
     _MAX_LOG_LINE_CHARS,
+    LOG_HEALTH_SPECS,
+    IncrementalLogScanner,
     _extract_session_id,
     _latest_log_mtime,
 )
@@ -142,7 +194,9 @@ from hermesd.collect.migration import (
 )
 from hermesd.collect.operations import (
     _BOUNDED_SCAN_LIMIT,
+    LogGrowthSamples,
     StateDbRead,
+    TreeSizeCache,
     _checkpoint_prune_interval_seconds,
     _count_delegation_live_logs,
     _is_dashboard_process,
@@ -150,9 +204,13 @@ from hermesd.collect.operations import (
     _live_log_tail,
     _moa_latest_record_summary,
     _model_cache_counts,
+    _pending_record_created_at,
     _read_checkpoint_prune_marker,
     _read_corrupt_ledger_marker,
     _read_delegation_live_manifests,
+    _read_disk_usage,
+    _read_journal_mode,
+    _read_pending_actions,
     _read_process_receipts,
     _read_projects_state,
     _read_state_snapshots,
@@ -213,6 +271,7 @@ from hermesd.collect.sessions import (
     _summarize_tokens,
     _summarize_window,
     _tool_names_from_entries,
+    _usage_analytics,
 )
 from hermesd.collect.skills import (
     _count_skills,
@@ -237,11 +296,14 @@ from hermesd.collect.system import (
     _RECENT_ACTIVITY_WINDOW_SECONDS,
     _git_checkpoint_summary,
     _git_ref_signature,
+    _kanban_worker_identity,
     _latest_runtime_activity_age,
     _lease_age_seconds,
     _observed_process_start_times,
     _pid_exists,
+    _read_estop,
     _surface_liveness,
+    _worker_identity,
 )
 from hermesd.db import HermesDB
 from hermesd.defaults import DEFAULT_LOG_TAIL_BYTES
@@ -255,18 +317,25 @@ from hermesd.models import (
     CheckpointInfo,
     ConfigSummary,
     CredentialPoolEntry,
+    CronBotChatState,
+    CronDeliveryQueueState,
     CronExecutionsState,
     CronJob,
+    CronRecoveryState,
     CronState,
+    CronUsageState,
     CuratorRun,
     DashboardState,
     DesktopPluginInfo,
+    DiskUsageState,
     GatewayLoopHealth,
     GatewayState,
     HealthSummary,
     HookInfo,
+    IntegrationsState,
     KanbanBoardSummary,
     KanbanState,
+    KanbanTaskSummary,
     LogLine,
     LogState,
     LogStream,
@@ -297,6 +366,8 @@ from hermesd.models import (
     ToolGatewayRoute,
     ToolsetAvailability,
     ToolStats,
+    UsageAnalytics,
+    WorkerIdentity,
 )
 from hermesd.paths import HermesPaths
 from hermesd.theme import normalize_skin_name
@@ -370,7 +441,15 @@ def _state_db_readout(conn: sqlite3.Connection) -> _StateDbReadout:
 
 # Fields each gateway sub-source owns, used to restore just that source's
 # values from the last good state when it fails.
-_HEARTBEAT_FIELDS = ("heartbeat_age_seconds", "loop_health")
+_HEARTBEAT_FIELDS = (
+    "heartbeat_age_seconds",
+    "loop_health",
+    "memory_rss_kib",
+    "memory_total_kib",
+    "memory_available_kib",
+    "memory_swap_used_kib",
+    "memory_pressure",
+)
 # The probe refines the same verdict the heartbeat ages into, plus the armed stamp.
 _LOOP_TICK_FIELDS = ("loop_health", "loop_tick_armed")
 # Upper bound on runtime/active_sessions.json entries turned into surfaces. Each
@@ -387,6 +466,42 @@ _PLUGIN_LIMIT = 200
 # The desktop inventory enriches SkillsMemory through an independent health
 # source so a transient root listing failure cannot blank agent integrations.
 _DESKTOP_PLUGIN_FIELDS = ("desktop_plugins", "desktop_plugin_scan_truncated")
+# skills/.hub — the fields the `skills_hub` source owns on SkillsMemory.
+_SKILLS_HUB_FIELDS = ("hub_lock_present", "hub_installed_count", "hub_quarantine_count")
+# skills/.hub/quarantine/ listing bound: one entry per quarantined skill.
+_HUB_QUARANTINE_LIST_LIMIT = 1000
+# Each integration store's fields on IntegrationsState, restored per source.
+_PAIRING_FIELDS = ("pairing_platforms",)
+_WEBHOOK_SUBSCRIPTION_FIELDS = (
+    "webhook_subscriptions_present",
+    "webhook_subscription_count",
+    "webhook_enabled_count",
+    "webhook_route_names",
+)
+_SHARED_METRICS_FIELDS = (
+    "shared_metrics_present",
+    "shared_metrics_counter_rows",
+    "shared_metrics_pending_periods",
+    "shared_metrics_outbox_by_state",
+    "shared_metrics_outbox_error_count",
+    "shared_metrics_consent_marks",
+)
+_RATE_LIMIT_FIELDS = ("rate_limit_holds",)
+# Pairing store listing bounds: files examined, platforms summarized.
+_PAIRING_DIR_ENTRY_LIMIT = 400
+_PAIRING_PLATFORM_LIMIT = 40
+# The `profile_credentials` source's field on ProfilesState.
+_PROFILE_CREDENTIAL_FIELDS = ("duplicate_platform_credentials",)
+# The `curator_activity` source's fields on CuratorRun.
+_CURATOR_ACTIVITY_FIELDS = (
+    "suppressed_count",
+    "ledger_present",
+    "ledger_recent",
+    "run_claim_present",
+    "run_claim_pid",
+    "run_claim_age_seconds",
+    "run_claim_live",
+)
 # backups/config/ scan — the fields the config-backups source owns on
 # ConfigSummary, so its last-good fallback restores exactly those.
 _CONFIG_BACKUP_FIELDS = (
@@ -441,7 +556,15 @@ _DELEGATION_LIVE_FIELDS = (
     "delegation_live_unparsed_count",
 )
 _PROCESS_RECEIPT_FIELDS = ("process_receipts",)
-_STATE_SNAPSHOT_FIELDS = ("snapshot_count", "snapshot_total_bytes", "newest_snapshot_age_seconds")
+_ESTOP_FIELDS = ("estop_engaged", "estop_reason", "estop_age_seconds", "estop_scope")
+_PENDING_ACTION_FIELDS = ("pending_actions", "pending_action_total")
+_STATE_SNAPSHOT_FIELDS = (
+    "snapshot_count",
+    "snapshot_total_bytes",
+    "newest_snapshot_age_seconds",
+    "snapshots",
+    "snapshot_failed_count",
+)
 _LIFECYCLE_FIELDS = (
     "lifecycle_phase",
     "last_exit_code",
@@ -487,6 +610,36 @@ _UPDATE_RECEIPT_FIELDS = (
     "update_receipt_unfinished",
     "update_fleet_states",
     "update_fleet_runtime_count",
+    "update_fleet_external_roots",
+    "update_post_swap_pid",
+    "update_pending_manual_serve_count",
+    "update_settled_from_live_fleet_age_seconds",
+    "update_runtime_outcomes",
+    "update_skip_count",
+    "update_skip_names",
+)
+_RESTART_NOTICE_FIELDS = (
+    "restart_notice_pending",
+    "restart_notice_requested_age_seconds",
+    "restart_notice_via_service",
+    "restart_notice_detached",
+    "restart_notice_delivered_count",
+)
+_SERVE_OBLIGATION_FIELDS = (
+    "serve_restart_pending_count",
+    "serve_restart_stale_count",
+    "serve_restart_pending",
+    "serve_restart_scan_truncated",
+)
+_UPDATE_HISTORY_FIELDS = ("update_history_scanned", "update_history_failed", "update_failures")
+_DEAD_TARGET_FIELDS = ("dead_target_count", "dead_target_platforms", "dead_targets")
+_RESTART_LOOP_FIELDS = (
+    "restart_loop_boots_recorded",
+    "restart_loop_chain",
+    "restart_loop_max_restarts",
+    "restart_loop_chain_gap_seconds",
+    "restart_loop_tripped",
+    "restart_loop_last_boot_age_seconds",
 )
 _LEDGER_FIELDS = (
     "gateway_incarnation_count",
@@ -495,6 +648,8 @@ _LEDGER_FIELDS = (
     "pending_delivery_count",
     "failed_delivery_count",
     "pending_deliveries",
+    "gateway_backend_groups",
+    "gateway_backend_groups_truncated",
 )
 
 
@@ -791,6 +946,8 @@ class Collector:
         self._last_generation_chat_count: int | None = None
         self._log_stream_cache: dict[str, tuple[float | None, int, LogStream]] = {}
         # Keyed by (output root, job id): a job id may itself contain ':'.
+        # Per-receipt parse cache for cron/bot_chat_pending/, by file signature.
+        self._bot_chat_cache: dict[str, tuple[_BotChatSignature, _BotChatReceipt | None]] = {}
         self._cron_excerpt_cache: dict[
             tuple[Path, str],
             tuple[
@@ -817,6 +974,14 @@ class Collector:
         # (source mtime, path to read, temp-dir owner). One per database, so the
         # boards' own stores do not evict the root one.
         self._kanban_snapshots: dict[Path, tuple[_DbSourceSignature | None, Path, Any]] = {}
+        # Bounded recursive directory sizes (state snapshots, disk usage),
+        # memoized per directory signature with a TTL.
+        self._tree_size_cache: TreeSizeCache = {}
+        # Per-file (observed-at, size) samples behind the log growth rates.
+        self._log_growth_samples: LogGrowthSamples = {}
+        # One incremental scanner per health-scanned log file (byte offset,
+        # inode and 24h event window survive between refreshes).
+        self._log_health_scanners: dict[str, IncrementalLogScanner] = {}
         self._checkpoint_summary_cache: dict[
             str, tuple[tuple[int, ...], tuple[int, float | None, str]]
         ] = {}
@@ -825,6 +990,9 @@ class Collector:
         # MEMORY.md / USER.md / SOUL.md is not re-read on every tick.
         self._derived_file_cache: dict[str, tuple[tuple[str, int, int] | None, Any]] = {}
         self._kanban_board_errors: list[str] = []
+        # telemetry/shared_metrics/metrics.sqlite3 readout keyed on the db+WAL
+        # signature, so an idle store is not re-queried every refresh.
+        self._shared_metrics_cache: tuple[_DbSourceSignature, dict[str, Any]] | None = None
         # Session-row-derived values, one entry per derived name: the rows
         # list itself (compared by identity), then (local date, entry-specific
         # deps) — see _derived_from_rows.
@@ -1012,9 +1180,54 @@ class Collector:
                     "gateway_ledgers", results["gateway"], _LEDGER_FIELDS
                 ),
             ),
-            # Own source_name so a torn gateway_migration.json (upstream writes it
-            # with a plain write_text) degrades only the migration verdict and keeps
-            # its own last-good value, leaving the gateway beside it fresh.
+            _SourceSpec(
+                "gateway",
+                "dead_targets",
+                lambda: self._with_dead_targets(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "dead_targets", results["gateway"], _DEAD_TARGET_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "gateway",
+                "restart_loop",
+                lambda: self._with_restart_loop(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "restart_loop", results["gateway"], _RESTART_LOOP_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "gateway",
+                "restart_pending",
+                lambda: self._with_restart_notice(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "restart_pending", results["gateway"], _RESTART_NOTICE_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "gateway",
+                "serve_restart_pending",
+                lambda: self._with_serve_obligations(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "serve_restart_pending", results["gateway"], _SERVE_OBLIGATION_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "gateway",
+                "update_receipt_history",
+                lambda: self._with_update_history(results["gateway"]),
+                lambda: results["gateway"],
+                fallback=lambda: self._last_source_fields(
+                    "update_receipt_history", results["gateway"], _UPDATE_HISTORY_FIELDS
+                ),
+            ),
+            # Own source_name so a malformed gateway_migration.json (upstream writes
+            # it atomically, so hand-edited or foreign) degrades only the migration
+            # verdict and keeps its own last-good value, leaving the gateway fresh.
             _SourceSpec(
                 "migration",
                 "migration",
@@ -1048,6 +1261,16 @@ class Collector:
                 TokenAnalytics,
             ),
             _SourceSpec(
+                "usage_analytics",
+                "usage_analytics",
+                derived(
+                    "usage_analytics",
+                    self._collect_usage_analytics,
+                    deps=self._window_time_bucket,
+                ),
+                UsageAnalytics,
+            ),
+            _SourceSpec(
                 "tool_stats",
                 "tool_stats",
                 lambda: self._collect_tool_stats(
@@ -1067,6 +1290,15 @@ class Collector:
                 "background_processes",
                 self._collect_background_processes,
                 list,
+            ),
+            # Second writer of `background_processes`: ledger identity (pid vs
+            # create_time) and orphaned helpers whose spawner is gone.
+            _SourceSpec(
+                "background_processes",
+                "process_identity",
+                lambda: self._with_process_identity(results["background_processes"]),
+                lambda: results["background_processes"],
+                fallback=lambda: self._last_process_identity(results["background_processes"]),
             ),
             _SourceSpec("checkpoints", "checkpoints", self._collect_checkpoints, list),
             _SourceSpec("config", "config", self._collect_config, ConfigSummary),
@@ -1092,6 +1324,30 @@ class Collector:
                 CronExecutionsState,
             ),
             _SourceSpec(
+                "cron_usage",
+                "cron_usage_audit",
+                lambda: self._collect_cron_usage(results["cron"]),
+                CronUsageState,
+            ),
+            _SourceSpec(
+                "cron_deliveries",
+                "cron_deliveries",
+                self._collect_cron_deliveries,
+                CronDeliveryQueueState,
+            ),
+            _SourceSpec(
+                "cron_bot_chat",
+                "cron_bot_chat_pending",
+                self._collect_cron_bot_chat,
+                CronBotChatState,
+            ),
+            _SourceSpec(
+                "cron_recovery",
+                "cron_recovery_ledgers",
+                self._collect_cron_recovery,
+                CronRecoveryState,
+            ),
+            _SourceSpec(
                 "channels",
                 "channels",
                 lambda: self._collect_channels(results["gateway"]),
@@ -1108,6 +1364,15 @@ class Collector:
                 fallback=lambda: self._last_source_fields(
                     "kanban_notify", results["kanban"], _KANBAN_NOTIFY_FIELDS
                 ),
+            ),
+            # Worker identity verdicts need a live process probe on every pass;
+            # a failed probe keeps the last verdicts on the fresh board rows.
+            _SourceSpec(
+                "kanban",
+                "kanban_worker_identity",
+                lambda: self._with_kanban_worker_identity(results["kanban"]),
+                lambda: results["kanban"],
+                fallback=lambda: self._last_kanban_worker_identity(results["kanban"]),
             ),
             _SourceSpec(
                 "operations",
@@ -1127,6 +1392,9 @@ class Collector:
                     "state_snapshots", results["operations"], _STATE_SNAPSHOT_FIELDS
                 ),
             ),
+            # Disk footprint and retention checks: bounded, cached walks of
+            # several stores, so a failure keeps the last-good readout.
+            _SourceSpec("disk", "disk_usage", self._collect_disk_usage, DiskUsageState),
             # Third writer of `operations`: an unreadable blocked-scripts dir
             # keeps the last-good counts rather than reporting a false zero.
             _SourceSpec(
@@ -1136,6 +1404,17 @@ class Collector:
                 lambda: results["operations"],
                 fallback=lambda: self._last_source_fields(
                     "blocked_scripts", results["operations"], _BLOCKED_SCRIPT_FIELDS
+                ),
+            ),
+            # Staged writes awaiting operator review (pending/<subsystem>/):
+            # a failed scan keeps the last-good counts instead of a false zero.
+            _SourceSpec(
+                "operations",
+                "pending_actions",
+                lambda: self._with_pending_actions(results["operations"]),
+                lambda: results["operations"],
+                fallback=lambda: self._last_source_fields(
+                    "pending_actions", results["operations"], _PENDING_ACTION_FIELDS
                 ),
             ),
             # Fourth writer of `operations`: the state.db recovery artifacts are
@@ -1220,6 +1499,55 @@ class Collector:
                 lambda: results["skills_memory"],
                 fallback=lambda: self._last_plugin_catalog(results["skills_memory"]),
             ),
+            _SourceSpec(
+                "skills_memory",
+                "skills_hub",
+                lambda: self._with_skills_hub(results["skills_memory"]),
+                lambda: results["skills_memory"],
+                fallback=lambda: self._last_source_fields(
+                    "skills_hub", results["skills_memory"], _SKILLS_HUB_FIELDS
+                ),
+            ),
+            # Four stores enrich `integrations`, each failing (and falling back)
+            # on its own so one corrupt store cannot blank the others.
+            _SourceSpec(
+                "integrations",
+                "pairing",
+                lambda: self._with_pairing(results.get("integrations") or IntegrationsState()),
+                IntegrationsState,
+                fallback=lambda: self._last_source_fields(
+                    "pairing",
+                    results.get("integrations") or IntegrationsState(),
+                    _PAIRING_FIELDS,
+                ),
+            ),
+            _SourceSpec(
+                "integrations",
+                "webhook_subscriptions",
+                lambda: self._with_webhook_subscriptions(results["integrations"]),
+                lambda: results["integrations"],
+                fallback=lambda: self._last_source_fields(
+                    "webhook_subscriptions", results["integrations"], _WEBHOOK_SUBSCRIPTION_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "integrations",
+                "shared_metrics",
+                lambda: self._with_shared_metrics(results["integrations"]),
+                lambda: results["integrations"],
+                fallback=lambda: self._last_source_fields(
+                    "shared_metrics", results["integrations"], _SHARED_METRICS_FIELDS
+                ),
+            ),
+            _SourceSpec(
+                "integrations",
+                "rate_limits",
+                lambda: self._with_rate_limits(results["integrations"]),
+                lambda: results["integrations"],
+                fallback=lambda: self._last_source_fields(
+                    "rate_limits", results["integrations"], _RATE_LIMIT_FIELDS
+                ),
+            ),
             _SourceSpec("mcp_cache", "mcp_cache", self._collect_mcp_cache, MCPSchemaCache),
             _SourceSpec(
                 "skills_prompt",
@@ -1229,12 +1557,42 @@ class Collector:
             ),
             _SourceSpec("memory", "memory", self._collect_memory, MemoryOverview),
             _SourceSpec("profiles", "profiles", self._collect_profiles, ProfilesState),
+            _SourceSpec(
+                "profiles",
+                "profile_credentials",
+                lambda: self._with_profile_credentials(results["profiles"]),
+                lambda: results["profiles"],
+                fallback=lambda: self._last_source_fields(
+                    "profile_credentials", results["profiles"], _PROFILE_CREDENTIAL_FIELDS
+                ),
+            ),
             _SourceSpec("logs", "logs", self._collect_logs, LogState),
+            # Second writer of `logs`: incremental health counters over the big
+            # unrotated logs. A read failure keeps the last-good counters while
+            # the tails beside them stay fresh.
+            _SourceSpec(
+                "logs",
+                "log_health",
+                lambda: self._with_log_health(results["logs"]),
+                lambda: results["logs"],
+                fallback=lambda: self._last_source_fields(
+                    "log_health", results["logs"], ("health",)
+                ),
+            ),
             _SourceSpec("version_behind", "version_check", self._collect_version_behind, int),
             # Without a last good read the fallback is the shipped skin name,
             # not the "" that the str default factory would yield.
             _SourceSpec("active_skin", "skin", self._collect_skin, str, fallback=self._last_skin),
             _SourceSpec("curator", "curator", self._collect_curator, CuratorRun),
+            _SourceSpec(
+                "curator",
+                "curator_activity",
+                lambda: self._with_curator_activity(results["curator"]),
+                lambda: results["curator"],
+                fallback=lambda: self._last_source_fields(
+                    "curator_activity", results["curator"], _CURATOR_ACTIVITY_FIELDS
+                ),
+            ),
             _SourceSpec(
                 "model_usage",
                 "model_usage",
@@ -1304,6 +1662,18 @@ class Collector:
                 "runtime",
                 lambda: self._collect_runtime_status(results["gateway"], results["sessions"]),
                 RuntimeStatus,
+            ),
+            # Second writer of `runtime`: the ESTOP sentinel is a separate file
+            # read on its own source, so a stat failure keeps the last-good pause
+            # state instead of silently reporting "not paused".
+            _SourceSpec(
+                "runtime",
+                "estop",
+                lambda: self._with_estop(results["runtime"]),
+                lambda: results["runtime"],
+                fallback=lambda: self._last_source_fields(
+                    "estop", results["runtime"], _ESTOP_FIELDS
+                ),
             ),
         )
 
@@ -1563,7 +1933,8 @@ class Collector:
         # would signal a process group or every process the user owns.
         recorded_pid = writer.pid or 0
         pid = recorded_pid
-        running = data.get("gateway_state") == "running"
+        recorded_state = str(data.get("gateway_state") or "unknown")
+        running = _claims_serving(recorded_state)
         recorded_writer_live = False
         # The PID in gateway_state.json can be stale if launchd restarted
         # the gateway. A replacement PID proves a process is running, but it does
@@ -1630,7 +2001,8 @@ class Collector:
             exit_reason=str(data.get("exit_reason") or ""),
             pid=pid,
             running=running,
-            state=str(data.get("gateway_state") or "unknown"),
+            state=recorded_state,
+            watchdog_exit_reason=_watchdog_exit_reason(data, running=running),
             platforms=platforms,
             hermes_version=version,
             updates_behind=behind,
@@ -1646,6 +2018,9 @@ class Collector:
             drain_suppress_notification=_coerce_bool(drain_request.get("suppress_notification")),
             served_profiles=served_names,
             served_profiles_recorded=served_recorded,
+            multiplex_standalone_reason=_multiplex_standalone_reason(
+                data, record_current=recorded_writer_live
+            ),
             scale_to_zero_idle_timeout_minutes=_coerce_int(scale_cfg.get("idle_timeout_minutes")),
             scale_to_zero_relay_only=_scale_to_zero_relay_only(scale_cfg, platforms),
         )
@@ -1688,9 +2063,15 @@ class Collector:
             data,
             file_mtime,
             self._clock(),
-            running=gateway.state == "running",
+            running=_claims_serving(gateway.state),
         )
-        return gateway.model_copy(update={"heartbeat_age_seconds": age, "loop_health": health})
+        return gateway.model_copy(
+            update={
+                "heartbeat_age_seconds": age,
+                "loop_health": health,
+                **_heartbeat_memory(data, age).as_update(),
+            }
+        )
 
     def _probed_loop_tick(self, pid: int, tcp_port: int | None) -> bool | None:
         return _default_loop_tick_probe(pid, tcp_port, self._paths.root_home)
@@ -1714,7 +2095,7 @@ class Collector:
         plan = _loop_tick_probe_plan(
             heartbeat,
             gateway.pid,
-            running=gateway.state == "running",
+            running=_claims_serving(gateway.state),
         )
         if plan is None:
             self._loop_tick_silent_strikes = 0
@@ -1820,20 +2201,7 @@ class Collector:
         last = self._last_good_by_source.get("update_receipt")
         data = self._read_liveness_json(path, bool(last is not None and last.last_update_outcome))
         receipt = _update_receipt_status(data, self._clock(), gateway.code_sha)
-        return gateway.model_copy(
-            update={
-                "last_update_outcome": receipt.outcome,
-                "last_update_finished_age_seconds": receipt.finished_age_seconds,
-                "last_update_from_version": receipt.from_version,
-                "last_update_to_version": receipt.to_version,
-                "last_update_failed_step": receipt.failed_step,
-                "runtime_code_skew": receipt.runtime_code_skew,
-                "runtime_code_skew_source": receipt.runtime_code_skew_source,
-                "update_receipt_unfinished": receipt.update_receipt_unfinished,
-                "update_fleet_states": receipt.update_fleet_states,
-                "update_fleet_runtime_count": receipt.update_fleet_runtime_count,
-            }
-        )
+        return gateway.model_copy(update=receipt.as_update())
 
     def _with_gateway_ledgers(self, gateway: GatewayState) -> GatewayState:
         last = self._last_good_by_source.get("gateway_ledgers")
@@ -1848,19 +2216,115 @@ class Collector:
             update=_gateway_ledger_fields(readout.ledgers, self._clock(), running=gateway.running)
         )
 
+    def _with_dead_targets(self, gateway: GatewayState) -> GatewayState:
+        """Confirmed-unreachable delivery targets from ``gateway/dead_targets.json``.
+
+        PROFILE-scoped: ``DeadTargetRegistry`` stores it at
+        ``get_hermes_home()/"gateway"/"dead_targets.json"``
+        (``gateway/dead_targets.py:54``), "a per-profile JSON file". The registry is
+        unbounded upstream, so the counts and newest rows are memoized by file
+        signature and only the ages are recomputed per tick.
+        """
+        path = self._paths.profile_path("gateway", "dead_targets.json")
+        last = self._last_good_by_source.get("dead_targets")
+        data = self._read_liveness_json(path, bool(last is not None and last.dead_target_count))
+        rows = self._signature_cached("dead_targets", path, lambda: _dead_target_rows(data))
+        return gateway.model_copy(update=_dead_target_fields(rows, self._clock()))
+
+    def _with_restart_loop(self, gateway: GatewayState) -> GatewayState:
+        """The auto-resume restart-loop breaker's boot chain, evaluated at now.
+
+        PROFILE-scoped: ``get_hermes_home()/"gateway"/"restart_loop.json"``
+        (``gateway/restart_loop_guard.py:37-38``). The policy is
+        ``gateway.restart_loop_guard`` from the root ``config.yaml``, like the other
+        gateway launch inputs (``gateway/run_shutdown.py:344-363``).
+        """
+        path = self._paths.profile_path("gateway", "restart_loop.json")
+        last = self._last_good_by_source.get("restart_loop")
+        data = self._read_liveness_json(
+            path, bool(last is not None and last.restart_loop_boots_recorded)
+        )
+        policy = _restart_loop_policy(self._read_yaml_cached())
+        return gateway.model_copy(update=_restart_loop_fields(data, self._clock(), policy))
+
+    def _with_restart_notice(self, gateway: GatewayState) -> GatewayState:
+        """The planned-restart back-online notice still owed (``.restart_pending.json``).
+
+        PROFILE-scoped: ``_hermes_home / ".restart_pending.json"`` where
+        ``_hermes_home = get_hermes_home()`` (``gateway/run.py:1585-1586,1602``).
+        """
+        path = self._paths.profile_path(".restart_pending.json")
+        last = self._last_good_by_source.get("restart_pending")
+        data = self._read_liveness_json(
+            path, bool(last is not None and last.restart_notice_pending)
+        )
+        return gateway.model_copy(update=_restart_notice_fields(data, self._clock()))
+
+    def _with_serve_obligations(self, gateway: GatewayState) -> GatewayState:
+        """Manual serve restarts an update still owes (``serve_restart_pending/``).
+
+        PROFILE-scoped: ``get_hermes_home()/"serve_restart_pending"``
+        (``hermes_cli/update_serve_obligations.py:40,91``). Each record is judged
+        like upstream's ``_pid_alive_matches``: a pid that is gone or now belongs to
+        another process is not owed; one whose identity cannot be checked still is.
+        """
+        directory = self._paths.profile_path("serve_restart_pending")
+        root = self._paths.root_home
+        paths, truncated = _serve_obligation_paths(directory, root)
+        rows = [
+            row
+            for path in paths
+            if _safe_child_path(path, root)
+            and (row := _serve_obligation_row(self._read_json_cached(path))) is not None
+        ]
+        pids = sorted({row[2] for row in rows})
+        observed = self._process_start_times(pids) if pids else {}
+        return gateway.model_copy(
+            update=_serve_obligation_fields(
+                rows,
+                lambda pid, created: _surface_liveness(pid, created, observed, self._pid_exists),
+                truncated=truncated,
+            )
+        )
+
+    def _with_update_history(self, gateway: GatewayState) -> GatewayState:
+        """Failures among the newest archived update receipts.
+
+        ROOT-scoped beside ``latest.json`` (the ``update_receipt`` source), so the
+        history and the latest run always describe the same home; upstream writes
+        both under ``get_hermes_home()/"logs"/"update_receipts"``
+        (``hermes_cli/update_receipt.py:119-125``). Memoized by the directory's
+        signature: archived receipts are never rewritten, only added and pruned.
+        """
+        directory = self._paths.shared_path("logs", "update_receipts")
+        root = self._paths.root_home
+
+        def read_rows() -> list[tuple[str, float | None, str, bool]]:
+            rows = []
+            for path in _update_history_paths(directory, root):
+                if not _safe_child_path(path, root):
+                    continue
+                data = self._read_json_cached(path)
+                if data and not self._file_cache.last_read_was_stale(path):
+                    rows.append(_receipt_history_row(data))
+            return rows
+
+        rows = self._signature_cached("update_history", directory, read_rows)
+        return gateway.model_copy(update=_update_history_fields(rows, self._clock()))
+
     def _collect_migration(self, gateway: GatewayState, *, gateway_fresh: bool) -> MigrationState:
         """Read ``gateway_migration.json`` and judge it against the live artifacts.
 
         ROOT-scoped: upstream anchors the manifest at the *default* profile home
-        (``hermes_cli/gateway_migrate.py:467-468``), never a secondary's, so a
+        (``hermes_cli/gateway_migrate.py:741-742``), never a secondary's, so a
         served profile has no copy of its own to read.
 
         Presence is checked separately from parseability because the two carry
-        different meanings: absent is "never migrated OR successfully rolled back",
-        while present-but-unparseable is a torn ``write_text`` mid-flight. A file
-        that was readable and then vanished or turned unsafe *raises*, so the source
-        is marked failed and its last-good verdict stays on display instead of
-        silently reporting "no migration".
+        different meanings: absent is "never migrated, converged, or compensated",
+        present means an unfinished migration, and present-but-unparseable is a
+        hand-edited or foreign file (upstream writes it atomically). A file that was
+        readable and then vanished or turned unsafe fails the source for one pass
+        (see ``_present_or_confirmed_absent``) before the absence is accepted.
         """
         if not gateway_fresh:
             raise RuntimeError("gateway dependency is stale; keeping last-good migration verdict")
@@ -1905,16 +2369,28 @@ class Collector:
         """Read hermes-agent version from pyproject.toml and update status."""
         version = ""
         pyproject = self._paths.shared_path("hermes-agent", "pyproject.toml")
-        if pyproject.exists():
+        if _exists_strict(pyproject) and (
+            # Bounded, confined, regular-file-only read. An I/O failure (FIFO,
+            # unreadable file) propagates so the gateway source falls back to
+            # its last-good state; a symlink or escaping path reads as absent,
+            # matching the lenient readers.
+            not pyproject.is_symlink() and _path_resolves_under(pyproject, self._paths.root_home)
+        ):
+            # Structured TOML must not parse a truncated prefix as a
+            # complete document: read one byte past the cap and treat an
+            # over-cap file as a failed read, not a partial parse.
+            with _open_regular_file(pyproject) as handle:
+                data = handle.read(_MAX_TEXT_READ_BYTES + 1)
+            if len(data) > _MAX_TEXT_READ_BYTES:
+                raise OSError(f"{pyproject} exceeds the {_MAX_TEXT_READ_BYTES}-byte read cap")
+            # Malformed TOML is data, not a read failure.
             try:
-                with pyproject.open("rb") as handle:
-                    data = tomllib.load(handle)
-                project = _as_dict(data.get("project"))
-                version = str(project.get("version") or "")
-            except OSError:
-                pass
+                project = _as_dict(
+                    tomllib.loads(data.decode("utf-8", errors="replace")).get("project")
+                )
             except tomllib.TOMLDecodeError:
-                pass
+                project = {}
+            version = str(project.get("version") or "")
         return version, self._collect_version_behind()
 
     def _read_context_lengths(self) -> dict[str, int]:
@@ -1974,24 +2450,32 @@ class Collector:
                 rewind_count=r.get("rewind_count") or 0,
                 handoff_state=r.get("handoff_state") or "",
                 handoff_platform=r.get("handoff_platform") or "",
-                handoff_error=r.get("handoff_error") or "",
+                # Chat-controlled or exception-derived free text is redacted at
+                # this boundary, before any panel clips it — like cron
+                # last_error and gateway route display names.
+                handoff_error=_redact_secret_text(r.get("handoff_error") or ""),
                 # SQLite columns are untyped: a text value in an epoch column must
                 # coerce, not fail model validation and blank the whole source.
                 started_at=_coerce_float(r.get("started_at")),
                 ended_at=None if r.get("ended_at") is None else _coerce_float(r.get("ended_at")),
-                title=None if r.get("title") is None else str(r.get("title")),
+                title=None if r.get("title") is None else _redact_secret_text(str(r.get("title"))),
                 is_active=r.get("ended_at") is None and not _coerce_bool(r.get("archived")),
                 git_branch=r.get("git_branch") or "",
                 chat_type=r.get("chat_type") or "",
-                display_name=r.get("display_name") or "",
+                display_name=_redact_secret_text(r.get("display_name") or ""),
                 title_source=r.get("title_source") or "",
                 profile_name=r.get("profile_name") or "",
                 pinned=_coerce_bool(r.get("pinned")),
                 last_activity_at=_coerce_float(r.get("last_activity_at")),
-                last_activity_description=r.get("last_activity_description") or "",
+                last_activity_description=_redact_secret_text(
+                    r.get("last_activity_description") or ""
+                ),
                 actual_cost_usd=_coerce_float(r.get("actual_cost_usd")),
                 cost_source=r.get("cost_source") or "",
-                compression_failure_error=r.get("compression_failure_error") or "",
+                transport_profile=r.get("transport_profile") or "",
+                compression_failure_error=_redact_secret_text(
+                    r.get("compression_failure_error") or ""
+                ),
                 # 0 and NULL both mean "no deadline" — see _optional_epoch.
                 compression_failure_cooldown_until=_optional_epoch(
                     r.get("compression_failure_cooldown_until")
@@ -2034,7 +2518,7 @@ class Collector:
 
         Scope note (``.codex/rules/source-ownership.md``): this reads the selected
         profile's registry via ``profile_path``, matching upstream's
-        ``_state_path`` (``hermes_cli/active_sessions.py:164-168``). Upstream's
+        ``_state_path`` (``hermes_cli/active_sessions.py:175-176``). Upstream's
         orphan reclamation sweeps the root home *and every profile home*
         (``release_orphaned_leases``, ``:660-687``), so the occupancy hermesd
         reports is one registry's — leases held under other profiles are invisible
@@ -2085,8 +2569,8 @@ class Collector:
         """Turn leases and compression locks from the profile's ``state.db``.
 
         PROFILE-scoped: upstream opens ``get_hermes_home()/"state.db"`` for
-        both tables (``hermes_state.py:160,178``; writers
-        ``hermes_state_compression.py:433-605``). See
+        both tables (``hermes_state.py:165,183``; writers
+        ``hermes_state_compression.py:437-609``). See
         ``.codex/rules/source-ownership.md`` (``session_leases``).
         """
         last = self._last_good_by_source.get("session_leases")
@@ -2105,7 +2589,7 @@ class Collector:
 
     def _with_gateway_hygiene(self, coord: SessionCoordinationState) -> SessionCoordinationState:
         """Per-chat hygiene failure streaks (PROFILE ``state.db``, table
-        ``gateway_hygiene_state`` — ``hermes_state.py:160,178``). The unfiltered
+        ``gateway_hygiene_state`` — ``hermes_state.py:165,183``). The unfiltered
         sessions table joins the recorded compression failure to each streak."""
         last = self._last_good_by_source.get("gateway_hygiene")
         readout = self._state_db_for(
@@ -2125,8 +2609,8 @@ class Collector:
 
     def _with_gateway_routes(self, coord: SessionCoordinationState) -> SessionCoordinationState:
         """Decoded routing entries (PROFILE ``state.db``, table
-        ``gateway_routing`` — ``hermes_state.py:160,178``; payload writer
-        ``gateway/session.py:535-545``). Dangling routes are those whose
+        ``gateway_routing`` — ``hermes_state.py:165,183``; payload writer
+        ``gateway/session.py:540-552``). Dangling routes are those whose
         session id has no row at all: the target set is the *unfiltered* id
         list, because upstream hides a session from the default listing while
         keeping it resumable (``hermes_state_sessions.py:898-900``)."""
@@ -2149,7 +2633,7 @@ class Collector:
 
     def _with_generation_churn(self, coord: SessionCoordinationState) -> SessionCoordinationState:
         """Conversation generations (PROFILE ``state.db`` —
-        ``hermes_state.py:160,178``). The table is deliberately never
+        ``hermes_state.py:165,183``). The table is deliberately never
         garbage-collected upstream (``hermes_state_common.py:460-487``), so the
         row count is remembered across refreshes and a shrink sets the panel's
         invariant-break warning. The remembered count advances only on a
@@ -2267,6 +2751,9 @@ class Collector:
             cost_status_counts=_count_cost_statuses(rows),
         )
 
+    def _collect_usage_analytics(self, rows: list[dict[str, Any]]) -> UsageAnalytics:
+        return _usage_analytics(rows, now=self._clock())
+
     def _collect_tool_stats(
         self,
         session_rows: list[dict[str, Any]] | None = None,
@@ -2333,6 +2820,83 @@ class Collector:
             )
             for entry in entries
             if str(entry.get("session_id") or "")
+        ]
+
+    def _with_process_identity(
+        self, processes: list[BackgroundProcessInfo]
+    ) -> list[BackgroundProcessInfo]:
+        """Check each ROOT ``spawn-ledger.json`` entry against its recorded identity.
+
+        Upstream keys every entry by ``(pid, create_time)`` and records the
+        spawner's ``(spawner_pid, spawner_create)`` (``hermes_cli/
+        process_identity.py:174-191,280-302``). A helper is orphaned when it is
+        still the recorded process but its spawner is provably gone — dead, or a
+        live pid with another start time — which is exactly when upstream's
+        startup sweep reaps it (``:325-360``). A spawner without a recorded
+        ``spawner_create`` is judged by pid existence alone, as upstream's
+        ``_same_incarnation`` treats ``None``. ``processes.json`` entries carry
+        no identity and get no verdict. The ledger read is the cached one the
+        ``background_processes`` source already made.
+        """
+        ledger_path = self._paths.shared_path("spawn-ledger.json")
+        by_pid = {
+            _coerce_int(entry.get("pid")): entry
+            for entry in self._read_json_list_cached(ledger_path)
+            if _coerce_int(entry.get("pid")) > 0
+        }
+        if not by_pid:
+            return processes
+        spawners = {_coerce_int(entry.get("spawner_pid")) for entry in by_pid.values()}
+        observed = self._process_start_times(sorted((set(by_pid) | spawners) - {0}))
+        enriched: list[BackgroundProcessInfo] = []
+        for process in processes:
+            entry = by_pid.get(process.pid)
+            if entry is None:
+                enriched.append(process)
+                continue
+            identity = _worker_identity(
+                process.pid, _optional_epoch(entry.get("create_time")), observed, self._pid_exists
+            )
+            spawner_pid = _coerce_int(entry.get("spawner_pid"))
+            spawner_create = _optional_epoch(entry.get("spawner_create"))
+            spawner = _worker_identity(
+                spawner_pid,
+                spawner_create,
+                observed,
+                self._pid_exists,
+                legacy=spawner_create is None,
+            )
+            enriched.append(
+                process.model_copy(
+                    update={
+                        "identity": identity,
+                        "spawner_pid": spawner_pid,
+                        "orphaned": identity is WorkerIdentity.LIVE
+                        and spawner in (WorkerIdentity.DEAD, WorkerIdentity.REUSED),
+                    }
+                )
+            )
+        return enriched
+
+    def _last_process_identity(
+        self, processes: list[BackgroundProcessInfo]
+    ) -> list[BackgroundProcessInfo]:
+        """Re-apply the last verdicts by pid onto the freshly read process list."""
+        last = {
+            process.pid: process
+            for process in self._last_good_by_source.get("process_identity", [])
+        }
+        return [
+            process.model_copy(
+                update={
+                    "identity": last[process.pid].identity,
+                    "spawner_pid": last[process.pid].spawner_pid,
+                    "orphaned": last[process.pid].orphaned,
+                }
+            )
+            if process.pid in last
+            else process
+            for process in processes
         ]
 
     def _process_alive(self, pid: int) -> bool:
@@ -2447,11 +3011,6 @@ class Collector:
         auxiliary_cfg = _as_dict(cfg.get("auxiliary"))
         moa_cfg = _as_dict(cfg.get("moa"))
         moa_summary = _moa_config_summary(moa_cfg)
-        personality = str(agent_cfg.get("active_personality") or "")
-        if not personality:
-            personalities = _as_dict(agent_cfg.get("personalities"))
-            if personalities:
-                personality = str(next(iter(personalities)))
         dashboard_auth_provider = str(
             dashboard_cfg.get("auth_provider")
             or dashboard_cfg.get("auth")
@@ -2462,7 +3021,7 @@ class Collector:
             # bare .get(key, default) would fail the whole config source.
             model=str(model_cfg.get("default") or ""),
             provider=str(model_cfg.get("provider") or ""),
-            personality=personality,
+            personality=_active_personality_name(cfg),
             max_turns=_coerce_int(agent_cfg.get("max_turns")),
             compression_threshold=_coerce_float(comp_cfg.get("threshold")),
             reasoning_effort=str(agent_cfg.get("reasoning_effort") or ""),
@@ -2518,6 +3077,8 @@ class Collector:
             moa_save_traces=bool(moa_cfg.get("save_traces")),
             moa_trace_dir=str(moa_cfg.get("trace_dir") or ""),
             **_config_agent_limits(cfg),
+            **_integration_flags(cfg),
+            **_doctor_config_findings(cfg),
         )
 
     def _with_config_backups(self, current: ConfigSummary) -> ConfigSummary:
@@ -2527,7 +3088,7 @@ class Collector:
         ``<config dir>/backups/config`` (``hermes_cli/config_backups.py:29-69``),
         keeping the newest five per reason and skipping byte-identical repeats.
         The config path upstream copies is ``get_config_path()`` —
-        ``hermes_constants.py:1132-1135`` — so the directory inherits whatever
+        ``hermes_constants.py:1430-1432`` — so the directory inherits whatever
         home that resolves to; hermesd keeps the ROOT copy on purpose, the same
         decision as the ``config`` source (see .codex/rules/source-ownership.md).
 
@@ -2630,6 +3191,7 @@ class Collector:
                 )
                 pending_slot_at, pending_slot_age = _cron_job_pending_slot(j, now=now)
                 fire_error, fire_error_age = _cron_job_fire_error(j, now=now)
+                effective_model, model_source = _cron_job_model(j, cfg)
                 jobs.append(
                     CronJob(
                         job_id=str(j.get("id") or ""),
@@ -2669,8 +3231,9 @@ class Collector:
                         last_fire_error=fire_error,
                         last_fire_error_age_seconds=fire_error_age,
                         preflight_alerted=_coerce_bool(j.get("preflight_alerted")),
-                        model_snapshot=str(j.get("model_snapshot") or ""),
-                        provider_snapshot=str(j.get("provider_snapshot") or ""),
+                        effective_model=effective_model,
+                        model_source=model_source,
+                        quota_hold_until=_cron_job_quota_hold(j, now=now),
                     )
                 )
 
@@ -2728,6 +3291,79 @@ class Collector:
             now=self._clock(),
             root=self._paths.root_home,
         )
+
+    def _collect_cron_usage(self, cron: CronState) -> CronUsageState:
+        """Per-job token rollup from ``cron/usage_audit.jsonl``.
+
+        Upstream appends one line per fire at ``get_hermes_home()/cron``
+        (``_usage_audit_path``, ``cron/scheduler.py:1196-1197``; record keys
+        ``_FireAudit.write``, ``:2415-2433``); read from the root store with the
+        rest of ``cron``. The capped-tail parse is cached by file signature.
+        """
+        path = self._paths.shared_path("cron", "usage_audit.jsonl")
+        if not _exists_strict(path):
+            return CronUsageState()
+        if not _safe_child_path(path, self._paths.root_home):
+            raise RuntimeError("cron/usage_audit.jsonl escapes the Hermes home")
+        audit = self._signature_cached(
+            "cron_usage_audit", path, lambda: _read_usage_audit_records(path)
+        )
+        job_names = {job.job_id: job.name for job in cron.jobs if job.job_id and job.name}
+        return _cron_usage_state(audit, job_names, now=self._clock())
+
+    def _collect_cron_deliveries(self) -> CronDeliveryQueueState:
+        """The cron delivery handoff queue, ``cron/deliveries.db``.
+
+        Upstream resolves ``get_hermes_home()/cron/deliveries.db``
+        (``queue_path``, ``cron/delivery_queue.py:74-80``); read from the root
+        store with the rest of ``cron``.
+        """
+        db_path = self._paths.shared_path("cron", "deliveries.db")
+        if not _exists_strict(db_path):
+            return CronDeliveryQueueState()
+        if not _safe_child_path(db_path, self._paths.root_home) or not db_path.is_file():
+            raise RuntimeError("cron/deliveries.db replaced by unsafe path")
+        return _read_cron_delivery_queue(db_path, now=self._clock())
+
+    def _collect_cron_bot_chat(self) -> CronBotChatState:
+        """Deferred Bot Chat receipts under ``cron/bot_chat_pending/``.
+
+        Upstream writes ``get_hermes_home()/cron/bot_chat_pending/<key>.json``
+        (``_root``/``defer``, ``cron/bot_chat_delivery.py:24-25,60-82``) and
+        never prunes it; read from the root store with the rest of ``cron``.
+        """
+        root_dir = self._paths.shared_path("cron", "bot_chat_pending")
+        if not _exists_strict(root_dir):
+            return CronBotChatState()
+        if not _safe_child_path(root_dir, self._paths.root_home) or not root_dir.is_dir():
+            raise RuntimeError("cron/bot_chat_pending escapes the Hermes home")
+        return _read_cron_bot_chat(root_dir, now=self._clock(), cache=self._bot_chat_cache)
+
+    def _collect_cron_recovery(self) -> CronRecoveryState:
+        """Fire-path recovery ledgers under ``cron/``.
+
+        Upstream appends ``persisted_error_recoveries.jsonl`` and
+        ``timezone_migration_catchups.jsonl`` to ``_current_cron_store().cron_dir``
+        (``cron/jobs.py:1011-1036,1110-1126``) and ``inflight_forced_releases.jsonl``
+        to ``get_hermes_home()/cron`` (``cron/scheduler.py:868-884``); read from
+        the root store with the rest of ``cron``. Each capped-tail parse is
+        cached by file signature.
+        """
+        ledgers = []
+        for name, label, stamp_key in _RECOVERY_LEDGERS:
+            path = self._paths.shared_path("cron", name)
+            if not _exists_strict(path):
+                continue
+            if not _safe_child_path(path, self._paths.root_home):
+                raise RuntimeError(f"cron/{name} escapes the Hermes home")
+            kind = name.removesuffix(".jsonl")
+            read = self._signature_cached(
+                "cron_recovery",
+                path,
+                functools.partial(_read_recovery_ledger, path, kind, stamp_key),
+            )
+            ledgers.append(_recovery_ledger(read, kind, label, now=self._clock()))
+        return CronRecoveryState(ledgers=ledgers)
 
     def _collect_channels(self, gateway: GatewayState) -> ChannelDirectoryState:
         directory = self._read_json_reporting_stale(
@@ -2860,7 +3496,9 @@ class Collector:
             return ""
         had_last_good = last_kanban is not None and bool(last_kanban.current_board)
         try:
-            with path.open("rb") as handle:
+            # A FIFO here has no writer to satisfy the open; the regular-file
+            # guard refuses it before the collector thread can block on one.
+            with _open_regular_file(path) as handle:
                 raw = handle.read(_MAX_TEXT_READ_BYTES)
         except FileNotFoundError:
             self._present_or_confirmed_absent(
@@ -2944,7 +3582,7 @@ class Collector:
 
         Both the store and the profile names live at the root: kanban.db is
         root-anchored upstream ("Shared across profiles BY DESIGN",
-        ``hermes_cli/kanban_db.py:382-401``) and ``profiles/`` is the root
+        ``hermes_cli/kanban_db.py:399-407``) and ``profiles/`` is the root
         profile store. An absent or unsafe kanban.db reads as no
         subscriptions; the kanban source itself reports path problems.
         """
@@ -2962,6 +3600,89 @@ class Collector:
                 known_profiles=self._kanban_notifier_profile_names(),
                 resolved=snapshotted,
             )
+        )
+
+    def _with_kanban_worker_identity(self, state: KanbanState) -> KanbanState:
+        """Verify each listed worker pid against its ``worker_started_at``.
+
+        Upstream refuses to trust bare pid existence: ``_worker_alive`` requires
+        the pid AND its spawn fingerprint to agree (``hermes_cli/
+        kanban_db_dispatch.py:381-413``, columns ``hermes_cli/kanban_db.py:
+        897-904,1011-1015``). The pids come from the rows the ``kanban`` source
+        already read; only one batched start-time probe runs per pass.
+        """
+        task_lists = (state.active_tasks, state.problem_tasks, state.recent_tasks)
+        pairs = {
+            (task.worker_pid, task.worker_started_at) for tasks in task_lists for task in tasks
+        } | {(run.worker_pid, run.worker_started_at) for run in state.recent_runs}
+        pids = sorted({pid for pid, _ in pairs if pid > 0})
+        observed = self._process_start_times(pids) if pids else {}
+        verdicts = {
+            pair: _kanban_worker_identity(pair[0], pair[1], observed, self._pid_exists)
+            for pair in pairs
+        }
+        return self._kanban_with_verdicts(
+            state,
+            verdicts,
+            reused_count=sum(
+                1 for verdict in verdicts.values() if verdict is WorkerIdentity.REUSED
+            ),
+        )
+
+    def _last_kanban_worker_identity(self, state: KanbanState) -> KanbanState:
+        """Re-apply the last verdicts onto the fresh rows, keyed by pid and fingerprint."""
+        last: KanbanState | None = self._last_good_by_source.get("kanban_worker_identity")
+        if last is None:
+            return state
+        verdicts = {
+            (task.worker_pid, task.worker_started_at): task.worker_identity
+            for tasks in (last.active_tasks, last.problem_tasks, last.recent_tasks)
+            for task in tasks
+        } | {
+            (run.worker_pid, run.worker_started_at): run.worker_identity for run in last.recent_runs
+        }
+        return self._kanban_with_verdicts(
+            state, verdicts, reused_count=last.worker_pid_reused_count
+        )
+
+    @staticmethod
+    def _kanban_with_verdicts(
+        state: KanbanState,
+        verdicts: Mapping[tuple[int, str], WorkerIdentity],
+        *,
+        reused_count: int,
+    ) -> KanbanState:
+        def tasks(entries: list[KanbanTaskSummary]) -> list[KanbanTaskSummary]:
+            return [
+                task.model_copy(
+                    update={
+                        "worker_identity": verdicts.get(
+                            (task.worker_pid, task.worker_started_at), WorkerIdentity.NONE
+                        )
+                    }
+                )
+                for task in entries
+            ]
+
+        runs = [
+            run.model_copy(
+                update={
+                    "worker_identity": verdicts.get(
+                        (run.worker_pid, run.worker_started_at), WorkerIdentity.NONE
+                    )
+                }
+            )
+            for run in state.recent_runs
+        ]
+        return state.model_copy(
+            update={
+                "active_tasks": tasks(state.active_tasks),
+                "problem_tasks": tasks(state.problem_tasks),
+                "recent_tasks": tasks(state.recent_tasks),
+                "recent_runs": runs,
+                # Distinct (pid, fingerprint) pairs: a task and its run share one.
+                "worker_pid_reused_count": reused_count,
+            }
         )
 
     def _kanban_notifier_profile_names(self) -> frozenset[str] | None:
@@ -3263,12 +3984,49 @@ class Collector:
             )
         )
 
+    def _with_pending_actions(self, operations: OperationsState) -> OperationsState:
+        """Staged writes under PROFILE ``pending/`` (``tools/write_approval.py:64-65``).
+
+        Each record is parsed at most once per file signature: a staged skill
+        write carries its whole payload, so re-reading every record on every
+        refresh would cost far more than the two numbers it yields.
+        """
+        return operations.model_copy(
+            update=_read_pending_actions(
+                self._paths.profile_path("pending"),
+                self._paths.profile_home,
+                now=self._clock(),
+                created_at=lambda path, home: self._signature_cached(
+                    "pending-created-at",
+                    path,
+                    lambda: _pending_record_created_at(path, home),
+                ),
+            )
+        )
+
+    def _collect_disk_usage(self) -> DiskUsageState:
+        """Disk & retention readout (``hermes doctor``'s size checks, read-only)."""
+        return _read_disk_usage(
+            root_logs=self._paths.shared_path("logs"),
+            root_home=self._paths.root_home,
+            # profile_path() re-validates the profile home on every call.
+            profile_home=self._paths.profile_path(),
+            cfg=self._read_yaml_cached(),
+            now=self._clock(),
+            tree_cache=self._tree_size_cache,
+            log_samples=self._log_growth_samples,
+            journal_mode=lambda path: self._signature_cached(
+                "journal-mode", path, lambda: _read_journal_mode(path)
+            ),
+        )
+
     def _with_state_snapshots(self, operations: OperationsState) -> OperationsState:
         return operations.model_copy(
             update=_read_state_snapshots(
                 self._paths.shared_path("state-snapshots"),
                 self._paths.root_home,
                 now=self._clock(),
+                size_cache=self._tree_size_cache,
             )
         )
 
@@ -3276,7 +4034,7 @@ class Collector:
         """Recovery artifacts beside the profile-scoped ``state.db``.
 
         PROFILE-scoped, and it agrees with upstream: the database hermes-agent
-        repairs is ``get_hermes_home()/"state.db"`` (``hermes_state.py:160``,
+        repairs is ``get_hermes_home()/"state.db"`` (``hermes_state.py:165``,
         repair invoked at ``:535``), and every artifact is written as a sibling of
         it (``hermes_state_repair.py:317``, ``hermes_state_dbfile.py:228``). The
         scan is therefore confined to ``profile_home``, not ``root_home``: a
@@ -3413,7 +4171,7 @@ class Collector:
         ``tools/process_registry_results.py:30,58`` resolves
         ``get_hermes_home()/"logs"/"process-results"`` — the same
         ``get_hermes_home()`` anchor as the registry checkpoint at
-        ``tools/process_registry.py:41,45-50`` that the ownership table already
+        ``tools/process_registry.py:42,46-51`` that the ownership table already
         records. That is the opposite of the ROOT ``spawn-ledger.json``: the two
         registries are deliberately not the same scope.
 
@@ -3532,6 +4290,65 @@ class Collector:
             scheduler_state,
             curator_cfg,
         ).model_copy(update=overlay)
+
+    def _with_curator_activity(self, current: CuratorRun) -> CuratorRun:
+        """Suppression list, ledger tail and run claim beside the curator state.
+
+        All three resolve through ``get_hermes_home()/"skills"`` upstream —
+        ``tools/skill_usage.py:194-207`` (``.curator_suppressed``),
+        ``tools/skill_ledger.py:79-84`` (``.curator_ledger.jsonl``) and
+        ``agent/curator.py:1121-1141`` (``.locks/curator-run``, the pid of an
+        ``O_EXCL`` claim taken over after an hour) — so they are PROFILE-scoped.
+        """
+        skills = self._paths.profile_path("skills")
+        root = self._paths.root_home
+        suppressed = skills / ".curator_suppressed"
+        ledger = skills / ".curator_ledger.jsonl"
+        claim = skills / ".locks" / "curator-run"
+        for path in (suppressed, ledger, claim):
+            if not _safe_or_absent_child_path(path, root):
+                raise RuntimeError(f"unsafe curator file: {path.name}")
+        suppressed_count = (
+            self._signature_cached(
+                "curator_suppressed",
+                suppressed,
+                lambda: _suppressed_count(self._text_reader(suppressed, root)),
+            )
+            if _exists_strict(suppressed)
+            else 0
+        )
+        ledger_present = _exists_strict(ledger)
+        recent = (
+            self._signature_cached(
+                "curator_ledger",
+                ledger,
+                lambda: _ledger_recent(_read_tail_text(ledger, _LEDGER_TAIL_BYTES)),
+            )
+            if ledger_present
+            else ()
+        )
+        claim_pid: int | None = None
+        claim_age: float | None = None
+        claim_present = _exists_strict(claim)
+        if claim_present:
+            claim_pid = _claim_pid(self._text_reader(claim, root)[:32])
+            claim_age = _age_seconds(_mtime(claim), self._clock())
+        return current.model_copy(
+            update={
+                "suppressed_count": suppressed_count,
+                "ledger_present": ledger_present,
+                "ledger_recent": list(recent),
+                "run_claim_present": claim_present,
+                "run_claim_pid": claim_pid,
+                "run_claim_age_seconds": claim_age,
+                "run_claim_live": (
+                    claim_pid is not None
+                    and claim_age is not None
+                    and claim_age <= _CURATOR_CLAIM_STALE_SECONDS
+                    and self._process_alive(claim_pid)
+                ),
+            }
+        )
 
     def _collect_model_caches(self) -> list[ModelCacheSummary]:
         cache_names = [
@@ -3776,6 +4593,131 @@ class Collector:
                 "desktop_plugin_scan_truncated": truncated,
             }
         )
+
+    def _with_skills_hub(self, current: SkillsMemory) -> SkillsMemory:
+        """Hub-installed and quarantined skill counts, as ``hermes doctor`` reports them.
+
+        ``tools/skills_hub.py:59-62`` resolves ``skills/.hub/lock.json`` and
+        ``skills/.hub/quarantine/`` under ``get_hermes_home()`` (PROFILE);
+        ``hermes_cli/doctor_state.py:452-464`` counts ``installed`` entries and
+        quarantined directories. Names inside the lock are not surfaced.
+        """
+        hub = self._paths.profile_path("skills", ".hub")
+        root = self._paths.root_home
+        lock = hub / "lock.json"
+        quarantine = hub / "quarantine"
+        for path in (lock, quarantine):
+            if not _safe_or_absent_child_path(path, root):
+                raise RuntimeError(f"unsafe skills hub path: {path.name}")
+        lock_present = _exists_strict(lock)
+        installed = (
+            len(_as_dict(self._read_json_reporting_stale(lock).get("installed")))
+            if lock_present
+            else 0
+        )
+        quarantined = 0
+        if _exists_strict(quarantine) and quarantine.is_dir():
+            quarantined = sum(
+                1
+                for entry in islice(quarantine.iterdir(), _HUB_QUARANTINE_LIST_LIMIT)
+                if entry.is_dir() and not entry.is_symlink()
+            )
+        return current.model_copy(
+            update={
+                "hub_lock_present": lock_present,
+                "hub_installed_count": installed,
+                "hub_quarantine_count": quarantined,
+            }
+        )
+
+    def _pairing_dir(self) -> Path:
+        """``get_hermes_dir("platforms/pairing", "pairing")`` (``hermes_constants.py:376-388``).
+
+        A populated legacy ``pairing/`` wins; an empty one never shadows
+        ``platforms/pairing/``. Both are PROFILE-scoped (``gateway/pairing.py:58-59``).
+        """
+        legacy = self._paths.profile_path("pairing")
+        modern = self._paths.profile_path("platforms", "pairing")
+        for path in (legacy, modern):
+            if not _safe_or_absent_child_path(path, self._paths.root_home):
+                raise RuntimeError(f"unsafe pairing directory: {path.name}")
+        if _exists_strict(legacy) and legacy.is_dir() and any(islice(legacy.iterdir(), 1)):
+            return legacy
+        return modern
+
+    def _with_pairing(self, current: IntegrationsState) -> IntegrationsState:
+        """Per-platform live pending and approved counts; codes and ids stay unread."""
+        directory = self._pairing_dir()
+        if not _exists_strict(directory) or not directory.is_dir():
+            return current.model_copy(update={"pairing_platforms": []})
+        files = {
+            entry.name
+            for entry in islice(directory.iterdir(), _PAIRING_DIR_ENTRY_LIMIT)
+            if entry.is_file() and not entry.is_symlink()
+        }
+        now = self._clock()
+        summaries = []
+        for platform in pairing_platforms(sorted(files))[:_PAIRING_PLATFORM_LIMIT]:
+            stores = []
+            for suffix in PAIRING_SUFFIXES:
+                name = f"{platform}{suffix}"
+                stores.append(
+                    self._read_json_reporting_stale(directory / name) if name in files else {}
+                )
+            summaries.append(pairing_summary(platform, stores[0], stores[1], now=now))
+        return current.model_copy(update={"pairing_platforms": summaries})
+
+    def _with_webhook_subscriptions(self, current: IntegrationsState) -> IntegrationsState:
+        """Route names and enabled counts (``hermes_cli/webhook.py:18-35``, PROFILE)."""
+        path = self._paths.profile_path("webhook_subscriptions.json")
+        if not _safe_or_absent_child_path(path, self._paths.root_home):
+            raise RuntimeError("unsafe webhook_subscriptions.json")
+        present = _exists_strict(path)
+        subscriptions = self._read_json_reporting_stale(path) if present else {}
+        return current.model_copy(
+            update={"webhook_subscriptions_present": present, **webhook_summary(subscriptions)}
+        )
+
+    def _with_shared_metrics(self, current: IntegrationsState) -> IntegrationsState:
+        """Counts over ``telemetry/shared_metrics/metrics.sqlite3`` (PROFILE).
+
+        ``SharedMetricsStore`` roots at ``get_hermes_home()/"telemetry"/
+        "shared_metrics"`` (``hermes_cli/observability/shared_metrics.py:179``).
+        The readout is reused until the db or its WAL changes.
+        """
+        path = self._paths.profile_path("telemetry", "shared_metrics", "metrics.sqlite3")
+        if not _safe_or_absent_child_path(path, self._paths.root_home):
+            raise RuntimeError("unsafe shared metrics database")
+        if not _exists_strict(path):
+            self._shared_metrics_cache = None
+            empty = IntegrationsState()
+            return current.model_copy(
+                update={name: getattr(empty, name) for name in _SHARED_METRICS_FIELDS}
+            )
+        signature = _db_source_signature(path)
+        cached = self._shared_metrics_cache
+        if cached is not None and signature is not None and cached[0] == signature:
+            readout = cached[1]
+        else:
+            with _connect_readonly_sqlite(path) as conn:
+                readout = shared_metrics_readout(conn)
+            self._shared_metrics_cache = (signature, readout) if signature is not None else None
+        return current.model_copy(update={"shared_metrics_present": True, **readout})
+
+    def _with_rate_limits(self, current: IntegrationsState) -> IntegrationsState:
+        """Active provider holds from ``rate_limits/*.json`` (``agent/nous_rate_guard.py:37-46``)."""
+        now = self._clock()
+        holds = []
+        for name in RATE_LIMIT_NAMES:
+            path = self._paths.profile_path("rate_limits", f"{name}.json")
+            if not _safe_or_absent_child_path(path, self._paths.root_home):
+                raise RuntimeError(f"unsafe rate limit file: {path.name}")
+            if not _exists_strict(path):
+                continue
+            hold = rate_limit_hold(name, self._read_json_reporting_stale(path), now=now)
+            if hold is not None:
+                holds.append(hold)
+        return current.model_copy(update={"rate_limit_holds": holds})
 
     def _with_plugin_catalog(self, current: SkillsMemory) -> SkillsMemory:
         """Flag catalog drift, catalog removals and unmanaged installs.
@@ -4168,8 +5110,10 @@ class Collector:
 
         providers_section = _as_dict(data.get("providers"))
         entries = []
+        now = self._clock()
         for name, raw_entry in sorted(_as_dict(data.get("credential_pool")).items()):
             entry = _select_pool_entry(raw_entry)
+            pool_entries = _pool_entries(raw_entry)
             provider_entry = _as_dict(providers_section.get(name))
             entries.append(
                 CredentialPoolEntry(
@@ -4179,7 +5123,15 @@ class Collector:
                     source=str(entry.get("source") or ""),
                     last_status=str(entry.get("last_status") or entry.get("status") or ""),
                     request_count=_coerce_int(entry.get("request_count") or entry.get("requests")),
-                    cooldown_remaining=str(entry.get("cooldown_remaining") or ""),
+                    cooldown_remaining_seconds=_credential_cooldown_remaining(
+                        entry,
+                        sole_credential=sum(
+                            1 for item in pool_entries if item.get("last_status") != "dead"
+                        )
+                        <= 1,
+                        now=now,
+                    ),
+                    model_cooldowns=_active_model_cooldowns(pool_entries, now=now),
                     priority=_coerce_int(entry.get("priority")),
                     token_present=_has_secret_material(entry)
                     or _has_secret_material(provider_entry),
@@ -4213,6 +5165,22 @@ class Collector:
             ),
             ("desktop", self._paths.shared_path("logs", "desktop.log"), _LOG_TAIL_LINES, root),
             ("dashboard", self._paths.shared_path("logs", "dashboard.log"), _LOG_TAIL_LINES, root),
+            # No upstream writer in the checkout, written beside dashboard.log
+            # on real installs: ROOT by observation, like dashboard.log.
+            (
+                "dashboard.error",
+                self._paths.shared_path("logs", "dashboard.error.log"),
+                _LOG_TAIL_LINES,
+                root,
+            ),
+            # get_hermes_home()/"logs"/"dashboard-restart.log" —
+            # hermes_cli/main_dashboard.py:360-368.
+            (
+                "dashboard.restart",
+                self._paths.profile_path("logs", "dashboard-restart.log"),
+                _LOG_TAIL_LINES,
+                profile,
+            ),
             ("gui", self._paths.shared_path("logs", "gui.log"), _LOG_TAIL_LINES, root),
             ("update", self._paths.shared_path("logs", "update.log"), _LOG_TAIL_LINES, root),
             (
@@ -4227,7 +5195,22 @@ class Collector:
                 _LOG_TAIL_LINES,
                 root,
             ),
-            ("audit", self._paths.shared_path("logs", "audit.log"), _LOG_TAIL_LINES, root),
+            # The real audit trails (nothing upstream writes logs/audit.log):
+            # skills hub installs/uninstalls under get_hermes_home()/skills/.hub
+            # (tools/skills_hub.py:59-63,386-399) and dashboard auth events under
+            # get_hermes_home()/logs (hermes_cli/dashboard_auth/audit.py:46-53).
+            (
+                "skills.audit",
+                self._paths.profile_path("skills", ".hub", "audit.log"),
+                _LOG_TAIL_LINES,
+                profile,
+            ),
+            (
+                "auth.audit",
+                self._paths.profile_path("logs", "dashboard-auth.log"),
+                _LOG_TAIL_LINES,
+                profile,
+            ),
             (
                 "mcp.stderr",
                 self._paths.shared_path("logs", "mcp-stderr.log"),
@@ -4268,6 +5251,29 @@ class Collector:
             streams=streams,
         )
 
+    def _with_log_health(self, logs: LogState) -> LogState:
+        """Health counters over ROOT ``logs/mcp-stderr.log``, ``gateway.error.log``
+        and ``workspace.log``, read incrementally (only appended bytes).
+
+        The same root copies the Logs panel tails: ``tools/mcp_tool_config.py:
+        31-35,62-67`` (MCP server banners), ``hermes_cli/gateway_launchd.py:
+        265-278`` with ``hermes_cli/stderr_timestamp.py:19-30`` (timestamped
+        gateway stderr); ``workspace.log`` has no upstream writer in the
+        checkout and is read by observation, as the ``logs`` source reads it.
+        """
+        now = self._clock()
+        health = []
+        for filename, spec in LOG_HEALTH_SPECS:
+            scanner = self._log_health_scanners.get(filename)
+            if scanner is None:
+                scanner = self._log_health_scanners[filename] = IncrementalLogScanner(spec)
+            result = scanner.scan(
+                self._paths.shared_path("logs", filename), self._paths.root_home, now
+            )
+            if result is not None:
+                health.append(result)
+        return logs.model_copy(update={"health": health})
+
     def _collect_profiles(self) -> ProfilesState:
         profiles_dir = self._paths.shared_path("profiles")
         if (
@@ -4301,6 +5307,10 @@ class Collector:
             banner=banner,
         )
 
+    def _with_estop(self, runtime: RuntimeStatus) -> RuntimeStatus:
+        """Merge the ESTOP sentinel (``agent/estop.py``) into the runtime status."""
+        return runtime.model_copy(update=_read_estop(self._paths, self._clock()))
+
     def _summarize_profile(self, name: str, profile_home: Path) -> ProfileSummary:
         db_path = profile_home / "state.db"
         logs_path = profile_home / "logs"
@@ -4327,6 +5337,44 @@ class Collector:
             skill_count=_count_skills(skills_path) if skills_safe else 0,
             db_size_bytes=_file_size(db_path) if db_safe else 0,
             soul_excerpt=(self._cached_soul_excerpt(soul_path, profile_home) if soul_safe else ""),
+            config_present=(profile_home / "config.yaml").exists(),
+            env_present=(profile_home / ".env").exists(),
+        )
+
+    def _with_profile_credentials(self, current: ProfilesState) -> ProfilesState:
+        """Platform credential key names held by more than one profile's .env.
+
+        ``hermes doctor`` names duplicates across the default home and every
+        named profile (``hermes_cli/doctor_state.py:576-581`` via
+        ``gateway_migrate.duplicate_credential_findings``, ``:434-443``); the
+        default profile's ``.env`` is the root one. Only key names leave the
+        read: values are checked for blankness and dropped. A symlinked ``.env``
+        is skipped rather than followed.
+        """
+        root = self._paths.root_home
+        homes = [("default", root)]
+        homes.extend(
+            (profile.name, self._paths.shared_path("profiles", profile.name))
+            for profile in current.profiles
+        )
+        holders: list[tuple[str, frozenset[str]]] = []
+        for name, home in homes:
+            env_path = home / ".env"
+            if env_path.is_symlink() or not _exists_strict(env_path):
+                continue
+            if not _path_resolves_under(env_path, root):
+                raise RuntimeError(f"unsafe .env for profile {name}")
+            holders.append((name, self._cached_env_credential_keys(env_path)))
+        return current.model_copy(
+            update={"duplicate_platform_credentials": _duplicate_platform_credentials(holders)}
+        )
+
+    def _cached_env_credential_keys(self, env_path: Path) -> frozenset[str]:
+        """Key names only are cached — the value set never outlives the read."""
+        return self._signature_cached(
+            "env_credential_keys",
+            env_path,
+            lambda: _env_platform_credential_keys(_read_env_text(env_path)),
         )
 
     def _last_profile_exists(self, name: str) -> bool:

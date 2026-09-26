@@ -12,6 +12,7 @@ from hermesd.models import (
     ModelUsage,
     TokenAnalytics,
     TokenBreakdown,
+    UsageAnalytics,
 )
 from hermesd.panels.formatting import (
     escape_terminal_text as escape,
@@ -21,11 +22,13 @@ from hermesd.panels.formatting import (
     fmt_usd,
     sanitize_terminal_text,
     section_heading,
+    sparkline,
 )
 from hermesd.theme import Theme
 
 _DETAIL_MAX_SESSION_ROWS = 50
 _COMPACT_TOP_MODELS = 3
+_TOP_SESSION_TITLE_CHARS = 32
 
 
 def _fmt_cost(value: float, *, estimated: bool) -> str:
@@ -64,6 +67,7 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         style=theme.banner_dim,
     )
     _append_top_models(lines, state, theme)
+    _append_daily_sparkline(lines, state.usage_analytics, theme)
 
     return Panel(
         lines,
@@ -104,6 +108,8 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     if analytics.by_provider:
         sections.append(section_heading("By Provider", theme))
         sections.append(_render_breakdown_table(analytics.by_provider, theme, aggregate_estimated))
+
+    sections.extend(_usage_analytics_sections(state.usage_analytics, theme, aggregate_estimated))
 
     sections.append(section_heading("Sessions", theme))
     sections.append(_sessions_table(state, theme))
@@ -169,6 +175,100 @@ def _append_top_models(lines: Text, state: DashboardState, theme: Theme) -> None
         lines.append("  " if index else " ", style=theme.banner_dim)
         lines.append(sanitize_terminal_text(usage.model or "unknown"), style=theme.banner_text)
         lines.append(f" {_usage_cost_cell(usage)}", style=theme.ui_accent)
+
+
+def _append_daily_sparkline(lines: Text, analytics: UsageAnalytics, theme: Theme) -> None:
+    tokens = [day.input_tokens + day.output_tokens for day in analytics.daily]
+    if not any(tokens):
+        return
+    lines.append("\n  14d", style=theme.ui_label)
+    lines.append(f"   {sparkline(tokens)}", style=theme.ui_accent)
+
+
+def _usage_analytics_sections(
+    analytics: UsageAnalytics, theme: Theme, aggregate_estimated: bool
+) -> list[RenderableType]:
+    sections: list[RenderableType] = []
+    if any(day.sessions for day in analytics.daily):
+        sections.append(section_heading("Daily Usage (14d)", theme))
+        sections.append(_daily_table(analytics, theme))
+    if analytics.by_source_7d:
+        sections.append(section_heading("By Source", theme))
+        sections.append(_source_table(analytics, theme, aggregate_estimated))
+    if analytics.top_sessions_7d:
+        sections.append(section_heading("Top Sessions (7d)", theme))
+        sections.append(_top_sessions_table(analytics, theme))
+    return sections
+
+
+def _daily_table(analytics: UsageAnalytics, theme: Theme) -> Table:
+    table = Table(box=None, show_header=True, padding=(0, 2))
+    table.add_column("Day", style=theme.ui_label)
+    table.add_column("Sessions", justify="right", style=theme.banner_text)
+    table.add_column("API", justify="right", style=theme.banner_text)
+    table.add_column("In", justify="right", style=theme.banner_text)
+    table.add_column("Out", justify="right", style=theme.banner_text)
+    table.add_column("Cost", justify="right", style=theme.ui_accent)
+    for day in analytics.daily:
+        if not day.sessions:
+            continue
+        table.add_row(
+            escape(day.day[5:]),
+            str(day.sessions),
+            str(day.api_calls),
+            fmt_tokens(day.input_tokens),
+            fmt_tokens(day.output_tokens),
+            _fmt_cost(day.total_cost_usd, estimated=day.cost_is_estimated),
+        )
+    return table
+
+
+def _source_table(analytics: UsageAnalytics, theme: Theme, estimated: bool) -> Table:
+    # 24h is a subset of 7d, so the 7d rows name every source.
+    day_by_label = {entry.label: entry for entry in analytics.by_source_24h}
+    table = Table(box=None, show_header=True, padding=(0, 2))
+    table.add_column("Source", style=theme.ui_label)
+    table.add_column("24h Sess", justify="right", style=theme.banner_text)
+    table.add_column("24h Tok", justify="right", style=theme.banner_text)
+    table.add_column("24h Cost", justify="right", style=theme.ui_accent)
+    table.add_column("7d Sess", justify="right", style=theme.banner_text)
+    table.add_column("7d Tok", justify="right", style=theme.banner_text)
+    table.add_column("7d Cost", justify="right", style=theme.ui_accent)
+    for week in analytics.by_source_7d:
+        day = day_by_label.get(week.label)
+        table.add_row(
+            escape(week.label),
+            str(day.session_count) if day else "—",
+            fmt_tokens(day.input_tokens + day.output_tokens) if day else "—",
+            _fmt_cost(day.total_cost_usd, estimated=estimated) if day else "—",
+            str(week.session_count),
+            fmt_tokens(week.input_tokens + week.output_tokens),
+            _fmt_cost(week.total_cost_usd, estimated=estimated),
+        )
+    return table
+
+
+def _top_sessions_table(analytics: UsageAnalytics, theme: Theme) -> Table:
+    table = Table(box=None, show_header=True, padding=(0, 2))
+    table.add_column("Session", style=theme.session_label)
+    table.add_column("Title", style=theme.banner_text)
+    table.add_column("Source", style=theme.ui_label)
+    table.add_column("Model", style=theme.banner_dim)
+    table.add_column("Tokens", justify="right", style=theme.banner_text)
+    table.add_column("Cost", justify="right", style=theme.ui_accent)
+    for top in analytics.top_sessions_7d:
+        title = top.title
+        if len(title) > _TOP_SESSION_TITLE_CHARS:
+            title = f"{title[: _TOP_SESSION_TITLE_CHARS - 1]}…"
+        table.add_row(
+            escape(top.session_id[-8:]),
+            escape(title) if title else "—",
+            escape(top.source) if top.source else "—",
+            escape(top.model) if top.model else "—",
+            fmt_tokens(top.input_tokens + top.output_tokens),
+            _fmt_cost(top.total_cost_usd, estimated=top.cost_is_estimated),
+        )
+    return table
 
 
 def _model_usage_section(analytics: TokenAnalytics, theme: Theme) -> list[RenderableType]:

@@ -74,19 +74,29 @@ def _file_size(path: Path) -> int:
 
 
 def _open_regular_file(path: Path) -> BinaryIO:
-    """Open path for binary reads, refusing FIFOs, devices and directories.
+    """Open path read-only, refusing FIFOs, devices and directories.
 
     Opening a FIFO that has no writer blocks forever, which would hang the
-    collector thread; the type is checked before opening and confirmed on the
-    opened descriptor.
+    collector thread. A stat-then-open pre-check would leave a race — the path
+    can be swapped for a FIFO between the check and the open — so the
+    descriptor is opened nonblocking (O_NONBLOCK is a no-op on regular files)
+    and the opened descriptor itself is validated as a regular file: the
+    fstat is the only check, with no gap to race.
     """
-    if not S_ISREG(os.stat(path).st_mode):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    try:
+        is_regular = S_ISREG(os.fstat(fd).st_mode)
+    except BaseException:
+        os.close(fd)
+        raise
+    if not is_regular:
+        os.close(fd)
         raise OSError(f"{path} is not a regular file")
-    handle = path.open("rb")
-    if not S_ISREG(os.fstat(handle.fileno()).st_mode):
-        handle.close()
-        raise OSError(f"{path} is not a regular file")
-    return handle
+    try:
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _read_text_capped(path: Path, root: Path | None = None) -> str:
@@ -98,6 +108,24 @@ def _read_text_capped(path: Path, root: Path | None = None) -> str:
             return handle.read(_MAX_TEXT_READ_BYTES).decode("utf-8", errors="replace")
     except OSError:
         return ""
+
+
+def _read_text_capped_strict(path: Path, root: Path | None = None) -> str:
+    """Like ``_read_text_capped``, but an I/O failure raises instead of reading as empty.
+
+    The signature-cached readers (word/card counts, SOUL excerpt, skill
+    frontmatter) key on ``_file_signature`` — (path, mtime_ns, size): a failed
+    read returned as "" would be recorded under the new signature as a
+    *successful* empty, blanking the panel, hiding the source from
+    health.failed_sources, and surviving even after the file becomes readable
+    again. Raising lets the caller fail the source to its last-good value and
+    retry on the next poll. Unsafe paths (symlink, escaping root) still read
+    as absent, matching the lenient reader.
+    """
+    if path.is_symlink() or (root is not None and not _path_resolves_under(path, root)):
+        return ""
+    with _open_regular_file(path) as handle:
+        return handle.read(_MAX_TEXT_READ_BYTES).decode("utf-8", errors="replace")
 
 
 def _safe_capped_file(path: Path, root: Path) -> bool:

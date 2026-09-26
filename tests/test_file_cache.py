@@ -39,15 +39,15 @@ def test_json_mapping_invalid_shape_reuses_bad_mtime(tmp_path, monkeypatch):
 
     path.write_text(json.dumps(["bad-shape"]))
     open_calls = 0
-    real_open = Path.open
+    real_os_open = os.open
 
-    def counting_open(self: Path, *args, **kwargs):
+    def counting_open(name, flags, *args, **kwargs):
         nonlocal open_calls
-        if self == path:
+        if Path(name) == path:
             open_calls += 1
-        return real_open(self, *args, **kwargs)
+        return real_os_open(name, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", counting_open)
+    monkeypatch.setattr(os, "open", counting_open)
 
     assert cache.read_json_mapping(path) == {"ok": 1}
     assert cache.read_json_mapping(path) == {"ok": 1}
@@ -62,15 +62,15 @@ def test_yaml_mapping_invalid_shape_reuses_bad_mtime(tmp_path, monkeypatch):
 
     path.write_text(yaml.safe_dump(["bad-shape"]))
     open_calls = 0
-    real_open = Path.open
+    real_os_open = os.open
 
-    def counting_open(self: Path, *args, **kwargs):
+    def counting_open(name, flags, *args, **kwargs):
         nonlocal open_calls
-        if self == path:
+        if Path(name) == path:
             open_calls += 1
-        return real_open(self, *args, **kwargs)
+        return real_os_open(name, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", counting_open)
+    monkeypatch.setattr(os, "open", counting_open)
 
     assert cache.read_yaml_mapping(path) == {"ok": 1}
     assert cache.read_yaml_mapping(path) == {"ok": 1}
@@ -85,15 +85,15 @@ def test_json_list_invalid_shape_reuses_bad_mtime(tmp_path, monkeypatch):
 
     path.write_text(json.dumps({"bad": "shape"}))
     open_calls = 0
-    real_open = Path.open
+    real_os_open = os.open
 
-    def counting_open(self: Path, *args, **kwargs):
+    def counting_open(name, flags, *args, **kwargs):
         nonlocal open_calls
-        if self == path:
+        if Path(name) == path:
             open_calls += 1
-        return real_open(self, *args, **kwargs)
+        return real_os_open(name, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", counting_open)
+    monkeypatch.setattr(os, "open", counting_open)
 
     assert cache.read_json_list(path) == [{"ok": 1}]
     assert cache.read_json_list(path) == [{"ok": 1}]
@@ -315,7 +315,9 @@ def test_oversized_json_is_not_reparsed_on_every_read(tmp_path, monkeypatch):
     def exploding_open(*args, **kwargs):
         raise AssertionError("an over-cap file must never be opened")
 
+    # Both open lanes: readers using Path.open and the descriptor-level guard.
     monkeypatch.setattr(Path, "open", exploding_open)
+    monkeypatch.setattr(os, "open", exploding_open)
 
     assert cache.read_json_mapping(path) == {}
     assert cache.read_json_mapping(path) == {}
@@ -416,17 +418,17 @@ def test_transient_open_failure_recovers_without_mtime_change(tmp_path, monkeypa
     else:
         path.write_text("v: 2\n")
 
-    real_open = Path.open
+    real_os_open = os.open
     open_calls = 0
 
-    def failing_open(self: Path, *args, **kwargs):
+    def failing_open(name, flags, *args, **kwargs):
         nonlocal open_calls
-        if self == path:
+        if Path(name) == path:
             open_calls += 1
             raise PermissionError("file locked by another process")
-        return real_open(self, *args, **kwargs)
+        return real_os_open(name, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", failing_open)
+    monkeypatch.setattr(os, "open", failing_open)
 
     assert read(path) == {"v": 1}
     assert cache.last_read_was_stale(path) is True
@@ -447,14 +449,14 @@ def test_transient_oserror_on_never_readable_file_returns_default(tmp_path, monk
     path = tmp_path / "data.json"
     path.write_text(json.dumps({"v": 1}))
 
-    real_open = Path.open
+    real_os_open = os.open
 
-    def failing_open(self: Path, *args, **kwargs):
-        if self == path:
+    def failing_open(name, flags, *args, **kwargs):
+        if Path(name) == path:
             raise OSError("transient read failure")
-        return real_open(self, *args, **kwargs)
+        return real_os_open(name, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", failing_open)
+    monkeypatch.setattr(os, "open", failing_open)
 
     assert cache.read_json_mapping(path) == {}
     assert cache.last_read_was_stale(path) is False
@@ -473,15 +475,15 @@ def test_invalid_utf8_keeps_bad_mtime_caching(tmp_path, monkeypatch):
 
     path.write_bytes(b"\xff")
     open_calls = 0
-    real_open = Path.open
+    real_os_open = os.open
 
-    def counting_open(self: Path, *args, **kwargs):
+    def counting_open(name, flags, *args, **kwargs):
         nonlocal open_calls
-        if self == path:
+        if Path(name) == path:
             open_calls += 1
-        return real_open(self, *args, **kwargs)
+        return real_os_open(name, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", counting_open)
+    monkeypatch.setattr(os, "open", counting_open)
 
     assert cache.read_json_mapping(path) == {"ok": 1}
     assert cache.read_json_mapping(path) == {"ok": 1}
@@ -501,15 +503,15 @@ def test_deeply_nested_json_is_refused_and_not_reparsed(tmp_path, monkeypatch):
     path.write_text("[" * 3000 + "]" * 3000)
 
     open_calls = 0
-    real_open = Path.open
+    real_os_open = os.open
 
-    def counting_open(self: Path, *args, **kwargs):
+    def counting_open(name, flags, *args, **kwargs):
         nonlocal open_calls
-        if self == path:
+        if Path(name) == path:
             open_calls += 1
-        return real_open(self, *args, **kwargs)
+        return real_os_open(name, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", counting_open)
+    monkeypatch.setattr(os, "open", counting_open)
 
     assert cache.read_json_mapping(path) == {}
     assert cache.read_json_mapping(path) == {}

@@ -4,7 +4,7 @@ import time
 from datetime import datetime
 
 import rich.box
-from rich.console import Group
+from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -33,6 +33,10 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     lines.append("\n")
     lines.append("  Profiles: ", style=theme.ui_label)
     lines.append(f"{state.profiles.profile_count} discovered", style=theme.banner_text)
+    duplicates = len(state.profiles.duplicate_platform_credentials)
+    if duplicates:
+        noun = "credential" if duplicates == 1 else "credentials"
+        lines.append(f"\n  ⚠ {duplicates} platform {noun} in several profiles", style=theme.ui_warn)
     return Panel(
         lines,
         title=f"[{theme.panel_title_style}]\\[9] Profiles[/]",
@@ -73,6 +77,7 @@ def _render_detail(state: DashboardState, theme: Theme, profile_view_index: int)
     table.add_column("Skills", justify="right", style=theme.banner_text)
     table.add_column("DB Size", justify="right", style=theme.banner_text)
     table.add_column("Last Log", style=theme.banner_dim)
+    table.add_column("Files", style=theme.banner_dim)
 
     for index, profile in enumerate(profiles):
         marker = "▶" if index == viewed_index else ""
@@ -83,6 +88,7 @@ def _render_detail(state: DashboardState, theme: Theme, profile_view_index: int)
             str(profile.skill_count),
             fmt_bytes(profile.db_size_bytes),
             _format_timestamp(profile.latest_log_mtime),
+            _files_label(profile.config_present, profile.env_present),
         )
 
     excerpt = Text()
@@ -96,14 +102,50 @@ def _render_detail(state: DashboardState, theme: Theme, profile_view_index: int)
         excerpt.append("SOUL: ", style=theme.ui_label)
         excerpt.append("—", style=theme.banner_dim)
 
+    sections: list[RenderableType] = [header, table, excerpt]
+    if state.profiles.duplicate_platform_credentials:
+        sections.append(_duplicate_credentials_text(state, theme))
+
     return Panel(
-        Group(header, table, excerpt),
+        Group(*sections),
         title=f"[{theme.panel_title_style}]\\[9] Profiles[/]",
         title_align="left",
         border_style=theme.panel_border_style,
         box=rich.box.HORIZONTALS,
         padding=(1, 2),
     )
+
+
+def _files_label(config_present: bool, env_present: bool) -> str:
+    """The per-profile file checks ``hermes doctor`` prints (doctor_state.py:560-565)."""
+    if config_present and env_present:
+        return "config+.env"
+    problems = []
+    if not config_present:
+        problems.append("⚠ missing config")
+    if not env_present:
+        problems.append("no .env")
+    return ", ".join(problems)
+
+
+def _duplicate_credentials_text(state: DashboardState, theme: Theme) -> Text:
+    """Platform credential key names set in more than one profile's .env."""
+    text = Text()
+    text.append("\nShared platform credentials\n", style=f"bold {theme.ui_warn}")
+    for duplicate in state.profiles.duplicate_platform_credentials:
+        text.append(
+            sanitize_terminal_text(
+                f"  {duplicate.key} ({duplicate.platform}): {', '.join(duplicate.profiles)}"
+            )
+            + "\n",
+            style=theme.ui_warn,
+        )
+    text.append(
+        "  Key names only, values not compared: one bot token can serve only one gateway,"
+        " so a token that really is shared parks the second profile's adapter.\n",
+        style=theme.banner_dim,
+    )
+    return text
 
 
 def _format_timestamp(value: float | None) -> str:

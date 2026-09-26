@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from rich.console import Console
 
 from hermesd.models import DashboardState, LogLine, LogState, LogStream, SourceScope
@@ -125,3 +126,43 @@ def test_logs_detail_scope_defaults_to_root_without_streams() -> None:
     state = DashboardState(logs=LogState(agent_lines=[LogLine(message="legacy agent line")]))
 
     assert "Scope: root" in _detail_text(state, "agent")
+
+
+def _many_streams_state(stream_count: int = 16, line_count: int = 60) -> DashboardState:
+    streams = [
+        LogStream(
+            name=f"stream.number{index}",
+            lines=[LogLine(message=f"line {n}") for n in range(line_count)],
+        )
+        for index in range(stream_count)
+    ]
+    return DashboardState(logs=LogState(streams=streams))
+
+
+@pytest.mark.parametrize("stream_count", [2, 16])
+def test_logs_detail_fits_its_height_when_the_tab_bar_wraps(stream_count: int) -> None:
+    # 2 streams: one tab row (the old trailing-newline off-by-one); 16: wrapped.
+    state = _many_streams_state(stream_count)
+    width, height = 100, 30
+    panel = render_logs(
+        state,
+        Theme(),
+        detail=True,
+        sub_view="stream.number0",
+        detail_height=height,
+        detail_width=width,
+    )
+    console = Console(width=width, no_color=True)
+    lines = console.render_lines(panel, console.options.update(height=None), pad=False)
+
+    assert len(lines) <= height
+
+
+def test_logs_scroll_clamp_counts_wrapped_tab_rows() -> None:
+    from hermesd.panels.logs import max_detail_scroll_offset
+
+    state = _many_streams_state()
+    narrow = max_detail_scroll_offset(state, "stream.number0", "", 30, 100)
+    wide = max_detail_scroll_offset(state, "stream.number0", "", 30, 1000)
+
+    assert narrow > wide, "a wrapped tab bar leaves fewer rows for log lines"

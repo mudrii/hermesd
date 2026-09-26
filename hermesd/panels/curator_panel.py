@@ -55,6 +55,12 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
         lines.append(str(cur.pruned_count), style=theme.banner_text)
         if cur.llm_error:
             lines.append("  ⚠ error", style=theme.ui_warn)
+    if cur.run_claim_live:
+        lines.append("\n  Running: ", style=theme.ui_label)
+        lines.append(
+            f"pid {cur.run_claim_pid} ({fmt_age_seconds(cur.run_claim_age_seconds)})",
+            style=theme.ui_accent,
+        )
     _append_hygiene_compact(cur, lines, theme)
     return Panel(
         lines,
@@ -76,6 +82,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         else:
             body = Text("  No curation runs found", style=theme.banner_dim)
         sections: list[RenderableType] = [body]
+        sections.extend(_activity_sections(cur, theme))
         if cur.managed_skill_count:
             sections.append(section_heading("Skill Hygiene", theme))
             sections.append(_hygiene_table(cur, theme))
@@ -110,6 +117,8 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     if cur.scheduler_state_present:
         sections.append(section_heading("Scheduler", theme))
         sections.append(_scheduler_table(cur, theme))
+
+    sections.extend(_activity_sections(cur, theme))
 
     if cur.managed_skill_count:
         sections.append(section_heading("Skill Hygiene", theme))
@@ -286,4 +295,46 @@ def _scheduler_table(cur: CuratorRun, theme: Theme) -> Table:
         escape(cur.scheduler_last_report_path) if cur.scheduler_last_report_path else "—",
     )
     table.add_row("Consolidate", "consolidate on" if cur.consolidate_enabled else "consolidate off")
+    table.add_row(
+        "Last Duration",
+        f"{cur.last_run_duration_seconds:.1f}s"
+        if cur.last_run_duration_seconds is not None
+        else "—",
+    )
     return table
+
+
+def _activity_sections(cur: CuratorRun, theme: Theme) -> list[RenderableType]:
+    """Suppression list, run claim and ledger tail — only when any exists."""
+    if not (cur.suppressed_count or cur.run_claim_present or cur.ledger_recent):
+        return []
+    table = Table(box=None, show_header=False, padding=(0, 2))
+    table.add_column("Key", style=theme.ui_label)
+    table.add_column("Value", style=theme.banner_text)
+    table.add_row("Suppressed", f"{cur.suppressed_count} built-in(s) the curator pruned")
+    table.add_row("Run claim", _run_claim_label(cur))
+    sections: list[RenderableType] = [section_heading("Activity", theme), table]
+    if cur.ledger_recent:
+        ledger = Table(box=None, show_header=True, padding=(0, 2), title_justify="left")
+        ledger.add_column("Recent ledger", style=theme.banner_dim, min_width=14)
+        ledger.add_column("Actor", style=theme.banner_text)
+        ledger.add_column("Action", style=theme.ui_accent)
+        ledger.add_column("Skill", style=theme.banner_text)
+        for row in cur.ledger_recent:
+            ledger.add_row(
+                escape(row.ts) if row.ts else "—",
+                escape(row.actor) if row.actor else "—",
+                escape(row.action),
+                escape(row.skill) if row.skill else "—",
+            )
+        sections.append(ledger)
+    return sections
+
+
+def _run_claim_label(cur: CuratorRun) -> str:
+    """skills/.locks/curator-run: live only while its pid runs and it is < 1h old."""
+    if not cur.run_claim_present:
+        return "none"
+    pid = str(cur.run_claim_pid) if cur.run_claim_pid is not None else "?"
+    verdict = "live" if cur.run_claim_live else "stale"
+    return f"{verdict} — pid {pid}, {fmt_age_seconds(cur.run_claim_age_seconds)} old"

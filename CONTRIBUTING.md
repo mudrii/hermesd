@@ -113,7 +113,8 @@ Test categories:
 - `test_db_extended.py` / `test_db_null_tolerance.py` — SQLite reader, WAL snapshotting, caching, NULL coalescing (including a static guard against `.get(col, default)` on rows)
 - `test_file_cache.py` — (mtime, size, inode)-keyed JSON/YAML cache
 - `test_collector.py` — `Collector` construction, `collect()` orchestration, health/fallback, available tools
-- `test_collector_<source>.py` — per-domain collector readers: `sessions`, `cron`, `kanban`, `skills`, `gateway`, `operations`, `config`, `logs`, `migration`, `hosted_rooms`, `api_runs`, `common`, plus `profiles` (profile-scoped collection)
+- `test_collector_<source>.py` — per-domain collector readers: `sessions`, `cron`, `cron_ledgers`, `kanban`, `skills`, `gateway`, `gateway_sync`, `operations`, `config`, `config_integrations`, `integrations`, `credential_cooldowns`, `curator_activity`, `usage_analytics`, `logs`, `migration`, `hosted_rooms`, `api_runs`, `common`, plus `profiles` (profile-scoped collection) and `profile_health`
+- `test_estop.py` / `test_disk_usage.py` / `test_log_health.py` / `test_pending_actions.py` / `test_process_identity.py` / `test_state_snapshots.py` / `test_ops_health_edges.py` — ESTOP sentinel, disk and retention, incremental log health, staged writes pending review, worker/helper process identity, state snapshot grouping and manifests, and their edge cases
 - `test_desktop_plugins.py` / `test_plugin_*.py` (`activation`, `catalog_cache`, `manifest_formats`, `provenance`) — desktop and agent plugin inventory
 - `test_paths.py` — `HermesPaths` resolution and profile scoping
 - `test_theme.py` — skin loading and theme inheritance
@@ -121,7 +122,7 @@ Test categories:
 - `test_main.py` — CLI argument parsing, snapshot modes, signal exit codes
 - `test_app.py` / `test_app_extended.py` / `test_app_input.py` — TUI key handling, input thread, layout, lifecycle
 - `test_panels.py` / `test_panels_extended.py` — cross-panel rendering (compact + detail)
-- `test_<panel>_panel.py` — one file per panel (`gateway`, `sessions`, `tokens`, `tools`, `config`, `cron`, `skills`, `logs`, `profiles`, `memory`, `kanban`, `operations`, `curator`)
+- `test_<panel>_panel.py` — one file per panel (`gateway`, `sessions`, `tokens`, `tools`, `config`, `cron`, `skills`, `logs`, `profiles`, `memory`, `kanban`, `operations`, `curator`), plus `test_gateway_panel_sync.py` for the gateway degraded, migration, memory, dead-target and restart-backlog views
 - `test_markup_safety.py` / `test_unicode_rendering.py` — Rich markup escaping, secret-redaction safety and CJK/wide-character rendering across every panel
 - `test_*_resilience.py` (`collector`, `db`, `gateway`, `curator`) — every test injects an error and asserts the next read returns last-good data
 - `test_package_metadata.py` — packaging, workflow, long-description, and wheel-smoke contracts

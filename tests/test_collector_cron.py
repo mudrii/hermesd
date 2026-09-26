@@ -27,7 +27,7 @@ from hermesd.collector import (
     _delivery_target_label,
     _latest_cron_output_excerpt,
 )
-from hermesd.models import CronFireClaimState, CronState, CronTickerHealth
+from hermesd.models import CronFireClaimState, CronModelSource, CronState, CronTickerHealth
 from hermesd.panels import render_panel
 from hermesd.theme import Theme
 from tests.conftest import (
@@ -811,14 +811,14 @@ def test_cron_tail_open_error_yields_no_cron_lines(
     out = job_dir / "run.log"
     out.write_text("2026-04-09 15:41:58,123 - hermes - INFO - cron ran\n")
 
-    real_open = Path.open
+    real_os_open = os.open
 
-    def fail_target_open(self: Path, *args, **kwargs):
-        if self == out:
+    def fail_target_open(name, flags, *args, **kwargs):
+        if Path(name) == out:
             raise OSError("simulated cron read failure")
-        return real_open(self, *args, **kwargs)
+        return real_os_open(name, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", fail_target_open)
+    monkeypatch.setattr(os, "open", fail_target_open)
     c = Collector(hermes_home)
     try:
         state = c.collect()
@@ -858,14 +858,14 @@ def test_cron_output_excerpt_open_error_returns_empty(
     out = job_dir / "latest.md"
     out.write_text("some cron output\n")
 
-    real_open = Path.open
+    real_os_open = os.open
 
-    def fail_target_open(self: Path, *args, **kwargs):
-        if self == out:
+    def fail_target_open(name, flags, *args, **kwargs):
+        if Path(name) == out:
             raise OSError("simulated cron excerpt read failure")
-        return real_open(self, *args, **kwargs)
+        return real_os_open(name, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", fail_target_open)
+    monkeypatch.setattr(os, "open", fail_target_open)
 
     assert _latest_cron_output_excerpt(output_root, "job-x", max_bytes=4096) == (
         "",
@@ -1821,6 +1821,76 @@ def test_collect_cron_incidents_absent_table_reports_zero(hermes_home: Path):
     assert state.cron_executions.open_incidents == []
 
 
+def _incidents_db_with_alerted_at(home: Path) -> sqlite3.Connection:
+    """executions.db with the ``alerted_at`` column upstream adds in place
+    (``cron/incidents.py:83,90``)."""
+    conn = sqlite3.connect(str(home / "cron" / "executions.db"))
+    create_cron_executions_tables(conn)
+    conn.execute("ALTER TABLE cron_incidents ADD COLUMN alerted_at TEXT")
+    return conn
+
+
+def _insert_incident(
+    conn: sqlite3.Connection,
+    incident_id: str,
+    state: str,
+    *,
+    closed_at: str | None = None,
+    alerted_at: str | None = None,
+) -> None:
+    conn.execute(
+        "INSERT INTO cron_incidents (id, job_id, error_sig, state, failure_type, "
+        "first_seen_at, last_seen_at, acked_at, closed_at, error, output_file, alerted_at) "
+        "VALUES (?, 'job-1', ?, ?, 'script', ?, ?, NULL, ?, 'boom', NULL, ?)",
+        (incident_id, incident_id, state, iso_ago(7200), iso_ago(600), closed_at, alerted_at),
+    )
+
+
+def test_collect_cron_incidents_resolved_state_is_not_open(hermes_home: Path):
+    """``resolved`` (job recovered, ``cron/incidents.py:32,248``) is not open; it
+    is counted apart, with the ones resolved inside the last 24h."""
+    conn = _incidents_db_with_alerted_at(hermes_home)
+    _insert_incident(conn, "inc_open", "alerted", alerted_at=iso_ago(300))
+    _insert_incident(conn, "inc_resolved_recent", "resolved", closed_at=iso_ago(3600))
+    _insert_incident(conn, "inc_resolved_old", "resolved", closed_at=iso_ago(3 * 86400))
+    # Upstream always stamps closed_at on resolve; a row without it is still
+    # resolved by state and must never leak into the open set.
+    _insert_incident(conn, "inc_resolved_unstamped", "resolved")
+    _insert_incident(conn, "inc_closed", "closed", closed_at=iso_ago(60))
+    conn.commit()
+    conn.close()
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    executions = state.cron_executions
+    assert executions.open_incident_count == 1
+    assert [incident.incident_id for incident in executions.open_incidents] == ["inc_open"]
+    assert executions.resolved_incident_count == 3
+    assert executions.resolved_24h_count == 1
+    (incident,) = executions.open_incidents
+    assert incident.alerted_age_seconds == pytest.approx(300, abs=30)
+
+
+def test_collect_cron_incidents_without_alerted_at_column_read_as_unalerted(
+    hermes_home: Path, sample_cron_executions_db: Path
+):
+    """A ledger created before the alert-once gate has no ``alerted_at``."""
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    assert "cron_executions" not in state.health.failed_sources
+    assert state.cron_executions.open_incidents
+    assert all(i.alerted_age_seconds is None for i in state.cron_executions.open_incidents)
+    assert state.cron_executions.resolved_incident_count == 0
+
+
 def test_collect_cron_reads_new_jobs_json_keys(hermes_home: Path):
     _write_jobs_json(
         hermes_home,
@@ -2568,14 +2638,14 @@ def test_cron_marker_open_failure_keeps_last_good_and_fails_the_source(
 
         blocked_path = hermes_home / "cron" / marker_name
         blocked_path.stat()
-        real_open = Path.open
+        real_os_open = os.open
 
-        def fail_marker_open(self: Path, *args: object, **kwargs: object):
-            if self == blocked_path:
+        def fail_marker_open(name, flags, *args, **kwargs):
+            if Path(name) == blocked_path:
                 raise PermissionError("marker read failed after stat")
-            return real_open(self, *args, **kwargs)
+            return real_os_open(name, flags, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "open", fail_marker_open)
+        monkeypatch.setattr(os, "open", fail_marker_open)
         second = c.collect()
 
         assert "cron" in second.health.failed_sources
@@ -2583,7 +2653,7 @@ def test_cron_marker_open_failure_keeps_last_good_and_fails_the_source(
         assert second.cron.catch_up_occurrences_recorded is True
         assert second.cron.ticker_last_error == "RuntimeError: boom"
 
-        monkeypatch.setattr(Path, "open", real_open)
+        monkeypatch.setattr(os, "open", real_os_open)
         third = c.collect()
 
         assert "cron" not in third.health.failed_sources
@@ -2855,28 +2925,65 @@ def test_collect_cron_preflight_alerted_flag(hermes_home: Path):
     assert by_id["job-quiet"].preflight_alerted is False
 
 
-def test_collect_cron_snapshots_record_unpinned_resolution(hermes_home: Path):
-    """Snapshots capture creation-time resolution for unpinned axes only
-    (``cron/jobs.py:1600-1630``, written at ``:1770-1771``); a pinned job records
-    neither, and an older agent writes no keys at all."""
+@pytest.mark.parametrize(
+    ("config", "job", "expected_model", "expected_source"),
+    [
+        # A per-job model is the pin: it wins over both config axes.
+        (
+            {"cron": {"model": "fleet"}, "model": {"default": "main"}},
+            {"model": "gpt-9", "provider": "openai"},
+            "gpt-9",
+            CronModelSource.PINNED,
+        ),
+        # Unpinned: cron.model (the fleet default) beats the main model.
+        (
+            {"cron": {"model": " fleet "}, "model": {"default": "main"}},
+            {"model": None},
+            "fleet",
+            CronModelSource.CRON_DEFAULT,
+        ),
+        # Unpinned, no fleet default: the main agent model at fire time.
+        ({"model": {"default": "main"}}, {"model": ""}, "main", CronModelSource.MAIN_MODEL),
+        # ``model: <name>`` shorthand and the dict's model/name fallbacks.
+        ({"model": "shorthand"}, {}, "shorthand", CronModelSource.MAIN_MODEL),
+        ({"model": {"model": "alias"}}, {}, "alias", CronModelSource.MAIN_MODEL),
+        ({"model": {"name": "named"}}, {}, "named", CronModelSource.MAIN_MODEL),
+        # Nothing configured anywhere: upstream refuses to run the job.
+        ({}, {}, "", None),
+        # A script-only job never reaches a model.
+        ({"model": {"default": "main"}}, {"no_agent": True}, "", None),
+    ],
+)
+def test_collect_cron_resolves_the_effective_model_like_the_scheduler(
+    hermes_home: Path,
+    config: dict,
+    job: dict,
+    expected_model: str,
+    expected_source: CronModelSource | None,
+):
+    """Unpinned jobs follow the main model at fire time; resolution is per-job
+    model > ``cron.model`` > main ``model:`` (``cron/scheduler.py:1561-1590``)."""
+    (hermes_home / "config.yaml").write_text(yaml.dump(config))
+    _write_jobs_json(hermes_home, [{"id": "job-1", "name": "One", **job}])
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    (collected,) = state.cron.jobs
+    assert collected.effective_model == expected_model
+    assert collected.model_source == expected_source
+
+
+def test_collect_cron_ignores_legacy_model_snapshots(hermes_home: Path):
+    """Upstream dropped ``model_snapshot``/``provider_snapshot``: a legacy
+    jobs.json that still carries them runs the main model, not the snapshot."""
+    (hermes_home / "config.yaml").write_text(yaml.dump({"model": {"default": "main"}}))
     _write_jobs_json(
         hermes_home,
-        [
-            {
-                "id": "job-unpinned",
-                "name": "Unpinned",
-                "model": None,
-                "provider": None,
-                "model_snapshot": "hermes-default-large",
-                "provider_snapshot": "openai",
-            },
-            {
-                "id": "job-pinned",
-                "name": "Pinned",
-                "model": "gpt-9",
-                "provider": "openai",
-            },
-        ],
+        [{"id": "job-1", "model": None, "model_snapshot": "stale", "provider_snapshot": "old"}],
     )
 
     c = Collector(hermes_home)
@@ -2885,15 +2992,9 @@ def test_collect_cron_snapshots_record_unpinned_resolution(hermes_home: Path):
     finally:
         c.close()
 
-    by_id = {job.job_id: job for job in state.cron.jobs}
-    unpinned = by_id["job-unpinned"]
-    assert unpinned.model == ""
-    assert unpinned.model_snapshot == "hermes-default-large"
-    assert unpinned.provider_snapshot == "openai"
-    pinned = by_id["job-pinned"]
-    assert pinned.model == "gpt-9"
-    assert pinned.model_snapshot == ""
-    assert pinned.provider_snapshot == ""
+    (collected,) = state.cron.jobs
+    assert collected.effective_model == "main"
+    assert "model_snapshot" not in collected.model_dump()
 
 
 def test_collect_cron_delivery_statuses_do_not_fold_into_error(hermes_home: Path):
@@ -3274,3 +3375,69 @@ def test_recent_cron_executions_match_a_full_python_ordering(hermes_home: Path):
 
     recent = [run.execution_id for run in state.cron_executions.recent]
     assert recent == expected[:_EXECUTIONS_RECENT_LIMIT]
+
+
+def test_collect_cron_reports_only_an_active_quota_hold(hermes_home: Path):
+    """``quota_hold_until`` parks a job past a closed provider usage window; an
+    expired marker is inert upstream (``hold_active``, ``cron/quota_hold.py:58-64``)."""
+    _write_jobs_json(
+        hermes_home,
+        [
+            {"id": "job-held", "quota_hold_until": iso_ago(-3600)},
+            {"id": "job-expired", "quota_hold_until": iso_ago(60)},
+            {"id": "job-garbage", "quota_hold_until": "not a time"},
+            {"id": "job-free"},
+        ],
+    )
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    by_id = {job.job_id: job for job in state.cron.jobs}
+    assert by_id["job-held"].quota_hold_until != ""
+    assert by_id["job-expired"].quota_hold_until == ""
+    assert by_id["job-garbage"].quota_hold_until == ""
+    assert by_id["job-free"].quota_hold_until == ""
+
+
+def test_collect_cron_recent_failures_survive_a_run_of_newer_successes(hermes_home: Path):
+    """A failure older than the newest ten runs still has its redacted error
+    shown (executions ``error``, ``cron/executions.py``), newest first, capped."""
+    conn = sqlite3.connect(str(hermes_home / "cron" / "executions.db"))
+    create_cron_executions_tables(conn)
+    for index in range(cron_module._RECENT_FAILURES_LIMIT + 2):
+        insert_cron_execution(
+            conn,
+            f"fail_{index:02d}",
+            "job-1",
+            "failed",
+            claimed_at=iso_ago(86400 + index * 60),
+            error=f"boom {index} api_key=sk-abcdef1234567890abcdef\nsecond line",
+        )
+    for index in range(_EXECUTIONS_RECENT_LIMIT + 2):
+        insert_cron_execution(
+            conn, f"ok_{index:02d}", "job-1", "completed", claimed_at=iso_ago(index * 60)
+        )
+    conn.commit()
+    conn.close()
+    _write_jobs_json(hermes_home, [{"id": "job-1", "name": "Nightly"}])
+
+    c = Collector(hermes_home)
+    try:
+        state = c.collect()
+    finally:
+        c.close()
+
+    executions = state.cron_executions
+    assert all(run.status == "completed" for run in executions.recent)
+    failures = executions.recent_failures
+    assert [run.execution_id for run in failures] == [
+        f"fail_{index:02d}" for index in range(cron_module._RECENT_FAILURES_LIMIT)
+    ]
+    assert failures[0].job_name == "Nightly"
+    assert failures[0].error_excerpt.startswith("boom 0")
+    assert "sk-abcdef" not in failures[0].error_excerpt
+    assert "second line" not in failures[0].error_excerpt

@@ -4,7 +4,7 @@ Everything here is a *sibling of ``state.db``*, named after it, and written by
 hermes-agent's own repair code:
 
 * ``state.db.repair-attempts.json`` — the cross-restart attempt ledger
-  (``_repair_ledger_path``, ``hermes_state_repair.py:317-318``; shape written by
+  (``_repair_ledger_path``, ``hermes_state_repair.py:318-319``; shape written by
   ``_record_repair_outcome``, ``:409-431``);
 * ``state.db.malformed-backup-<stamp>[_<seq>]`` plus ``-wal``/``-shm``/``-journal``
   sidecars — the forensic copies (``_backup_db_file``, ``:481-513``), retained to

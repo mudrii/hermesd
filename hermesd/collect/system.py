@@ -18,11 +18,15 @@ from hermesd.collect.common import (
     _age_seconds,
     _coerce_float,
     _coerce_int,
+    _excerpt,
+    _iso_to_epoch,
+    _json_object_capped,
     _mtime,
     _mtime_ns,
     _optional_epoch,
+    _read_text_capped,
 )
-from hermesd.models import ProcessLiveness
+from hermesd.models import ProcessLiveness, WorkerIdentity
 from hermesd.paths import HermesPaths
 
 # Seconds a `git` call may run before it is abandoned. Two git subprocesses
@@ -317,3 +321,136 @@ def _latest_runtime_activity_age(paths: HermesPaths, now: float) -> float | None
     if latest <= 0.0:
         return None
     return max(0.0, now - latest)
+
+
+_ESTOP_SENTINEL_NAME = "ESTOP"
+_ESTOP_REASON_MAX_CHARS = 120
+_ESTOP_MAX_BYTES = 16 * 1024
+
+
+def _read_estop(paths: HermesPaths, now: float) -> dict[str, object]:
+    """The ``ESTOP`` sentinel as RuntimeStatus fields.
+
+    ``hermes pause`` writes ``<home>/ESTOP`` with optional JSON
+    ``{"reason", "engaged_at"}``; any existing file is engaged, including an
+    empty or corrupt one (``agent/estop.py:1-8,64-73``). A profile process
+    checks its own home first, then the fleet root (``:33-50``), so hermesd
+    checks ``profile_path`` then ``shared_path``. Presence is an ``lstat``: a
+    symlinked sentinel still counts, but its target is never read. A stat error
+    other than absence propagates, so the ``estop`` source keeps its last-good
+    value instead of reporting "not paused".
+    """
+    profile_sentinel = paths.profile_path(_ESTOP_SENTINEL_NAME)
+    root_sentinel = paths.shared_path(_ESTOP_SENTINEL_NAME)
+    candidates = [("root", root_sentinel)]
+    if profile_sentinel != root_sentinel:
+        candidates.insert(0, ("profile", profile_sentinel))
+    for scope, path in candidates:
+        try:
+            stat = path.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        home = paths.profile_home if scope == "profile" else paths.root_home
+        data = _json_object_capped(_read_text_capped(path, home), max_bytes=_ESTOP_MAX_BYTES) or {}
+        engaged_at = _iso_to_epoch(data.get("engaged_at"))
+        return {
+            "estop_engaged": True,
+            "estop_reason": _excerpt(data.get("reason") or "", _ESTOP_REASON_MAX_CHARS),
+            "estop_age_seconds": _age_seconds(
+                engaged_at if engaged_at is not None else stat.st_mtime, now
+            ),
+            "estop_scope": scope,
+        }
+    return {
+        "estop_engaged": False,
+        "estop_reason": "",
+        "estop_age_seconds": None,
+        "estop_scope": "",
+    }
+
+
+# Upstream's kanban fingerprint marker for a spawn whose start time could not be
+# captured (``hermes_cli/kanban_db_dispatch.py:361-364``).
+_UNVERIFIED_FINGERPRINT = "unverified"
+# psutil centiseconds since the epoch are ~1.8e11 today, while Linux /proc
+# start ticks since boot stay far below this for any realistic uptime.
+_EPOCH_CENTISECONDS_FLOOR = 10_000_000_000
+
+
+def _fingerprint_start_epoch(fingerprint: str) -> float | None:
+    """Epoch seconds of the start time inside a kanban ``worker_started_at``.
+
+    The value is ``"<instantiation epoch>|<start>"`` or a bare legacy integer
+    (``hermes_cli/kanban_db_dispatch.py:367-378,396-413``), where ``<start>`` is
+    ``gateway.status.get_process_start_time``: ``/proc`` clock ticks since boot
+    on Linux, psutil ``create_time() * 100`` elsewhere
+    (``gateway/status.py:458-468``). The instantiation-epoch half (boot id plus
+    PID 1 start) cannot be recomputed here, so only the start time is compared.
+    None when the value is unparseable or cannot be placed on the epoch.
+    """
+    raw = fingerprint.rsplit("|", 1)[-1].strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    if value >= _EPOCH_CENTISECONDS_FLOOR:
+        return value / 100.0
+    boot = _proc_boot_epoch()
+    try:
+        tick = os.sysconf("SC_CLK_TCK")
+    except (AttributeError, OSError, ValueError):
+        return None
+    if boot is None or tick <= 0:
+        return None
+    return boot + value / tick
+
+
+def _worker_identity(
+    pid: int,
+    recorded_start: float | None,
+    observed: Mapping[int, float],
+    pid_exists: Callable[[int], bool],
+    *,
+    legacy: bool = False,
+) -> WorkerIdentity:
+    """Whether ``pid`` is still the process whose start time was recorded.
+
+    ``legacy`` marks a record written before fingerprints existed: only the
+    pid's existence can be checked. A recorded start that is missing or that
+    this host cannot observe leaves the verdict unverified, never live.
+    """
+    if pid <= 0:
+        return WorkerIdentity.NONE
+    if not pid_exists(pid):
+        return WorkerIdentity.DEAD
+    if legacy:
+        return WorkerIdentity.LEGACY
+    seen = observed.get(pid)
+    if recorded_start is None or seen is None:
+        return WorkerIdentity.UNVERIFIED
+    if abs(seen - recorded_start) <= _PROCESS_START_TOLERANCE_SECONDS:
+        return WorkerIdentity.LIVE
+    return WorkerIdentity.REUSED
+
+
+def _kanban_worker_identity(
+    pid: int,
+    fingerprint: str,
+    observed: Mapping[int, float],
+    pid_exists: Callable[[int], bool],
+) -> WorkerIdentity:
+    """Verdict for one kanban ``worker_pid``/``worker_started_at`` pair."""
+    if fingerprint == _UNVERIFIED_FINGERPRINT:
+        # Held while live, never trusted as verified (kanban_db_dispatch.py:381-393).
+        if pid <= 0:
+            return WorkerIdentity.NONE
+        return WorkerIdentity.UNVERIFIED if pid_exists(pid) else WorkerIdentity.DEAD
+    return _worker_identity(
+        pid,
+        _fingerprint_start_epoch(fingerprint) if fingerprint else None,
+        observed,
+        pid_exists,
+        legacy=not fingerprint,
+    )

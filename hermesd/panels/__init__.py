@@ -23,6 +23,8 @@ class PanelRenderContext:
     session_message_match_ids: set[str] | None = None
     # Rows available to a self-windowing detail (Logs); None = fixed default.
     detail_height: int | None = None
+    # Columns available to it, so wrapped chrome is counted; None = unknown.
+    detail_width: int | None = None
 
 
 PanelRenderer = Callable[[PanelRenderContext], Panel]
@@ -88,6 +90,7 @@ def _render_logs_panel(ctx: PanelRenderContext) -> Panel:
         scroll_offset=ctx.scroll_offset,
         filter_query=ctx.filter_query,
         detail_height=ctx.detail_height,
+        detail_width=ctx.detail_width,
     )
 
 
@@ -172,6 +175,7 @@ def render_panel(
     session_sort: str = "recent",
     session_message_match_ids: set[str] | None = None,
     detail_height: int | None = None,
+    detail_width: int | None = None,
 ) -> Panel:
     renderer = _RENDERERS.get(panel_num)
     if renderer is None:
@@ -187,5 +191,6 @@ def render_panel(
         session_sort=session_sort,
         session_message_match_ids=session_message_match_ids,
         detail_height=detail_height,
+        detail_width=detail_width,
     )
     return renderer(context)

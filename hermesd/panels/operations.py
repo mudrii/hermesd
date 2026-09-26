@@ -18,17 +18,22 @@ from hermesd.models import (
     ApiRunReservation,
     ApiRunReservationsState,
     DashboardState,
+    DatabaseJournal,
     DbRecoveryState,
     DelegationInfo,
     DelegationLiveManifest,
+    DiskUsageState,
     HostedRoomState,
     HostedRoomSummary,
     OperationsState,
     ProcessReceiptsState,
+    RuntimeStatus,
+    StateSnapshotSummary,
     checkpoint_prune_overdue_after,
 )
 from hermesd.panels.formatting import escape_terminal_text as escape
 from hermesd.panels.formatting import fmt_age_seconds, sanitize_terminal_text
+from hermesd.panels.logs import log_health_summary
 from hermesd.theme import Theme
 
 # Rendered under the Database Recovery section. Every line is a limit on what the
@@ -97,9 +102,25 @@ _LIVE_MANIFEST_NOTE_LINES = (
     "leaves tasks marked running. Tails are redacted again before rendering.",
 )
 
+# Rendered under the ESTOP banner: what a pause does and does not stop.
+_ESTOP_NOTE_LINES = (
+    "hermes pause: cron, the kanban dispatcher and new gateway turns skip new work;",
+    "in-flight work is never killed. `hermes resume` removes the sentinel.",
+)
+
 # Rendered whenever a bounded list was cut short, so a display cap can never be
 # mistaken for the size of the table it came from.
 _TRUNCATION_LABEL = "showing {shown} of {total} — the counts above cover the whole table"
+
+
+def estop_banner(runtime: RuntimeStatus) -> str:
+    """One-line ESTOP banner, terminal-sanitized (plain text, never markup)."""
+    label = "⏸ PAUSED (ESTOP)"
+    if runtime.estop_reason:
+        label = f"{label}: {sanitize_terminal_text(runtime.estop_reason)}"
+    if runtime.estop_age_seconds is not None:
+        label = f"{label}, since {fmt_age_seconds(runtime.estop_age_seconds)} ago"
+    return label
 
 
 def render_operations(state: DashboardState, theme: Theme, detail: bool = False) -> Panel:
@@ -112,6 +133,8 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     ops = state.operations
     model_count = sum(cache.model_count for cache in ops.model_caches)
     lines = Text()
+    if state.runtime.estop_engaged:
+        lines.append(f"  {estop_banner(state.runtime)}\n", style=f"bold {theme.ui_error}")
     lines.append("  Dashboard: ", style=theme.ui_label)
     lines.append(f"{ops.dashboard_process_count} proc\n", style=theme.banner_text)
     lines.append("  Model Caches: ", style=theme.ui_label)
@@ -157,6 +180,26 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
     if ops.blocked_script_count:
         lines.append("  Blocked scripts: ", style=theme.ui_label)
         lines.append(f"{ops.blocked_script_count}\n", style=theme.ui_warn)
+    if ops.pending_action_total:
+        oldest = max(
+            (entry.oldest_age_seconds or 0.0 for entry in ops.pending_actions), default=None
+        )
+        lines.append("  Pending review: ", style=theme.ui_label)
+        lines.append(
+            f"{ops.pending_action_total} (oldest {fmt_age_seconds(oldest)})\n",
+            style=theme.ui_warn,
+        )
+    health_line = _log_health_compact(state)
+    if health_line:
+        lines.append("  Log health: ", style=theme.ui_label)
+        lines.append(f"{health_line}\n", style=theme.banner_text)
+    disk_warnings = _disk_warnings(state.disk)
+    if disk_warnings:
+        lines.append("  ⚠ Disk: ", style=theme.ui_warn)
+        lines.append(" · ".join(disk_warnings) + "\n", style=theme.ui_warn)
+    if ops.snapshot_failed_count:
+        lines.append("  ⚠ Snapshots: ", style=theme.ui_warn)
+        lines.append(f"{ops.snapshot_failed_count} with failed DBs\n", style=theme.ui_warn)
     if ops.checkpoint_prune_overdue:
         age = ops.checkpoint_prune_marker_age_seconds
         lines.append("  ⚠ Checkpoint prune overdue ", style=theme.ui_warn)
@@ -191,7 +234,11 @@ def _render_compact(state: DashboardState, theme: Theme) -> Panel:
 def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     ops = state.operations
     no_artifacts = _has_no_artifacts(ops)
-    sections: list[RenderableType] = [_summary_table(ops, theme)]
+    sections: list[RenderableType] = []
+    if state.runtime.estop_engaged:
+        sections.append(Text(f"  {estop_banner(state.runtime)}", style=f"bold {theme.ui_error}"))
+        sections.append(_note(_ESTOP_NOTE_LINES, theme))
+    sections.append(_summary_table(ops, theme))
 
     if ops.model_caches:
         sections.append(_heading("Model Caches", theme))
@@ -231,6 +278,27 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
     # "No operations artifacts found" line below instead of saying both.
     if not no_artifacts:
         sections.extend(_receipt_sections(ops.process_receipts, theme))
+
+    if ops.snapshots:
+        sections.append(_heading("State Snapshots", theme))
+        sections.append(_snapshots_table(ops, theme))
+        if ops.snapshot_count > len(ops.snapshots):
+            sections.append(
+                Text(
+                    f"  {_truncation_label(len(ops.snapshots), ops.snapshot_count)}",
+                    style=theme.banner_dim,
+                )
+            )
+
+    if state.logs.health:
+        sections.append(_heading("Log Health", theme))
+        sections.append(_log_health_table(state, theme))
+
+    if _disk_has_readout(state.disk):
+        sections.append(_heading("Disk & Retention", theme))
+        sections.append(_disk_table(ops, state.disk, theme))
+        if state.disk.log_files:
+            sections.append(_log_files_table(state.disk, theme))
 
     if ops.state_db_size_bytes or ops.state_db_schema_version:
         sections.append(_heading("State DB", theme))
@@ -300,6 +368,7 @@ def _has_no_artifacts(ops: OperationsState) -> bool:
         and not ops.web_ui_build_hash
         and not ops.desktop_build_stamp
         and not ops.blocked_script_count
+        and not ops.pending_action_total
         and not ops.checkpoint_prune_marker_present
         and not ops.spawn_ledger_corrupt_present
         and not ops.db_recovery.artifacts_present
@@ -558,10 +627,17 @@ def _summary_table(ops: OperationsState, theme: Theme) -> Table:
         summary.add_row(
             "Snapshots",
             f"{ops.snapshot_count} · {_size_label(ops.snapshot_total_bytes)} · "
-            f"newest {fmt_age_seconds(ops.newest_snapshot_age_seconds)} ago",
+            f"newest {fmt_age_seconds(ops.newest_snapshot_age_seconds)} ago"
+            + (
+                f" · ⚠ {ops.snapshot_failed_count} with failed DBs"
+                if ops.snapshot_failed_count
+                else ""
+            ),
         )
     if ops.blocked_script_count:
         summary.add_row("Blocked scripts", _blocked_scripts_label(ops))
+    if ops.pending_action_total:
+        summary.add_row("Pending Review", _pending_actions_label(ops))
     if ops.checkpoint_prune_marker_present:
         summary.add_row("Checkpoint Prune", _checkpoint_prune_label(ops))
     if ops.spawn_ledger_corrupt_present:
@@ -593,6 +669,17 @@ def _spawn_ledger_corrupt_label(ops: OperationsState) -> str:
         f"⚠ corrupt ledger parked {fmt_age_seconds(ops.spawn_ledger_corrupt_age_seconds)} ago "
         "(read-only viewer; contents never parsed)"
     )
+
+
+def _pending_actions_label(ops: OperationsState) -> str:
+    """Staged writes per subsystem: counts and oldest age, never the payload."""
+    parts = []
+    for entry in ops.pending_actions:
+        label = f"{escape(entry.subsystem)}: {entry.count} · oldest {fmt_age_seconds(entry.oldest_age_seconds)}"
+        if entry.unreadable_count:
+            label += f" ({entry.unreadable_count} unreadable)"
+        parts.append(label)
+    return "  ".join(parts) + "  — /<subsystem> approve|reject <id>"
 
 
 def _blocked_scripts_label(ops: OperationsState) -> str:
@@ -857,6 +944,183 @@ def _delegation_procs_label(delegation: DelegationInfo) -> str:
     return " · ".join(parts) if parts else "—"
 
 
+# Compact labels for the counters worth a glance on the overview.
+_LOG_HEALTH_COMPACT_LABELS = {
+    "mcp_server_starts": "MCP starts",
+    "gateway_errors": "gateway errors",
+    "workspace_crashes": "workspace crashes",
+}
+
+
+def _log_health_compact(state: DashboardState) -> str:
+    """One line of last-hour rates, only for counters with events in 24h."""
+    parts = [
+        f"{_LOG_HEALTH_COMPACT_LABELS[counter.key]} {counter.last_1h}/1h"
+        for health in state.logs.health
+        for counter in health.counters
+        if counter.key in _LOG_HEALTH_COMPACT_LABELS and counter.last_24h
+    ]
+    return " · ".join(parts)
+
+
+def _log_health_table(state: DashboardState, theme: Theme) -> Table:
+    """Per-stream counters with the top repeated signatures (escaped)."""
+    table = Table(box=None, show_header=False, padding=(0, 2))
+    table.add_column("Key", style=theme.ui_label)
+    table.add_column("Value", style=theme.banner_text)
+    for health in state.logs.health:
+        table.add_row(escape(health.path), escape(log_health_summary(health)))
+        for top in health.top:
+            count = f"{top.last_24h}/24h" + (f" (+{top.undated} undated)" if top.undated else "")
+            table.add_row("", f"[{theme.banner_dim}]{count}[/]  {escape(top.signature)}")
+    return table
+
+
+def _disk_warnings(disk: DiskUsageState) -> list[str]:
+    """Compact one-liners for the disk checks that ``hermes doctor`` warns on."""
+    warnings: list[str] = []
+    if disk.unrotated_oversize_count:
+        plural = "s" if disk.unrotated_oversize_count != 1 else ""
+        warnings.append(f"{disk.unrotated_oversize_count} unrotated log{plural} > 10 MB")
+    if disk.state_db_wal_verdict == "warn":
+        warnings.append(f"WAL {_size_label(disk.state_db_wal_bytes)} (> 50 MB)")
+    if disk.checkpoints_over_cap:
+        warnings.append(f"checkpoints over {disk.checkpoints_cap_mb} MB cap")
+    if disk.cache_hogs:
+        warnings.append(f"{len(disk.cache_hogs)} cache dir(s) ≥ 1 GiB")
+    return warnings
+
+
+def _disk_has_readout(disk: DiskUsageState) -> bool:
+    return bool(
+        disk.log_files
+        or disk.sessions_bytes
+        or disk.checkpoints_bytes
+        or disk.scratch_bytes
+        or disk.cache_hogs
+        or disk.state_db_wal_bytes
+        or disk.databases
+    )
+
+
+def _approx_size(size_bytes: int, truncated: bool) -> str:
+    return f"≥{_size_label(size_bytes)}" if truncated else _size_label(size_bytes)
+
+
+def _disk_table(ops: OperationsState, disk: DiskUsageState, theme: Theme) -> Table:
+    table = Table(box=None, show_header=False, padding=(0, 2))
+    table.add_column("Key", style=theme.ui_label)
+    table.add_column("Value", style=theme.banner_text)
+    logs = f"{_size_label(disk.logs_dir_bytes)} in {disk.log_file_count} files"
+    if disk.unrotated_oversize_count:
+        logs += (
+            f" · [{theme.ui_warn}]{disk.unrotated_oversize_count} unrotated > 10 MB[/]"
+            " (upstream rotates only agent/errors/gateway/gui.log)"
+        )
+    table.add_row("Logs (root)", logs)
+    table.add_row("Sessions", _approx_size(disk.sessions_bytes, disk.sessions_truncated))
+    checkpoints = (
+        f"{_approx_size(disk.checkpoints_bytes, disk.checkpoints_truncated)} · "
+        f"cap {disk.checkpoints_cap_mb} MB · "
+        + ("enabled" if disk.checkpoints_enabled else "disabled")
+    )
+    if disk.checkpoints_over_cap:
+        checkpoints += f" · [{theme.ui_warn}]⚠ at or above the cap[/]"
+    table.add_row("Checkpoints", checkpoints)
+    if ops.snapshot_count:
+        table.add_row("State Snapshots", _size_label(ops.snapshot_total_bytes))
+    table.add_row(
+        "Scratch",
+        f"{_approx_size(disk.scratch_bytes, disk.scratch_truncated)} (pruned after idle)",
+    )
+    for hog in disk.cache_hogs:
+        table.add_row(
+            f"cache/{escape(hog.name)}",
+            f"[{theme.ui_warn}]⚠ {_approx_size(hog.size_bytes, hog.size_truncated)} "
+            "outside every pruner[/]",
+        )
+    wal = _size_label(disk.state_db_wal_bytes)
+    if disk.state_db_wal_verdict == "warn":
+        wal = f"[{theme.ui_warn}]⚠ {wal} (> 50 MB: missed checkpoints, or a live writer)[/]"
+    elif disk.state_db_wal_verdict == "note":
+        wal = f"{wal} (> 10 MB, normal for active sessions)"
+    table.add_row("state.db WAL", wal)
+    if disk.databases:
+        table.add_row("Journal Modes", _journal_modes_label(disk.databases))
+    if disk.pending_walks:
+        table.add_row("", f"[{theme.banner_dim}]{disk.pending_walks} dir(s) still being sized[/]")
+    return table
+
+
+def _journal_modes_label(databases: list[DatabaseJournal]) -> str:
+    parts = []
+    for db in databases:
+        mode = db.journal_mode or f"? ({db.error})"
+        parts.append(f"{escape(db.name)}: {escape(mode)}")
+    return " · ".join(parts)
+
+
+def _log_files_table(disk: DiskUsageState, theme: Theme) -> Table:
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("Log", style=theme.ui_accent)
+    table.add_column("Size", justify="right", style=theme.banner_text)
+    table.add_column("Growth/h", justify="right", style=theme.banner_text)
+    table.add_column("Rotation", style=theme.banner_dim)
+    for entry in disk.log_files:
+        growth = (
+            "—"
+            if entry.growth_bytes_per_hour is None
+            else _size_label(max(0, int(entry.growth_bytes_per_hour)))
+        )
+        if entry.rotated_upstream:
+            rotation = "rotated"
+        elif entry.unrotated_oversize:
+            rotation = f"[{theme.ui_warn}]⚠ unrotated[/]"
+        else:
+            rotation = "unrotated"
+        table.add_row(escape(entry.name), _size_label(entry.size_bytes), growth, rotation)
+    if disk.log_file_count > len(disk.log_files):
+        table.caption = _truncation_label(len(disk.log_files), disk.log_file_count)
+    return table
+
+
+def _snapshots_table(ops: OperationsState, theme: Theme) -> Table:
+    """Newest snapshots with the manifest's verdict; names and labels escaped."""
+    table = Table(box=None, show_header=True, padding=(0, 1))
+    table.add_column("Snapshot", style=theme.ui_accent)
+    table.add_column("Kind", style=theme.banner_dim)
+    table.add_column("Size", justify="right", style=theme.banner_text)
+    table.add_column("Age", justify="right", style=theme.banner_dim)
+    table.add_column("Label", style=theme.banner_text)
+    table.add_column("Manifest", style=theme.banner_text)
+    for snap in ops.snapshots:
+        size = _size_label(snap.size_bytes) + ("+" if snap.size_truncated else "")
+        table.add_row(
+            escape(snap.name),
+            snap.kind,
+            size,
+            fmt_age_seconds(snap.age_seconds),
+            escape(snap.label) or "—",
+            _snapshot_manifest_label(snap, theme),
+        )
+    return table
+
+
+def _snapshot_manifest_label(snap: StateSnapshotSummary, theme: Theme) -> str:
+    if snap.kind == "file":
+        return "loose db (no manifest)"
+    if not snap.manifest_present:
+        return f"[{theme.banner_dim}]no manifest[/]"
+    parts = [f"{snap.file_count} files"]
+    if snap.failed_dbs:
+        names = ", ".join(escape(name) for name in snap.failed_dbs)
+        parts.append(f"[{theme.ui_warn}]⚠ failed DBs: {names}[/]")
+    if snap.oversized_skipped:
+        names = ", ".join(escape(name) for name in snap.oversized_skipped)
+        parts.append(f"[{theme.ui_warn}]oversized skipped: {names}[/]")
+    return " · ".join(parts)
+
+
 def _state_db_table(ops: OperationsState, theme: Theme) -> Table:
     table = Table(box=None, show_header=False, padding=(0, 2))
     table.add_column("Key", style=theme.ui_label)
@@ -947,9 +1211,21 @@ def _verification_events_table(ops: OperationsState, theme: Theme) -> Table:
             escape(event.scope or "—"),
             escape(command) if command else "—",
             str(event.exit_code),
-            escape(event.output_summary) if event.output_summary else "—",
+            escape(_first_line(event.output_summary)) if event.output_summary.strip() else "—",
         )
     return event_table
+
+
+# A verification summary is the tool's captured output; the table shows its
+# first non-empty line, capped, so one noisy run cannot fill the detail view.
+_SUMMARY_CELL_CHARS = 120
+
+
+def _first_line(text: str) -> str:
+    line = next((part.strip() for part in text.splitlines() if part.strip()), "")
+    if len(line) > _SUMMARY_CELL_CHARS:
+        return line[: _SUMMARY_CELL_CHARS - 1] + "…"
+    return line
 
 
 def _verification_roots_table(ops: OperationsState, theme: Theme) -> Table:
@@ -1061,6 +1337,11 @@ def _discovered_repos_table(ops: OperationsState, theme: Theme) -> Table:
 
 
 def _size_label(size_bytes: int) -> str:
+    # Untrusted byte counts can be arbitrary-precision ints (a TEXT value in a
+    # numeric SQLite column); past 10**15 the precise figure is noise and the
+    # float division would raise OverflowError, so the label saturates.
+    if size_bytes >= 10**15:
+        return ">=1000T"
     if size_bytes >= 1_000_000_000:
         return f"{size_bytes / 1_000_000_000:.1f}G"
     if size_bytes >= 1_000_000:

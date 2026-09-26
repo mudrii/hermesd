@@ -136,7 +136,7 @@ class PlatformStatus(BaseModel):
     retrying_since_age_seconds: float | None = None
     # Per-served-profile mirror URLs synthesized from this port-binder's
     # listener_base (``<listener_base>/p/<profile><mirror_path>``,
-    # gateway/status.py:951-974), where a client reaches the profile on the
+    # gateway/status.py:1289-1312), where a client reaches the profile on the
     # default listener. Empty unless the writer is live and the adapter serves.
     mirror_urls: dict[str, str] = Field(default_factory=dict)
     # The synthesized roster is sliced to a display bound, so a short list must
@@ -182,10 +182,62 @@ class DeliveryObligationSummary(BaseModel):
     last_error: str = ""
 
 
+class GatewayBackendGroup(BaseModel):
+    """``gateway_heartbeats`` rows for one (profile, host): how many backends ever
+    registered there, and how fresh the newest one is. ``live`` means the newest
+    beat is within three 60 s refreshes; crashed rows only age out upstream."""
+
+    profile: str = ""
+    host: str = ""
+    backends: int = 0
+    last_heartbeat_age_seconds: float | None = None
+    newest_start_age_seconds: float | None = None
+    live: bool = False
+
+
+class ServeRestartObligation(BaseModel):
+    """A manual ``hermes serve``/``dashboard`` an update could not restart.
+
+    ``verified`` is True when this host observed the recorded incarnation's start
+    time; False when the pid is alive but its identity could not be checked.
+    """
+
+    kind: str = ""
+    profile: str = ""
+    pid: int = 0
+    verified: bool = False
+
+
+class UpdateReceiptSummary(BaseModel):
+    """One archived update run that never reached a clean finish."""
+
+    outcome: str = ""
+    finished_age_seconds: float | None = None
+    failed_step: str = ""
+
+
+class DeadTargetSummary(BaseModel):
+    """One confirmed-unreachable delivery target. The chat id is never read out."""
+
+    platform: str = ""
+    reason: str = ""
+    age_seconds: float | None = None
+
+
 class GatewayState(BaseModel):
     pid: int = 0
+    # Live and serving: the recorded ``gateway_state`` is ``running`` or ``degraded``
+    # (upstream's ``_DRAINABLE_GATEWAY_STATES``, gateway/status.py:1207-1209) and the
+    # recorded or launchd PID is alive.
     running: bool = False
+    # The recorded ``gateway_state`` verbatim. ``degraded`` is a serving gateway with a
+    # parked platform (gateway/run_startup.py:56-59), not a stopped one.
     state: str = "unknown"
+    # A dead gateway whose last record is the watchdog's ``degraded`` stamp with an
+    # ``exit_reason`` in upstream's ``WATCHDOG_EXIT_REASONS`` (gateway/status.py:362-385):
+    # the loop stopped dispatching and the watchdog hard-exited it. Empty otherwise,
+    # including once the operator recorded ``desired_state: stopped``.
+    watchdog_exit_reason: str = ""
     platforms: list[PlatformStatus] = Field(default_factory=list)
     hermes_version: str = ""
     updates_behind: int = 0
@@ -206,11 +258,25 @@ class GatewayState(BaseModel):
     # distinguishable from "no live record" — while ``served_profiles`` still keeps
     # the names a dead gateway left behind, as preserved rather than current.
     served_profiles_recorded: bool = False
+    # Why the live gateway stayed standalone instead of multiplexing: the boot
+    # guard's reason, persisted by ``record_multiplex_decision``
+    # (hermes_cli/gateway_multiplex_mode.py:194-199) and cleared on any other
+    # verdict. Redacted and capped; empty unless the state-file writer is live.
+    multiplex_standalone_reason: str = ""
     scale_to_zero_idle_timeout_minutes: int = 0
     scale_to_zero_relay_only: bool = False
     # Event-loop liveness (state/gateway.heartbeat)
     heartbeat_age_seconds: float | None = None
     loop_health: GatewayLoopHealth = GatewayLoopHealth.UNKNOWN
+    # The heartbeat's ``mem`` block in KiB (Linux-only upstream, absent elsewhere):
+    # gateway RSS, system MemTotal/MemAvailable and swap in use. ``memory_pressure``
+    # is upstream's tier (ok/elevated/critical) for a fresh sample, "unknown" for a
+    # stale or malformed one, and empty when no block was written.
+    memory_rss_kib: int | None = None
+    memory_total_kib: int | None = None
+    memory_available_kib: int | None = None
+    memory_swap_used_kib: int | None = None
+    memory_pressure: str = ""
     # Witness armed on the heartbeat that produced loop_health: True when the
     # payload advertised ``loop_tick_socket`` truthy, False when it wrote the key
     # with any other value (the witness could not be armed), and None when the
@@ -278,6 +344,19 @@ class GatewayState(BaseModel):
     update_receipt_unfinished: bool = False
     update_fleet_states: dict[str, int] = Field(default_factory=dict)
     update_fleet_runtime_count: int = 0
+    # ``code_root`` of fleet rows in state ``external``: runtimes serving a checkout
+    # the update did not touch, never counted as skew. Bounded and redacted.
+    update_fleet_external_roots: list[str] = Field(default_factory=list)
+    # The interpreter that finished the run after the code swap, if it re-execed.
+    update_post_swap_pid: int | None = None
+    # Manual ``hermes serve``/``dashboard`` restarts the receipt still owed.
+    update_pending_manual_serve_count: int = 0
+    # Set once a later check saw the whole live fleet current and settled latest.json.
+    update_settled_from_live_fleet_age_seconds: float | None = None
+    # Per-runtime restart outcomes (restarted/stopped/failed/deferred/unaccounted).
+    update_runtime_outcomes: dict[str, int] = Field(default_factory=dict)
+    update_skip_count: int = 0
+    update_skip_names: list[str] = Field(default_factory=list)
     # Restart history and delivery obligations (state.db)
     gateway_incarnation_count: int = 0
     gateway_restarts_24h: int = 0
@@ -285,25 +364,67 @@ class GatewayState(BaseModel):
     pending_delivery_count: int = 0
     failed_delivery_count: int = 0
     pending_deliveries: list[DeliveryObligationSummary] = Field(default_factory=list)
+    # Backend heartbeats (state.db gateway_heartbeats) grouped by profile and host,
+    # newest beat first and bounded.
+    gateway_backend_groups: list[GatewayBackendGroup] = Field(default_factory=list)
+    gateway_backend_groups_truncated: bool = False
+    # Planned-restart back-online notice still owed to home channels
+    # (.restart_pending.json, per profile). Pending is not "not restarted": the
+    # file outlives the restart until every home channel was notified.
+    restart_notice_pending: bool = False
+    restart_notice_requested_age_seconds: float | None = None
+    restart_notice_via_service: bool = False
+    restart_notice_detached: bool = False
+    restart_notice_delivered_count: int = 0
+    # Manual serve restarts an update still owes (serve_restart_pending/, per
+    # profile); only incarnations not provably gone are counted.
+    serve_restart_pending_count: int = 0
+    serve_restart_stale_count: int = 0
+    serve_restart_pending: list[ServeRestartObligation] = Field(default_factory=list)
+    serve_restart_scan_truncated: bool = False
+    # Archived update receipts (logs/update_receipts/update_*.json): how many of
+    # the newest runs were read, how many never finished cleanly, the newest few.
+    update_history_scanned: int = 0
+    update_history_failed: int = 0
+    update_failures: list[UpdateReceiptSummary] = Field(default_factory=list)
+    # Dead delivery targets (gateway/dead_targets.json, per profile): chats the
+    # gateway stopped sending to until a send succeeds. Newest few only.
+    dead_target_count: int = 0
+    dead_target_platforms: dict[str, int] = Field(default_factory=dict)
+    dead_targets: list[DeadTargetSummary] = Field(default_factory=list)
+    # Restart-loop breaker (gateway/restart_loop.json, per profile): boots that
+    # found restart-interrupted sessions, and the chain ending now. Tripped means
+    # the next such boot skips auto-resume.
+    restart_loop_boots_recorded: int = 0
+    restart_loop_chain: int = 0
+    restart_loop_max_restarts: int = 0
+    restart_loop_chain_gap_seconds: float = 0.0
+    restart_loop_tripped: bool = False
+    restart_loop_last_boot_age_seconds: float | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def degraded(self) -> bool:
+        """Serving, but a configured platform is parked or retrying."""
+        return self.running and self.state == "degraded"
 
 
 class MigrationVerificationGap(StrEnum):
     """Which clause of the verified predicate hermesd could not satisfy.
 
     ``NONE`` is the only value that licenses a "multiplexed (verified)" claim.
-    Every other value names *missing evidence*, never an outcome: upstream writes
-    the manifest before it flips the multiplex flag and restarts the default
-    gateway, and never updates it afterwards, so the file cannot tell a migration
-    still in flight from one that was applied and never verified — and neither can
-    hermesd. ``NO_MANIFEST`` is likewise ambiguous: rollback deletes the manifest on
-    success, so absence means "never migrated OR successfully rolled back".
+    Every other value names *missing evidence*, never an outcome. Convergence is
+    TOPOLOGY, not a config flag (``hermes_cli/gateway_migrate.py:1-8,130-139``), so
+    the multiplex flag is not a clause: an explicit ``false`` is retired and ignored
+    at boot. ``NO_MANIFEST`` is ambiguous: upstream deletes the manifest on confirmed
+    convergence and after a successful compensation, so absence means "never
+    migrated, converged, or compensated".
     """
 
     NONE = ""
     NO_MANIFEST = "no_manifest"
     MANIFEST_UNREADABLE = "manifest_unreadable"
     MANIFEST_INVALID = "manifest_invalid"
-    FLAG_OFF = "flag_off"
     GATEWAY_NOT_LIVE = "gateway_not_live"
     SERVED_NOT_RECORDED = "served_not_recorded"
     PROFILES_UNSERVED = "profiles_unserved"
@@ -313,9 +434,8 @@ class MigrationVerificationGap(StrEnum):
 class MigrationProfileRecord(BaseModel):
     """One profile's standalone-gateway footprint as recorded in the manifest.
 
-    ``home`` is display data that hermesd never resolves: upstream's rollback builds
-    ``Path(rec["home"])`` straight from this file (``gateway_migrate.py:594``), and
-    an untrusted manifest must not be able to steer a hermesd read. ``served`` is
+    ``home`` is display data that hermesd never resolves: an untrusted manifest must
+    not be able to steer a hermesd read. ``served`` is
     coverage by the *live* default gateway's recorded ``served_profiles``, so it is
     always False when nothing live was recorded.
     """
@@ -329,7 +449,7 @@ class MigrationProfileRecord(BaseModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def service_label(self) -> str:
-        """Upstream's own ``ProfileGateway.service_label()`` wording (``:48-52``)."""
+        """Upstream's ``_service_label`` wording (``gateway_migrate.py:88-92``)."""
         if not self.service_kind:
             return "none"
         if self.service_kind == "systemd":
@@ -338,30 +458,33 @@ class MigrationProfileRecord(BaseModel):
 
 
 class MigrationState(BaseModel):
-    """``gateway_migration.json``: recorded intent, progress, and one verified verdict.
+    """``gateway_migration.json``: an unfinished migration, its progress, one verdict.
 
-    Three things are kept apart on purpose, because the manifest conflates them:
+    Three things are kept apart on purpose:
 
     * **recorded intent** — the manifest contents. ``migrated_at`` means "the attempt
-      began at": upstream builds the dict and writes it *inside* the per-secondary
-      loop (``gateway_migrate.py:528-544``), before ``_write_multiplex_flag``
-      (``:545``) and before ``_restart_default`` (``:549``), rewrites it
-      byte-identically at ``:546``, and then never touches it again on either the
-      verified (``:553-557``) or the unverified (``:558-561``) path. There is no
-      ``completed``/``verified``/``outcome`` field, so the file is a start marker.
+      began at": upstream writes the dict once, before the first destructive step
+      (``gateway_migrate.py:945-953``), and never rewrites it. It deletes the file
+      when the apply confirms the default gateway serves every profile
+      (``:967-973``) and after a successful compensation (``:1059``, ``:1087``), so a
+      manifest on disk means the migration is UNFINISHED; re-running
+      ``hermes gateway migrate --multiplex`` resumes from it.
     * **intermediate progress** — ``flag_flipped``, ``default_gateway_live``,
       ``served_recorded`` and each record's ``served``: re-read every pass, and each
       one true of a migration that crashed halfway.
     * **verified current topology** — ``migration_verified``, derived from a
-      predicate over artifacts hermesd can actually read.
+      predicate over artifacts hermesd can actually read. A verified topology can
+      still leave a manifest behind (``already_multiplexed`` short-circuits without
+      deleting it, ``:130-139``).
 
-    ``multiplex_flag_on`` mirrors upstream's *reader* (``:203-215``), which ORs a
-    stale top-level ``multiplex_profiles`` alias with ``gateway.multiplex_profiles``
-    after an environment override hermesd cannot see — so every verdict built on it
-    is labelled "as recorded in config".
+    ``multiplex_flag_on`` is the explicit opt-in as upstream's
+    ``explicit_multiplex_flag`` reads it (``gateway_multiplex_mode.py:49-72``), minus
+    an environment override hermesd cannot see — so it is labelled "as recorded in
+    config". ``multiplex_flag_retired_off`` is an explicit ``false``, which is retired:
+    parsed, logged and resolved like an unset key (``:161-191``).
 
     Known limit: upstream verifies against every profile in its plan
-    (``expected = {p.name for p in plan.profiles}``, ``:551-552``), which includes
+    (``expected = {p.name for p in plan.profiles}``, ``:967``), which includes
     profiles that never had a standalone gateway and so are *not* in the manifest.
     hermesd can only see the manifest, so its expected set is a subset of upstream's
     and its verdict is correspondingly weaker.
@@ -369,8 +492,8 @@ class MigrationState(BaseModel):
 
     # Recorded intent (the manifest, never rewritten after the attempt began)
     manifest_present: bool = False
-    # A present manifest hermesd could not parse: upstream writes it with a plain
-    # write_text, so a torn file is observable mid-write. Distinct from absent.
+    # A present manifest hermesd could not parse (upstream writes it atomically, so
+    # this is a hand-edited or foreign file). Distinct from absent.
     manifest_parsed: bool = False
     # Parsed JSON can still be an unsupported or malformed migration schema.
     # Its intent remains displayable, but it cannot license a verified verdict.
@@ -385,6 +508,7 @@ class MigrationState(BaseModel):
     secondaries_truncated: bool = False
     # Intermediate progress, re-read every pass
     multiplex_flag_on: bool = False
+    multiplex_flag_retired_off: bool = False
     default_gateway_live: bool = False
     served_recorded: bool = False
 
@@ -421,8 +545,6 @@ class MigrationState(BaseModel):
             return MigrationVerificationGap.MANIFEST_UNREADABLE
         if not self.manifest_schema_valid:
             return MigrationVerificationGap.MANIFEST_INVALID
-        if not self.multiplex_flag_on:
-            return MigrationVerificationGap.FLAG_OFF
         if not self.default_gateway_live:
             return MigrationVerificationGap.GATEWAY_NOT_LIVE
         if not self.served_recorded:
@@ -482,6 +604,9 @@ class SessionInfo(BaseModel):
     last_activity_description: str = ""
     actual_cost_usd: float = 0.0
     cost_source: str = ""
+    # Which bot/transport profile a conversation arrived through
+    # (hermes_state_common.py:391); absent on older databases.
+    transport_profile: str = ""
     compression_failure_error: str = ""
     # The durable half of the compressor's anti-thrash guard
     # (hermes_state_common.py:375-379). Counters and timestamps only: nothing
@@ -610,7 +735,7 @@ class GatewayHygieneState(BaseModel):
 
 class GatewayRouteState(BaseModel):
     """Decoded ``gateway_routing.entry_json`` (one ``SessionEntry.to_dict()``,
-    ``gateway/session.py:535-545``) for one routed chat.
+    ``gateway/session.py:540-552``) for one routed chat.
 
     ``entry_json`` also carries token counters and Slack watermarks; only the
     state flags below are extracted, and ``display_name`` is redacted before it
@@ -874,9 +999,72 @@ class TokenAnalytics(BaseModel):
     model_usage_7d: list[ModelUsage] = Field(default_factory=list)
 
 
+class DailyUsage(BaseModel):
+    """One local calendar day of session usage, bucketed by session start."""
+
+    day: str
+    sessions: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    api_calls: int = 0
+    total_cost_usd: float = 0.0
+    cost_is_estimated: bool = True
+
+
+class TopSession(BaseModel):
+    session_id: str
+    title: str = ""
+    source: str = ""
+    model: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_cost_usd: float = 0.0
+    cost_is_estimated: bool = True
+    started_at: float = 0.0
+
+
+class RepoActivity(BaseModel):
+    repo_root: str
+    sessions_7d: int = 0
+    sessions_30d: int = 0
+
+
+class UsageAnalytics(BaseModel):
+    """Upstream insights/analytics views, derived from the visible session rows."""
+
+    daily: list[DailyUsage] = Field(default_factory=list)
+    by_source_24h: list[TokenBreakdown] = Field(default_factory=list)
+    by_source_7d: list[TokenBreakdown] = Field(default_factory=list)
+    top_sessions_7d: list[TopSession] = Field(default_factory=list)
+    # Sessions started per local hour of day (index 0-23) over the last 7 days.
+    hourly_sessions_7d: list[int] = Field(default_factory=list)
+    repos: list[RepoActivity] = Field(default_factory=list)
+
+
 class ToolStats(BaseModel):
     name: str
     call_count: int = 0
+
+
+class WorkerIdentity(StrEnum):
+    """Whether a recorded pid is still the process that was recorded.
+
+    Upstream records a start-time fingerprint beside the pid (kanban
+    ``worker_started_at``, ``hermes_cli/kanban_db_dispatch.py:361-413``; the
+    spawn ledger's ``create_time``, ``hermes_cli/process_identity.py:174-191``)
+    because pids are reused. A live pid whose observed start time disagrees is
+    ``REUSED`` — a stranger holds the number and the recorded process is gone.
+    """
+
+    # No pid recorded (or not a ledger entry): nothing to verify.
+    NONE = ""
+    LIVE = "live"
+    DEAD = "dead"
+    REUSED = "reused"
+    # Recorded as "unverified" upstream, unparseable, or unobservable here.
+    UNVERIFIED = "unverified"
+    # A pre-fingerprint row: only pid existence can be checked.
+    LEGACY = "legacy"
 
 
 class BackgroundProcessInfo(BaseModel):
@@ -904,6 +1092,14 @@ class BackgroundProcessInfo(BaseModel):
     # True when the recorded pid is still live (checked via the injected
     # pid_exists); False marks a stale ledger/registry entry.
     alive: bool = False
+    # Written by the ``process_identity`` source for spawn-ledger entries: the
+    # pid checked against its recorded ``create_time``, and the recorded
+    # spawner. ``orphaned`` is a live helper whose spawner is provably gone —
+    # the case upstream's startup sweep reaps
+    # (``hermes_cli/process_identity.py:325-360``).
+    identity: WorkerIdentity = WorkerIdentity.NONE
+    spawner_pid: int = 0
+    orphaned: bool = False
 
 
 class CheckpointInfo(BaseModel):
@@ -913,6 +1109,14 @@ class CheckpointInfo(BaseModel):
     commit_count: int = 0
     last_reason: str = ""
     last_checkpoint_at: float | None = None
+
+
+class CronModelSource(StrEnum):
+    """Which axis resolved a cron job's model, in upstream's precedence order."""
+
+    PINNED = "pinned"
+    CRON_DEFAULT = "cron.model default"
+    MAIN_MODEL = "follows main model"
 
 
 class CronJob(BaseModel):
@@ -939,10 +1143,19 @@ class CronJob(BaseModel):
     repeat_times: int | None = None
     repeat_completed: int = 0
     no_agent: bool = False
-    # Explicit inference pins from jobs.json. Empty means unpinned, which is the
-    # condition under which upstream records a resolution snapshot instead.
+    # Explicit inference pins from jobs.json. Empty means unpinned: the job
+    # follows ``cron.model`` or the main model at fire time.
     model: str = ""
     provider: str = ""
+    # The model the next fire resolves to, and which axis it came from
+    # (``_load_cron_job_config``, ``cron/scheduler.py:1561-1590``). "" / None for
+    # a no-agent job or when nothing is configured (upstream refuses to run).
+    effective_model: str = ""
+    model_source: CronModelSource | None = None
+    # ``quota_hold_until`` (``cron/quota_hold.py:27,69-93``): fires are parked
+    # past a closed provider usage window. Verbatim instant while the hold is
+    # active; "" once it has expired, which upstream treats as inert.
+    quota_hold_until: str = ""
     # ``fire_claim`` (``cron/jobs.py:2588-2608``): the dispatch lease, refreshed
     # every 60 s against a 300 s TTL. ``fire_claim_state`` is derived from the
     # claim age in the collector; both are None/"" when no usable claim exists.
@@ -961,11 +1174,6 @@ class CronJob(BaseModel):
     # ``preflight_alerted`` (``cron/jobs.py:2190-2198``): upstream's alert-once
     # dedup marker for a config-blocked job.
     preflight_alerted: bool = False
-    # Creation-time resolution snapshots for unpinned axes
-    # (``cron/jobs.py:1600-1630``). Empty means pinned, no-agent, or unrecorded
-    # (older agent) — the snapshot is what the job will actually run.
-    model_snapshot: str = ""
-    provider_snapshot: str = ""
 
 
 class CronTickerHealth(StrEnum):
@@ -1042,6 +1250,10 @@ class CronIncident(BaseModel):
     failure_type: str = ""
     first_seen_age_seconds: float | None = None
     last_seen_age_seconds: float | None = None
+    # Age of the latest delivered failure ping: upstream restamps ``alerted_at``
+    # on every alert, including cooldown reminders (``cron/incidents.py:196-212``).
+    # None when no ping was delivered or the ledger predates the column.
+    alerted_age_seconds: float | None = None
     error_excerpt: str = ""
 
 
@@ -1049,9 +1261,16 @@ class CronExecutionsState(BaseModel):
     db_present: bool = False
     job_stats: list[CronJobExecutionStats] = Field(default_factory=list)
     recent: list[CronExecution] = Field(default_factory=list)
+    # The newest failed runs regardless of age, so a failure pushed out of
+    # ``recent`` by later successes still shows its (redacted) error.
+    recent_failures: list[CronExecution] = Field(default_factory=list)
     open_incident_count: int = 0
     unacked_incident_count: int = 0
     open_incidents: list[CronIncident] = Field(default_factory=list)
+    # ``resolved`` = the job ran OK after the failure; a repeat of the same error
+    # re-opens it (``cron/incidents.py:32,151-181,233-248``). Not open, not acked.
+    resolved_incident_count: int = 0
+    resolved_24h_count: int = 0
     # Retention. Upstream prunes terminal history to a fixed record cap, so every
     # aggregate above describes *recorded* attempts rather than every attempt that
     # happened. ``retention_cap`` is 0 when the table could not be read, which is
@@ -1062,6 +1281,129 @@ class CronExecutionsState(BaseModel):
     at_retention_cap: bool = False
     oldest_claimed_age_seconds: float | None = None
     newest_claimed_age_seconds: float | None = None
+
+
+class CronJobUsage(BaseModel):
+    """One job's fires and tokens from ``cron/usage_audit.jsonl``.
+
+    Tokens sum only the fires that recorded ``total_tokens``; a fire without
+    them (script job, pre-agent failure) still counts as a fire.
+    """
+
+    job_id: str = ""
+    job_name: str = ""
+    fires_24h: int = 0
+    tokens_24h: int = 0
+    fires_7d: int = 0
+    tokens_7d: int = 0
+    errors_7d: int = 0
+    last_fire_age_seconds: float | None = None
+    last_total_tokens: int | None = None
+    last_model: str = ""
+    last_duration_seconds: float | None = None
+    last_error_excerpt: str = ""
+
+
+class CronUsageState(BaseModel):
+    """Per-fire usage audit (``_FireAudit``, ``cron/scheduler.py:2415-2433``).
+
+    Upstream never prunes the ledger, so only a capped tail is read.
+    ``window_truncated`` means that tail was cut while still inside the 7d
+    window: the 7d figures are then a lower bound.
+    """
+
+    present: bool = False
+    jobs: list[CronJobUsage] = Field(default_factory=list)
+    tokens_24h: int = 0
+    tokens_7d: int = 0
+    fires_7d: int = 0
+    window_truncated: bool = False
+    unparseable_lines: int = 0
+
+
+class CronDeliveryFailure(BaseModel):
+    """A terminal delivery that did not land: ``failed``, or ``unknown`` (the
+    claiming gateway died mid-send; never retried, ``cron/delivery_queue.py:1-7``)."""
+
+    execution_id: str = ""
+    status: str = ""
+    for_failure: bool = False
+    finished_age_seconds: float | None = None
+    error_excerpt: str = ""
+
+
+class CronDeliveryQueueState(BaseModel):
+    """``cron/deliveries.db``: the durable gateway handoff for cron sends.
+
+    ``pending_count`` covers ``pending`` and in-flight ``delivering`` rows;
+    terminal rows are retained up to a 1000-row cap
+    (``MAX_TERMINAL_DELIVERIES``, ``cron/delivery_queue.py:35``), so
+    ``status_counts`` describes the retained rows only.
+    """
+
+    db_present: bool = False
+    status_counts: dict[str, int] = Field(default_factory=dict)
+    pending_count: int = 0
+    oldest_pending_age_seconds: float | None = None
+    failed_24h: int = 0
+    recent_failures: list[CronDeliveryFailure] = Field(default_factory=list)
+
+
+class CronBotChatReceipt(BaseModel):
+    """A deferred Bot Chat send needing attention; its ``content`` is never kept."""
+
+    receipt_id: str = ""
+    job_name: str = ""
+    status: str = ""
+    for_failure: bool = False
+    # From the receipt file's mtime: upstream records no timestamp.
+    age_seconds: float | None = None
+    error_excerpt: str = ""
+
+
+class CronBotChatState(BaseModel):
+    """``cron/bot_chat_pending/<key>.json`` deferred Bot Chat receipts.
+
+    Statuses (``cron/bot_chat_delivery.py:60-150``): ``queued`` and ``claimed``
+    are unsettled — a persisted claim never expires, so an old ``claimed`` is a
+    send that may never finish; ``ambiguous`` errored after the claim;
+    ``settled``/``transferred``/``suppressed`` are done. Upstream never prunes
+    the directory, so the scan is capped (``scan_truncated``).
+    """
+
+    present: bool = False
+    status_counts: dict[str, int] = Field(default_factory=dict)
+    unsettled_count: int = 0
+    oldest_unsettled_age_seconds: float | None = None
+    attention: list[CronBotChatReceipt] = Field(default_factory=list)
+    unreadable_count: int = 0
+    scan_truncated: bool = False
+
+
+class CronRecoveryLedger(BaseModel):
+    """One fire-path recovery ledger under ``cron/`` (append-only JSONL).
+
+    Each entry is a wedge the scheduler had to recover from: a stale-error
+    re-arm (``cron/jobs.py:1025-1036``), a timezone-migration catch-up fire
+    (``:1110-1126``) or a forced in-flight release (``cron/scheduler.py:868-884``).
+    Written best effort, so absence proves nothing. ``window_truncated`` means
+    the capped tail ended inside the 7d window (a lower bound).
+    """
+
+    kind: str = ""
+    label: str = ""
+    count_24h: int = 0
+    count_7d: int = 0
+    newest_age_seconds: float | None = None
+    newest_job_name: str = ""
+    newest_detail: str = ""
+    window_truncated: bool = False
+
+
+class CronRecoveryState(BaseModel):
+    """The recovery ledgers that exist on disk, in a fixed order."""
+
+    ledgers: list[CronRecoveryLedger] = Field(default_factory=list)
 
 
 class CronState(BaseModel):
@@ -1168,6 +1510,18 @@ class ConfigBackupGroup(BaseModel):
     newest_age_seconds: float | None = None
 
 
+class ProfileRouteSummary(BaseModel):
+    """One gateway.profile_routes rule — which discriminators it uses, never their ids."""
+
+    name: str = ""
+    platform: str = ""
+    profile: str = ""
+    enabled: bool = True
+    bot_profile: str = ""
+    # Subset of guild_id/chat_id/thread_id/user_id the rule matches on.
+    discriminators: list[str] = Field(default_factory=list)
+
+
 class ConfigSummary(BaseModel):
     model: str = ""
     provider: str = ""
@@ -1262,6 +1616,29 @@ class ConfigSummary(BaseModel):
     config_backups_present: bool = False
     config_backup_groups: list[ConfigBackupGroup] = Field(default_factory=list)
     config_backup_groups_truncated: bool = False
+    # Integration switches read from config.yaml — flags and names only.
+    # platforms.webhook.enabled (hermes_cli/webhook.py:42-55).
+    webhook_platform_enabled: bool = False
+    # profile_routes, root key first then gateway.profile_routes
+    # (gateway/config_loader.py:93,106-126; gateway/profile_routing.py:133-171).
+    profile_routes: list[ProfileRouteSummary] = Field(default_factory=list)
+    # Entries upstream's parser skips (no platform/profile, or a null/empty
+    # user_id) — counted, never rendered as routes.
+    profile_routes_skipped: int = 0
+    # monitoring.* (hermes_cli/config_defaults.py:2038-2060): nothing is sent
+    # until export is enabled with an endpoint; the endpoint URL itself is not
+    # surfaced (presence only).
+    monitoring_health_export_enabled: bool = False
+    monitoring_otlp_enabled: bool = False
+    monitoring_otlp_endpoint_configured: bool = False
+    # The bundled observability/langfuse plugin passes the plugins.enabled /
+    # plugins.disabled gate (hermes_cli/tools_config_post_setup.py:279-291).
+    langfuse_plugin_enabled: bool = False
+    # Doctor parity (hermes_cli/doctor_config.py:341-361,405-430), from the file
+    # alone: root-level string provider/base_url that belong under model:, and
+    # legacy custom_providers list entries with no providers: twin.
+    stale_root_keys: list[str] = Field(default_factory=list)
+    legacy_custom_provider_labels: list[str] = Field(default_factory=list)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -1291,6 +1668,13 @@ class ProviderInfo(BaseModel):
     free_tier: bool = False
 
 
+class ModelCooldown(BaseModel):
+    """One model a pooled credential is benched for (model name only)."""
+
+    model: str
+    remaining_seconds: float = 0.0
+
+
 class CredentialPoolEntry(BaseModel):
     name: str
     label: str = ""
@@ -1298,7 +1682,11 @@ class CredentialPoolEntry(BaseModel):
     source: str = ""
     last_status: str = ""
     request_count: int = 0
-    cooldown_remaining: str = ""
+    # Seconds the representative entry stays benched after an exhaustion
+    # (agent/credential_pool.py:468-480); None when it is not cooling down.
+    cooldown_remaining_seconds: float | None = None
+    # Active per-model cooldowns merged across the provider's entries.
+    model_cooldowns: list[ModelCooldown] = Field(default_factory=list)
     priority: int = 0
     token_present: bool = False
     expires_at: str = ""
@@ -1498,6 +1886,55 @@ class SkillsMemory(BaseModel):
     plugin_catalog_cache_age_seconds: float | None = None
     plugin_catalog_update_count: int = 0
     plugin_catalog_removed_count: int = 0
+    # `skills_hub` source: skills/.hub/lock.json installed entries and
+    # skills/.hub/quarantine/ directories (tools/skills_hub.py:59-62,295-344;
+    # the counts `hermes doctor` reports, hermes_cli/doctor_state.py:452-464).
+    hub_lock_present: bool = False
+    hub_installed_count: int = 0
+    hub_quarantine_count: int = 0
+
+
+class PairingPlatformSummary(BaseModel):
+    """One platform's pairing store: counts and the newest approval time only.
+
+    Pending entries hold hashed one-time codes and approved entries hold user
+    ids and names; none of that leaves the collector.
+    """
+
+    platform: str
+    pending_count: int = 0
+    approved_count: int = 0
+    newest_approved_age_seconds: float | None = None
+
+
+class RateLimitHold(BaseModel):
+    """An active ``rate_limits/<name>.json`` hold (agent/nous_rate_guard.py:36-86)."""
+
+    name: str
+    remaining_seconds: float = 0.0
+    recorded_age_seconds: float | None = None
+
+
+class IntegrationsState(BaseModel):
+    """Runtime integration stores, each written by its own health source."""
+
+    # `pairing`: platforms/pairing/<platform>-{pending,approved}.json.
+    pairing_platforms: list[PairingPlatformSummary] = Field(default_factory=list)
+    # `webhook_subscriptions`: webhook_subscriptions.json route names and flags.
+    webhook_subscriptions_present: bool = False
+    webhook_subscription_count: int = 0
+    webhook_enabled_count: int = 0
+    webhook_route_names: list[str] = Field(default_factory=list)
+    # `shared_metrics`: telemetry/shared_metrics/metrics.sqlite3 bookkeeping.
+    shared_metrics_present: bool = False
+    shared_metrics_counter_rows: int = 0
+    shared_metrics_pending_periods: int = 0
+    shared_metrics_outbox_by_state: dict[str, int] = Field(default_factory=dict)
+    shared_metrics_outbox_error_count: int = 0
+    # consent_marks name -> stamp ("obs", "data").
+    shared_metrics_consent_marks: dict[str, str] = Field(default_factory=dict)
+    # `rate_limits`: active provider rate-limit holds.
+    rate_limit_holds: list[RateLimitHold] = Field(default_factory=list)
 
 
 class ToolsetAvailability(BaseModel):
@@ -1625,11 +2062,30 @@ class ProfileSummary(BaseModel):
     skill_count: int = 0
     db_size_bytes: int = 0
     soul_excerpt: str = ""
+    # The file checks `hermes doctor` runs per profile
+    # (hermes_cli/doctor_state.py:560-565): "⚠ missing config", "no .env".
+    config_present: bool = False
+    env_present: bool = False
+
+
+class DuplicatePlatformCredential(BaseModel):
+    """A platform credential key NAME set in more than one profile's .env.
+
+    Values are never read into the model or compared: the same name in two
+    profiles is the shape of upstream's duplicate-credential finding
+    (hermes_cli/gateway_migrate.py:403-431), not proof the tokens are equal.
+    """
+
+    key: str
+    platform: str = ""
+    profiles: list[str] = Field(default_factory=list)
 
 
 class ProfilesState(BaseModel):
     profile_count: int = 0
     profiles: list[ProfileSummary] = Field(default_factory=list)
+    # `profile_credentials` source: root .env ("default") and profiles/*/.env.
+    duplicate_platform_credentials: list[DuplicatePlatformCredential] = Field(default_factory=list)
 
 
 class LogLine(BaseModel):
@@ -1668,12 +2124,60 @@ class LogStream(BaseModel):
     lines: list[LogLine] = Field(default_factory=list)
 
 
+class LogHealthCounter(BaseModel):
+    """One event class counted in an incrementally scanned log.
+
+    ``last_1h``/``last_24h`` count dated events: the line's own timestamp, the
+    nearest timestamp above it in the same file, or — for lines appended while
+    hermesd watches a log that carries no timestamps — the refresh that first
+    saw them. ``undated`` counts events found in the initial backfill of a log
+    with no usable timestamp, which cannot be placed in either window.
+    """
+
+    key: str
+    label: str
+    last_1h: int = 0
+    last_24h: int = 0
+    undated: int = 0
+    last_seen_age_seconds: float | None = None
+
+
+class LogSignatureCount(BaseModel):
+    """A repeated error signature (or MCP server name) with its 24h count."""
+
+    signature: str
+    last_24h: int = 0
+    undated: int = 0
+    last_seen_age_seconds: float | None = None
+
+
+class LogStreamHealth(BaseModel):
+    """Health counters for one log scanned incrementally (source ``log_health``).
+
+    Only appended bytes are read once a log has been caught up; the first sight
+    of a log scans at most a bounded backfill from its end, a chunk per
+    refresh, so ``backlog_bytes`` is non-zero while that catch-up is running and
+    counts cover only ``scanned_bytes`` of history.
+    """
+
+    stream: str
+    path: str = ""
+    size_bytes: int = 0
+    scanned_bytes: int = 0
+    backlog_bytes: int = 0
+    oldest_event_age_seconds: float | None = None
+    counters: list[LogHealthCounter] = Field(default_factory=list)
+    top: list[LogSignatureCount] = Field(default_factory=list)
+
+
 class LogState(BaseModel):
     agent_lines: list[LogLine] = Field(default_factory=list)
     gateway_lines: list[LogLine] = Field(default_factory=list)
     error_lines: list[LogLine] = Field(default_factory=list)
     cron_lines: list[LogLine] = Field(default_factory=list)
     streams: list[LogStream] = Field(default_factory=list)
+    # Written by its own source (``log_health``).
+    health: list[LogStreamHealth] = Field(default_factory=list)
 
 
 class ChannelPlatformInfo(BaseModel):
@@ -1730,6 +2234,11 @@ class KanbanTaskSummary(BaseModel):
     # configured kanban.failure_limit at collect time.
     breaker_limit: int = 0
     breaker_tripped: bool = False
+    # Spawn-time fingerprint of worker_pid as stored ("<epoch>|<start>", a
+    # legacy integer, "unverified", or "" for NULL), and the verdict the
+    # ``kanban_worker_identity`` source derives from it.
+    worker_started_at: str = ""
+    worker_identity: WorkerIdentity = WorkerIdentity.NONE
 
 
 class KanbanRunSummary(BaseModel):
@@ -1739,6 +2248,8 @@ class KanbanRunSummary(BaseModel):
     status: str = ""
     outcome: str = ""
     worker_pid: int = 0
+    worker_started_at: str = ""
+    worker_identity: WorkerIdentity = WorkerIdentity.NONE
     started_at: int = 0
     ended_at: int = 0
     error: str = ""
@@ -1795,6 +2306,9 @@ class KanbanState(BaseModel):
     board_count: int = 0
     current_board: str = ""
     stale_claim_count: int = 0
+    # Listed tasks and runs whose live worker pid now belongs to another
+    # process (``kanban_worker_identity`` source).
+    worker_pid_reused_count: int = 0
     boards: list[KanbanBoardSummary] = Field(default_factory=list)
     status_counts: dict[str, int] = Field(default_factory=dict)
     assignee_counts: dict[str, int] = Field(default_factory=dict)
@@ -2020,7 +2534,7 @@ class DbRecoveryState(BaseModel):
     """
 
     # ``state.db.repair-attempts.json`` — ``_repair_ledger_path``,
-    # ``hermes_state_repair.py:317-318``.
+    # ``hermes_state_repair.py:318-319``.
     repair_ledger_present: bool = False
     failed_attempts: int = 0
     # ``datetime.now().isoformat(timespec="seconds")``: naive local time.
@@ -2310,7 +2824,7 @@ class ApiRunReservationsState(BaseModel):
     """Retained API run reservations, read from ``runs_idempotency.db``.
 
     **An empty store is not an idle API.** ``_prune_stale_terminal_locked``
-    (``api_server_run_idempotency.py:168-186``) runs inside every ``reserve`` and
+    (``api_server_run_idempotency.py:169-187``) runs inside every ``reserve`` and
     ``lookup`` and deletes an aged row only once its stored status is terminal,
     and long room runs push ``retention_until`` out
     (``api_server_runs.py:56-61,222-232``). On top of that, when the file cannot
@@ -2402,6 +2916,113 @@ class ProcessReceiptsState(BaseModel):
     receipts_truncated: bool = False
 
 
+class LogFileUsage(BaseModel):
+    """One file under ROOT ``logs/``: size, observed growth and rotation."""
+
+    name: str
+    size_bytes: int = 0
+    # Bytes per hour over the window this dashboard has observed (up to an
+    # hour); None until two samples a minute apart exist or after a shrink.
+    growth_bytes_per_hour: float | None = None
+    # Upstream attaches a RotatingFileHandler only to agent/errors/gateway/gui
+    # (``hermes_logging.py:241-244``); everything else grows without bound.
+    rotated_upstream: bool = False
+    unrotated_oversize: bool = False
+
+
+class CacheDirUsage(BaseModel):
+    name: str
+    size_bytes: int = 0
+    size_truncated: bool = False
+
+
+class DatabaseJournal(BaseModel):
+    """Journal mode of one Hermes database from header byte 18 (never opened)."""
+
+    name: str
+    size_bytes: int = 0
+    journal_mode: str = ""
+    error: str = ""
+
+
+class DiskUsageState(BaseModel):
+    """Disk footprint and retention of the Hermes home (source ``disk_usage``).
+
+    Directory totals come from bounded walks recomputed at most every few
+    minutes, so they lag the disk slightly; a ``*_truncated`` total is a lower
+    bound. ``pending_walks`` counts directories not yet walked because the
+    per-refresh walk budget ran out.
+    """
+
+    logs_dir_bytes: int = 0
+    log_file_count: int = 0
+    log_files: list[LogFileUsage] = Field(default_factory=list)
+    unrotated_oversize_count: int = 0
+    sessions_bytes: int = 0
+    sessions_truncated: bool = False
+    checkpoints_bytes: int = 0
+    checkpoints_truncated: bool = False
+    # ``checkpoints.enabled`` defaults to false and ``max_total_size_mb`` to 500
+    # (``tools/checkpoint_manager.py:1206-1221``); the doctor warns only when
+    # enabled and at or above the cap.
+    checkpoints_enabled: bool = False
+    checkpoints_cap_mb: int = 500
+    checkpoints_over_cap: bool = False
+    scratch_bytes: int = 0
+    scratch_truncated: bool = False
+    # cache/* dirs outside the pruned scratch/terminal at or above 1 GiB
+    # (``hermes_cli/doctor_state.py:168-190``).
+    cache_hogs: list[CacheDirUsage] = Field(default_factory=list)
+    state_db_wal_bytes: int = 0
+    # "ok", "note" (> 10 MB) or "warn" (> 50 MB), the doctor's thresholds
+    # (``hermes_cli/doctor_state.py:354-390``).
+    state_db_wal_verdict: str = "ok"
+    databases: list[DatabaseJournal] = Field(default_factory=list)
+    pending_walks: int = 0
+
+
+class PendingActionSubsystem(BaseModel):
+    """Writes staged for operator review under PROFILE ``pending/<subsystem>/``.
+
+    Upstream's write-approval gate stages a memory/skill write as one JSON
+    record per id (``tools/write_approval.py:64-86``) until it is approved or
+    discarded. Only the count and the oldest ``created_at`` are carried — the
+    staged payload is never read into state. ``unreadable_count`` records the
+    files upstream's own ``list_pending`` would skip; they are still counted
+    and aged by mtime.
+    """
+
+    subsystem: str
+    count: int = 0
+    oldest_age_seconds: float | None = None
+    unreadable_count: int = 0
+
+
+class StateSnapshotSummary(BaseModel):
+    """One snapshot under ROOT ``state-snapshots/``.
+
+    A ``dir`` is an upstream quick snapshot (``hermes_cli/backup.py:1237-1294``)
+    whose ``manifest.json`` names what the copy captured; a ``file`` is a loose
+    parked database grouped with its ``-wal``/``-shm``/``-journal`` sidecars.
+    ``size_bytes`` is measured on disk by a bounded walk (``size_truncated`` when
+    the bound cut it short); ``manifest_total_size`` is what upstream recorded.
+    A non-empty ``failed_dbs`` means the snapshot is missing databases upstream
+    tried and failed to copy, so it cannot restore them.
+    """
+
+    name: str
+    kind: Literal["dir", "file"] = "dir"
+    size_bytes: int = 0
+    size_truncated: bool = False
+    age_seconds: float | None = None
+    manifest_present: bool = False
+    label: str = ""
+    file_count: int = 0
+    manifest_total_size: int = 0
+    failed_dbs: list[str] = Field(default_factory=list)
+    oversized_skipped: list[str] = Field(default_factory=list)
+
+
 class OperationsState(BaseModel):
     dashboard_process_count: int = 0
     desktop_build_stamp: str = ""
@@ -2459,11 +3080,19 @@ class OperationsState(BaseModel):
     snapshot_count: int = 0
     snapshot_total_bytes: int = 0
     newest_snapshot_age_seconds: float | None = None
+    # Newest-first slice of the snapshots counted above, and how many of ALL
+    # counted snapshots carry a manifest with failed_dbs.
+    snapshots: list[StateSnapshotSummary] = Field(default_factory=list)
+    snapshot_failed_count: int = 0
     web_ui_build_hash: str = ""
     web_ui_built_age_seconds: float | None = None
     blocked_script_count: int = 0
     newest_blocked_script_age_seconds: float | None = None
     blocked_script_names: list[str] = Field(default_factory=list)
+    # Written by its own source (``pending_actions``): staged writes awaiting
+    # operator review, per subsystem.
+    pending_actions: list[PendingActionSubsystem] = Field(default_factory=list)
+    pending_action_total: int = 0
     # Written by its own source (``db_recovery``), so a corrupt repair ledger or
     # retired-WAL manifest degrades only this field and keeps its last-good value.
     db_recovery: DbRecoveryState = Field(default_factory=DbRecoveryState)
@@ -2522,6 +3151,15 @@ class SkillCurationWindow(BaseModel):
     days_until_archive: float | None = None
 
 
+class CuratorLedgerAction(BaseModel):
+    """One skills/.curator_ledger.jsonl row, without its file manifests."""
+
+    ts: str = ""
+    actor: str = ""
+    action: str = ""
+    skill: str = ""
+
+
 class CuratorRun(BaseModel):
     run_present: bool = False
     stamp: str = ""
@@ -2564,6 +3202,21 @@ class CuratorRun(BaseModel):
     # Display-bounded slice of the per-skill windows, soonest deadline first;
     # managed_skill_count is the complete number.
     skill_windows: list[SkillCurationWindow] = Field(default_factory=list)
+    # skills/.curator_state last_run_duration_seconds (agent/curator.py:45,949).
+    last_run_duration_seconds: float | None = None
+    # `curator_activity` source: skills/.curator_suppressed (built-ins the
+    # curator pruned), the tail of skills/.curator_ledger.jsonl, and the
+    # skills/.locks/curator-run claim (agent/curator.py:1116-1141).
+    suppressed_count: int = 0
+    ledger_present: bool = False
+    # Newest first, display-bounded; actor/action/skill/timestamp only.
+    ledger_recent: list[CuratorLedgerAction] = Field(default_factory=list)
+    run_claim_present: bool = False
+    run_claim_pid: int | None = None
+    run_claim_age_seconds: float | None = None
+    # A claim is a live run only while its pid is alive and it is younger than
+    # upstream's one-hour takeover window.
+    run_claim_live: bool = False
 
 
 class HealthSummary(BaseModel):
@@ -2580,6 +3233,15 @@ class RuntimeStatus(BaseModel):
     agent_running: bool = False
     last_activity_age_seconds: float | None = None
     banner: str = ""
+    # Global emergency stop (``hermes pause``): the ``ESTOP`` sentinel pauses
+    # NEW cron, kanban and gateway work; in-flight work keeps running
+    # (``agent/estop.py:1-8``). Written by its own ``estop`` source. A profile
+    # process honours its own home first, then the fleet root (``:33-50``);
+    # ``estop_scope`` says which sentinel was found.
+    estop_engaged: bool = False
+    estop_reason: str = ""
+    estop_age_seconds: float | None = None
+    estop_scope: str = ""
 
 
 class DashboardState(BaseModel):
@@ -2603,6 +3265,7 @@ class DashboardState(BaseModel):
     tokens_today: TokenSummary = Field(default_factory=TokenSummary)
     tokens_total: TokenSummary = Field(default_factory=TokenSummary)
     token_analytics: TokenAnalytics = Field(default_factory=TokenAnalytics)
+    usage_analytics: UsageAnalytics = Field(default_factory=UsageAnalytics)
     tool_stats: list[ToolStats] = Field(default_factory=list)
     total_tool_calls: int = 0
     available_tools: int = 0
@@ -2613,10 +3276,17 @@ class DashboardState(BaseModel):
     config: ConfigSummary = Field(default_factory=ConfigSummary)
     cron: CronState = Field(default_factory=CronState)
     cron_executions: CronExecutionsState = Field(default_factory=CronExecutionsState)
+    cron_usage: CronUsageState = Field(default_factory=CronUsageState)
+    cron_deliveries: CronDeliveryQueueState = Field(default_factory=CronDeliveryQueueState)
+    cron_bot_chat: CronBotChatState = Field(default_factory=CronBotChatState)
+    cron_recovery: CronRecoveryState = Field(default_factory=CronRecoveryState)
     channels: ChannelDirectoryState = Field(default_factory=ChannelDirectoryState)
     kanban: KanbanState = Field(default_factory=KanbanState)
     operations: OperationsState = Field(default_factory=OperationsState)
+    # Disk footprint and retention (source ``disk_usage``), rendered in panel 12.
+    disk: DiskUsageState = Field(default_factory=DiskUsageState)
     skills_memory: SkillsMemory = Field(default_factory=SkillsMemory)
+    integrations: IntegrationsState = Field(default_factory=IntegrationsState)
     mcp_cache: MCPSchemaCache = Field(default_factory=MCPSchemaCache)
     skills_prompt: SkillsPromptSnapshot = Field(default_factory=SkillsPromptSnapshot)
     memory: MemoryOverview = Field(default_factory=MemoryOverview)

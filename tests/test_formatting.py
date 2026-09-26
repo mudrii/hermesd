@@ -14,6 +14,7 @@ from hermesd.panels.formatting import (
     fmt_tokens,
     fmt_usd,
     sanitize_terminal_text,
+    sparkline,
 )
 
 
@@ -151,3 +152,35 @@ def test_fmt_age_seconds_tiers_and_non_finite_guard(age: float | None, expected:
 )
 def test_fmt_bytes_uses_binary_units(size: int, expected: str):
     assert fmt_bytes(size) == expected
+
+
+def test_fmt_tokens_saturates_counts_past_the_cap():
+    """SQLite TEXT in a numeric column coerces to an arbitrary-precision int;
+    dividing it into a float raises OverflowError, so absurd counts saturate."""
+    assert fmt_tokens(10**400) == ">=999T"
+    assert fmt_tokens(-(10**400)) == "<=-999T"
+
+
+def test_fmt_tokens_below_the_cap_is_unchanged():
+    assert fmt_tokens(999_000_000_000_000) == "999000000.0M"
+    assert fmt_tokens(-999_000_000_000_000) == "-999000000.0M"
+
+
+def test_fmt_bytes_saturates_absurd_sizes():
+    assert fmt_bytes(10**400) == ">=1024 TB"
+    assert fmt_bytes(1024**5) == ">=1024 TB"
+    assert fmt_bytes(1000 * 1024**4) == "1000.0 TB"
+
+
+def test_sparkline_scales_arbitrary_precision_counts():
+    huge = 10**400
+    assert sparkline([huge, 0]) == "█▁"
+    assert sparkline([huge, huge]) == "██"
+    # huge//2 / huge -> ceil(0.5 * 7) = 4 -> ▅; exact integer math, no float.
+    assert sparkline([huge, huge // 2, 0]) == "█▅▁"
+
+
+def test_sparkline_keeps_a_tiny_positive_share_above_the_zero_block():
+    # ceil(1 / 10**20 * 7) == 1: a small positive value must not collapse to ▁.
+    assert sparkline([1, 10**20]) == "▂█"
+    assert sparkline([1, 10**400]) == "▂█"
