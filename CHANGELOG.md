@@ -50,6 +50,16 @@ and this project uses date-based versions in `YYYY.M.D` form.
   - `--snapshot-panel 00` works like `0`.
   - An empty `--hermes-home` or `--snapshot-file` is rejected.
 
+### Performance
+
+- A repeat collection pass on a live home takes about 25 ms instead of about 90 ms:
+  - On macOS, process start times come from the kernel via `sysctl`, not a `ps` subprocess on every refresh. This also fixes a bug where one PID above 99999 made `ps` fail and every active session read as unverifiable.
+  - Secret redaction, the executions.db timestamp parser, and the dashboard-process check are memoized. They are pure functions re-applied to unchanged text on every refresh.
+  - Confinement checks cache the resolved Hermes home. The cache is keyed on the home's own `lstat`, so re-pointing a symlinked home is still noticed.
+  - Cron history fetches only the 10 rows it displays, not 500.
+- WAL-mode databases are copied to a private snapshot only when they change. Before, every refresh copied them again, which wrote about 7.6 GB of temp data per day on a typical home.
+- Detail views cache their rendered lines until the data, width or view settings change. Idle frames and scrolling in Sessions and Tokens take about 1 ms instead of 35 ms.
+
 ### Changed
 
 - Ages of a day or more display as `Nd` in every panel, instead of `NNh` in some. Non-finite ages display as `—`, and Gateway KB sizes show one decimal.

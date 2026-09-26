@@ -1614,7 +1614,11 @@ def test_column_exists_false_for_absent_column_or_table():
 def test_connect_readonly_sqlite_cleans_up_snapshot_when_close_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """A failing conn.close() must not skip the WAL snapshot dir cleanup."""
+    """A failing conn.close() must still release the cached WAL snapshot.
+
+    Snapshots are reused across refreshes, so release (not deletion) happens on
+    exit; a released snapshot is then deleted when the cache is cleared.
+    """
     db_path = tmp_path / "kanban.db"
     db_path.write_bytes(b"")
     db_path.with_name("kanban.db-wal").write_bytes(b"")
@@ -1642,7 +1646,9 @@ def test_connect_readonly_sqlite_cleans_up_snapshot_when_close_raises(
         sqlite_util_module._connect_readonly_sqlite(db_path),
     ):
         pass
-    assert cleaned_up
+    assert not cleaned_up, "an idle snapshot stays cached for the next refresh"
+    sqlite_util_module.clear_snapshot_cache()
+    assert cleaned_up, "the released snapshot is deleted, not leaked as in-use"
 
 
 def test_state_snapshots_root_symlinked_outside_home_is_ignored(

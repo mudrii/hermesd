@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import pytest
 from rich.console import Console
 
+from hermesd.collect.sqlite_util import clear_snapshot_cache
 from hermesd.collector import Collector
 
 if TYPE_CHECKING:
@@ -35,6 +36,13 @@ def isolate_runtime_environment(
     for name in _AMBIENT_RUNTIME_ENV:
         if name != "HERMES_HOME" or not preserve_live_home:
             monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def release_cached_sqlite_snapshots() -> Iterator[None]:
+    """Drop WAL snapshots a test left cached, so no temp dir outlives its test."""
+    yield
+    clear_snapshot_cache()
 
 
 @pytest.fixture(autouse=True)

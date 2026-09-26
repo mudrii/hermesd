@@ -231,6 +231,7 @@ from hermesd.collect.sqlite_util import (
     _connect_readonly_sqlite,
     _snapshot_wal_if_present,
     _table_count_or_zero,
+    clear_snapshot_cache,
 )
 from hermesd.collect.system import (
     _RECENT_ACTIVITY_WINDOW_SECONDS,
@@ -4494,4 +4495,5 @@ class Collector:
                 if snapshot[2] is not None:
                     snapshot[2].cleanup()
             self._kanban_snapshots.clear()
+            clear_snapshot_cache()
             self._db.close()

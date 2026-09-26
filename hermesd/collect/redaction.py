@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 import shlex
@@ -365,7 +366,7 @@ def _redact_bare_credentials(value: str, *, token_start: bool = False) -> str:
     return pattern.sub("[REDACTED]", value)
 
 
-def _redact_secret_text(value: str) -> str:
+def _redact_secret_text_uncached(value: str) -> str:
     if value.lstrip().startswith(("{", "[")):
         try:
             structured = json.loads(value)
@@ -386,6 +387,23 @@ def _redact_secret_text(value: str) -> str:
     )
     redacted = re.sub(r"(?i)(bearer)\s+[^,\s]+", r"\1 [REDACTED]", redacted)
     return _redact_text_fields(_redact_bare_credentials(redacted, token_start=True))
+
+
+# Log tails, delegation goals and error excerpts are re-read unchanged on every
+# refresh, and the scan above is regex-heavy. Redaction is a pure function of
+# the text, so a bounded memo removes the repeat work; oversized text is not
+# retained (bounds memory to roughly _REDACTION_MEMO_SIZE * 2 * max chars).
+_REDACTION_MEMO_SIZE = 1024
+_REDACTION_MEMO_MAX_CHARS = 4096
+_redact_secret_text_memo = functools.lru_cache(maxsize=_REDACTION_MEMO_SIZE)(
+    _redact_secret_text_uncached
+)
+
+
+def _redact_secret_text(value: str) -> str:
+    if len(value) > _REDACTION_MEMO_MAX_CHARS:
+        return _redact_secret_text_uncached(value)
+    return _redact_secret_text_memo(value)
 
 
 def _safe_exception_text(exc: Exception) -> str:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import heapq
 import json
 import math
@@ -51,9 +52,8 @@ from hermesd.models import (
 # executions.db grows without bound (1k rows on a month-old home). The 24h
 # counters aggregate the full window in SQL and each job's last run comes from
 # a per-job chronological ranking, so a busy job cannot crowd another job
-# out of either; only the display history is capped at _EXECUTIONS_SCAN_LIMIT
-# (the newest _EXECUTIONS_RECENT_LIMIT of those are shown).
-_EXECUTIONS_SCAN_LIMIT = 500
+# out of either; only the displayed history is fetched, capped at
+# _EXECUTIONS_RECENT_LIMIT rows.
 _EXECUTIONS_RECENT_LIMIT = 10
 _EXECUTIONS_WINDOW_SECONDS = 24 * 60 * 60.0
 _INCIDENTS_LIMIT = 5
@@ -84,6 +84,8 @@ _CATCH_UP_MISSED_KEY = "catch_up_missed"
 # Each refresh therefore lists a bounded number of entries and stats only the
 # lexically newest few, instead of stat'ing an unpruned directory whole.
 _CRON_OUTPUT_LIST_LIMIT = 10_000
+# Memoized form of the shared ISO parser for the executions.db SQL function.
+_memo_iso_to_epoch = functools.lru_cache(maxsize=8192)(_iso_to_epoch)
 _CRON_OUTPUT_STAT_LIMIT = 50
 
 
@@ -284,7 +286,7 @@ def _execution_duration(started_at: str, finished_at: str) -> float | None:
 
 def _claimed_sort_key(row: dict[str, Any]) -> float:
     """Claim epoch for newest-first ordering; unparseable stamps sort last."""
-    claimed = _iso_to_epoch(str(row.get("claimed_at") or ""))
+    claimed = _memo_iso_to_epoch(str(row.get("claimed_at") or ""))
     return -math.inf if claimed is None else claimed
 
 
@@ -440,13 +442,17 @@ def _execution_rows(
     # Keep SQL ordering and cutoffs identical to the shared ISO parser, including
     # offsets, naive UTC timestamps, fractional seconds, and malformed values.
     # The UDF defeats any index on claimed_at (full scan per poll); acceptable at
-    # the expected executions.db scale, revisit if the table grows large.
-    conn.create_function("hermes_epoch", 1, _iso_to_epoch, deterministic=True)
+    # the expected executions.db scale. Three queries per poll parse the same
+    # unchanging claimed_at strings, so the parser is memoized.
+    conn.create_function("hermes_epoch", 1, _memo_iso_to_epoch, deterministic=True)
     return _query_rows(conn, sql, params)
 
 
 def _recent_execution_rows(conn: sqlite3.Connection, *, columns: set[str]) -> list[dict[str, Any]]:
-    """The newest _EXECUTIONS_SCAN_LIMIT executions, [] on a missing/foreign schema.
+    """The newest _EXECUTIONS_RECENT_LIMIT executions, [] on a missing/foreign schema.
+
+    Ordered in SQL by the same parser as every other cutoff (``hermes_epoch``),
+    newest claim first with ``id`` breaking ties; unparseable stamps sort last.
 
     Operational read errors propagate so the cron_executions source fails to
     its last-good value instead of reporting a false empty history.
@@ -456,7 +462,7 @@ def _recent_execution_rows(conn: sqlite3.Connection, *, columns: set[str]) -> li
         conn,
         f"SELECT {_execution_select_columns(columns)} "
         "FROM executions ORDER BY hermes_epoch(claimed_at) DESC, id DESC "
-        f"LIMIT {_EXECUTIONS_SCAN_LIMIT}",
+        f"LIMIT {_EXECUTIONS_RECENT_LIMIT}",
         columns=columns,
     )
 
@@ -636,11 +642,7 @@ def _read_cron_executions_state(
     with _connect_readonly_sqlite(db_path) as conn:
         conn.row_factory = sqlite3.Row
         columns = _executions_columns(conn)
-        ordered = sorted(
-            _recent_execution_rows(conn, columns=columns),
-            key=_claimed_sort_key,
-            reverse=True,
-        )
+        recent_rows = _recent_execution_rows(conn, columns=columns)
         window_rows = _execution_window_rows(conn, now=now, columns=columns)
         delivery_rows = _execution_delivery_rows(conn, now=now, columns=columns)
         last_rows = _last_execution_rows(conn, columns=columns)
@@ -653,10 +655,7 @@ def _read_cron_executions_state(
                 delivery_rows,
                 delivery_tracked="delivery_outcome" in columns,
             ),
-            recent=[
-                _execution_from_row(row, job_names, now=now)
-                for row in ordered[:_EXECUTIONS_RECENT_LIMIT]
-            ],
+            recent=[_execution_from_row(row, job_names, now=now) for row in recent_rows],
             open_incident_count=open_count,
             unacked_incident_count=unacked_count,
             open_incidents=incidents,

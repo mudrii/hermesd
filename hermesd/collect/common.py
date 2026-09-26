@@ -189,10 +189,34 @@ def _db_source_signature(db_path: Path) -> _DbSourceSignature | None:
     return tuple(signature) if any(entry is not None for entry in signature) else None
 
 
+# Confinement roots (the Hermes home, a profile home) are checked ~200 times a
+# refresh but almost never move. Their resolution is cached per root, keyed on
+# the root's own lstat so re-pointing a symlinked home is noticed at once.
+_ROOT_RESOLVE_CACHE: dict[str, tuple[tuple[int, int, int], Path]] = {}
+_ROOT_RESOLVE_CACHE_LIMIT = 64
+
+
+def _resolved_root(root: Path) -> Path:
+    try:
+        stat = os.lstat(root)
+    except OSError:
+        return root.resolve(strict=False)
+    key = str(root)
+    signature = (stat.st_ino, stat.st_dev, stat.st_mtime_ns)
+    cached = _ROOT_RESOLVE_CACHE.get(key)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    resolved = root.resolve(strict=False)
+    if len(_ROOT_RESOLVE_CACHE) >= _ROOT_RESOLVE_CACHE_LIMIT:
+        _ROOT_RESOLVE_CACHE.clear()
+    _ROOT_RESOLVE_CACHE[key] = (signature, resolved)
+    return resolved
+
+
 def _path_resolves_under(path: Path, root: Path) -> bool:
     try:
         resolved_path = path.resolve(strict=False)
-        resolved_root = root.resolve(strict=False)
+        resolved_root = _resolved_root(root)
     except (OSError, RuntimeError):
         return False
     return resolved_path == resolved_root or resolved_path.is_relative_to(resolved_root)

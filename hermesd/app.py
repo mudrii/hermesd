@@ -18,7 +18,7 @@ from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
-from rich.segment import Segments
+from rich.segment import Segment, Segments
 from rich.text import Text
 
 from hermesd import __version__
@@ -274,6 +274,12 @@ class DashboardApp:
         # results are tagged with the revision they were computed against so a
         # collector refresh invalidates them even when the query is unchanged.
         self._state_generation = 0
+        # (state, theme, view key, rendered lines) of the last viewport detail;
+        # state and theme are compared by identity (both are replaced, never
+        # mutated). A tuple swap is atomic, so concurrent builds stay safe.
+        self._detail_lines_cache: (
+            tuple[DashboardState, Theme, tuple[object, ...], list[list[Segment]]] | None
+        ) = None
         self._message_search_ok: tuple[str, int] | None = None
         self._message_search_failed: tuple[str, int] | None = None
         # True while a worker is still willing to pick up _message_search_inflight.
@@ -719,26 +725,49 @@ class DashboardApp:
         if show_help:
             layout["body"].update(self._build_help(theme))
         elif mode == "detail" and detail_panel:
-            panel = render_panel(
-                detail_panel,
-                state,
-                theme,
-                detail=True,
-                log_sub_view=log_sub_view,
-                scroll_offset=scroll_offset,
-                profile_view_index=profile_view_index,
-                filter_query=filter_query,
-                session_sort=session_sort,
-                session_message_match_ids=session_message_match_ids,
-                detail_height=body_height,
-            )
-            if detail_panel in _RENDERED_VIEWPORT_PANEL_NUMS:
-                viewport, max_offset = _rendered_detail_viewport(
-                    panel, render_console, scroll_offset
+
+            def detail() -> Panel:
+                return render_panel(
+                    detail_panel,
+                    state,
+                    theme,
+                    detail=True,
+                    log_sub_view=log_sub_view,
+                    scroll_offset=scroll_offset,
+                    profile_view_index=profile_view_index,
+                    filter_query=filter_query,
+                    session_sort=session_sort,
+                    session_message_match_ids=session_message_match_ids,
+                    detail_height=body_height,
                 )
+
+            if detail_panel in _RENDERED_VIEWPORT_PANEL_NUMS:
+                # Viewport panels ignore scroll_offset/detail_height (only Logs
+                # reads them), so their rendered lines depend on nothing below:
+                # idle frames and scrolling slice the same lines instead of
+                # re-rendering the whole detail twice a second.
+                key = (
+                    detail_panel,
+                    profile_view_index,
+                    filter_query,
+                    session_sort,
+                    render_console.width,
+                )
+                cached = self._detail_lines_cache
+                if (
+                    cached is not None
+                    and cached[0] is state
+                    and cached[1] is theme
+                    and cached[2] == key
+                ):
+                    lines = cached[3]
+                else:
+                    lines = _render_detail_lines(detail(), render_console)
+                    self._detail_lines_cache = (state, theme, key, lines)
+                viewport, max_offset = _slice_detail_viewport(lines, render_console, scroll_offset)
                 layout["body"].update(viewport)
             else:
-                layout["body"].update(panel)
+                layout["body"].update(detail())
         else:
             layout["body"].update(self._build_overview(state, theme, console=render_console))
 
@@ -1110,13 +1139,19 @@ def _decode_input_keys_with_remainder(data: bytes) -> tuple[list[str], bytes]:
     return keys, b""
 
 
-def _rendered_detail_viewport(panel: Panel, console: Console, offset: int) -> tuple[Segments, int]:
+def _render_detail_lines(panel: Panel, console: Console) -> list[list[Segment]]:
     # Scroll the complete rendered detail, not just its last table: preceding
-    # sections may themselves exceed the terminal height. Header/footer use two
-    # rows, and removing the height constraint keeps Rich from cropping first.
-    lines = console.render_lines(
+    # sections may themselves exceed the terminal height. Removing the height
+    # constraint keeps Rich from cropping first.
+    return console.render_lines(
         panel, console.options.update(height=None), new_lines=True, pad=False
     )
+
+
+def _slice_detail_viewport(
+    lines: list[list[Segment]], console: Console, offset: int
+) -> tuple[Segments, int]:
+    # Header/footer use two rows.
     height = max(1, console.height - 2)
     max_offset = max(0, len(lines) - height)
     offset = max(0, min(offset, max_offset))
