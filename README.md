@@ -2,29 +2,27 @@
 
 A real-time TUI monitoring dashboard for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
-![hermesd overview](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/overview.png)
+![hermesd overview](https://raw.githubusercontent.com/mudrii/hermesd/v2026.9.26/images/overview.png)
 
-Screenshots are from `v2026.6.15` and illustrate the earlier interface. The current release adds panel content, scrolling, and interaction improvements described below.
+Screenshots show `v2026.9.26` rendered with synthetic demo data; no private Hermes state is included.
 
-## What’s New in 2026.9.13
+## What’s New in 2026.9.26
 
-[**Release notes**](https://github.com/mudrii/hermesd/releases/tag/v2026.9.13) · [**Install from PyPI**](https://pypi.org/project/hermesd/2026.9.13/) · [**Installation and upgrades**](#installation)
+[**Release notes**](docs/releases/2026.9.26.md) · [**Installation and upgrades**](#installation)
 
-This release brings together the features and fixes since **v2026.7.11**, the previous published release. The `2026.9.8` development milestone was not published separately.
+This release makes a busy Hermes Agent easier to follow, with clearer warning signals, richer usage history, smoother navigation, and stronger protection for your data.
 
-- **Gateway health:** loop responsiveness alongside heartbeat age, crash/restart evidence, shared-listener routing, update receipts, and delivery problems. Process ownership checks distinguish current records from preserved or unverifiable evidence.
-- **Sessions and recovery:** names, pins, Git branches, profiles, activity ordering, capacity, turn leases, compression recovery, routing suspension, and reset churn. Hidden but resumable sessions no longer trigger false dangling-route warnings.
-- **Usage and costs:** per-model all-time, 24-hour, and seven-day breakdowns, including auxiliary work. Cache-write estimates, explicitly billed zero, mixed billed/estimated totals, and rolling-window refresh are corrected.
-- **Scheduled work and Kanban:** cron execution history, delivery outcomes, dispatch/ticker state, catch-up activity, and incidents; board notification backlogs, completion requirements, and failure breakers. Execution and delivery remain separate facts, and one corrupt board no longer hides healthy boards.
-- **Delegations and Operations:** recent task cards with model/provider, results, receipts, and redacted log tails, plus PR-monitoring, database recovery, hosted-room, and retained API-run evidence. Bounded display lists keep their totals and unreadable-record counts separate.
-- **Plugins, skills, and configuration:** installation provenance, activation evidence, cached catalog drift, MCP cache validity, prompted-skill snapshots, configuration backup history, and policy-aware Curator hygiene.
-- **Terminal usability:** whole-view Sessions/Config scrolling, fresh search results, plain-text clipboard export, atomic snapshot files, and improved Unicode, input, and shutdown handling.
-- **Privacy and resilience:** broader secret redaction, terminal-control sanitization, profile/path confinement, bounded reads, and safer malformed-data handling. Healthy sources keep updating while failed sources preserve last-good evidence.
-- **Release validation:** Python 3.11–3.14 checks, installed wheel/sdist runtime tests, Docker smoke checks, four Linux/macOS Nix targets, scheduled security audits, and protected exact-commit release gates.
+- **Know what needs attention:** see paused operation, gateway memory pressure, restart backlogs, unfinished migrations, and recent cron failures.
+- **Understand usage:** daily token history, activity by source, top sessions, repository activity, and per-job cron usage make trends easier to spot.
+- **Follow scheduled work:** delivery queues, deferred bot-chat receipts, recovery ledgers, and provider holds explain why work is waiting.
+- **Inspect more of your setup:** integrations, provider cooldowns, storage usage, snapshots, and pending reviews are visible alongside existing panels.
+- **Navigate comfortably:** scroll every detail view, keep useful content on short terminals, and export full detail snapshots.
+- **Stay responsive:** fewer repeated database copies and cached collection/rendering reduce work during idle refreshes.
+- **Keep sensitive data protected:** broader redaction, bounded reads, safe file handling, and last-good recovery keep malformed or temporarily unreadable data from disrupting the dashboard.
 
-Optional views depend on the records your Hermes Agent version produces; older schemas retain supported fallbacks. Missing, stale, and unverifiable evidence is labelled explicitly. hermesd remains independently installed and read-only.
+Optional views depend on the records your Hermes Agent version produces; older schemas retain supported fallbacks. hermesd remains independently installed and read-only.
 
-**JSON snapshot consumers:** review the [compatibility notes](docs/releases/2026.9.13.md#compatibility-and-upgrade-notes) for added fields and the replacement of `gateway_starts_2m` with the configurable-window field `gateway_starts_window`.
+**JSON snapshot consumers:** review the [compatibility and upgrade notes](docs/releases/2026.9.26.md#compatibility-and-upgrade-notes) before updating parsers for renamed or removed fields.
 
 ## Why This Exists
 
@@ -94,7 +92,7 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 
 The main dashboard shows all 13 panels at a glance. The header starts with the installed `hermesd` version, then shows the current profile mode and time on the right. Gateway status with PID and Hermes Agent version sits at the top (note the `discord ⚠` connection-error marker), sessions and token costs side by side, tools and config, cron and skills, logs plus profile metadata, and dedicated memory, kanban, operations, and curator panels at the bottom. The footer shows keyboard shortcuts and a polling indicator.
 
-![Overview](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/overview.png)
+![Overview](https://raw.githubusercontent.com/mudrii/hermesd/v2026.9.26/images/overview.png)
 
 ### [1] Gateway & Platforms — Is Everything Connected?
 
@@ -120,7 +118,7 @@ The detail view adds a **Liveness** section (heartbeat age, incarnation count, r
 
 Sources: `state/gateway.heartbeat` (plus the witness node it advertises), `state/gateway.lifecycle.json`, `gateway-starts.log`, `logs/gateway-exit-diag.log` and its stat-only companions, `state/dashboard_clients.heartbeat`, the `gateway.respawn_storm` policy of root `config.yaml`, the `code_sha`/`code_version`/`config_generation`/`session_store`/`exit_reason`/`served_profiles`/`multiplex_standalone_reason` keys and the per-platform `ingress_url` of `gateway_state.json`, `logs/update_receipts/latest.json` and the archived `update_*.json` receipts beside it, `gateway_migration.json`, the `gateway.multiplex_profiles` and `gateway.restart_loop_guard` keys of `config.yaml`, the profile's `gateway/dead_targets.json`, `gateway/restart_loop.json`, `.restart_pending.json` and `serve_restart_pending/`, and the `gateway_heartbeats` / `delivery_obligations` tables of `state.db` (all optional; anything missing renders as `—`).
 
-![Gateway Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-01-gateway.png)
+![Gateway Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.9.26/images/panel-01-gateway.png)
 
 ### [2] Sessions — What’s Active and Where Did It Fork?
 
@@ -134,7 +132,7 @@ Press `2` to expand. An **Activity** section (hermes-agent 0.21 and newer) shows
 
 **Coordination state beside the session table.** Four profile-scoped `state.db` tables that had no reader are now surfaced under one `session_coordination` model, each with its own health source and last-good fallback. **Turn Leases & Locks** lists `session_turn_leases` and `compression_locks` with the holder pid, hold duration, remaining TTL and a verdict: an expired lease whose holder still matches is labelled benign (upstream revives it rather than stealing it), a provably dead holder reads `orphaned`, and a holder with no parseable pid stays unverifiable instead of being declared dead — kernel proof only, never a guess. **Hygiene Cooldowns** joins `gateway_hygiene_state` to the chat's recorded `compression_failure_error` and explains the effect: the ladder runs ×1/×3/×9 over the configured base, clamped at an hour, so streak 3 renders as `compaction suspended, cooldown up to 1h`. **Chat Routes** decodes `gateway_routing.entry_json` into platform, chat type, a redacted display name and the state flags — `suspended`, `resume-pending`, `was-auto-reset` — flags a route whose session id has no `sessions` row as `dangling`, and marks a durable turn token older than the five-minute unwind grace as `turn never unwound`; token counters and Slack watermarks in that payload are never carried into state. **Reset Churn** lists the top chats by `conversation_generations` plus the lifetime reset total, and because upstream never prunes that table a shrinking row count raises an explicit invariant-break warning rather than quietly reporting fewer chats. Counts are exact even when the row lists are capped (`hygiene_total`, `route_total`), and **CLI Terminals** reports the breadcrumbs under `terminal-sessions/` from the last 24 hours as an *upper bound* on open terminals, with the scan bound stated when the directory was cut.
 
-![Sessions Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-02-sessions.png)
+![Sessions Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.9.26/images/panel-02-sessions.png)
 
 ### [3] Tokens / Cost — Where Are My Tokens Going?
 
@@ -142,13 +140,13 @@ Press `3` for the full per-session token breakdown plus recent `7d`/`30d` rollup
 
 The detail view also has **Daily Usage (14d)** (sessions, tokens, API calls and cost per local day), **By Source** (sessions, tokens and cost per session source for 24h and 7d), and **Top Sessions (7d)** (the five costliest sessions). These are derived from the session rows hermesd already loads, following upstream's insights and `/api/analytics/usage` views. The compact view ends with a 14-day token sparkline, so a short panel crops it first.
 
-![Tokens Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-03-tokens.png)
+![Tokens Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.9.26/images/panel-03-tokens.png)
 
 ### [4] Tools — What's Available and What's Being Used?
 
 Press `4` for four sections: **Tool Calls** showing the current call leaders by name (tool names when the `messages` table provides them, otherwise fallback session labels), **Available Tools** listing the union of tools discovered across session files in a 3-column grid followed by a `Toolsets: N enabled · unavailable: … · N lazy · N disabled` line read from the `availability` block of `cache/banner_snapshot.json` (the compact view shows a `⚠ N toolsets unavailable` marker whenever any toolset failed to load), **Background Processes** showing the live registry (`spawn-ledger.json`, falling back to the legacy `processes.json`) with PID, purpose, port, profile, notify-on-complete, watch-pattern summary, start time, and command — a PID whose process is gone is marked with `✗`, a PID now held by a different process (checked against the ledger's `create_time`) is marked `✗ pid reused`, a live helper whose spawner is gone is marked `⚠ orphaned` (the case upstream's startup sweep reaps), and absent purpose/port/profile render as `—` — and **Checkpoints** showing filesystem shadow repos with workdir name, commit depth, and latest checkpoint reason. The compact view shows the top callers plus the current background-process and checkpoint counts.
 
-![Tools Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-04-tools.png)
+![Tools Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.9.26/images/panel-04-tools.png)
 
 ### [5] Config — Current Agent Configuration
 
@@ -162,7 +160,7 @@ A **Doctor (file checks)** row reports the raw-file drift `hermes doctor` warns 
 
 A **Config Backups** section dates the config itself from `backups/config/`: the newest `good` copy is rendered as "config last changed" with its age, corrupt snapshots are a hard alert, and `pre-setup`/migration stamps appear as an audit trail. Both caveats are stated on the panel: a good copy is written only when `config.yaml`'s bytes change, so an old stamp means an unchanged config rather than a stale reader, and the stamps are the writer's local time. Groups are ranked so the load-bearing `good`/`corrupt` rows survive the group cap, and truncation is flagged in both views. Under `--profile` these copies stay on the root config the panel displays (see `.codex/rules/source-ownership.md`).
 
-![Config Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-05-config.png)
+![Config Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.9.26/images/panel-05-config.png)
 
 ### [6] Cron — Scheduled Jobs
 
@@ -184,7 +182,7 @@ Each job shows the model its next fire resolves to and where it came from — `p
 
 **Retention qualification.** hermes-agent prunes terminal execution history to `MAX_TERMINAL_EXECUTIONS` (1000) records, keeping the newest by `finished_at`; in-flight rows are never pruned. Every aggregate therefore describes *recorded attempts*, not every attempt that ever happened, and the detail view says so: a `Recorded attempts: N retained (M terminal) spanning Xs to Yh ago` line exposes the retained counts and the observed bounds. When the terminal count reaches the cap, a qualified warning notes that older terminal runs were pruned — and explicitly that a capped history does not by itself make any particular 24h window incomplete, since the retained span can cover far more than a day. `retention_cap` is `0` when the table could not be read at all, which is distinct from an empty one.
 
-![Cron Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-06-cron.png)
+![Cron Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.9.26/images/panel-06-cron.png)
 
 ### [7] Skills & Integrations — What's Installed?
 
@@ -206,7 +204,7 @@ An **MCP** section summarises `~/.hermes/cache/mcp_schema_cache.json`: how many 
 
 An **Integrations** section summarises profile-scoped integration stores as names and counts only: pairing codes pending (live within the 1 h TTL) and approvals per platform from `platforms/pairing/`, webhook subscription route names and enabled counts from `webhook_subscriptions.json`, `profile_routes` from `config.yaml` with the discriminator names they match on (never the ids), the monitoring health-export and OTLP flags, the webhook platform switch, the Langfuse plugin gate, and `telemetry/shared_metrics/metrics.sqlite3` counter rows, unpackaged periods, outbox counts by send state, error-row count and consent marks. Pairing codes, user ids, webhook secrets, telemetry payloads and error text are never read into state. The compact view adds pairing and throttling lines and a cooling count for credential pools.
 
-![Skills Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-07-skills.png)
+![Skills Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.9.26/images/panel-07-skills.png)
 
 ### [8] Logs — What Just Happened?
 
@@ -216,19 +214,19 @@ The stream list is not one directory: **agent**, **gateway**, **errors**, **dash
 
 **Log health.** `mcp-stderr.log`, `gateway.error.log` and `workspace.log` are also scanned incrementally for counters: MCP server start banners per server and supervisor argparse errors, repeated ERROR/CRITICAL and exception signatures (numbers collapsed, text redacted), and pnpm `ELIFECYCLE` crash lines. hermesd remembers each file's inode and byte offset and reads only appended bytes — at most 256 KiB per stream per refresh, with a 2 MiB tail backfill the first time it sees a file — and starts over when the file is truncated or replaced. When the selected stream is one of these, a `Health:` line under the scope label shows the counters with 1h/24h rates, and panel 12 summarises them.
 
-![Logs Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-08-logs.png)
+![Logs Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.9.26/images/panel-08-logs.png)
 
 ### [9] Profiles — Which Runtime State Am I Looking At?
 
 Press `9` for a read-only profile table discovered from `~/.hermes/profiles/*/`. It shows per-profile session count, latest log mtime, skill count, DB size, a **Files** column for `config.yaml`/`.env` presence (the per-profile checks `hermes doctor` prints), and a short `SOUL.md` excerpt when present. **Shared platform credentials** lists built-in platform credential key names set in more than one profile's `.env` (the default profile included). Only the names are compared: each value is checked for blankness and dropped, never stored or rendered, so a match is a name match, not proof of a shared token. A symlinked `.env` is skipped. Press `p` in this panel to cycle the viewed profile highlight without changing the dashboard's selected data source.
 
-![Profiles Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-09-profiles.png)
+![Profiles Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.9.26/images/panel-09-profiles.png)
 
 ### [10] Memory — What Context Is Persisted?
 
 Press `0` to expand. The Memory panel shows the configured memory provider, memory-file count, `MEMORY.md` and `USER.md` word counts, a lightweight learning summary from skill usage and learned skill metadata (skills with `created_by` of `agent` or `learn`), `SOUL.md` size, and a short `SOUL.md` excerpt with the discovered memory files listed below.
 
-![Memory Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-10-memory.png)
+![Memory Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.9.26/images/panel-10-memory.png)
 
 ### [11] Kanban — What Are Workers Doing?
 
@@ -236,7 +234,7 @@ Use `]` from panel 10 or `--snapshot-panel 11` to expand. The Kanban panel reads
 
 **Notify subscriptions and the breaker.** A `kanban_notify` source reads `kanban_notify_subs` from the same root-anchored board and reports, per subscription, the backlog of that task's own events newer than its cursor (`id > last_event_id`, as upstream's notifier claims them) — a growing backlog helps identify subscriptions whose delivery progress needs investigation; it does not establish watcher liveness. The panel shows subscriber counts rolled up per platform (case-insensitively, matching notifier routing), the total and worst backlog, a bounded worst-first table, and subscriptions whose `notifier_profile` names a profile that no longer exists; the default profile is excluded (upstream reports `"default"` for the root home) and orphan detection stays silent when `profiles/` itself cannot be read. The source fails independently of the board read. Review cards also carry their `completion_contract` (NULL = local-only, `OWNER/REPO` for PR publication, or an exact PR URL), and the Failures column doubles as a breaker read-out: `consecutive_failures` is upstream's trip counter (preserved across review reopens, not a retry budget) and the effective threshold follows upstream's order exactly — per-task `max_retries` (including an explicit `0`; a task with no failures is not shown as tripped) over the configured `kanban.failure_limit` over the default 2.
 
-![Kanban Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-11-kanban.png)
+![Kanban Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.9.26/images/panel-11-kanban.png)
 
 ### [12] Operations — What Runtime Artifacts Exist?
 
@@ -246,7 +244,7 @@ Use `]` from Kanban or `--snapshot-panel 12` to expand. The Operations panel sum
 
 **Pause, disk and review.** While `hermes pause` is engaged, an **ESTOP** row (and the header banner) shows the recorded reason and how long ago it was engaged; the profile's `ESTOP` sentinel is checked first, then the root one, and an empty or unparseable sentinel still counts as engaged. **Disk & Retention** reports root `logs/` size with per-file growth and flags unrotated logs over 10 MB (upstream rotates only `agent`, `errors`, `gateway` and `gui.log`), `sessions/`, `checkpoints/` against `checkpoints.max_total_size_mb`, `cache/scratch`, any `cache/*` directory of 1 GiB or more, the `state.db` WAL against the doctor's 10 MB / 50 MB thresholds, and each known database's journal mode from its header bytes; directory walks are bounded, cached for up to 10 minutes and limited to three per refresh. **Log Health** summarises the Logs panel's counters, and **Pending Review** counts staged writes under `pending/<subsystem>/` awaiting operator approval, with the oldest age per subsystem; the staged payload is never kept.
 
-![Operations Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-12-operations.png)
+![Operations Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.9.26/images/panel-12-operations.png)
 
 A **Database Recovery** section reports what hermes-agent's own repair code left beside `state.db`, as its own `db_recovery` health source: the repair-attempt ledger (`state.db.repair-attempts.json`) with its `failed_attempts`, its `last_attempt` as an age, and whether the recorded budget of 3 is exhausted; the settled forensic backups (`state.db.malformed-backup-*`) with count, total bytes including their `-wal`/`-shm`/`-journal` sidecars, and newest age; the retired-WAL generations (`state.db.retired-wal-*/`) with the newest one's `captured_at`, `trigger`, `wal.bytes` and `main.mode` read from its `manifest.json`; and the `state.db.repair.lock` / `state.db.auto-maintenance.lock` files as presence booleans. Mid-write artifacts — `.backup-staging-*`, `*.incomplete*` and `.partial` generations — get their own **In Progress** row and are never counted as completed captures. **This is presence and metadata only:** hermesd never runs a repair, a checkpoint or an integrity check, and never hashes the database (the live `state.db` is ~480 MB, and hashing it is exactly the expensive work excluded here) — the reader stats a bounded, symlink-safe directory listing and parses two small JSON documents, and it never opens `state.db` at all. Three wording rules follow from upstream's behaviour: a *successful* repair deletes the ledger, so `none — no failed repair recorded` is not evidence the database is healthy; `budget exhausted` counts the ledger's recorded failures and does not recompute the fingerprint upstream also matches them against, so it cannot tell whether the file changed since; and a lock *file* on disk is not a held lock, since upstream opens both with `a+b` and never deletes them. Note also that `~/.hermes/recovery/` is an operator-made remediation bundle directory that no upstream repair code writes, so it is deliberately not read as recovery evidence.
 
@@ -264,7 +262,7 @@ A **Skill Hygiene** section reads `skills/.usage.json`: how many skills were pat
 
 The scheduler table adds the last run's duration from `.curator_state`. An **Activity** section appears when any of its sources exists: the count of built-ins the curator pruned (`skills/.curator_suppressed`), the recent actions in a 64 KiB tail of `skills/.curator_ledger.jsonl` (actor, action, skill, time), and the `skills/.locks/curator-run` claim, which is live only while its pid runs and it is less than an hour old.
 
-![Curator Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.6.15/images/panel-13-curator.png)
+![Curator Detail](https://raw.githubusercontent.com/mudrii/hermesd/v2026.9.26/images/panel-13-curator.png)
 
 ## Installation
 

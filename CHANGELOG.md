@@ -7,6 +7,8 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ## [Unreleased]
 
+## [2026.9.26] - 2026-09-26
+
 ### Fixed
 
 - **Verification evidence:** the Operations detail shows one line of each verification summary, capped at 120 characters. Before, one noisy run's full captured output could fill the view.
