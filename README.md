@@ -67,7 +67,7 @@ It's not trying to replace the Hermes CLI or your Telegram interface. It's the a
 - **Read-only** — hermesd never writes to `~/.hermes/` or modifies Hermes Agent state
 - **Live-updating** — polls every 5 seconds (configurable with `--refresh-rate`)
 - **Snapshot mode** — `--snapshot` renders one overview frame to stdout and exits; `--snapshot-panel N` selects any registered detail panel for text snapshots and annotates JSON snapshots (`0` aliases panel 10); `--snapshot-file PATH` writes either form to disk outside the Hermes home; `--snapshot-format json` emits machine-readable full-state snapshots
-- **Bounded log reads** — `--log-tail-bytes` caps how much of each log file and cron output excerpt is read per refresh
+- **Bounded log reads** — `--log-tail-bytes` caps displayed log tails and cron output excerpts per refresh; incremental log-health counters have a separate 256 KiB per-stream budget
 - **Opt-in profiles** — root mode stays the default; use `--profile NAME` or `HERMES_PROFILE=NAME` to read profile-scoped runtime data
 - **Adaptive layout** — full 13-panel grid on wide terminals, a tall-narrow single-column overview for vertical tmux splits, and a denser all-panel overview on 80x24
 - **Detail views** — press `1`-`9` or `0` for panel 10 to expand directly, or use `[` / `]` to move through every panel including Kanban, Operations, and Curator
@@ -126,7 +126,7 @@ Press `2` to expand. An **Activity** section (hermes-agent 0.21 and newer) shows
 
 **Capacity is three numbers, never one.** The **Live Surfaces** header line keeps them apart: the *configured* capacity (`max_concurrent_sessions`, rendered `cap C leases` or `no active-session cap configured`), the *observed registry occupancy* (`N registry entries`), and the *verified executing activity* (`M verified executing`, which counts only identity-verified leases — an unverifiable one is listed beside it and never folded in). A fourth figure, `distinct pids`, sits next to them because several leases can name one process, so occupancy is not a process count. `max_concurrent_sessions` is a cross-process **lease cap** checked when a surface attaches (`try_acquire_active_session`: "Capacity second, and only when an operator asked for one"), and a refusal under it names the holders per surface; it is resolved exactly as upstream resolves it — the top-level key, else `gateway.max_concurrent_sessions` — with `0`/`null`/invalid/absent all reading as *not configured* rather than as a limit of zero. Scope note: hermesd reads the **selected profile's** registry, while upstream's orphan reclamation sweeps the root home *and* every profile home, so the occupancy shown is one registry's and not the install's (see `.codex/rules/source-ownership.md`).
 
-**Surface liveness verifies process identity, not just the PID.** PIDs are reused, so "a process with this PID exists" is not evidence that the recorded session is still running. hermesd compares the registry's `process_start_time` against the start time observed for that PID on this host and reports `live` (identity matched), `dead` (the PID is gone, *or* it now belongs to a different process), or `unverified` (the PID exists but the start time was never recorded or could not be observed here). The two sources use different units — this registry records **epoch seconds**, while `gateway_state.json` records **centiseconds** — and are never compared against each other. Start times are read from `/proc/<pid>/stat` field 22 on Linux, and elsewhere from a single bounded `ps -o lstart=` call covering every PID at once, since hermesd has no `psutil` dependency; `lstart` reports whole seconds against a fractional recorded stamp, so identity is matched within a 2-second tolerance rather than by exact equality. A PID that cannot be observed is reported as unverified, never as dead. Press `/` to filter the currently loaded sessions by ID, source, model, lineage, provider, title, cwd, archived state, handoff state, platform, or message content via `message:term`, and press `s` to cycle recent/cost/token sorting. Use `j`/`k` or `g`/`G` to reach the full detail content at smaller terminal heights. Databases without the 0.21 columns simply omit the new sections.
+**Surface liveness verifies process identity, not just the PID.** PIDs are reused, so "a process with this PID exists" is not evidence that the recorded session is still running. hermesd compares the registry's `process_start_time` against the start time observed for that PID on this host and reports `live` (identity matched), `dead` (the PID is gone, *or* it now belongs to a different process), or `unverified` (the PID exists but the start time was never recorded or could not be observed here). The two sources use different units — this registry records **epoch seconds**, while `gateway_state.json` records **centiseconds** — and are never compared against each other. Start times are read from `/proc/<pid>/stat` field 22 on Linux and from the kernel via `sysctl` on macOS. PIDs whose start times remain unobservable fall back to one bounded `ps -o lstart=` call, since hermesd has no `psutil` dependency; `lstart` reports whole seconds against a fractional recorded stamp, so identity is matched within a 2-second tolerance rather than by exact equality. A PID that cannot be observed is reported as unverified, never as dead. Press `/` to filter the currently loaded sessions by ID, source, model, lineage, provider, title, cwd, archived state, handoff state, platform, or message content via `message:term`, and press `s` to cycle recent/cost/token sorting. Use `j`/`k` or `g`/`G` to reach the full detail content at smaller terminal heights. Databases without the 0.21 columns simply omit the new sections.
 
 **Repositories and activity.** A **Repositories** table lists 7d and 30d session counts per git repository (`git_repo_root`), and **Activity by Hour (7d, local)** is a 24-slot sparkline of sessions started per local hour over the last 7 days, with the peak hour named. Both cover all visible sessions, not the current filter. A **Via** column shows the bot transport profile (`transport_profile`) when any shown session carries one. Databases without these columns omit them.
 
@@ -303,7 +303,7 @@ hermesd --version
 
 ### From Source
 
-The checkout follows `main` and may include changes after the latest release. Use the `v2026.9.13` tag when you need that release’s source.
+The checkout follows `main` and may include changes after the latest release. Use the `v2026.9.26` tag when you need the current release’s source (`git switch --detach v2026.9.26` after cloning).
 
 ```bash
 git clone https://github.com/mudrii/hermesd.git
@@ -380,6 +380,10 @@ hermesd --snapshot-panel 13
 hermesd --log-tail-bytes 8192
 ```
 
+`--refresh-rate` accepts integer seconds from **1 to 86400** (default: 5). `--log-tail-bytes` accepts a positive integer (default: 32768). Empty `--hermes-home` and `--snapshot-file` paths are rejected. Panel numbers are 1–13, with `0` and `00` both selecting Memory (10).
+
+JSON snapshots contain `panel_num`, `panel_name`, and a `state` object. Dashboard fields live under `state` (for example, `state.usage_analytics`); selecting a panel annotates the full state rather than filtering it. See the [JSON migration guide](docs/releases/2026.9.26.md#json-snapshot-migration) for changed fields and examples.
+
 ### Environment Variables
 
 | Variable | Default | Description |
@@ -387,13 +391,17 @@ hermesd --log-tail-bytes 8192
 | `HERMES_HOME` | `~/.hermes` | Override the Hermes home directory |
 | `HERMES_PROFILE` | unset | Read profile-scoped runtime data from `profiles/<name>`; root mode remains the default when unset |
 
+Explicit `--hermes-home` and nonempty `--profile` arguments take precedence over their environment variables. Without a selected profile, hermesd reads root mode and does not follow the Agent’s `active_profile`.
+
 ## Keyboard Shortcuts
 
 | Key | Action |
 |-----|--------|
 | `1`-`9`, `0` | Expand panels 1-10 to full-screen detail view (`0` opens panel 10) |
 | `[` / `]` | Move to the previous/next registered panel, including panels 11-13 |
-| `Esc` | Close the help overlay, otherwise return to overview |
+| `Esc` | Close help first; otherwise stop filter editing; otherwise return from detail to overview |
+| `Enter` | Finish filter editing in Sessions or Logs detail |
+| `Backspace` | Delete the last character while editing a filter |
 | `f` | Toggle focus mode for the last selected panel |
 | `c` | Copy the current rendered view as plain text via OSC 52 |
 | `j` / `k` | Scroll down/up in detail views |
@@ -428,11 +436,13 @@ The green/yellow/red dot next to the polling spinner shows how many collector so
 No. Source databases without a WAL sidecar use immutable, read-only connections. Databases with a WAL sidecar are copied with their `-wal` sidecar to a private temporary directory outside your Hermes home and opened read-only there; the copy is checked for a concurrent checkpoint and retried once rather than served torn, and SQLite rebuilds `-shm` inside the copy. Any SQLite shared-memory coordination is confined to that copy, including when another connection in the same process is writing to the source. The shared `state.db` snapshot is reused until the source changes; updates require another copy, which adds I/O for large databases. If a read fails transiently (e.g. during a WAL checkpoint), hermesd keeps the last good data on screen and retries on the next poll instead of blanking panels.
 
 **hermesd is slow with very large log files**
-Each refresh reads only the last `--log-tail-bytes` bytes of every log file and cron output excerpt (default: 32768). Lower it to cut I/O on multi-GB logs:
+Displayed log tails and cron output excerpts read at most `--log-tail-bytes` bytes per file per refresh (default: 32768). Lower it to reduce this tail-reading I/O on multi-GB logs:
 
 ```bash
 hermesd --log-tail-bytes 8192
 ```
+
+The separate log-health scanner for `mcp-stderr.log`, `gateway.error.log`, and `workspace.log` reads up to **256 KiB per stream per refresh**, independent of `--log-tail-bytes`. On first discovery it works through at most a 2 MiB tail under that per-refresh cap; later refreshes consume appended bytes. Lowering the display-tail budget does not lower this health-scan budget.
 
 ## Architecture
 
@@ -517,6 +527,7 @@ uv run pytest tests/ -q -ra --tb=short -W error::ResourceWarning --cov=hermesd -
 uv run python scripts/pip_audit_gate.py
 uv lock --check
 uv build
+uv run python scripts/check_wheel_pins.py
 python -m venv /tmp/hermesd-wheel-smoke
 /tmp/hermesd-wheel-smoke/bin/python -m pip install dist/hermesd-*.whl
 /tmp/hermesd-wheel-smoke/bin/hermesd --version
@@ -537,7 +548,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full TDD-first contributor work
 
 ### Releases
 
-The [2026.9.13 release notes](docs/releases/2026.9.13.md) describe the current published release; [`CHANGELOG.md`](CHANGELOG.md) retains the development history. `main` can contain unreleased changes after a release tag.
+The [2026.9.26 release notes](docs/releases/2026.9.26.md) describe the current published release; [`CHANGELOG.md`](CHANGELOG.md) retains the development history. `main` can contain unreleased changes after a release tag.
 
 Follow the canonical [release policy](docs/ci-release-policy.md#release-eligibility-ci-04) before publishing. Update `pyproject.toml`, refresh `uv.lock`, and prepare the matching changelog/release notes; Nix derives the version from the package manifest. The exact release commit must pass the required CI gate on protected `main`. GitHub Release publication then checks eligibility, reruns the Python matrix and fresh security audits, builds and smoke-tests the distributions, and publishes to PyPI through the restricted environment using OIDC. Release tags are protected against updates and deletion.
 
@@ -633,7 +644,7 @@ hermesd uses **TDD-first** contribution (see [`CONTRIBUTING.md`](CONTRIBUTING.md
 
 ### Dependencies
 
-Three **direct** runtime dependencies are pinned for the published `2026.9.13` package:
+Three **direct** runtime dependencies are pinned for the published `2026.9.26` package:
 
 | Package | Version | Purpose |
 |---------|---------|---------|

@@ -7,6 +7,10 @@ and this project uses date-based versions in `YYYY.M.D` form.
 
 ## [Unreleased]
 
+### Documentation
+
+- Correct the README's current-release references, macOS process detection, log-read budgets, Escape/filter behavior, and local wheel-pin validation command. Expand the 2026.9.26 release notes with per-panel changes, CLI limits, upgrade instructions, verification links, and JSON migration paths/examples under `state`.
+
 ## [2026.9.26] - 2026-09-26
 
 ### Fixed
@@ -126,7 +130,7 @@ and this project uses date-based versions in `YYYY.M.D` form.
   - `CredentialPoolEntry.cooldown_remaining` (a string) is replaced by `cooldown_remaining_seconds` (a number or `null`) and a `model_cooldowns` list.
   - `migration.verification_gap` no longer produces `flag_off`.
   - `CronJob.model_snapshot` and `CronJob.provider_snapshot` are removed. Jobs carry `effective_model` and `model_source` instead.
-  - New top-level fields: `usage_analytics`, `cron_usage`, `cron_deliveries`, `cron_bot_chat`, `cron_recovery`, `disk` and `integrations`. Existing objects gain fields, including `runtime.estop_*`, `logs.health`, `operations.snapshots`, `operations.pending_actions`, `profiles.duplicate_platform_credentials` and the new gateway memory, dead-target, restart-loop and restart-backlog fields.
+  - New fields under the JSON snapshot's `state` object: `usage_analytics`, `cron_usage`, `cron_deliveries`, `cron_bot_chat`, `cron_recovery`, `disk` and `integrations`. Existing objects gain fields, including `runtime.estop_*`, `logs.health`, `operations.snapshots`, `operations.pending_actions`, `profiles.duplicate_platform_credentials` and the new gateway memory, dead-target, restart-loop and restart-backlog fields.
 
 ## [2026.9.13] - 2026-09-13
 
